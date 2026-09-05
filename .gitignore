@@ -22,3 +22,14 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+# LocalVault sensitive/local files
+.env
+.env.*
+!.env.example
+*.lvault
+*.lvault.*
+*.backup
+*.bak
+*.before-*
+local-data/
+vault-data/
