@@ -4,4 +4,3 @@
 fn main() {
     localvault_lib::run()
 }
-
