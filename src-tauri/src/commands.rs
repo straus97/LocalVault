@@ -1,3 +1,4 @@
+pub(crate) mod categories;
 pub(crate) mod entries;
 
 use std::path::PathBuf;
@@ -46,6 +47,18 @@ impl From<AppStateError> for CommandError {
                 "pendingUnsavedChanges",
                 "The vault has pending unsaved changes.",
             ),
+
+            AppStateError::Session(SessionError::CategoryNotFound) => {
+                Self::new("categoryNotFound", "The vault category was not found.")
+            }
+
+            AppStateError::Session(SessionError::CategoryInUse) => {
+                Self::new("categoryInUse", "The vault category is still in use.")
+            }
+
+            AppStateError::Session(SessionError::InvalidCategory(_)) => {
+                Self::new("invalidCategory", "The vault category is invalid.")
+            }
 
             AppStateError::StateUnavailable => Self::new(
                 "stateUnavailable",

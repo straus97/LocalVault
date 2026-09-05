@@ -1,3 +1,5 @@
+mod categories;
+pub use categories::{CategoryInput, CategorySummary};
 mod entries;
 pub use entries::{EntryDetails, EntryInput, EntrySummary};
 
@@ -40,6 +42,15 @@ pub enum SessionError {
 
     #[error("vault entry is invalid")]
     InvalidEntry(#[source] VaultDataError),
+
+    #[error("vault category was not found")]
+    CategoryNotFound,
+
+    #[error("vault category is still used by an entry")]
+    CategoryInUse,
+
+    #[error("vault category is invalid")]
+    InvalidCategory(#[source] VaultDataError),
 
     #[error("vault session lock filesystem operation failed")]
     LockIo(#[source] io::Error),

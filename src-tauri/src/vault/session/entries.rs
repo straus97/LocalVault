@@ -1,6 +1,6 @@
 use std::mem;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -8,8 +8,6 @@ use crate::vault::data::VaultEntry;
 
 use super::{SessionError, UnlockedVaultSession};
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct EntryInput {
     pub title: String,
     pub url: String,

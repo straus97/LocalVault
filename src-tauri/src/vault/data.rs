@@ -633,4 +633,15 @@ mod tests {
         assert!(entry.notes.is_empty());
         assert!(entry.tags.is_empty());
     }
+
+    #[test]
+    fn individual_category_name_can_be_zeroized() {
+        let mut category = VaultCategory::new("Sensitive Category", NOW_MS).unwrap();
+
+        assert!(!category.name.is_empty());
+
+        category.zeroize_sensitive_fields();
+
+        assert!(category.name.is_empty());
+    }
 }
