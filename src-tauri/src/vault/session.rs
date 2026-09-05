@@ -64,7 +64,7 @@ pub struct UnlockedVaultSession {
 impl UnlockedVaultSession {
     pub fn create(
         path: impl AsRef<Path>,
-        master_password: String,
+        master_password: Zeroizing<String>,
         now_ms: i64,
     ) -> Result<Self, SessionError> {
         let path = path.as_ref().to_path_buf();
@@ -81,8 +81,6 @@ impl UnlockedVaultSession {
                 return Err(SessionError::LockIo(error));
             }
         }
-
-        let master_password = Zeroizing::new(master_password);
 
         let data = VaultData::new(now_ms)?;
 
@@ -105,7 +103,10 @@ impl UnlockedVaultSession {
         })
     }
 
-    pub fn unlock(path: impl AsRef<Path>, master_password: String) -> Result<Self, SessionError> {
+    pub fn unlock(
+        path: impl AsRef<Path>,
+        master_password: Zeroizing<String>,
+    ) -> Result<Self, SessionError> {
         let path = path.as_ref().to_path_buf();
         let backup_path = backup_path_for(&path);
 
@@ -119,8 +120,6 @@ impl UnlockedVaultSession {
         // Re-read after the lock has been acquired so the
         // session starts from the post-lock disk state.
         let envelope = load_envelope(&path)?;
-
-        let master_password = Zeroizing::new(master_password);
 
         let (vault_key, plaintext) = open_envelope_with_key(master_password.as_str(), &envelope)?;
 
@@ -260,14 +259,16 @@ mod tests {
     const MASTER_PASSWORD: &str = "session-master-password-test-only";
 
     const SESSION_SECRET: &str = "SESSION_TEST_ONLY_SECRET";
+    fn test_password() -> Zeroizing<String> {
+        Zeroizing::new(MASTER_PASSWORD.to_owned())
+    }
 
     #[test]
     fn create_session_persists_valid_empty_vault_and_is_clean() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("vault.lvault");
 
-        let session =
-            UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS).unwrap();
+        let session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
 
         assert!(path.is_file());
         assert!(!session.is_dirty());
@@ -281,14 +282,13 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("vault.lvault");
 
-        let session =
-            UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS).unwrap();
+        let session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
 
         let vault_id = session.data().vault_id;
 
         session.lock();
 
-        let reopened = UnlockedVaultSession::unlock(&path, MASTER_PASSWORD.to_owned()).unwrap();
+        let reopened = UnlockedVaultSession::unlock(&path, test_password()).unwrap();
 
         assert!(reopened.data().vault_id == vault_id);
         assert!(!reopened.is_dirty());
@@ -299,12 +299,14 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("vault.lvault");
 
-        let session =
-            UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS).unwrap();
+        let session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
 
         session.lock();
 
-        let result = UnlockedVaultSession::unlock(&path, "definitely-wrong-password".to_owned());
+        let result = UnlockedVaultSession::unlock(
+            &path,
+            Zeroizing::new("definitely-wrong-password".to_owned()),
+        );
 
         assert!(matches!(
             result,
@@ -319,8 +321,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("vault.lvault");
 
-        let mut session =
-            UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS).unwrap();
+        let mut session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
 
         let mut entry = VaultEntry::new("Session Account", NOW_MS + 1).unwrap();
 
@@ -343,7 +344,7 @@ mod tests {
 
         session.lock();
 
-        let reopened = UnlockedVaultSession::unlock(&path, MASTER_PASSWORD.to_owned()).unwrap();
+        let reopened = UnlockedVaultSession::unlock(&path, test_password()).unwrap();
 
         assert_eq!(reopened.data().entries.len(), 1);
 
@@ -357,8 +358,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("vault.lvault");
 
-        let mut session =
-            UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS).unwrap();
+        let mut session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
 
         let backup = session.backup_path().to_path_buf();
 
@@ -375,8 +375,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("vault.lvault");
 
-        let mut session =
-            UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS).unwrap();
+        let mut session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
 
         let mut first = VaultEntry::new("First Entry", NOW_MS + 1).unwrap();
 
@@ -422,8 +421,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("vault.lvault");
 
-        let mut session =
-            UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS).unwrap();
+        let mut session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
 
         let mut entry = VaultEntry::new("Secret Session Entry", NOW_MS + 1).unwrap();
 
@@ -459,7 +457,7 @@ mod tests {
 
         let before = fs::read(&path).unwrap();
 
-        let result = UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS);
+        let result = UnlockedVaultSession::create(&path, test_password(), NOW_MS);
 
         assert!(matches!(result, Err(SessionError::AlreadyExists)));
 
@@ -473,10 +471,9 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("vault.lvault");
 
-        let _first =
-            UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS).unwrap();
+        let _first = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
 
-        let result = UnlockedVaultSession::unlock(&path, MASTER_PASSWORD.to_owned());
+        let result = UnlockedVaultSession::unlock(&path, test_password());
 
         assert!(matches!(result, Err(SessionError::InUse)));
     }
@@ -486,12 +483,11 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("vault.lvault");
 
-        let first =
-            UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS).unwrap();
+        let first = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
 
         drop(first);
 
-        let reopened = UnlockedVaultSession::unlock(&path, MASTER_PASSWORD.to_owned()).unwrap();
+        let reopened = UnlockedVaultSession::unlock(&path, test_password()).unwrap();
 
         assert!(!reopened.is_dirty());
     }
@@ -501,8 +497,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("vault.lvault");
 
-        let mut session =
-            UnlockedVaultSession::create(&path, MASTER_PASSWORD.to_owned(), NOW_MS).unwrap();
+        let mut session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
 
         let mut entry = VaultEntry::new("Unsaved Entry", NOW_MS + 1).unwrap();
 
