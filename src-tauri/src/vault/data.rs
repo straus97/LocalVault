@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 pub const VAULT_DATA_SCHEMA_VERSION: u16 = 1;
 
@@ -94,7 +95,7 @@ pub enum VaultDataError {
     InvalidCategoryTimestamp(Uuid),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultData {
     pub schema_version: u16,
     pub vault_id: Uuid,
@@ -104,7 +105,7 @@ pub struct VaultData {
     pub categories: Vec<VaultCategory>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultEntry {
     pub id: Uuid,
     pub title: String,
@@ -119,7 +120,7 @@ pub struct VaultEntry {
     pub updated_at_ms: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultCategory {
     pub id: Uuid,
     pub name: String,
@@ -188,6 +189,35 @@ impl VaultData {
     }
 }
 
+impl VaultData {
+    pub(crate) fn zeroize_sensitive_fields(&mut self) {
+        for entry in &mut self.entries {
+            entry.title.zeroize();
+            entry.url.zeroize();
+            entry.username.zeroize();
+            entry.password.zeroize();
+            entry.notes.zeroize();
+
+            for tag in &mut entry.tags {
+                tag.zeroize();
+            }
+
+            entry.tags.clear();
+        }
+
+        for category in &mut self.categories {
+            category.name.zeroize();
+        }
+
+        self.entries.clear();
+        self.categories.clear();
+    }
+}
+impl Drop for VaultData {
+    fn drop(&mut self) {
+        self.zeroize_sensitive_fields();
+    }
+}
 impl VaultEntry {
     pub fn new(title: impl Into<String>, now_ms: i64) -> Result<Self, VaultDataError> {
         if now_ms < 0 {
@@ -501,7 +531,7 @@ mod tests {
 
         restored.validate().unwrap();
 
-        assert_eq!(restored, data);
+        assert!(restored == data);
     }
 
     #[test]
@@ -532,6 +562,22 @@ mod tests {
 
         restored.validate().unwrap();
 
-        assert_eq!(restored, data);
+        assert!(restored == data);
+    }
+
+    #[test]
+    fn sensitive_fields_are_zeroized_before_session_drop() {
+        let mut data = valid_sample_data();
+
+        assert!(!data.entries[0].password.is_empty());
+        assert!(!data.entries[0].username.is_empty());
+        assert!(!data.entries[0].url.is_empty());
+        assert!(!data.entries[0].notes.is_empty());
+        assert!(!data.categories[0].name.is_empty());
+
+        data.zeroize_sensitive_fields();
+
+        assert!(data.entries.is_empty());
+        assert!(data.categories.is_empty());
     }
 }

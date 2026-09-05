@@ -5,7 +5,7 @@ use zeroize::Zeroizing;
 use crate::crypto::{
     cipher::{decrypt, encrypt, EncryptedBlob},
     kdf::{derive_master_key, KdfParams},
-    keys::{random_salt, random_secret_key, KEY_LEN, SALT_LEN},
+    keys::{random_salt, random_secret_key, SecretKey, KEY_LEN, SALT_LEN},
     CryptoError,
 };
 
@@ -52,10 +52,10 @@ impl VaultEnvelope {
     }
 }
 
-pub fn create_envelope(
+pub(crate) fn create_envelope_with_key(
     master_password: &str,
     plaintext: &[u8],
-) -> Result<VaultEnvelope, VaultError> {
+) -> Result<(VaultEnvelope, SecretKey), VaultError> {
     if master_password.is_empty() {
         return Err(VaultError::EmptyMasterPassword);
     }
@@ -71,20 +71,31 @@ pub fn create_envelope(
 
     let payload = encrypt(&vault_key, plaintext, PAYLOAD_AAD)?;
 
-    Ok(VaultEnvelope {
+    let envelope = VaultEnvelope {
         magic: VAULT_MAGIC.to_owned(),
         version: VAULT_VERSION,
         kdf,
         kdf_salt,
         wrapped_vault_key,
         payload,
-    })
+    };
+
+    Ok((envelope, vault_key))
 }
 
-pub fn open_envelope(
+pub fn create_envelope(
+    master_password: &str,
+    plaintext: &[u8],
+) -> Result<VaultEnvelope, VaultError> {
+    let (envelope, _vault_key) = create_envelope_with_key(master_password, plaintext)?;
+
+    Ok(envelope)
+}
+
+pub(crate) fn open_envelope_with_key(
     master_password: &str,
     envelope: &VaultEnvelope,
-) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+) -> Result<(SecretKey, Zeroizing<Vec<u8>>), VaultError> {
     if master_password.is_empty() {
         return Err(VaultError::EmptyMasterPassword);
     }
@@ -100,11 +111,36 @@ pub fn open_envelope(
     }
 
     let mut vault_key = Zeroizing::new([0u8; KEY_LEN]);
+
     vault_key.copy_from_slice(decrypted_vault_key.as_slice());
 
-    decrypt(&vault_key, &envelope.payload, PAYLOAD_AAD).map_err(VaultError::from)
+    let plaintext = decrypt(&vault_key, &envelope.payload, PAYLOAD_AAD)?;
+
+    Ok((vault_key, plaintext))
 }
 
+pub(crate) fn reseal_envelope(
+    envelope: &VaultEnvelope,
+    vault_key: &[u8; KEY_LEN],
+    plaintext: &[u8],
+) -> Result<VaultEnvelope, VaultError> {
+    envelope.validate_header()?;
+
+    let mut updated = envelope.clone();
+
+    updated.payload = encrypt(vault_key, plaintext, PAYLOAD_AAD)?;
+
+    Ok(updated)
+}
+
+pub fn open_envelope(
+    master_password: &str,
+    envelope: &VaultEnvelope,
+) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    let (_vault_key, plaintext) = open_envelope_with_key(master_password, envelope)?;
+
+    Ok(plaintext)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
