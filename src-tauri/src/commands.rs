@@ -1,3 +1,5 @@
+pub(crate) mod entries;
+
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -29,6 +31,21 @@ impl From<AppStateError> for CommandError {
             AppStateError::AlreadyUnlocked => {
                 Self::new("vaultAlreadyUnlocked", "A vault is already unlocked.")
             }
+
+            AppStateError::VaultLocked => Self::new("vaultLocked", "The vault is locked."),
+
+            AppStateError::Session(SessionError::EntryNotFound) => {
+                Self::new("entryNotFound", "The vault entry was not found.")
+            }
+
+            AppStateError::Session(SessionError::InvalidEntry(_)) => {
+                Self::new("invalidEntry", "The vault entry is invalid.")
+            }
+
+            AppStateError::Session(SessionError::PendingUnsavedChanges) => Self::new(
+                "pendingUnsavedChanges",
+                "The vault has pending unsaved changes.",
+            ),
 
             AppStateError::StateUnavailable => Self::new(
                 "stateUnavailable",

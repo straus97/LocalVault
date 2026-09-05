@@ -13,6 +13,11 @@ pub fn run() {
             commands::create_vault,
             commands::unlock_vault,
             commands::lock_vault,
+            commands::entries::list_entries,
+            commands::entries::get_entry,
+            commands::entries::create_entry,
+            commands::entries::update_entry,
+            commands::entries::delete_entry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

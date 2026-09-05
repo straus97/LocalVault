@@ -1,3 +1,6 @@
+mod entries;
+pub use entries::{EntryDetails, EntryInput, EntrySummary};
+
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io,
@@ -28,6 +31,15 @@ pub enum SessionError {
 
     #[error("vault changed on disk while this session was unlocked")]
     ChangedOnDisk,
+
+    #[error("vault contains pending unsaved changes")]
+    PendingUnsavedChanges,
+
+    #[error("vault entry was not found")]
+    EntryNotFound,
+
+    #[error("vault entry is invalid")]
+    InvalidEntry(#[source] VaultDataError),
 
     #[error("vault session lock filesystem operation failed")]
     LockIo(#[source] io::Error),
@@ -143,7 +155,8 @@ impl UnlockedVaultSession {
         &self.data
     }
 
-    pub fn data_mut(&mut self) -> &mut VaultData {
+    #[cfg(test)]
+    pub(crate) fn data_mut(&mut self) -> &mut VaultData {
         self.dirty = true;
 
         &mut self.data
@@ -188,6 +201,34 @@ impl UnlockedVaultSession {
         self.dirty = false;
 
         Ok(true)
+    }
+
+    pub(crate) fn commit_candidate(&mut self, candidate: VaultData) -> Result<(), SessionError> {
+        if self.dirty {
+            return Err(SessionError::PendingUnsavedChanges);
+        }
+
+        candidate.validate()?;
+
+        let current_on_disk = load_envelope(&self.path)?;
+
+        if current_on_disk != self.envelope {
+            return Err(SessionError::ChangedOnDisk);
+        }
+
+        let plaintext =
+            Zeroizing::new(serde_json::to_vec(&candidate).map_err(SessionError::Serialization)?);
+
+        let updated_envelope =
+            reseal_envelope(&self.envelope, &self.vault_key, plaintext.as_slice())?;
+
+        save_envelope_atomic_with_backup(&self.path, &self.backup_path, &updated_envelope)?;
+
+        self.envelope = updated_envelope;
+        self.data = candidate;
+        self.dirty = false;
+
+        Ok(())
     }
 
     pub fn lock(self) {

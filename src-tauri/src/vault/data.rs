@@ -219,6 +219,39 @@ impl Drop for VaultData {
     }
 }
 impl VaultEntry {
+    pub(crate) fn zeroize_sensitive_fields(&mut self) {
+        self.title.zeroize();
+        self.url.zeroize();
+        self.username.zeroize();
+        self.password.zeroize();
+        self.notes.zeroize();
+
+        for tag in &mut self.tags {
+            tag.zeroize();
+        }
+
+        self.tags.clear();
+    }
+}
+
+impl Drop for VaultEntry {
+    fn drop(&mut self) {
+        self.zeroize_sensitive_fields();
+    }
+}
+
+impl VaultCategory {
+    pub(crate) fn zeroize_sensitive_fields(&mut self) {
+        self.name.zeroize();
+    }
+}
+
+impl Drop for VaultCategory {
+    fn drop(&mut self) {
+        self.zeroize_sensitive_fields();
+    }
+}
+impl VaultEntry {
     pub fn new(title: impl Into<String>, now_ms: i64) -> Result<Self, VaultDataError> {
         if now_ms < 0 {
             return Err(VaultDataError::InvalidEntryTimestamp(Uuid::nil()));
@@ -579,5 +612,25 @@ mod tests {
 
         assert!(data.entries.is_empty());
         assert!(data.categories.is_empty());
+    }
+
+    #[test]
+    fn individual_entry_sensitive_fields_can_be_zeroized() {
+        let mut entry = VaultEntry::new("Sensitive title", NOW_MS).unwrap();
+
+        entry.url = "https://sensitive.example".to_owned();
+        entry.username = "sensitive-user".to_owned();
+        entry.password = "sensitive-password".to_owned();
+        entry.notes = "sensitive-notes".to_owned();
+        entry.tags = vec!["private".to_owned(), "important".to_owned()];
+
+        entry.zeroize_sensitive_fields();
+
+        assert!(entry.title.is_empty());
+        assert!(entry.url.is_empty());
+        assert!(entry.username.is_empty());
+        assert!(entry.password.is_empty());
+        assert!(entry.notes.is_empty());
+        assert!(entry.tags.is_empty());
     }
 }

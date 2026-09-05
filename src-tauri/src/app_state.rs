@@ -1,3 +1,5 @@
+mod entries;
+
 use std::{
     path::PathBuf,
     sync::{Mutex, MutexGuard},
@@ -21,6 +23,9 @@ pub struct VaultStatus {
 pub enum AppStateError {
     #[error("a vault is already unlocked")]
     AlreadyUnlocked,
+
+    #[error("vault is locked")]
+    VaultLocked,
 
     #[error("application state is unavailable")]
     StateUnavailable,
