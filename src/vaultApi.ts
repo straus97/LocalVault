@@ -122,3 +122,8 @@ export function deleteCategory(
     { id },
   );
 }
+export function touchVaultActivity(): Promise<void> {
+  return invoke<void>(
+    "touch_vault_activity",
+  );
+}

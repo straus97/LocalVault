@@ -6,17 +6,17 @@ use super::{unix_time_ms, AppState, AppStateError};
 
 impl AppState {
     pub fn list_categories(&self) -> Result<Vec<CategorySummary>, AppStateError> {
-        let guard = self.session_guard()?;
+        let guard = self.active_session_guard()?;
 
-        let session = guard.as_ref().ok_or(AppStateError::VaultLocked)?;
+        let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
 
         Ok(session.list_categories())
     }
 
     pub fn get_category(&self, id: Uuid) -> Result<CategorySummary, AppStateError> {
-        let guard = self.session_guard()?;
+        let guard = self.active_session_guard()?;
 
-        let session = guard.as_ref().ok_or(AppStateError::VaultLocked)?;
+        let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
 
         session.get_category(id).map_err(AppStateError::from)
     }
@@ -24,9 +24,9 @@ impl AppState {
     pub fn create_category(&self, input: CategoryInput) -> Result<CategorySummary, AppStateError> {
         let now_ms = unix_time_ms()?;
 
-        let mut guard = self.session_guard()?;
+        let mut guard = self.active_session_guard()?;
 
-        let session = guard.as_mut().ok_or(AppStateError::VaultLocked)?;
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
 
         session
             .create_category(input, now_ms)
@@ -40,9 +40,9 @@ impl AppState {
     ) -> Result<CategorySummary, AppStateError> {
         let now_ms = unix_time_ms()?;
 
-        let mut guard = self.session_guard()?;
+        let mut guard = self.active_session_guard()?;
 
-        let session = guard.as_mut().ok_or(AppStateError::VaultLocked)?;
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
 
         session
             .update_category(id, input, now_ms)
@@ -52,9 +52,9 @@ impl AppState {
     pub fn delete_category(&self, id: Uuid) -> Result<(), AppStateError> {
         let now_ms = unix_time_ms()?;
 
-        let mut guard = self.session_guard()?;
+        let mut guard = self.active_session_guard()?;
 
-        let session = guard.as_mut().ok_or(AppStateError::VaultLocked)?;
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
 
         session
             .delete_category(id, now_ms)
@@ -162,5 +162,24 @@ mod tests {
                 crate::vault::session::SessionError::CategoryNotFound
             ))
         ));
+    }
+
+    #[test]
+    fn expired_state_rejects_category_operation_and_drops_session() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vault.lvault");
+
+        let state = AppState::with_auto_lock_timeout(std::time::Duration::from_secs(60));
+
+        state.create_vault(path, password()).unwrap();
+
+        state.age_session_for_test(std::time::Duration::from_secs(61));
+
+        assert!(matches!(
+            state.list_categories(),
+            Err(AppStateError::SessionExpired)
+        ));
+
+        assert!(!state.status().unwrap().unlocked);
     }
 }

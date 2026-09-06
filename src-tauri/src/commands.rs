@@ -36,6 +36,11 @@ impl From<AppStateError> for CommandError {
 
             AppStateError::VaultLocked => Self::new("vaultLocked", "The vault is locked."),
 
+            AppStateError::SessionExpired => Self::new(
+                "vaultSessionExpired",
+                "The vault session expired due to inactivity.",
+            ),
+
             AppStateError::Session(SessionError::EntryNotFound) => {
                 Self::new("entryNotFound", "The vault entry was not found.")
             }
@@ -173,6 +178,11 @@ pub fn lock_vault(state: State<'_, AppState>) -> Result<VaultStatus, CommandErro
     state.lock_vault().map_err(CommandError::from)
 }
 
+#[tauri::command]
+pub fn touch_vault_activity(state: State<'_, AppState>) -> Result<(), CommandError> {
+    state.touch_activity().map_err(CommandError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -223,5 +233,17 @@ mod tests {
         assert_eq!(error.code, "vaultOperationFailed");
 
         assert!(!error.message.contains("SECRET_INTERNAL_IO_DETAIL"));
+    }
+
+    #[test]
+    fn expired_session_has_stable_command_error() {
+        let error = CommandError::from(AppStateError::SessionExpired);
+
+        assert_eq!(error.code, "vaultSessionExpired");
+
+        assert_eq!(
+            error.message,
+            "The vault session expired due to inactivity."
+        );
     }
 }

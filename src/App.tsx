@@ -10,6 +10,8 @@ import {
   save as saveDialog,
 } from "@tauri-apps/plugin-dialog";
 
+import { listen } from "@tauri-apps/api/event";
+
 import CategoryEditor from "./CategoryEditor";
 import EntryEditor from "./EntryEditor";
 import "./App.css";
@@ -38,6 +40,7 @@ import {
   rememberRecentVault,
   updateCategory,
   updateEntry,
+  touchVaultActivity,
   unlockVault,
 } from "./vaultApi";
 
@@ -75,6 +78,8 @@ const friendlyErrors: Record<string, string> = {
     "Не удалось корректно заблокировать хранилище.",
   vaultOperationFailed:
     "Операция с хранилищем не выполнена.",
+  vaultSessionExpired:
+    "Хранилище автоматически заблокировано из-за бездействия.",
   entryNotFound:
     "Выбранная запись больше не существует.",
   categoryNotFound:
@@ -238,6 +243,7 @@ function App() {
     setSelectedEntry(null);
     setSelectedEntryId(null);
     setPasswordVisible(false);
+    setDetailsLoading(false);
   }
 
   function clearUnlockedData() {
@@ -253,6 +259,26 @@ function App() {
     setFilter({ type: "all" });
   }
 
+  function applyAutoLockedUi() {
+    setStatus(initialStatus);
+
+    clearUnlockedData();
+
+    setBusy(false);
+    setDetailsLoading(false);
+    setEntryMutationBusy(false);
+    setCategoryMutationBusy(false);
+
+    setGateMode(null);
+    setSelectedPath("");
+
+    setMasterPassword("");
+    setConfirmPassword("");
+
+    setErrorMessage(
+      "Хранилище автоматически заблокировано из-за бездействия.",
+    );
+  }
   useEffect(() => {
     let active = true;
 
@@ -320,6 +346,178 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let active = true;
+    let unlisten:
+      | (() => void)
+      | undefined;
+
+    void listen<void>(
+      "vault-session-expired",
+      () => {
+        /*
+         * A queued event can theoretically arrive just after
+         * the user unlocks again. Re-check Rust before hiding
+         * a newly active session.
+         */
+        void getVaultStatus()
+          .then((nextStatus) => {
+            if (!active) {
+              return;
+            }
+
+            if (nextStatus.unlocked) {
+              setStatus(nextStatus);
+              return;
+            }
+
+            applyAutoLockedUi();
+          })
+          .catch(() => {
+            if (active) {
+              /*
+               * If backend state cannot be verified, remove
+               * decrypted WebView state rather than keeping
+               * it visible.
+               */
+              applyAutoLockedUi();
+            }
+          });
+      },
+    )
+      .then((nextUnlisten) => {
+        if (active) {
+          unlisten = nextUnlisten;
+        } else {
+          nextUnlisten();
+        }
+      })
+      .catch(() => {
+        if (!active) {
+          return;
+        }
+
+        /*
+         * Without the expiry event channel the UI cannot
+         * reliably learn about backend auto-lock. Fail closed.
+         */
+        void lockVault()
+          .catch(() => undefined)
+          .finally(() => {
+            if (active) {
+              applyAutoLockedUi();
+            }
+          });
+      });
+
+    return () => {
+      active = false;
+
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!status.unlocked) {
+      return;
+    }
+
+    let active = true;
+    let heartbeatInFlight = false;
+
+    const heartbeatIntervalMs =
+      5_000;
+
+    let lastHeartbeatMs =
+      performance.now() -
+      heartbeatIntervalMs;
+
+    const verifyAfterHeartbeatFailure =
+      () => {
+        void getVaultStatus()
+          .then((nextStatus) => {
+            if (
+              active &&
+              !nextStatus.unlocked
+            ) {
+              applyAutoLockedUi();
+            }
+          })
+          .catch(() => {
+            if (active) {
+              applyAutoLockedUi();
+            }
+          });
+      };
+
+    const handleUserActivity =
+      () => {
+        const now =
+          performance.now();
+
+        if (
+          heartbeatInFlight ||
+          now - lastHeartbeatMs <
+            heartbeatIntervalMs
+        ) {
+          return;
+        }
+
+        lastHeartbeatMs = now;
+        heartbeatInFlight = true;
+
+        void touchVaultActivity()
+          .catch(() => {
+            /*
+             * A heartbeat may be the operation which first
+             * notices expiry. Verify immediately instead of
+             * waiting for the watcher event.
+             */
+            verifyAfterHeartbeatFailure();
+          })
+          .finally(() => {
+            if (active) {
+              heartbeatInFlight =
+                false;
+            }
+          });
+      };
+
+    const activityEvents = [
+      "pointerdown",
+      "keydown",
+      "mousemove",
+      "wheel",
+      "focus",
+    ] as const;
+
+    for (
+      const eventName
+      of activityEvents
+    ) {
+      window.addEventListener(
+        eventName,
+        handleUserActivity,
+        { passive: true },
+      );
+    }
+
+    return () => {
+      active = false;
+
+      for (
+        const eventName
+        of activityEvents
+      ) {
+        window.removeEventListener(
+          eventName,
+          handleUserActivity,
+        );
+      }
+    };
+  }, [status.unlocked]);
   async function chooseVaultPath(
     mode: GateMode,
   ) {
@@ -1392,9 +1590,10 @@ function App() {
               TEST DATA ONLY
             </div>
             <p>
-              Auto-lock и защищённое
-              копирование добавим до работы
-              с реальными паролями.
+              Автоблокировка: 60 секунд.
+              Защищённое копирование паролей
+              будет добавлено следующим
+              security-этапом.
             </p>
           </div>
         </aside>
