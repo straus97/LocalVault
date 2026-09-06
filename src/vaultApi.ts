@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  CategoryCommandInput,
   CategorySummary,
   EntryDetails,
   EntryCommandInput,
@@ -88,6 +89,36 @@ export function deleteEntry(
 ): Promise<void> {
   return invoke<void>(
     "delete_entry",
+    { id },
+  );
+}
+export function createCategory(
+  input: CategoryCommandInput,
+): Promise<CategorySummary> {
+  return invoke<CategorySummary>(
+    "create_category",
+    { input },
+  );
+}
+
+export function updateCategory(
+  id: string,
+  input: CategoryCommandInput,
+): Promise<CategorySummary> {
+  return invoke<CategorySummary>(
+    "update_category",
+    {
+      id,
+      input,
+    },
+  );
+}
+
+export function deleteCategory(
+  id: string,
+): Promise<void> {
+  return invoke<void>(
+    "delete_category",
     { id },
   );
 }

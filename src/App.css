@@ -2242,3 +2242,173 @@ input:focus-visible {
 .test-mode-note {
   font-size: 11px;
 }
+/* LOCALVAULT CATEGORY CRUD UI */
+
+.sidebar-label-row {
+  padding-right: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sidebar-label-row .sidebar-label {
+  padding-right: 0;
+}
+
+.add-category-button {
+  width: 25px;
+  height: 25px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  color: var(--accent-strong);
+  font-size: 17px;
+  line-height: 1;
+  border: 1px solid rgba(111, 140, 255, 0.2);
+  border-radius: 7px;
+  background: rgba(111, 140, 255, 0.07);
+  cursor: pointer;
+}
+
+.add-category-button:hover:not(:disabled) {
+  border-color: rgba(111, 140, 255, 0.42);
+  background: rgba(111, 140, 255, 0.13);
+}
+
+.add-category-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.manage-category-button {
+  width: calc(100% - 18px);
+  min-height: 32px;
+  margin: 9px 9px 0;
+  padding: 0 9px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #8394aa;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-align: left;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: #0c131d;
+  cursor: pointer;
+}
+
+.manage-category-button span {
+  color: #667891;
+  letter-spacing: 0.1em;
+}
+
+.manage-category-button:hover:not(:disabled) {
+  color: #c3cfdd;
+  border-color: #34455f;
+  background: #111a27;
+}
+
+.manage-category-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.category-modal-backdrop {
+  z-index: 110;
+}
+
+.category-editor {
+  width: min(100%, 480px);
+  overflow: hidden;
+  border: 1px solid #2b3950;
+  border-radius: 17px;
+  background: #101722;
+  box-shadow:
+    0 30px 90px rgba(0, 0, 0, 0.48),
+    inset 0 1px rgba(255, 255, 255, 0.025);
+}
+
+.category-editor-form {
+  padding: 20px 22px 21px;
+}
+
+.category-editor-error {
+  margin: 0 0 15px;
+}
+
+.category-editor-note {
+  margin: 12px 0 0;
+  color: #68798f;
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.category-danger-zone {
+  margin-top: 19px;
+  padding: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border: 1px solid rgba(255, 126, 145, 0.17);
+  border-radius: 10px;
+  background: rgba(255, 126, 145, 0.035);
+}
+
+.category-danger-zone > div {
+  min-width: 0;
+}
+
+.category-danger-zone strong,
+.category-danger-zone span {
+  display: block;
+}
+
+.category-danger-zone strong {
+  color: #d9a6af;
+  font-size: 11px;
+}
+
+.category-danger-zone span {
+  max-width: 280px;
+  margin-top: 4px;
+  color: #7f6d75;
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+.category-delete-button {
+  min-height: 34px;
+  padding: 0 11px;
+  flex: 0 0 auto;
+  color: #ffabb8;
+  font-size: 10.5px;
+  font-weight: 700;
+  border: 1px solid rgba(255, 126, 145, 0.28);
+  border-radius: 8px;
+  background: rgba(255, 126, 145, 0.065);
+  cursor: pointer;
+}
+
+.category-delete-button:hover:not(:disabled) {
+  border-color: rgba(255, 126, 145, 0.5);
+  background: rgba(255, 126, 145, 0.11);
+}
+
+.category-delete-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+@media (max-width: 620px) {
+  .category-danger-zone {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .category-delete-button {
+    width: 100%;
+  }
+}

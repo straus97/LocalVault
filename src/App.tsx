@@ -10,9 +10,11 @@ import {
   save as saveDialog,
 } from "@tauri-apps/plugin-dialog";
 
+import CategoryEditor from "./CategoryEditor";
 import EntryEditor from "./EntryEditor";
 import "./App.css";
 import type {
+  CategoryCommandInput,
   CategorySummary,
   CommandError,
   EntryCommandInput,
@@ -22,8 +24,10 @@ import type {
   VaultStatus,
 } from "./types";
 import {
+  createCategory,
   createEntry,
   createVault,
+  deleteCategory,
   deleteEntry,
   getEntry,
   getRecentVaults,
@@ -32,6 +36,7 @@ import {
   listEntries,
   lockVault,
   rememberRecentVault,
+  updateCategory,
   updateEntry,
   unlockVault,
 } from "./vaultApi";
@@ -74,6 +79,10 @@ const friendlyErrors: Record<string, string> = {
     "Выбранная запись больше не существует.",
   categoryNotFound:
     "Выбранная категория больше не существует.",
+  categoryInUse:
+    "Категорию нельзя удалить, пока она используется одной или несколькими записями.",
+  invalidCategory:
+    "Проверьте название категории.",
 };
 
 function normalizeCommandError(error: unknown): CommandError {
@@ -173,6 +182,29 @@ function App() {
 
   const [passwordVisible, setPasswordVisible] =
     useState(false);
+  const [
+    categoryEditorMode,
+    setCategoryEditorMode,
+  ] = useState<
+    "create" | "edit" | null
+  >(null);
+
+  const [
+    editingCategory,
+    setEditingCategory,
+  ] = useState<CategorySummary | null>(
+    null,
+  );
+
+  const [
+    categoryMutationBusy,
+    setCategoryMutationBusy,
+  ] = useState(false);
+
+  const [
+    categoryMutationError,
+    setCategoryMutationError,
+  ] = useState<string | null>(null);
   const [entryEditorMode, setEntryEditorMode] =
     useState<"create" | "edit" | null>(
       null,
@@ -209,6 +241,9 @@ function App() {
   }
 
   function clearUnlockedData() {
+    setCategoryEditorMode(null);
+    setEditingCategory(null);
+    setCategoryMutationError(null);
     setEntryEditorMode(null);
     setEntryMutationError(null);
     clearSecretView();
@@ -505,6 +540,141 @@ function App() {
       ) {
         setDetailsLoading(false);
       }
+    }
+  }
+  function openSelectedCategoryEditor() {
+    if (filter.type !== "category") {
+      return;
+    }
+
+    const category =
+      categories.find(
+        (candidate) =>
+          candidate.id ===
+          filter.categoryId,
+      );
+
+    if (!category) {
+      setErrorMessage(
+        "Выбранная категория больше не существует.",
+      );
+      return;
+    }
+
+    setEditingCategory(category);
+    setCategoryMutationError(null);
+    setCategoryEditorMode("edit");
+  }
+
+  async function handleCategorySubmit(
+    name: string,
+  ) {
+    if (!categoryEditorMode) {
+      return;
+    }
+
+    const input: CategoryCommandInput = {
+      name,
+    };
+
+    if (
+      categoryEditorMode === "edit" &&
+      !editingCategory
+    ) {
+      setCategoryMutationError(
+        "Не удалось определить редактируемую категорию.",
+      );
+      return;
+    }
+
+    setCategoryMutationBusy(true);
+    setCategoryMutationError(null);
+
+    try {
+      const summary =
+        categoryEditorMode === "edit" &&
+        editingCategory
+          ? await updateCategory(
+              editingCategory.id,
+              input,
+            )
+          : await createCategory(
+              input,
+            );
+
+      const nextCategories =
+        await listCategories();
+
+      setCategories(nextCategories);
+
+      setFilter({
+        type: "category",
+        categoryId: summary.id,
+      });
+
+      setEditingCategory(null);
+      setCategoryEditorMode(null);
+      setCategoryMutationError(null);
+    } catch (error) {
+      setCategoryMutationError(
+        friendlyError(error),
+      );
+    } finally {
+      setCategoryMutationBusy(false);
+    }
+  }
+
+  async function handleDeleteCategory() {
+    if (
+      categoryEditorMode !== "edit" ||
+      !editingCategory
+    ) {
+      return;
+    }
+
+    const categoryId =
+      editingCategory.id;
+
+    const confirmed =
+      window.confirm(
+        `Удалить категорию «${editingCategory.name}»?`,
+      );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setCategoryMutationBusy(true);
+    setCategoryMutationError(null);
+
+    try {
+      await deleteCategory(
+        categoryId,
+      );
+
+      const nextCategories =
+        await listCategories();
+
+      setCategories(nextCategories);
+
+      if (
+        filter.type === "category" &&
+        filter.categoryId ===
+          categoryId
+      ) {
+        setFilter({
+          type: "all",
+        });
+      }
+
+      setEditingCategory(null);
+      setCategoryEditorMode(null);
+    } catch (error) {
+      setCategoryMutationError(
+        friendlyError(error),
+      );
+    } finally {
+      setCategoryMutationBusy(false);
     }
   }
   async function handleEntrySubmit(
@@ -1121,8 +1291,31 @@ function App() {
           </nav>
 
           <div className="sidebar-section">
-            <div className="sidebar-label">
-              Категории
+            <div className="sidebar-label-row">
+              <div className="sidebar-label">
+                Категории
+              </div>
+
+              <button
+                type="button"
+                className="add-category-button"
+                aria-label="Создать категорию"
+                title="Создать категорию"
+                disabled={
+                  categoryMutationBusy
+                }
+                onClick={() => {
+                  setEditingCategory(null);
+                  setCategoryMutationError(
+                    null,
+                  );
+                  setCategoryEditorMode(
+                    "create",
+                  );
+                }}
+              >
+                +
+              </button>
             </div>
 
             {categories.length === 0 ? (
@@ -1176,6 +1369,23 @@ function App() {
               </div>
             )}
           </div>
+          {filter.type === "category" && (
+            <button
+              type="button"
+              className="manage-category-button"
+              disabled={
+                categoryMutationBusy
+              }
+              onClick={
+                openSelectedCategoryEditor
+              }
+            >
+              <span aria-hidden="true">
+                ···
+              </span>
+              Управлять категорией
+            </button>
+          )}
 
           <div className="sidebar-footer">
             <div className="test-chip">
@@ -1501,6 +1711,39 @@ function App() {
           )}
         </section>
       </div>
+      {categoryEditorMode && (
+        <CategoryEditor
+          key={
+            categoryEditorMode === "edit" &&
+            editingCategory
+              ? `edit-${editingCategory.id}`
+              : "create"
+          }
+          mode={categoryEditorMode}
+          category={
+            categoryEditorMode === "edit"
+              ? editingCategory
+              : null
+          }
+          busy={categoryMutationBusy}
+          errorMessage={
+            categoryMutationError
+          }
+          onCancel={() => {
+            if (!categoryMutationBusy) {
+              setCategoryEditorMode(null);
+              setEditingCategory(null);
+              setCategoryMutationError(null);
+            }
+          }}
+          onSubmit={
+            handleCategorySubmit
+          }
+          onDelete={
+            handleDeleteCategory
+          }
+        />
+      )}
       {entryEditorMode && (
         <EntryEditor
           key={

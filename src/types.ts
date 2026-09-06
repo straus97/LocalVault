@@ -53,3 +53,6 @@ export interface EntryCommandInput {
   tags: string[];
   favorite: boolean;
 }
+export interface CategoryCommandInput {
+  name: string;
+}
