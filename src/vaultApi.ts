@@ -1,0 +1,50 @@
+import { invoke } from "@tauri-apps/api/core";
+
+import type {
+  CategorySummary,
+  EntryDetails,
+  EntrySummary,
+  VaultStatus,
+} from "./types";
+
+export function getVaultStatus(): Promise<VaultStatus> {
+  return invoke<VaultStatus>("get_vault_status");
+}
+
+export function createVault(
+  path: string,
+  masterPassword: string,
+): Promise<VaultStatus> {
+  return invoke<VaultStatus>("create_vault", {
+    path,
+    masterPassword,
+  });
+}
+
+export function unlockVault(
+  path: string,
+  masterPassword: string,
+): Promise<VaultStatus> {
+  return invoke<VaultStatus>("unlock_vault", {
+    path,
+    masterPassword,
+  });
+}
+
+export function lockVault(): Promise<VaultStatus> {
+  return invoke<VaultStatus>("lock_vault");
+}
+
+export function listEntries(): Promise<EntrySummary[]> {
+  return invoke<EntrySummary[]>("list_entries");
+}
+
+export function getEntry(
+  id: string,
+): Promise<EntryDetails> {
+  return invoke<EntryDetails>("get_entry", { id });
+}
+
+export function listCategories(): Promise<CategorySummary[]> {
+  return invoke<CategorySummary[]>("list_categories");
+}
