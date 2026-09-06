@@ -10,17 +10,21 @@ import {
   save as saveDialog,
 } from "@tauri-apps/plugin-dialog";
 
+import EntryEditor from "./EntryEditor";
 import "./App.css";
 import type {
   CategorySummary,
   CommandError,
+  EntryCommandInput,
   EntryDetails,
   EntrySummary,
   VaultFilter,
   VaultStatus,
 } from "./types";
 import {
+  createEntry,
   createVault,
+  deleteEntry,
   getEntry,
   getRecentVaults,
   getVaultStatus,
@@ -28,6 +32,7 @@ import {
   listEntries,
   lockVault,
   rememberRecentVault,
+  updateEntry,
   unlockVault,
 } from "./vaultApi";
 
@@ -168,6 +173,20 @@ function App() {
 
   const [passwordVisible, setPasswordVisible] =
     useState(false);
+  const [entryEditorMode, setEntryEditorMode] =
+    useState<"create" | "edit" | null>(
+      null,
+    );
+
+  const [
+    entryMutationBusy,
+    setEntryMutationBusy,
+  ] = useState(false);
+
+  const [
+    entryMutationError,
+    setEntryMutationError,
+  ] = useState<string | null>(null);
 
   const detailsRequest = useRef(0);
 
@@ -190,6 +209,8 @@ function App() {
   }
 
   function clearUnlockedData() {
+    setEntryEditorMode(null);
+    setEntryMutationError(null);
     clearSecretView();
     setEntries([]);
     setCategories([]);
@@ -484,6 +505,99 @@ function App() {
       ) {
         setDetailsLoading(false);
       }
+    }
+  }
+  async function handleEntrySubmit(
+    input: EntryCommandInput,
+  ) {
+    if (!entryEditorMode) {
+      return;
+    }
+
+    if (
+      entryEditorMode === "edit" &&
+      !selectedEntry
+    ) {
+      setEntryMutationError(
+        "Не удалось определить редактируемую запись.",
+      );
+      return;
+    }
+
+    setEntryMutationBusy(true);
+    setEntryMutationError(null);
+
+    try {
+      const summary =
+        entryEditorMode === "edit" &&
+        selectedEntry
+          ? await updateEntry(
+              selectedEntry.id,
+              input,
+            )
+          : await createEntry(input);
+
+      const [
+        nextEntries,
+        nextDetails,
+      ] = await Promise.all([
+        listEntries(),
+        getEntry(summary.id),
+      ]);
+
+      setEntries(nextEntries);
+      setSelectedEntryId(
+        summary.id,
+      );
+      setSelectedEntry(
+        nextDetails,
+      );
+      setPasswordVisible(false);
+      setEntryEditorMode(null);
+      setEntryMutationError(null);
+    } catch (error) {
+      setEntryMutationError(
+        friendlyError(error),
+      );
+    } finally {
+      setEntryMutationBusy(false);
+    }
+  }
+
+  async function handleDeleteSelectedEntry() {
+    if (!selectedEntry) {
+      return;
+    }
+
+    const confirmed =
+      window.confirm(
+        `Удалить запись «${selectedEntry.title}»? Это действие нельзя отменить.`,
+      );
+
+    if (!confirmed) {
+      return;
+    }
+
+    const entryId =
+      selectedEntry.id;
+
+    setEntryMutationBusy(true);
+    setErrorMessage(null);
+
+    try {
+      await deleteEntry(entryId);
+
+      const nextEntries =
+        await listEntries();
+
+      setEntries(nextEntries);
+      clearSecretView();
+    } catch (error) {
+      setErrorMessage(
+        friendlyError(error),
+      );
+    } finally {
+      setEntryMutationBusy(false);
     }
   }
 
@@ -1094,9 +1208,28 @@ function App() {
               </h2>
             </div>
 
-            <span className="entry-count">
-              {visibleEntries.length}
-            </span>
+            <div className="entry-header-actions">
+              <span className="entry-count">
+                {visibleEntries.length}
+              </span>
+
+              <button
+                type="button"
+                className="new-entry-button"
+                disabled={entryMutationBusy}
+                onClick={() => {
+                  setEntryMutationError(null);
+                  setEntryEditorMode(
+                    "create",
+                  );
+                }}
+              >
+                <span aria-hidden="true">
+                  +
+                </span>
+                Новая запись
+              </button>
+            </div>
           </div>
 
           <div className="search-box">
@@ -1206,6 +1339,32 @@ function App() {
             </div>
           ) : (
             <div className="entry-detail">
+              <div className="detail-toolbar">
+                <button
+                  type="button"
+                  className="detail-action"
+                  disabled={entryMutationBusy}
+                  onClick={() => {
+                    setEntryMutationError(null);
+                    setEntryEditorMode(
+                      "edit",
+                    );
+                  }}
+                >
+                  Изменить
+                </button>
+
+                <button
+                  type="button"
+                  className="detail-action danger"
+                  disabled={entryMutationBusy}
+                  onClick={() =>
+                    void handleDeleteSelectedEntry()
+                  }
+                >
+                  Удалить
+                </button>
+              </div>
               <div className="detail-heading">
                 <div className="detail-avatar">
                   {selectedEntry.title
@@ -1342,6 +1501,36 @@ function App() {
           )}
         </section>
       </div>
+      {entryEditorMode && (
+        <EntryEditor
+          key={
+            entryEditorMode === "edit" &&
+            selectedEntry
+              ? `edit-${selectedEntry.id}`
+              : "create"
+          }
+          mode={entryEditorMode}
+          initialEntry={
+            entryEditorMode === "edit"
+              ? selectedEntry
+              : null
+          }
+          categories={categories}
+          busy={entryMutationBusy}
+          errorMessage={
+            entryMutationError
+          }
+          onCancel={() => {
+            if (!entryMutationBusy) {
+              setEntryEditorMode(null);
+              setEntryMutationError(null);
+            }
+          }}
+          onSubmit={
+            handleEntrySubmit
+          }
+        />
+      )}
     </main>
   );
 }

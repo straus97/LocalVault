@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   CategorySummary,
   EntryDetails,
+  EntryCommandInput,
   EntrySummary,
   VaultStatus,
 } from "./types";
@@ -58,5 +59,35 @@ export function rememberRecentVault(
   return invoke<string[]>(
     "remember_recent_vault",
     { path },
+  );
+}
+export function createEntry(
+  input: EntryCommandInput,
+): Promise<EntrySummary> {
+  return invoke<EntrySummary>(
+    "create_entry",
+    { input },
+  );
+}
+
+export function updateEntry(
+  id: string,
+  input: EntryCommandInput,
+): Promise<EntrySummary> {
+  return invoke<EntrySummary>(
+    "update_entry",
+    {
+      id,
+      input,
+    },
+  );
+}
+
+export function deleteEntry(
+  id: string,
+): Promise<void> {
+  return invoke<void>(
+    "delete_entry",
+    { id },
   );
 }

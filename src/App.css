@@ -1591,3 +1591,654 @@ input:focus-visible {
     margin-top: 18px;
   }
 }
+/* LOCALVAULT ENTRY CRUD UI */
+
+.entry-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.new-entry-button {
+  height: 29px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #dfe6ff;
+  font-size: 9px;
+  font-weight: 700;
+  border: 1px solid rgba(111, 140, 255, 0.32);
+  border-radius: 8px;
+  background: rgba(111, 140, 255, 0.12);
+  cursor: pointer;
+}
+
+.new-entry-button span {
+  color: var(--accent-strong);
+  font-size: 14px;
+}
+
+.new-entry-button:hover:not(:disabled) {
+  border-color: rgba(111, 140, 255, 0.55);
+  background: rgba(111, 140, 255, 0.18);
+}
+
+.new-entry-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.detail-toolbar {
+  margin-bottom: 18px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.detail-action {
+  min-height: 30px;
+  padding: 0 10px;
+  color: #aab9cd;
+  font-size: 9px;
+  font-weight: 650;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #121a27;
+  cursor: pointer;
+}
+
+.detail-action:hover:not(:disabled) {
+  color: #d8e2f0;
+  border-color: #3c4c66;
+  background: #172131;
+}
+
+.detail-action.danger {
+  color: #d998a4;
+  border-color: rgba(255, 126, 145, 0.2);
+  background: rgba(255, 126, 145, 0.05);
+}
+
+.detail-action.danger:hover:not(:disabled) {
+  color: #ffb8c3;
+  border-color: rgba(255, 126, 145, 0.38);
+  background: rgba(255, 126, 145, 0.09);
+}
+
+.detail-action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.modal-backdrop {
+  padding: 28px;
+  display: grid;
+  place-items: center;
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  overflow-y: auto;
+  background: rgba(4, 8, 14, 0.76);
+  backdrop-filter: blur(7px);
+}
+
+.entry-editor {
+  width: min(100%, 680px);
+  max-height: calc(100vh - 56px);
+  display: grid;
+  grid-template-rows:
+    auto
+    auto
+    minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid #2b3950;
+  border-radius: 17px;
+  background: #101722;
+  box-shadow:
+    0 30px 90px rgba(0, 0, 0, 0.48),
+    inset 0 1px rgba(255, 255, 255, 0.025);
+}
+
+.editor-header {
+  padding: 20px 22px 16px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.editor-eyebrow {
+  color: var(--accent-strong);
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.editor-header h2 {
+  margin: 5px 0 0;
+  color: #e8eef8;
+  font-size: 19px;
+  letter-spacing: -0.03em;
+}
+
+.editor-close {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  color: #8797ac;
+  font-size: 19px;
+  line-height: 1;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #121b28;
+  cursor: pointer;
+}
+
+.editor-close:hover:not(:disabled) {
+  color: #d7e0ec;
+  border-color: #3b4a63;
+}
+
+.editor-close:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.editor-error {
+  margin: 13px 22px 0;
+  padding: 10px 12px;
+  color: #ffd4db;
+  font-size: 10px;
+  line-height: 1.5;
+  border: 1px solid rgba(255, 126, 145, 0.25);
+  border-radius: 9px;
+  background: rgba(255, 126, 145, 0.07);
+}
+
+.editor-form {
+  min-height: 0;
+  padding: 19px 22px 20px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+
+.editor-form::-webkit-scrollbar {
+  width: 7px;
+}
+
+.editor-form::-webkit-scrollbar-thumb {
+  border: 2px solid #101722;
+  border-radius: 10px;
+  background: #304059;
+}
+
+.editor-grid {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr)
+    minmax(0, 1fr);
+  gap: 14px;
+}
+
+.editor-field {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 7px;
+}
+
+.editor-field.span-two {
+  grid-column: 1 / -1;
+}
+
+.editor-field > span {
+  color: #8797ab;
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.editor-field > span strong {
+  margin-left: 3px;
+  color: var(--danger);
+}
+
+.editor-field input,
+.editor-field select,
+.editor-field textarea {
+  width: 100%;
+  color: #d8e1ed;
+  font: inherit;
+  font-size: 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  outline: 0;
+  background: #0a111a;
+}
+
+.editor-field input,
+.editor-field select {
+  height: 38px;
+  padding: 0 10px;
+}
+
+.editor-field textarea {
+  min-height: 100px;
+  padding: 10px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.editor-field input:focus,
+.editor-field select:focus,
+.editor-field textarea:focus {
+  border-color: #496092;
+  box-shadow: 0 0 0 2px rgba(111, 140, 255, 0.07);
+}
+
+.editor-field input::placeholder,
+.editor-field textarea::placeholder {
+  color: #4f5f74;
+}
+
+.editor-field input:disabled,
+.editor-field select:disabled,
+.editor-field textarea:disabled {
+  opacity: 0.55;
+}
+
+.editor-password {
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr)
+    auto;
+  gap: 7px;
+}
+
+.editor-password button {
+  min-width: 76px;
+  padding: 0 10px;
+  color: #9bacbf;
+  font-size: 9px;
+  font-weight: 650;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: #151e2c;
+  cursor: pointer;
+}
+
+.editor-password button:hover:not(:disabled) {
+  color: #d2dce9;
+  border-color: #3a4a64;
+}
+
+.editor-password button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.favorite-control {
+  width: max-content;
+  margin-top: 15px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #9dacbf;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.favorite-control input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.editor-security-note {
+  margin-top: 14px;
+  padding: 10px 11px;
+  color: #67778d;
+  font-size: 9px;
+  line-height: 1.5;
+  border: 1px solid #1e2a3b;
+  border-radius: 8px;
+  background: #0c131d;
+}
+
+.editor-footer {
+  margin-top: 18px;
+  padding-top: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.editor-secondary,
+.editor-primary {
+  min-height: 36px;
+  padding: 0 14px;
+  font-size: 10px;
+  font-weight: 700;
+  border-radius: 9px;
+  cursor: pointer;
+}
+
+.editor-secondary {
+  color: #9dabbe;
+  border: 1px solid var(--border);
+  background: #111925;
+}
+
+.editor-primary {
+  color: #fff;
+  border: 1px solid rgba(132, 155, 255, 0.22);
+  background: linear-gradient(
+    135deg,
+    #6884f5,
+    #7895ff
+  );
+}
+
+.editor-secondary:hover:not(:disabled) {
+  color: #d3dce8;
+  border-color: #3a4a63;
+}
+
+.editor-primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.editor-secondary:disabled,
+.editor-primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+@media (max-height: 690px) {
+  .modal-backdrop {
+    padding: 16px;
+  }
+
+  .entry-editor {
+    max-height: calc(100vh - 32px);
+  }
+
+  .editor-header {
+    padding-top: 15px;
+    padding-bottom: 13px;
+  }
+
+  .editor-form {
+    padding-top: 15px;
+    padding-bottom: 15px;
+  }
+
+  .editor-grid {
+    gap: 11px;
+  }
+
+  .editor-field textarea {
+    min-height: 78px;
+  }
+}
+
+@media (max-width: 760px) {
+  .modal-backdrop {
+    padding: 12px;
+  }
+
+  .entry-editor {
+    max-height: calc(100vh - 24px);
+  }
+
+  .editor-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .editor-field.span-two {
+    grid-column: auto;
+  }
+}
+/* LOCALVAULT READABILITY POLISH */
+
+/*
+ * Keep the dense password-manager layout, but avoid
+ * 8–9px operational text that becomes uncomfortable
+ * on ordinary Windows displays.
+ */
+
+.secure-status {
+  font-size: 11px;
+}
+
+.lock-button {
+  font-size: 11px;
+}
+
+.header-brand strong {
+  font-size: 15px;
+}
+
+.header-brand small {
+  font-size: 10px;
+}
+
+.nav-item,
+.category-item {
+  font-size: 12px;
+}
+
+.nav-item small,
+.category-item small {
+  font-size: 10px;
+}
+
+.sidebar-label {
+  font-size: 10px;
+}
+
+.sidebar-empty {
+  font-size: 10.5px;
+}
+
+.sidebar-footer p {
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.test-chip {
+  font-size: 9px;
+}
+
+.column-eyebrow {
+  font-size: 10px;
+}
+
+.entry-count {
+  font-size: 10px;
+}
+
+.search-box {
+  height: 38px;
+}
+
+.search-box input {
+  font-size: 12px;
+}
+
+.entry-row {
+  min-height: 62px;
+}
+
+.entry-row-copy strong {
+  font-size: 12.5px;
+}
+
+.entry-row-copy small {
+  font-size: 10.5px;
+}
+
+.new-entry-button {
+  min-height: 32px;
+  padding-left: 11px;
+  padding-right: 11px;
+  font-size: 11px;
+}
+
+.empty-list strong {
+  font-size: 12px;
+}
+
+.empty-list span {
+  font-size: 10.5px;
+  line-height: 1.55;
+}
+
+.detail-placeholder strong {
+  font-size: 13px;
+}
+
+.detail-placeholder p {
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+.detail-heading > div:nth-child(2) > span {
+  font-size: 10.5px;
+}
+
+.detail-action {
+  min-height: 34px;
+  padding-left: 12px;
+  padding-right: 12px;
+  font-size: 11px;
+}
+
+.detail-label {
+  font-size: 10.5px;
+}
+
+.detail-value,
+.notes-value {
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.password-display {
+  height: 39px;
+  font-size: 12px;
+}
+
+.reveal-button {
+  min-width: 78px;
+  font-size: 10.5px;
+}
+
+.copy-disabled-note {
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+
+.tag {
+  font-size: 9.5px;
+}
+
+.detail-meta {
+  font-size: 9.5px;
+}
+
+/* Entry editor */
+
+.editor-eyebrow {
+  font-size: 10px;
+}
+
+.editor-field > span {
+  font-size: 10.5px;
+}
+
+.editor-field input,
+.editor-field select,
+.editor-field textarea {
+  font-size: 12px;
+}
+
+.editor-field input,
+.editor-field select {
+  height: 41px;
+}
+
+.editor-password button {
+  min-width: 82px;
+  font-size: 10.5px;
+}
+
+.favorite-control {
+  font-size: 11px;
+}
+
+.editor-security-note {
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.editor-secondary,
+.editor-primary {
+  min-height: 39px;
+  padding-left: 16px;
+  padding-right: 16px;
+  font-size: 11px;
+}
+
+/* Locked-screen form readability */
+
+.field > span {
+  font-size: 12px;
+}
+
+.field input {
+  font-size: 13px;
+}
+
+.password-note {
+  font-size: 11px;
+}
+
+.text-button {
+  font-size: 11px;
+}
+
+.submit-button {
+  font-size: 12px;
+}
+
+.file-copy strong {
+  font-size: 12px;
+}
+
+.file-copy small {
+  font-size: 10px;
+}
+
+.recent-vault-copy strong {
+  font-size: 12px;
+}
+
+.recent-vault-copy small {
+  font-size: 10px;
+}
+
+.recent-vaults-label {
+  font-size: 10px;
+}
+
+.test-mode-note {
+  font-size: 11px;
+}

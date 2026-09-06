@@ -43,3 +43,13 @@ export type VaultFilter =
   | { type: "all" }
   | { type: "favorite" }
   | { type: "category"; categoryId: string };
+export interface EntryCommandInput {
+  title: string;
+  url: string;
+  username: string;
+  password: string;
+  notes: string;
+  categoryId: string | null;
+  tags: string[];
+  favorite: boolean;
+}
