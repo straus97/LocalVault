@@ -1,5 +1,6 @@
 pub(crate) mod categories;
 pub(crate) mod entries;
+pub(crate) mod recent_vaults;
 
 use std::path::PathBuf;
 

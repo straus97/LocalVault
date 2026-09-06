@@ -22,10 +22,12 @@ import type {
 import {
   createVault,
   getEntry,
+  getRecentVaults,
   getVaultStatus,
   listCategories,
   listEntries,
   lockVault,
+  rememberRecentVault,
   unlockVault,
 } from "./vaultApi";
 
@@ -203,11 +205,28 @@ function App() {
         const nextStatus =
           await getVaultStatus();
 
+        let nextRecentVaultPaths: string[] =
+          [];
+
+        try {
+          nextRecentVaultPaths =
+            await getRecentVaults();
+        } catch {
+          if (active) {
+            setErrorMessage(
+              "Не удалось загрузить список недавних хранилищ. Сами файлы сейфов не затронуты.",
+            );
+          }
+        }
+
         if (!active) {
           return;
         }
 
         setStatus(nextStatus);
+        setRecentVaultPaths(
+          nextRecentVaultPaths,
+        );
 
         if (nextStatus.unlocked) {
           const [
@@ -310,18 +329,36 @@ function App() {
     }
   }
 
-  function rememberVaultPath(
+  async function persistRecentVault(
     path: string,
   ) {
-    setRecentVaultPaths(
-      (current) => [
-        path,
-        ...current.filter(
-          (candidate) =>
-            candidate !== path,
-        ),
-      ].slice(0, 5),
-    );
+    try {
+      const nextRecentVaultPaths =
+        await rememberRecentVault(path);
+
+      setRecentVaultPaths(
+        nextRecentVaultPaths,
+      );
+    } catch {
+      /*
+       * Convenience metadata must never make a
+       * successfully opened vault look like an
+       * unlock failure.
+       */
+      setRecentVaultPaths(
+        (current) => [
+          path,
+          ...current.filter(
+            (candidate) =>
+              candidate !== path,
+          ),
+        ].slice(0, 5),
+      );
+
+      setErrorMessage(
+        "Хранилище открыто, но не удалось обновить список недавних хранилищ.",
+      );
+    }
   }
 
   function openRecentVault(
@@ -397,7 +434,7 @@ function App() {
 
       setStatus(nextStatus);
       setCurrentVaultPath(selectedPath);
-      rememberVaultPath(selectedPath);
+      await persistRecentVault(selectedPath);
       setGateMode(null);
       setSelectedPath("");
 

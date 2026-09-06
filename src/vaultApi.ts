@@ -48,3 +48,15 @@ export function getEntry(
 export function listCategories(): Promise<CategorySummary[]> {
   return invoke<CategorySummary[]>("list_categories");
 }
+export function getRecentVaults(): Promise<string[]> {
+  return invoke<string[]>("get_recent_vaults");
+}
+
+export function rememberRecentVault(
+  path: string,
+): Promise<string[]> {
+  return invoke<string[]>(
+    "remember_recent_vault",
+    { path },
+  );
+}

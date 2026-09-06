@@ -1,6 +1,7 @@
 pub mod app_state;
 pub mod commands;
 pub mod crypto;
+mod recent_vaults;
 pub mod vault;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -23,6 +24,8 @@ pub fn run() {
             commands::categories::create_category,
             commands::categories::update_category,
             commands::categories::delete_category,
+            commands::recent_vaults::get_recent_vaults,
+            commands::recent_vaults::remember_recent_vault,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
