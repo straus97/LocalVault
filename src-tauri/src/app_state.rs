@@ -1,3 +1,4 @@
+mod backups;
 mod categories;
 mod entries;
 
@@ -11,7 +12,10 @@ use serde::Serialize;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::vault::session::{SessionError, UnlockedVaultSession};
+use crate::vault::{
+    backup::BackupError,
+    session::{SessionError, UnlockedVaultSession},
+};
 
 const DEFAULT_AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -71,6 +75,9 @@ pub enum AppStateError {
 
     #[error("vault session operation failed")]
     Session(#[from] SessionError),
+
+    #[error("backup operation failed")]
+    Backup(#[from] BackupError),
 }
 
 #[derive(Default)]

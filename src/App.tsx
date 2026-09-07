@@ -12,6 +12,7 @@ import {
 
 import { listen } from "@tauri-apps/api/event";
 
+import BackupRestoreDialog from "./BackupRestoreDialog";
 import CategoryEditor from "./CategoryEditor";
 import EntryEditor from "./EntryEditor";
 import "./App.css";
@@ -27,6 +28,7 @@ import type {
 } from "./types";
 import {
   createCategory,
+  createVaultBackup,
   createEntry,
   createVault,
   deleteCategory,
@@ -46,6 +48,46 @@ import {
 } from "./vaultApi";
 
 type GateMode = "create" | "open";
+
+function ensureBackupExtension(
+  path: string,
+): string {
+  return path
+    .toLocaleLowerCase()
+    .endsWith(".lvbackup")
+    ? path
+    : `${path}.lvbackup`;
+}
+
+function backupDefaultName(
+  vaultPath: string,
+): string {
+  const normalized =
+    vaultPath.replace(/\\/g, "/");
+
+  const filename =
+    normalized
+      .split("/")
+      .pop() ||
+    "LocalVault";
+
+  const stem =
+    filename.replace(
+      /\.lvault$/i,
+      "",
+    );
+
+  const stamp =
+    new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(
+        /[:T]/g,
+        "-",
+      );
+
+  return `${stem}-${stamp}.lvbackup`;
+}
 
 const initialStatus: VaultStatus = {
   unlocked: false,
@@ -71,6 +113,18 @@ const friendlyErrors: Record<string, string> = {
     "Выбран некорректный путь к хранилищу.",
   masterPasswordRequired:
     "Введите мастер-пароль.",
+  backupAlreadyExists:
+    "По выбранному пути уже существует резервная копия или файл хранилища. LocalVault не будет его перезаписывать.",
+  backupPathMatchesSource:
+    "Основной сейф и резервная копия должны находиться по разным путям.",
+  backupNotFound:
+    "Файл резервной копии не найден.",
+  invalidBackupPath:
+    "Выбран некорректный путь резервной копии.",
+  backupAuthenticationFailed:
+    "Не удалось подтвердить резервную копию.",
+  invalidBackup:
+    "Резервная копия повреждена или имеет неподдерживаемый формат.",
   stateUnavailable:
     "Внутреннее состояние LocalVault временно недоступно.",
   invalidSystemClock:
@@ -149,6 +203,14 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [errorMessage, setErrorMessage] =
     useState<string | null>(null);
+
+  const [successMessage, setSuccessMessage] =
+    useState<string | null>(null);
+
+  const [
+    restoreDialogOpen,
+    setRestoreDialogOpen,
+  ] = useState(false);
 
   const [gateMode, setGateMode] =
     useState<GateMode | null>(null);
@@ -269,6 +331,8 @@ const [
     clearUnlockedData();
 
     setBusy(false);
+    setSuccessMessage(null);
+    setRestoreDialogOpen(false);
     setDetailsLoading(false);
     setEntryMutationBusy(false);
     setCategoryMutationBusy(false);
@@ -1049,10 +1113,69 @@ const [
     }
   }
 
+  async function handleCreateBackup() {
+    if (
+      busy ||
+      !currentVaultPath
+    ) {
+      return;
+    }
+
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setBusy(true);
+
+    try {
+      const path =
+        await saveDialog({
+          title:
+            "Создать резервную копию LocalVault",
+          defaultPath:
+            backupDefaultName(
+              currentVaultPath,
+            ),
+          filters: [
+            {
+              name:
+                "LocalVault Backup",
+              extensions: [
+                "lvbackup",
+              ],
+            },
+          ],
+        });
+
+      if (!path) {
+        return;
+      }
+
+      const backupPath =
+        ensureBackupExtension(
+          path,
+        );
+
+      await createVaultBackup(
+        backupPath,
+      );
+
+      setSuccessMessage(
+        `Зашифрованная резервная копия создана: ${backupPath}`,
+      );
+    } catch (error) {
+      setErrorMessage(
+        friendlyError(
+          error,
+        ),
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
   async function handleLock() {
     clearSecretView();
     setBusy(true);
     setErrorMessage(null);
+    setSuccessMessage(null);
 
     try {
       const nextStatus =
@@ -1203,6 +1326,26 @@ const [
             </div>
           )}
 
+          {successMessage && (
+            <div
+              className="gate-success"
+              role="status"
+            >
+              <span>
+                {successMessage}
+              </span>
+
+              <button
+                type="button"
+                aria-label="Закрыть сообщение"
+                onClick={() =>
+                  setSuccessMessage(null)
+                }
+              >
+                ×
+              </button>
+            </div>
+          )}
           {!gateMode ? (
             <div className="gate-actions">
               {recentVaultPaths.length > 0 && (
@@ -1299,6 +1442,36 @@ const [
                     файл .lvault
                   </small>
                 </span>
+                <span className="action-arrow">
+                  →
+                </span>
+              </button>
+
+              <button
+                className="gate-action backup-card"
+                type="button"
+                disabled={busy}
+                onClick={() => {
+                  setErrorMessage(null);
+                  setSuccessMessage(null);
+                  setRestoreDialogOpen(true);
+                }}
+              >
+                <span className="action-icon">
+                  ↺
+                </span>
+
+                <span>
+                  <strong>
+                    Восстановить из копии
+                  </strong>
+
+                  <small>
+                    Проверить .lvbackup и
+                    создать новый .lvault
+                  </small>
+                </span>
+
                 <span className="action-arrow">
                   →
                 </span>
@@ -1411,6 +1584,26 @@ const [
             </form>
           )}
 
+          {restoreDialogOpen && (
+            <BackupRestoreDialog
+              onCancel={() =>
+                setRestoreDialogOpen(false)
+              }
+              onRestored={async (
+                restoredPath,
+              ) => {
+                setRestoreDialogOpen(false);
+
+                await persistRecentVault(
+                  restoredPath,
+                );
+
+                setSuccessMessage(
+                  `Резервная копия проверена и восстановлена: ${restoredPath}. Новый сейф остаётся заблокированным.`,
+                );
+              }}
+            />
+          )}
           <div className="security-mode-note">
             <span className="security-dot" />
             Мастер-пароль не сохраняется.
@@ -1482,6 +1675,19 @@ const [
 
           <button
             type="button"
+            className="backup-button"
+            disabled={busy}
+            onClick={() =>
+              void handleCreateBackup()
+            }
+          >
+            <span aria-hidden="true">
+              ◫
+            </span>
+            Резервная копия
+          </button>
+          <button
+            type="button"
             className="lock-button"
             disabled={busy}
             onClick={() =>
@@ -1496,6 +1702,26 @@ const [
         </div>
       </header>
 
+      {successMessage && (
+        <div
+          className="workspace-success"
+          role="status"
+        >
+          <span>
+            {successMessage}
+          </span>
+
+          <button
+            type="button"
+            aria-label="Закрыть сообщение"
+            onClick={() =>
+              setSuccessMessage(null)
+            }
+          >
+            ×
+          </button>
+        </div>
+      )}
       {errorMessage && (
         <div
           className="workspace-error"

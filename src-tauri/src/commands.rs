@@ -1,3 +1,4 @@
+pub(crate) mod backups;
 pub(crate) mod categories;
 pub(crate) mod entries;
 pub(crate) mod passwords;
@@ -14,7 +15,9 @@ use crate::{
     crypto::CryptoError,
     password_generator::PasswordGeneratorError,
     secure_clipboard::{SecureClipboard, SecureClipboardError},
-    vault::{format::VaultError, session::SessionError, storage::StorageError},
+    vault::{
+        backup::BackupError, format::VaultError, session::SessionError, storage::StorageError,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -44,6 +47,61 @@ impl From<AppStateError> for CommandError {
                 "The vault session expired due to inactivity.",
             ),
 
+            AppStateError::Session(SessionError::Storage(StorageError::DestinationExists))
+            | AppStateError::Backup(BackupError::Storage(StorageError::DestinationExists)) => {
+                Self::new(
+                    "backupAlreadyExists",
+                    "A backup or restored vault already exists at the destination.",
+                )
+            }
+
+            AppStateError::Session(SessionError::Storage(StorageError::BackupPathMatchesVault))
+            | AppStateError::Backup(BackupError::Storage(StorageError::BackupPathMatchesVault)) => {
+                Self::new(
+                    "backupPathMatchesSource",
+                    "The backup source and destination must be different.",
+                )
+            }
+
+            AppStateError::Backup(BackupError::Storage(StorageError::NotFound)) => {
+                Self::new("backupNotFound", "The backup file was not found.")
+            }
+
+            AppStateError::Backup(BackupError::Storage(StorageError::InvalidPath)) => {
+                Self::new("invalidBackupPath", "The selected backup path is invalid.")
+            }
+
+            AppStateError::Backup(BackupError::Vault(VaultError::EmptyMasterPassword)) => {
+                Self::new("masterPasswordRequired", "A master password is required.")
+            }
+
+            AppStateError::Backup(BackupError::Vault(VaultError::Crypto(
+                CryptoError::Decryption,
+            ))) => Self::new(
+                "backupAuthenticationFailed",
+                "The backup could not be authenticated.",
+            ),
+
+            AppStateError::Backup(BackupError::Storage(
+                StorageError::EmptyFile
+                | StorageError::TooLarge
+                | StorageError::NotRegularFile
+                | StorageError::SymlinkPath,
+            ))
+            | AppStateError::Backup(BackupError::Storage(
+                StorageError::Deserialization(_) | StorageError::InvalidEnvelope(_),
+            ))
+            | AppStateError::Backup(BackupError::Vault(
+                VaultError::UnsupportedFormat | VaultError::InvalidWrappedKey,
+            ))
+            | AppStateError::Backup(BackupError::Vault(VaultError::Crypto(
+                CryptoError::InvalidKdfParameters,
+            )))
+            | AppStateError::Backup(BackupError::Deserialization(_))
+            | AppStateError::Backup(BackupError::Data(_)) => Self::new(
+                "invalidBackup",
+                "The backup file is invalid or unsupported.",
+            ),
             AppStateError::Session(SessionError::EntryNotFound) => {
                 Self::new("entryNotFound", "The vault entry was not found.")
             }

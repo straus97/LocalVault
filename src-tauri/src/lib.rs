@@ -60,6 +60,8 @@ pub fn run() {
             commands::unlock_vault,
             commands::lock_vault,
             commands::touch_vault_activity,
+            commands::backups::create_vault_backup,
+            commands::backups::restore_vault_backup,
             commands::entries::list_entries,
             commands::entries::get_entry,
             commands::entries::copy_entry_password,

@@ -1,3 +1,4 @@
+mod backups;
 mod categories;
 pub use categories::{CategoryInput, CategorySummary};
 mod entries;

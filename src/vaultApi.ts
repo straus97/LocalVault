@@ -40,6 +40,29 @@ export function lockVault(): Promise<VaultStatus> {
   return invoke<VaultStatus>("lock_vault");
 }
 
+export function createVaultBackup(
+  path: string,
+): Promise<void> {
+  return invoke<void>(
+    "create_vault_backup",
+    { path },
+  );
+}
+
+export function restoreVaultBackup(
+  backupPath: string,
+  destinationPath: string,
+  masterPassword: string,
+): Promise<void> {
+  return invoke<void>(
+    "restore_vault_backup",
+    {
+      backupPath,
+      destinationPath,
+      masterPassword,
+    },
+  );
+}
 export function listEntries(): Promise<EntrySummary[]> {
   return invoke<EntrySummary[]>("list_entries");
 }

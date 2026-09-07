@@ -1,11 +1,13 @@
 use std::{
-    fs::{self, File},
+    ffi::OsString,
+    fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use atomic_write_file::AtomicWriteFile;
 use thiserror::Error;
+use uuid::Uuid;
 
 use super::format::{VaultEnvelope, VaultError};
 
@@ -24,6 +26,9 @@ pub enum StorageError {
 
     #[error("vault path is not a regular file")]
     NotRegularFile,
+
+    #[error("destination already exists")]
+    DestinationExists,
 
     #[error("backup path must differ from the vault path")]
     BackupPathMatchesVault,
@@ -145,6 +150,188 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
     Ok(())
 }
 
+pub(crate) fn ensure_distinct_paths(source: &Path, destination: &Path) -> Result<(), StorageError> {
+    if source == destination {
+        return Err(StorageError::BackupPathMatchesVault);
+    }
+
+    let source_canonical = fs::canonicalize(source).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            StorageError::NotFound
+        } else {
+            StorageError::Io(error)
+        }
+    })?;
+
+    match fs::canonicalize(destination) {
+        Ok(destination_canonical) => {
+            if source_canonical == destination_canonical {
+                return Err(StorageError::BackupPathMatchesVault);
+            }
+
+            Ok(())
+        }
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+
+        Err(error) => Err(StorageError::Io(error)),
+    }
+}
+
+fn reject_existing_new_destination(path: &Path) -> Result<(), StorageError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(StorageError::SymlinkPath);
+            }
+
+            if !metadata.is_file() {
+                return Err(StorageError::NotRegularFile);
+            }
+
+            Err(StorageError::DestinationExists)
+        }
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+
+        Err(error) => Err(StorageError::Io(error)),
+    }
+}
+
+fn create_atomic_temp_file(destination: &Path) -> Result<(PathBuf, File), StorageError> {
+    let parent = parent_directory(destination)?;
+
+    let file_name = destination.file_name().ok_or(StorageError::InvalidPath)?;
+
+    for _ in 0..16 {
+        let mut temp_name = OsString::from(".");
+
+        temp_name.push(file_name);
+
+        temp_name.push(format!(".localvault-{}.tmp", Uuid::new_v4(),));
+
+        let temp_path = parent.join(temp_name);
+
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => {
+                return Ok((temp_path, file));
+            }
+
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                continue;
+            }
+
+            Err(error) => {
+                return Err(StorageError::Io(error));
+            }
+        }
+    }
+
+    Err(StorageError::Io(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate temporary backup file",
+    )))
+}
+
+#[cfg(windows)]
+fn commit_new_temp_file(temp_path: &Path, destination: &Path) -> io::Result<()> {
+    /*
+     * On Windows rename does not replace an existing target.
+     * The operation stays inside one directory/filesystem.
+     */
+    fs::rename(temp_path, destination)
+}
+
+#[cfg(not(windows))]
+fn commit_new_temp_file(temp_path: &Path, destination: &Path) -> io::Result<()> {
+    /*
+     * hard_link is an atomic no-clobber publication step:
+     * it fails if destination already exists.
+     */
+    fs::hard_link(temp_path, destination)?;
+
+    let _ = fs::remove_file(temp_path);
+
+    Ok(())
+}
+
+fn map_new_destination_commit_error(destination: &Path, original: io::Error) -> StorageError {
+    match fs::symlink_metadata(destination) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                StorageError::SymlinkPath
+            } else if !metadata.is_file() {
+                StorageError::NotRegularFile
+            } else {
+                StorageError::DestinationExists
+            }
+        }
+
+        Err(error) if error.kind() == io::ErrorKind::NotFound => StorageError::Io(original),
+
+        Err(error) => StorageError::Io(error),
+    }
+}
+
+fn write_bytes_atomic_new(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    if bytes.is_empty() {
+        return Err(StorageError::EmptyFile);
+    }
+
+    if bytes.len() as u64 > MAX_VAULT_FILE_BYTES {
+        return Err(StorageError::TooLarge);
+    }
+
+    let parent = parent_directory(path)?;
+
+    fs::create_dir_all(parent).map_err(StorageError::Io)?;
+
+    reject_existing_new_destination(path)?;
+
+    let (temp_path, mut temp_file) = create_atomic_temp_file(path)?;
+
+    let result = (|| {
+        temp_file.write_all(bytes).map_err(StorageError::Io)?;
+
+        temp_file.flush().map_err(StorageError::Io)?;
+
+        temp_file.sync_all().map_err(StorageError::Io)?;
+
+        /*
+         * Close the temporary file before publication,
+         * which is important for Windows rename semantics.
+         */
+        drop(temp_file);
+
+        commit_new_temp_file(&temp_path, path)
+            .map_err(|error| map_new_destination_commit_error(path, error))?;
+
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    result
+}
+
+pub(crate) fn save_envelope_atomic_new(
+    path: &Path,
+    envelope: &VaultEnvelope,
+) -> Result<(), StorageError> {
+    envelope
+        .validate_header()
+        .map_err(StorageError::InvalidEnvelope)?;
+
+    let bytes = serde_json::to_vec(envelope).map_err(StorageError::Serialization)?;
+
+    write_bytes_atomic_new(path, &bytes)
+}
 pub fn save_envelope_atomic(path: &Path, envelope: &VaultEnvelope) -> Result<(), StorageError> {
     envelope
         .validate_header()

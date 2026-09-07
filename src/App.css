@@ -2491,3 +2491,148 @@ input:focus-visible {
     width: 100%;
   }
 }
+/* 1J encrypted backups and restore */
+
+.backup-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 38px;
+  padding: 0 13px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.34);
+  color: inherit;
+  cursor: pointer;
+}
+
+.backup-button:hover:not(:disabled) {
+  background: rgba(30, 41, 59, 0.54);
+}
+
+.backup-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.backup-card {
+  border-style: dashed;
+}
+
+.gate-success,
+.workspace-success {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid rgba(74, 222, 128, 0.24);
+  border-radius: 11px;
+  background: rgba(22, 101, 52, 0.12);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.gate-success {
+  margin-bottom: 14px;
+}
+
+.workspace-success {
+  margin: 14px 18px 0;
+}
+
+.gate-success button,
+.workspace-success button {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.backup-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(2, 6, 23, 0.72);
+  backdrop-filter: blur(10px);
+}
+
+.backup-modal {
+  width: min(620px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  padding: 22px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 18px;
+  background: #111827;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.42);
+}
+
+.backup-modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.backup-modal-header h2 {
+  margin: 5px 0 0;
+}
+
+.backup-modal-description {
+  margin: 14px 0 18px;
+  opacity: 0.76;
+  line-height: 1.55;
+}
+
+.backup-restore-form {
+  display: grid;
+  gap: 14px;
+}
+
+.backup-path-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 11px;
+  background: rgba(15, 23, 42, 0.34);
+}
+
+.backup-path-copy {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 4px;
+}
+
+.backup-path-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.68;
+}
+
+@media (max-width: 760px) {
+  .backup-button {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .backup-modal-backdrop {
+    padding: 12px;
+  }
+
+  .backup-path-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
