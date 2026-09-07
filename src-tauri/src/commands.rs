@@ -1,5 +1,6 @@
 pub(crate) mod categories;
 pub(crate) mod entries;
+pub(crate) mod passwords;
 pub(crate) mod recent_vaults;
 
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ use zeroize::Zeroizing;
 use crate::{
     app_state::{AppState, AppStateError, VaultStatus},
     crypto::CryptoError,
+    password_generator::PasswordGeneratorError,
     secure_clipboard::{SecureClipboard, SecureClipboardError},
     vault::{format::VaultError, session::SessionError, storage::StorageError},
 };
@@ -139,6 +141,23 @@ impl From<AppStateError> for CommandError {
     }
 }
 
+impl From<PasswordGeneratorError> for CommandError {
+    fn from(error: PasswordGeneratorError) -> Self {
+        match error {
+            PasswordGeneratorError::InvalidLength
+            | PasswordGeneratorError::NoCharacterClasses
+            | PasswordGeneratorError::LengthTooShort => Self::new(
+                "invalidPasswordGenerator",
+                "The password generator settings are invalid.",
+            ),
+
+            PasswordGeneratorError::Randomness => Self::new(
+                "passwordGenerationFailed",
+                "Secure password generation is unavailable.",
+            ),
+        }
+    }
+}
 impl From<SecureClipboardError> for CommandError {
     fn from(_error: SecureClipboardError) -> Self {
         Self::new(

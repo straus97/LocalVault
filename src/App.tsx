@@ -162,13 +162,7 @@ function App() {
   const [recentVaultPaths, setRecentVaultPaths] =
     useState<string[]>([]);
 
-  const [masterPassword, setMasterPassword] =
-    useState("");
-
-  const [confirmPassword, setConfirmPassword] =
-    useState("");
-
-  const [entries, setEntries] =
+const [entries, setEntries] =
     useState<EntrySummary[]>([]);
 
   const [categories, setCategories] =
@@ -282,8 +276,6 @@ const [
     setGateMode(null);
     setSelectedPath("");
 
-    setMasterPassword("");
-    setConfirmPassword("");
 
     setErrorMessage(
       "Хранилище автоматически заблокировано из-за бездействия.",
@@ -582,8 +574,6 @@ const [
         setSelectedPath(path);
       }
 
-      setMasterPassword("");
-      setConfirmPassword("");
     } catch {
       setErrorMessage(
         "Не удалось открыть системный выбор файла.",
@@ -631,15 +621,11 @@ const [
     setErrorMessage(null);
     setGateMode("open");
     setSelectedPath(path);
-    setMasterPassword("");
-    setConfirmPassword("");
   }
 
   function cancelGateForm() {
     setGateMode(null);
     setSelectedPath("");
-    setMasterPassword("");
-    setConfirmPassword("");
     setErrorMessage(null);
   }
 
@@ -652,35 +638,80 @@ const [
       return;
     }
 
-    if (!masterPassword) {
+    const form =
+      event.currentTarget;
+
+    const formData =
+      new FormData(form);
+
+    let passwordForInvoke =
+      formData.get(
+        "masterPassword",
+      );
+
+    let confirmationForCheck =
+      formData.get(
+        "confirmPassword",
+      );
+
+    passwordForInvoke =
+      typeof passwordForInvoke === "string"
+        ? passwordForInvoke
+        : "";
+
+    confirmationForCheck =
+      typeof confirmationForCheck === "string"
+        ? confirmationForCheck
+        : "";
+
+    /*
+     * Drop FormData's references immediately. JavaScript
+     * strings themselves cannot be reliably zeroized.
+     */
+    formData.delete(
+      "masterPassword",
+    );
+
+    formData.delete(
+      "confirmPassword",
+    );
+
+    if (!passwordForInvoke) {
+      form.reset();
+
+      confirmationForCheck = "";
+
       setErrorMessage(
         "Введите мастер-пароль.",
       );
+
       return;
     }
 
     if (
       gateMode === "create" &&
-      masterPassword !== confirmPassword
+      passwordForInvoke !==
+        confirmationForCheck
     ) {
-      setMasterPassword("");
-      setConfirmPassword("");
+      form.reset();
+
+      passwordForInvoke = "";
+      confirmationForCheck = "";
+
       setErrorMessage(
         "Мастер-пароли не совпадают. Введите их заново.",
       );
+
       return;
     }
 
-    /*
-     * JavaScript strings cannot be reliably zeroized.
-     * Keep this value only for the duration of the IPC call,
-     * clear controlled inputs immediately, and never persist it.
-     */
-    const passwordForInvoke =
-      masterPassword;
+    confirmationForCheck = "";
 
-    setMasterPassword("");
-    setConfirmPassword("");
+    /*
+     * Clear DOM password fields before awaiting IPC.
+     */
+    form.reset();
+
     setBusy(true);
     setErrorMessage(null);
 
@@ -697,8 +728,14 @@ const [
             );
 
       setStatus(nextStatus);
-      setCurrentVaultPath(selectedPath);
-      await persistRecentVault(selectedPath);
+      setCurrentVaultPath(
+        selectedPath,
+      );
+
+      await persistRecentVault(
+        selectedPath,
+      );
+
       setGateMode(null);
       setSelectedPath("");
 
@@ -708,10 +745,14 @@ const [
         friendlyError(error),
       );
     } finally {
+      /*
+       * Best-effort shortening of LocalVault's JS reference.
+       */
+      passwordForInvoke = "";
+
       setBusy(false);
     }
   }
-
   async function selectEntry(
     entry: EntrySummary,
   ) {
@@ -1021,8 +1062,6 @@ const [
       clearUnlockedData();
       setGateMode(null);
       setSelectedPath("");
-      setMasterPassword("");
-      setConfirmPassword("");
     } catch (error) {
       setErrorMessage(
         friendlyError(error),
@@ -1267,7 +1306,9 @@ const [
             </div>
           ) : (
             <form
+              key={`${gateMode}:${selectedPath}`}
               className="unlock-form"
+              autoComplete="off"
               onSubmit={submitGate}
             >
               <div className="form-heading">
@@ -1326,15 +1367,11 @@ const [
                 <span>Мастер-пароль</span>
                 <input
                   autoFocus
+                  name="masterPassword"
                   autoComplete="off"
                   type="password"
-                  value={masterPassword}
+                  required
                   disabled={busy}
-                  onChange={(event) =>
-                    setMasterPassword(
-                      event.currentTarget.value,
-                    )
-                  }
                 />
               </label>
 
@@ -1344,16 +1381,11 @@ const [
                     Повторите мастер-пароль
                   </span>
                   <input
+                    name="confirmPassword"
                     autoComplete="off"
                     type="password"
-                    value={confirmPassword}
+                    required
                     disabled={busy}
-                    onChange={(event) =>
-                      setConfirmPassword(
-                        event.currentTarget
-                          .value,
-                      )
-                    }
                   />
                 </label>
               )}
@@ -1379,10 +1411,11 @@ const [
             </form>
           )}
 
-          <div className="test-mode-note">
-            <span className="test-dot" />
-            На текущем этапе используйте только
-            тестовые данные и тестовые пароли.
+          <div className="security-mode-note">
+            <span className="security-dot" />
+            Мастер-пароль не сохраняется.
+            Данные остаются локально в
+            зашифрованном файле хранилища.
           </div>
         </section>
 
@@ -1625,14 +1658,14 @@ const [
           )}
 
           <div className="sidebar-footer">
-            <div className="test-chip">
-              TEST DATA ONLY
+            <div className="security-chip">
+              LOCAL ONLY
             </div>
             <p>
               Автоблокировка: 60 секунд.
-              Защищённое копирование паролей
-              будет добавлено следующим
-              security-этапом.
+              Защищённый буфер: 30 секунд.
+              Генерация паролей выполняется через
+              криптографический источник ОС.
             </p>
           </div>
         </aside>

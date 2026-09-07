@@ -332,7 +332,7 @@ input:focus-visible {
   font-size: 20px;
 }
 
-.test-mode-note {
+.security-mode-note {
   max-width: 520px;
   margin-top: auto;
   padding-top: 34px;
@@ -344,7 +344,7 @@ input:focus-visible {
   line-height: 1.5;
 }
 
-.test-dot {
+.security-dot {
   width: 6px;
   height: 6px;
   flex: 0 0 auto;
@@ -892,7 +892,7 @@ input:focus-visible {
   border-top: 1px solid var(--border-soft);
 }
 
-.test-chip {
+.security-chip {
   width: max-content;
   padding: 4px 7px;
   color: #d6a963;
@@ -1358,7 +1358,7 @@ input:focus-visible {
     margin-top: 24px;
   }
 
-  .test-mode-note {
+  .security-mode-note {
     padding-top: 20px;
   }
 }
@@ -1412,7 +1412,7 @@ input:focus-visible {
 }
 
 .error-banner,
-.test-mode-note {
+.security-mode-note {
   max-width: 620px;
 }
 
@@ -1438,7 +1438,7 @@ input:focus-visible {
   margin-top: 22px;
 }
 
-.gate-screen.form-active .test-mode-note {
+.gate-screen.form-active .security-mode-note {
   margin-top: 24px;
   padding-top: 0;
 }
@@ -1587,7 +1587,7 @@ input:focus-visible {
     font-size: 32px;
   }
 
-  .gate-screen.form-active .test-mode-note {
+  .gate-screen.form-active .security-mode-note {
     margin-top: 18px;
   }
 }
@@ -2053,7 +2053,7 @@ input:focus-visible {
   line-height: 1.55;
 }
 
-.test-chip {
+.security-chip {
   font-size: 9px;
 }
 
@@ -2239,7 +2239,7 @@ input:focus-visible {
   font-size: 10px;
 }
 
-.test-mode-note {
+.security-mode-note {
   font-size: 11px;
 }
 /* LOCALVAULT CATEGORY CRUD UI */
@@ -2409,6 +2409,85 @@ input:focus-visible {
   }
 
   .category-delete-button {
+    width: 100%;
+  }
+}
+/* 1I.3 secure password generator */
+
+.password-generator {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 12px;
+  background: rgba(15, 23, 42, 0.22);
+}
+
+.password-generator-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.password-generator-head > strong {
+  margin-right: auto;
+  font-size: 13px;
+}
+
+.generator-length {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+}
+
+.generator-length input {
+  width: 72px;
+  min-width: 72px;
+  padding: 7px 8px;
+  text-align: center;
+}
+
+.generator-button {
+  min-height: 34px;
+  padding-inline: 12px;
+}
+
+.password-generator-options {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-top: 10px;
+}
+
+.password-generator-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.password-generator-options input {
+  width: auto;
+  min-width: 0;
+  margin: 0;
+}
+
+.password-generator-message {
+  margin-top: 9px;
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0.78;
+}
+
+@media (max-width: 760px) {
+  .password-generator-head {
+    align-items: stretch;
+  }
+
+  .generator-button {
     width: 100%;
   }
 }

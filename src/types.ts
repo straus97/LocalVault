@@ -39,6 +39,17 @@ export interface CommandError {
   message: string;
 }
 
+export interface PasswordGeneratorInput {
+  length: number;
+  includeLowercase: boolean;
+  includeUppercase: boolean;
+  includeDigits: boolean;
+  includeSymbols: boolean;
+}
+
+export interface GeneratedPassword {
+  password: string;
+}
 export interface ClipboardCopyResult {
   clearAfterSeconds: number;
 }

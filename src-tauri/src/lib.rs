@@ -31,6 +31,7 @@ fn start_auto_lock_watcher(app: AppHandle) {
 pub mod app_state;
 pub mod commands;
 pub mod crypto;
+mod password_generator;
 mod recent_vaults;
 mod secure_clipboard;
 pub mod vault;
@@ -70,6 +71,7 @@ pub fn run() {
             commands::categories::create_category,
             commands::categories::update_category,
             commands::categories::delete_category,
+            commands::passwords::generate_password,
             commands::recent_vaults::get_recent_vaults,
             commands::recent_vaults::remember_recent_vault,
         ])

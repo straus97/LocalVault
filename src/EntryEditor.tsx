@@ -1,5 +1,6 @@
 import {
   type FormEvent,
+  useRef,
   useState,
 } from "react";
 
@@ -8,6 +9,10 @@ import type {
   EntryCommandInput,
   EntryDetails,
 } from "./types";
+
+import {
+  generatePassword,
+} from "./vaultApi";
 
 interface EntryEditorProps {
   mode: "create" | "edit";
@@ -52,8 +57,118 @@ export default function EntryEditor({
   onCancel,
   onSubmit,
 }: EntryEditorProps) {
+  const passwordInputRef =
+    useRef<HTMLInputElement | null>(null);
+
   const [passwordVisible, setPasswordVisible] =
     useState(false);
+
+  const [generatorBusy, setGeneratorBusy] =
+    useState(false);
+
+  const [generatorMessage, setGeneratorMessage] =
+    useState<string | null>(null);
+
+  const [generatorLength, setGeneratorLength] =
+    useState(20);
+
+  const [includeLowercase, setIncludeLowercase] =
+    useState(true);
+
+  const [includeUppercase, setIncludeUppercase] =
+    useState(true);
+
+  const [includeDigits, setIncludeDigits] =
+    useState(true);
+
+  const [includeSymbols, setIncludeSymbols] =
+    useState(true);
+
+  async function handleGeneratePassword() {
+    if (busy || generatorBusy) {
+      return;
+    }
+
+    if (
+      !includeLowercase &&
+      !includeUppercase &&
+      !includeDigits &&
+      !includeSymbols
+    ) {
+      setGeneratorMessage(
+        "Выберите хотя бы один набор символов.",
+      );
+
+      return;
+    }
+
+    const length =
+      Math.min(
+        128,
+        Math.max(
+          12,
+          Number.isFinite(generatorLength)
+            ? Math.trunc(generatorLength)
+            : 20,
+        ),
+      );
+
+    setGeneratorLength(length);
+    setGeneratorBusy(true);
+    setGeneratorMessage(null);
+
+    try {
+      const result =
+        await generatePassword({
+          length,
+          includeLowercase,
+          includeUppercase,
+          includeDigits,
+          includeSymbols,
+        });
+
+      const input =
+        passwordInputRef.current;
+
+      if (!input) {
+        /*
+         * Best-effort reference shortening. JavaScript strings
+         * themselves cannot be reliably zeroized.
+         */
+        result.password = "";
+
+        setGeneratorMessage(
+          "Поле пароля уже закрыто.",
+        );
+
+        return;
+      }
+
+      /*
+       * Do not put the generated password in React state.
+       * Assign it directly to the uncontrolled password input.
+       */
+      input.value =
+        result.password;
+
+      /*
+       * Remove our response-object reference immediately.
+       */
+      result.password = "";
+
+      setPasswordVisible(false);
+
+      setGeneratorMessage(
+        `Создан пароль длиной ${length} символов.`,
+      );
+    } catch {
+      setGeneratorMessage(
+        "Не удалось безопасно сгенерировать пароль.",
+      );
+    } finally {
+      setGeneratorBusy(false);
+    }
+  }
 
   async function handleSubmit(
     event: FormEvent<HTMLFormElement>,
@@ -65,7 +180,9 @@ export default function EntryEditor({
     }
 
     const formData =
-      new FormData(event.currentTarget);
+      new FormData(
+        event.currentTarget,
+      );
 
     const rawCategoryId =
       fieldValue(
@@ -78,32 +195,41 @@ export default function EntryEditor({
         formData,
         "title",
       ),
+
       url: fieldValue(
         formData,
         "url",
       ),
+
       username: fieldValue(
         formData,
         "username",
       ),
+
       password: fieldValue(
         formData,
         "password",
       ),
+
       notes: fieldValue(
         formData,
         "notes",
       ),
+
       categoryId:
         rawCategoryId || null,
+
       tags: parseTags(
         fieldValue(
           formData,
           "tags",
         ),
       ),
+
       favorite:
-        formData.has("favorite"),
+        formData.has(
+          "favorite",
+        ),
     };
 
     await onSubmit(input);
@@ -221,6 +347,7 @@ export default function EntryEditor({
 
               <div className="editor-password">
                 <input
+                  ref={passwordInputRef}
                   name="password"
                   type={
                     passwordVisible
@@ -237,7 +364,10 @@ export default function EntryEditor({
 
                 <button
                   type="button"
-                  disabled={busy}
+                  disabled={
+                    busy ||
+                    generatorBusy
+                  }
                   onClick={() =>
                     setPasswordVisible(
                       (value) => !value,
@@ -248,6 +378,144 @@ export default function EntryEditor({
                     ? "Скрыть"
                     : "Показать"}
                 </button>
+              </div>
+
+              <div className="password-generator">
+                <div className="password-generator-head">
+                  <strong>
+                    Генератор пароля
+                  </strong>
+
+                  <label className="generator-length">
+                    <span>Длина</span>
+
+                    <input
+                      type="number"
+                      min={12}
+                      max={128}
+                      step={1}
+                      value={generatorLength}
+                      disabled={
+                        busy ||
+                        generatorBusy
+                      }
+                      onChange={(event) =>
+                        setGeneratorLength(
+                          Number(
+                            event.currentTarget
+                              .value,
+                          ),
+                        )
+                      }
+                    />
+                  </label>
+
+                  <button
+                    type="button"
+                    className="editor-secondary generator-button"
+                    disabled={
+                      busy ||
+                      generatorBusy
+                    }
+                    onClick={() =>
+                      void handleGeneratePassword()
+                    }
+                  >
+                    {generatorBusy
+                      ? "Генерируем…"
+                      : "Сгенерировать"}
+                  </button>
+                </div>
+
+                <div className="password-generator-options">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={
+                        includeLowercase
+                      }
+                      disabled={
+                        busy ||
+                        generatorBusy
+                      }
+                      onChange={(event) =>
+                        setIncludeLowercase(
+                          event.currentTarget
+                            .checked,
+                        )
+                      }
+                    />
+                    <span>a-z</span>
+                  </label>
+
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={
+                        includeUppercase
+                      }
+                      disabled={
+                        busy ||
+                        generatorBusy
+                      }
+                      onChange={(event) =>
+                        setIncludeUppercase(
+                          event.currentTarget
+                            .checked,
+                        )
+                      }
+                    />
+                    <span>A-Z</span>
+                  </label>
+
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={
+                        includeDigits
+                      }
+                      disabled={
+                        busy ||
+                        generatorBusy
+                      }
+                      onChange={(event) =>
+                        setIncludeDigits(
+                          event.currentTarget
+                            .checked,
+                        )
+                      }
+                    />
+                    <span>0-9</span>
+                  </label>
+
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={
+                        includeSymbols
+                      }
+                      disabled={
+                        busy ||
+                        generatorBusy
+                      }
+                      onChange={(event) =>
+                        setIncludeSymbols(
+                          event.currentTarget
+                            .checked,
+                        )
+                      }
+                    />
+                    <span>!@#…</span>
+                  </label>
+                </div>
+
+                <div
+                  className="password-generator-message"
+                  aria-live="polite"
+                >
+                  {generatorMessage ??
+                    "Криптографическая случайность ОС. Длина 12–128 символов."}
+                </div>
               </div>
             </label>
 
@@ -328,10 +596,10 @@ export default function EntryEditor({
           </label>
 
           <div className="editor-security-note">
-            Пока используйте только тестовые
-            данные. Безопасное копирование
-            пароля и auto-lock будут добавлены
-            отдельным security-этапом.
+            Генерация выполняется в Rust через
+            системный криптографический источник.
+            Несохранённый пароль исчезает при
+            закрытии редактора или блокировке сейфа.
           </div>
 
           <footer className="editor-footer">

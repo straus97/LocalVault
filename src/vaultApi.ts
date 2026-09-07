@@ -3,10 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   CategoryCommandInput,
   CategorySummary,
+  GeneratedPassword,
   ClipboardCopyResult,
   EntryDetails,
   EntryCommandInput,
   EntrySummary,
+  PasswordGeneratorInput,
   VaultStatus,
 } from "./types";
 
@@ -61,6 +63,14 @@ export function rememberRecentVault(
   return invoke<string[]>(
     "remember_recent_vault",
     { path },
+  );
+}
+export function generatePassword(
+  input: PasswordGeneratorInput,
+): Promise<GeneratedPassword> {
+  return invoke<GeneratedPassword>(
+    "generate_password",
+    { input },
   );
 }
 export function copyEntryPassword(
