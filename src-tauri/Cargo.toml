@@ -33,6 +33,9 @@ uuid = { version = "1.26.0", features = ["v4", "serde"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[target.'cfg(windows)'.dependencies]
+clipboard-win = "=5.4.1"
+
 [profile.release]
 codegen-units = 1
 lto = true

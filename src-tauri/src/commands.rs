@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 use crate::{
     app_state::{AppState, AppStateError, VaultStatus},
     crypto::CryptoError,
+    secure_clipboard::{SecureClipboard, SecureClipboardError},
     vault::{format::VaultError, session::SessionError, storage::StorageError},
 };
 
@@ -138,6 +139,14 @@ impl From<AppStateError> for CommandError {
     }
 }
 
+impl From<SecureClipboardError> for CommandError {
+    fn from(_error: SecureClipboardError) -> Self {
+        Self::new(
+            "clipboardUnavailable",
+            "The secure clipboard is unavailable.",
+        )
+    }
+}
 #[tauri::command]
 pub fn get_vault_status(state: State<'_, AppState>) -> Result<VaultStatus, CommandError> {
     state.status().map_err(CommandError::from)
@@ -174,8 +183,15 @@ pub fn unlock_vault(
 }
 
 #[tauri::command]
-pub fn lock_vault(state: State<'_, AppState>) -> Result<VaultStatus, CommandError> {
-    state.lock_vault().map_err(CommandError::from)
+pub fn lock_vault(
+    state: State<'_, AppState>,
+    clipboard: State<'_, SecureClipboard>,
+) -> Result<VaultStatus, CommandError> {
+    let result = state.lock_vault().map_err(CommandError::from);
+
+    clipboard.clear_owned_best_effort();
+
+    result
 }
 
 #[tauri::command]
@@ -245,5 +261,14 @@ mod tests {
             error.message,
             "The vault session expired due to inactivity."
         );
+    }
+
+    #[test]
+    fn clipboard_errors_are_sanitized_for_frontend() {
+        let error = CommandError::from(SecureClipboardError::Unavailable);
+
+        assert_eq!(error.code, "clipboardUnavailable");
+
+        assert_eq!(error.message, "The secure clipboard is unavailable.");
     }
 }

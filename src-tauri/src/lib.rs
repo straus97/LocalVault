@@ -19,6 +19,10 @@ fn start_auto_lock_watcher(app: AppHandle) {
             };
 
             if should_emit {
+                let clipboard = app.state::<secure_clipboard::SecureClipboard>();
+
+                clipboard.clear_owned_best_effort();
+
                 let _ = app.emit(AUTO_LOCK_EVENT, ());
             }
         })
@@ -28,17 +32,26 @@ pub mod app_state;
 pub mod commands;
 pub mod crypto;
 mod recent_vaults;
+mod secure_clipboard;
 pub mod vault;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(secure_clipboard::SecureClipboard::default())
         .manage(app_state::AppState::default())
         .setup(|app| {
             start_auto_lock_watcher(app.handle().clone());
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                let clipboard = window.state::<secure_clipboard::SecureClipboard>();
+
+                clipboard.clear_owned_best_effort();
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_vault_status,
@@ -48,6 +61,7 @@ pub fn run() {
             commands::touch_vault_activity,
             commands::entries::list_entries,
             commands::entries::get_entry,
+            commands::entries::copy_entry_password,
             commands::entries::create_entry,
             commands::entries::update_entry,
             commands::entries::delete_entry,

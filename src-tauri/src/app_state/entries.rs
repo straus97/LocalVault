@@ -1,4 +1,5 @@
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::vault::session::{EntryDetails, EntryInput, EntrySummary};
 
@@ -21,6 +22,18 @@ impl AppState {
         session.get_entry(id).map_err(AppStateError::from)
     }
 
+    pub fn entry_password_for_clipboard(
+        &self,
+        id: Uuid,
+    ) -> Result<Zeroizing<String>, AppStateError> {
+        let guard = self.active_session_guard()?;
+
+        let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
+
+        session
+            .password_for_clipboard(id)
+            .map_err(AppStateError::from)
+    }
     pub fn create_entry(&self, input: EntryInput) -> Result<EntrySummary, AppStateError> {
         let now_ms = unix_time_ms()?;
 
@@ -204,5 +217,22 @@ mod tests {
         ));
 
         assert!(!state.status().unwrap().unlocked);
+    }
+
+    #[test]
+    fn clipboard_password_lookup_returns_requested_secret() {
+        let temp = tempdir().unwrap();
+
+        let path = temp.path().join("vault.lvault");
+
+        let state = AppState::default();
+
+        state.create_vault(path, password()).unwrap();
+
+        let created = state.create_entry(input("Clipboard Entry")).unwrap();
+
+        let password = state.entry_password_for_clipboard(created.id).unwrap();
+
+        assert_eq!(password.as_str(), ENTRY_SECRET);
     }
 }

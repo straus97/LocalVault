@@ -1,12 +1,13 @@
 use std::mem;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::State;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::{
     app_state::AppState,
+    secure_clipboard::SecureClipboard,
     vault::session::{EntryDetails, EntryInput, EntrySummary},
 };
 
@@ -25,6 +26,11 @@ pub struct EntryCommandInput {
     pub favorite: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardCopyResult {
+    pub clear_after_seconds: u64,
+}
 impl Drop for EntryCommandInput {
     fn drop(&mut self) {
         self.title.zeroize();
@@ -93,6 +99,22 @@ pub fn get_entry(id: String, state: State<'_, AppState>) -> Result<EntryDetails,
     state.get_entry(id).map_err(CommandError::from)
 }
 
+#[tauri::command]
+pub fn copy_entry_password(
+    id: String,
+    state: State<'_, AppState>,
+    clipboard: State<'_, SecureClipboard>,
+) -> Result<ClipboardCopyResult, CommandError> {
+    let id = parse_entry_id(&id)?;
+
+    let password = state.entry_password_for_clipboard(id)?;
+
+    let clear_after_seconds = clipboard.copy_secret(password.as_str())?;
+
+    Ok(ClipboardCopyResult {
+        clear_after_seconds,
+    })
+}
 #[tauri::command]
 pub fn create_entry(
     input: EntryCommandInput,

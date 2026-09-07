@@ -2,7 +2,7 @@ use std::mem;
 
 use serde::Serialize;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::vault::data::VaultEntry;
 
@@ -178,6 +178,16 @@ impl UnlockedVaultSession {
         Ok(EntryDetails::from_entry(entry))
     }
 
+    pub fn password_for_clipboard(&self, id: Uuid) -> Result<Zeroizing<String>, SessionError> {
+        let entry = self
+            .data()
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or(SessionError::EntryNotFound)?;
+
+        Ok(Zeroizing::new(entry.password.clone()))
+    }
     pub fn create_entry(
         &mut self,
         input: EntryInput,

@@ -31,6 +31,7 @@ import {
   createVault,
   deleteCategory,
   deleteEntry,
+  copyEntryPassword,
   getEntry,
   getRecentVaults,
   getVaultStatus,
@@ -80,6 +81,8 @@ const friendlyErrors: Record<string, string> = {
     "Операция с хранилищем не выполнена.",
   vaultSessionExpired:
     "Хранилище автоматически заблокировано из-за бездействия.",
+  clipboardUnavailable:
+    "Не удалось получить защищённый доступ к буферу обмена.",
   entryNotFound:
     "Выбранная запись больше не существует.",
   categoryNotFound:
@@ -187,7 +190,12 @@ function App() {
 
   const [passwordVisible, setPasswordVisible] =
     useState(false);
-  const [
+  const [copyBusy, setCopyBusy] =
+    useState(false);
+
+  const [copyMessage, setCopyMessage] =
+    useState<string | null>(null);
+const [
     categoryEditorMode,
     setCategoryEditorMode,
   ] = useState<
@@ -244,6 +252,8 @@ function App() {
     setSelectedEntryId(null);
     setPasswordVisible(false);
     setDetailsLoading(false);
+    setCopyBusy(false);
+    setCopyMessage(null);
   }
 
   function clearUnlockedData() {
@@ -711,6 +721,7 @@ function App() {
     setSelectedEntryId(entry.id);
     setSelectedEntry(null);
     setPasswordVisible(false);
+    setCopyMessage(null);
     setDetailsLoading(true);
     setErrorMessage(null);
 
@@ -932,6 +943,34 @@ function App() {
     }
   }
 
+  async function handleCopyPassword() {
+    if (
+      !selectedEntry ||
+      copyBusy
+    ) {
+      return;
+    }
+
+    setCopyBusy(true);
+    setCopyMessage(null);
+
+    try {
+      const result =
+        await copyEntryPassword(
+          selectedEntry.id,
+        );
+
+      setCopyMessage(
+        `Пароль скопирован. Буфер автоматически очистится через ${result.clearAfterSeconds} сек., если вы не скопируете что-то другое.`,
+      );
+    } catch (error) {
+      setCopyMessage(
+        friendlyError(error),
+      );
+    } finally {
+      setCopyBusy(false);
+    }
+  }
   async function handleDeleteSelectedEntry() {
     if (!selectedEntry) {
       return;
@@ -1851,15 +1890,26 @@ function App() {
                       ? "Скрыть"
                       : "Показать"}
                   </button>
+
+                  <button
+                    type="button"
+                    className="reveal-button"
+                    disabled={copyBusy}
+                    onClick={() =>
+                      void handleCopyPassword()
+                    }
+                  >
+                    {copyBusy
+                      ? "Копируем…"
+                      : "Копировать"}
+                  </button>
                 </div>
 
                 <div className="copy-disabled-note">
-                  Копирование пока отключено до
-                  реализации безопасной очистки
-                  буфера обмена.
+                  {copyMessage ??
+                    "Защищённое копирование: автоочистка через 30 секунд; новое содержимое буфера LocalVault не удаляет."}
                 </div>
               </div>
-
               <div className="detail-section">
                 <div className="detail-label">
                   Сайт

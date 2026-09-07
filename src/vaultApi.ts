@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   CategoryCommandInput,
   CategorySummary,
+  ClipboardCopyResult,
   EntryDetails,
   EntryCommandInput,
   EntrySummary,
@@ -60,6 +61,14 @@ export function rememberRecentVault(
   return invoke<string[]>(
     "remember_recent_vault",
     { path },
+  );
+}
+export function copyEntryPassword(
+  id: string,
+): Promise<ClipboardCopyResult> {
+  return invoke<ClipboardCopyResult>(
+    "copy_entry_password",
+    { id },
   );
 }
 export function createEntry(

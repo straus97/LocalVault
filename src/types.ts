@@ -39,6 +39,9 @@ export interface CommandError {
   message: string;
 }
 
+export interface ClipboardCopyResult {
+  clearAfterSeconds: number;
+}
 export type VaultFilter =
   | { type: "all" }
   | { type: "favorite" }
