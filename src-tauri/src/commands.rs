@@ -16,7 +16,8 @@ use crate::{
     password_generator::PasswordGeneratorError,
     secure_clipboard::{SecureClipboard, SecureClipboardError},
     vault::{
-        backup::BackupError, format::VaultError, session::SessionError, storage::StorageError,
+        backup::BackupError, format::VaultError, lifecycle::VaultLifecycleError,
+        session::SessionError, storage::StorageError,
     },
 };
 
@@ -102,6 +103,30 @@ impl From<AppStateError> for CommandError {
                 "invalidBackup",
                 "The backup file is invalid or unsupported.",
             ),
+            AppStateError::Lifecycle(VaultLifecycleError::NotFound) => {
+                Self::new("vaultNotFound", "The vault file was not found.")
+            }
+
+            AppStateError::Lifecycle(VaultLifecycleError::InvalidPath) => {
+                Self::new("invalidVaultPath", "The selected vault path is invalid.")
+            }
+
+            AppStateError::Lifecycle(VaultLifecycleError::InUse) => {
+                Self::new("vaultInUse", "This vault appears to be in use.")
+            }
+
+            AppStateError::Lifecycle(
+                VaultLifecycleError::SymlinkPath
+                | VaultLifecycleError::NotRegularFile
+                | VaultLifecycleError::UnsafeInternalBackup,
+            ) => Self::new(
+                "invalidVault",
+                "The selected vault path is unsafe or unsupported.",
+            ),
+
+            AppStateError::Lifecycle(VaultLifecycleError::Io(_)) => {
+                Self::new("vaultDeleteFailed", "The vault could not be deleted.")
+            }
             AppStateError::Session(SessionError::EntryNotFound) => {
                 Self::new("entryNotFound", "The vault entry was not found.")
             }

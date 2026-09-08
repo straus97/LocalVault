@@ -76,6 +76,7 @@ pub fn run() {
             commands::passwords::generate_password,
             commands::recent_vaults::get_recent_vaults,
             commands::recent_vaults::remember_recent_vault,
+            commands::recent_vaults::delete_closed_vault,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -50,6 +50,10 @@ export interface PasswordGeneratorInput {
 export interface GeneratedPassword {
   password: string;
 }
+export interface DeleteVaultResult {
+  recentVaults: string[];
+  internalBackupRemoved: boolean;
+}
 export interface ClipboardCopyResult {
   clearAfterSeconds: number;
 }

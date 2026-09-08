@@ -198,6 +198,28 @@ pub fn remember_recent_vault(
     Ok(paths)
 }
 
+pub fn forget_recent_vault(
+    config_path: &Path,
+    vault_path: &Path,
+) -> Result<Vec<String>, RecentVaultError> {
+    let target = vault_path
+        .to_str()
+        .ok_or(RecentVaultError::InvalidVaultPath)?;
+
+    /*
+     * Unlike remember_recent_vault, forgetting must also work
+     * after the vault file itself has already been deleted.
+     */
+    let mut config = read_config(config_path)?;
+
+    config
+        .paths
+        .retain(|existing| !path_strings_equal(existing, target));
+
+    write_config(config_path, &config.paths)?;
+
+    load_recent_vaults(config_path)
+}
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
@@ -301,6 +323,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn forgetting_deleted_vault_removes_it_from_persisted_recent_list() {
+        let temp = tempdir().unwrap();
+
+        let config_path = temp.path().join("recent-vaults.json");
+
+        let first = create_vault_file(temp.path(), "first.lvault");
+
+        let second = create_vault_file(temp.path(), "second.lvault");
+
+        remember_recent_vault(&config_path, &first).unwrap();
+
+        remember_recent_vault(&config_path, &second).unwrap();
+
+        let canonical_first = fs::canonicalize(&first).unwrap();
+
+        fs::remove_file(&first).unwrap();
+
+        let paths = forget_recent_vault(&config_path, &canonical_first).unwrap();
+
+        assert_eq!(paths.len(), 1);
+
+        assert!(paths[0].ends_with("second.lvault",));
+
+        let config = read_config(&config_path).unwrap();
+
+        let forgotten = canonical_first.to_str().unwrap();
+
+        assert!(config
+            .paths
+            .iter()
+            .all(|path| { !path_strings_equal(path, forgotten,) },));
+    }
     #[test]
     fn malformed_config_is_rejected() {
         let temp = tempdir().unwrap();

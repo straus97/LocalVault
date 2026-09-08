@@ -1,6 +1,7 @@
 mod backups;
 mod categories;
 mod entries;
+mod lifecycle;
 
 use std::{
     path::PathBuf,
@@ -14,6 +15,7 @@ use zeroize::Zeroizing;
 
 use crate::vault::{
     backup::BackupError,
+    lifecycle::VaultLifecycleError,
     session::{SessionError, UnlockedVaultSession},
 };
 
@@ -78,6 +80,9 @@ pub enum AppStateError {
 
     #[error("backup operation failed")]
     Backup(#[from] BackupError),
+
+    #[error("vault lifecycle operation failed")]
+    Lifecycle(#[from] VaultLifecycleError),
 }
 
 #[derive(Default)]

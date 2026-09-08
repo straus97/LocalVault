@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   CategoryCommandInput,
   CategorySummary,
+  DeleteVaultResult,
   GeneratedPassword,
   ClipboardCopyResult,
   EntryDetails,
@@ -75,6 +76,14 @@ export function getEntry(
 
 export function listCategories(): Promise<CategorySummary[]> {
   return invoke<CategorySummary[]>("list_categories");
+}
+export function deleteClosedVault(
+  path: string,
+): Promise<DeleteVaultResult> {
+  return invoke<DeleteVaultResult>(
+    "delete_closed_vault",
+    { path },
+  );
 }
 export function getRecentVaults(): Promise<string[]> {
   return invoke<string[]>("get_recent_vaults");

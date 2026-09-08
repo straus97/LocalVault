@@ -2636,3 +2636,323 @@ input:focus-visible {
     flex-direction: column;
   }
 }
+/* LOCALVAULT 1K-A COMPACT GATE + LIFECYCLE UX */
+
+.vault-app {
+  position: relative;
+}
+
+/*
+ * Success/error notifications are overlays, not additional
+ * grid rows. This prevents a one-line message from consuming
+ * most of the unlocked workspace.
+ */
+.workspace-success,
+.workspace-error {
+  width: min(calc(100% - 36px), 980px);
+  height: auto;
+  min-height: 42px;
+  max-height: 96px;
+  margin: 0;
+  padding: 10px 14px;
+  position: absolute;
+  top: 72px;
+  left: 50%;
+  right: auto;
+  z-index: 20;
+  border-radius: 12px;
+  transform: translateX(-50%);
+  overflow: auto;
+  backdrop-filter: blur(10px);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/*
+ * Locked-screen messages are compact floating notices and do
+ * not alter the gate layout height.
+ */
+.gate-card > .error-banner,
+.gate-card > .gate-success {
+  width: min(520px, calc(100vw - 32px));
+  max-width: none;
+  min-height: 42px;
+  max-height: 100px;
+  margin: 0;
+  padding: 10px 14px;
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  left: auto;
+  z-index: 1200;
+  overflow: auto;
+  border-radius: 12px;
+  backdrop-filter: blur(10px);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/*
+ * The decorative right-hand safe has been removed. The locked
+ * interface now uses the entire window for actual actions.
+ */
+.gate-screen,
+.gate-screen.form-active {
+  width: 100%;
+  height: 100vh;
+  min-height: 0;
+  display: block;
+  overflow: hidden;
+  background:
+    radial-gradient(
+      circle at 80% 20%,
+      rgba(111, 140, 255, 0.055),
+      transparent 30%
+    ),
+    var(--bg);
+}
+
+.gate-card,
+.gate-screen.form-active .gate-card {
+  width: min(100%, 1120px);
+  height: 100vh;
+  min-height: 0;
+  margin: 0 auto;
+  padding: 24px 40px 18px;
+  overflow: hidden;
+  border-right: 0;
+  background: transparent;
+}
+
+.gate-screen.form-active .gate-card {
+  width: min(100%, 820px);
+}
+
+.gate-brand {
+  gap: 11px;
+}
+
+.gate-copy,
+.gate-screen.form-active .gate-copy {
+  max-width: 760px;
+  margin-top: 18px;
+}
+
+.gate-copy h1,
+.gate-screen.form-active .gate-copy h1 {
+  max-width: 760px;
+  margin: 9px 0 9px;
+  font-size: clamp(34px, 4vw, 48px);
+  line-height: 1.02;
+}
+
+.gate-copy p,
+.gate-screen.form-active .gate-copy p {
+  max-width: 720px;
+  font-size: 13px;
+  line-height: 1.48;
+}
+
+.gate-actions {
+  width: 100%;
+  max-width: none;
+  margin-top: 18px;
+  display: grid;
+  grid-template-columns:
+    repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.gate-action {
+  min-height: 70px;
+  padding: 11px 13px;
+  grid-template-columns:
+    36px minmax(0, 1fr) auto;
+  gap: 10px;
+  border-radius: 13px;
+}
+
+.gate-action .action-icon {
+  width: 36px;
+  height: 36px;
+  font-size: 19px;
+  border-radius: 10px;
+}
+
+.gate-action strong {
+  font-size: 13px;
+}
+
+.gate-action small {
+  margin-top: 2px;
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.recent-vaults {
+  grid-column: 1 / -1;
+  margin: 0 0 3px;
+  padding: 9px;
+  display: grid;
+  grid-template-columns:
+    repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  border-radius: 13px;
+}
+
+.recent-vaults-label {
+  grid-column: 1 / -1;
+  padding: 0 3px 3px;
+}
+
+.recent-vault-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr) 34px;
+  gap: 6px;
+}
+
+.recent-vault {
+  min-height: 47px;
+  padding: 6px 8px;
+  grid-template-columns:
+    30px minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.recent-vault .file-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+}
+
+.recent-vault-copy strong {
+  font-size: 10px;
+}
+
+.recent-vault-copy small {
+  margin-top: 2px;
+  font-size: 8px;
+}
+
+.recent-vault-delete {
+  width: 34px;
+  min-width: 34px;
+  border: 1px solid rgba(255, 126, 145, 0.18);
+  border-radius: 9px;
+  background: rgba(255, 126, 145, 0.045);
+  color: #c98491;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.recent-vault-delete:hover:not(:disabled) {
+  color: #ffadba;
+  border-color: rgba(255, 126, 145, 0.42);
+  background: rgba(255, 126, 145, 0.09);
+}
+
+.recent-vault-delete:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.security-mode-note,
+.gate-screen.form-active .security-mode-note {
+  max-width: 760px;
+  margin-top: 13px;
+  padding-top: 0;
+}
+
+.unlock-form,
+.gate-screen.form-active .unlock-form {
+  width: min(100%, 620px);
+  margin-top: 18px;
+}
+
+/*
+ * 1366x768 and other ordinary desktop heights have no gate
+ * scrollbar. Only genuinely short windows fall back to
+ * scrolling rather than clipping controls.
+ */
+@media (max-height: 640px) {
+  .gate-card,
+  .gate-screen.form-active .gate-card {
+    overflow-y: auto;
+    padding-top: 18px;
+    padding-bottom: 18px;
+  }
+}
+
+@media (max-width: 900px) {
+  .gate-card,
+  .gate-screen.form-active .gate-card {
+    padding-left: 24px;
+    padding-right: 24px;
+  }
+
+  .gate-actions {
+    grid-template-columns:
+      repeat(2, minmax(0, 1fr));
+  }
+
+  .recent-vaults {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 680px) {
+  .gate-actions {
+    grid-template-columns: 1fr;
+  }
+}
+/* LOCALVAULT 1K-A READABILITY TUNE */
+
+.gate-copy p,
+.gate-screen.form-active .gate-copy p {
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.recent-vaults-label {
+  font-size: 12px;
+  letter-spacing: 0.08em;
+}
+
+.recent-vault-copy strong {
+  font-size: 12.5px;
+  line-height: 1.35;
+}
+
+.recent-vault-copy small {
+  margin-top: 3px;
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
+.gate-action strong {
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.gate-action small {
+  margin-top: 3px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.security-mode-note,
+.gate-screen.form-active .security-mode-note {
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.gate-success,
+.gate-card > .error-banner,
+.workspace-success,
+.workspace-error {
+  font-size: 12.5px;
+  line-height: 1.45;
+}

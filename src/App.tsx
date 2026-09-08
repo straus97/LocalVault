@@ -32,6 +32,7 @@ import {
   createEntry,
   createVault,
   deleteCategory,
+  deleteClosedVault,
   deleteEntry,
   copyEntryPassword,
   getEntry,
@@ -133,6 +134,8 @@ const friendlyErrors: Record<string, string> = {
     "Не удалось корректно заблокировать хранилище.",
   vaultOperationFailed:
     "Операция с хранилищем не выполнена.",
+  vaultDeleteFailed:
+    "Не удалось удалить файл хранилища. Проверьте права доступа и убедитесь, что файл не используется другой программой.",
   vaultSessionExpired:
     "Хранилище автоматически заблокировано из-за бездействия.",
   clipboardUnavailable:
@@ -679,6 +682,73 @@ const [
     }
   }
 
+  async function handleDeleteRecentVault(
+    path: string,
+  ) {
+    if (
+      busy ||
+      status.unlocked
+    ) {
+      return;
+    }
+
+    const name =
+      basename(path);
+
+    const confirmed =
+      window.confirm(
+        `Удалить хранилище «${name}»?
+
+${path}
+
+Будут удалены:
+• основной файл .lvault;
+• внутренняя предыдущая версия .lvault.backup, если она существует.
+
+Созданные вами файлы .lvbackup НЕ удаляются.
+
+Это действие нельзя отменить.`,
+      );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setBusy(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+
+    try {
+      const result =
+        await deleteClosedVault(
+          path,
+        );
+
+      setRecentVaultPaths(
+        result.recentVaults,
+      );
+
+      if (
+        result.internalBackupRemoved
+      ) {
+        setSuccessMessage(
+          `Хранилище «${name}» удалено. Пользовательские .lvbackup не затронуты.`,
+        );
+      } else {
+        setErrorMessage(
+          `Основной сейф «${name}» удалён, но внутренний файл .lvault.backup не удалось удалить. Его нужно удалить вручную. Пользовательские .lvbackup не затронуты.`,
+        );
+      }
+    } catch (error) {
+      setErrorMessage(
+        friendlyError(
+          error,
+        ),
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
   function openRecentVault(
     path: string,
   ) {
@@ -1359,35 +1429,54 @@ const [
 
                   {recentVaultPaths.map(
                     (path) => (
-                      <button
-                        type="button"
-                        className="recent-vault"
+                      <div
+                        className="recent-vault-item"
                         key={path}
-                        disabled={busy}
-                        onClick={() =>
-                          openRecentVault(path)
-                        }
                       >
-                        <span className="file-icon">
-                          LV
-                        </span>
-
-                        <span className="recent-vault-copy">
-                          <strong>
-                            {basename(path)}
-                          </strong>
-                          <small title={path}>
-                            {path}
-                          </small>
-                        </span>
-
-                        <span
-                          className="action-arrow"
-                          aria-hidden="true"
+                        <button
+                          type="button"
+                          className="recent-vault"
+                          disabled={busy}
+                          onClick={() =>
+                            openRecentVault(path)
+                          }
                         >
-                          →
-                        </span>
-                      </button>
+                          <span className="file-icon">
+                            LV
+                          </span>
+
+                          <span className="recent-vault-copy">
+                            <strong>
+                              {basename(path)}
+                            </strong>
+                            <small title={path}>
+                              {path}
+                            </small>
+                          </span>
+
+                          <span
+                            className="action-arrow"
+                            aria-hidden="true"
+                          >
+                            →
+                          </span>
+                        </button>
+
+                        <button
+                          type="button"
+                          className="recent-vault-delete"
+                          aria-label={`Удалить хранилище ${basename(path)}`}
+                          title="Удалить хранилище"
+                          disabled={busy}
+                          onClick={() =>
+                            void handleDeleteRecentVault(
+                              path,
+                            )
+                          }
+                        >
+                          ×
+                        </button>
+                      </div>
                     ),
                   )}
                 </section>
@@ -1612,29 +1701,7 @@ const [
           </div>
         </section>
 
-        <aside className="gate-visual">
-          <div className="visual-orbit orbit-one" />
-          <div className="visual-orbit orbit-two" />
 
-          <div className="vault-illustration">
-            <div className="vault-door">
-              <div className="vault-ring">
-                <div className="vault-core">
-                  <span />
-                </div>
-              </div>
-            </div>
-
-            <div className="visual-label">
-              <strong>
-                XChaCha20-Poly1305
-              </strong>
-              <span>
-                Локальное шифрование сейфа
-              </span>
-            </div>
-          </div>
-        </aside>
       </main>
     );
   }
