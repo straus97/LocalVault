@@ -1,8 +1,8 @@
 [package]
 name = "localvault"
-version = "0.1.0"
+version = "1.0.0"
 description = "Local encrypted password manager"
-authors = ["you"]
+authors = ["Штраус Никита Алексеевич"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
