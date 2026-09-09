@@ -12,7 +12,7 @@ pub fn create_vault_backup(path: String, state: State<'_, AppState>) -> Result<(
         .map_err(CommandError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn restore_vault_backup(
     backup_path: String,
     destination_path: String,

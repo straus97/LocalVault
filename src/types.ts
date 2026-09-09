@@ -53,6 +53,7 @@ export interface GeneratedPassword {
 export interface DeleteVaultResult {
   recentVaults: string[];
   internalBackupRemoved: boolean;
+  lockFileRemoved: boolean;
 }
 export interface ClipboardCopyResult {
   clearAfterSeconds: number;

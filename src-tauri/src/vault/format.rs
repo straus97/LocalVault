@@ -133,6 +133,43 @@ pub(crate) fn reseal_envelope(
     Ok(updated)
 }
 
+pub(crate) fn rewrap_envelope_master_password(
+    envelope: &VaultEnvelope,
+    vault_key: &SecretKey,
+    new_master_password: &str,
+) -> Result<VaultEnvelope, VaultError> {
+    if new_master_password.is_empty() {
+        return Err(VaultError::EmptyMasterPassword);
+    }
+
+    envelope.validate_header()?;
+
+    /*
+     * The Vault Key and encrypted payload are deliberately
+     * preserved. Only the password-derived wrapping layer is
+     * replaced.
+     */
+    let kdf = KdfParams::default();
+
+    let kdf_salt = random_salt()?;
+
+    let master_key = derive_master_key(new_master_password, &kdf_salt, kdf)?;
+
+    let wrapped_vault_key = encrypt(&master_key, vault_key.as_slice(), WRAPPED_KEY_AAD)?;
+
+    let mut updated = envelope.clone();
+
+    updated.kdf = kdf;
+
+    updated.kdf_salt = kdf_salt;
+
+    updated.wrapped_vault_key = wrapped_vault_key;
+
+    /*
+     * `updated.payload` is intentionally unchanged byte-for-byte.
+     */
+    Ok(updated)
+}
 pub fn open_envelope(
     master_password: &str,
     envelope: &VaultEnvelope,
@@ -219,6 +256,58 @@ mod tests {
         assert_ne!(first.payload.ciphertext, second.payload.ciphertext);
     }
 
+    #[test]
+    fn master_password_rewrap_preserves_payload_and_vault_key() {
+        const NEW_PASSWORD: &str = "new-master-password-test-only";
+
+        let original = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        let (vault_key, original_plaintext) =
+            open_envelope_with_key(MASTER_PASSWORD, &original).unwrap();
+
+        let updated = rewrap_envelope_master_password(&original, &vault_key, NEW_PASSWORD).unwrap();
+
+        assert_eq!(updated.payload, original.payload);
+
+        assert_ne!(updated.kdf_salt, original.kdf_salt);
+
+        assert_ne!(updated.wrapped_vault_key, original.wrapped_vault_key);
+
+        assert!(matches!(
+            open_envelope(MASTER_PASSWORD, &updated,),
+            Err(VaultError::Crypto(CryptoError::Decryption))
+        ));
+
+        let (reopened_key, reopened_plaintext) =
+            open_envelope_with_key(NEW_PASSWORD, &updated).unwrap();
+
+        assert_eq!(reopened_key.as_slice(), vault_key.as_slice());
+
+        assert_eq!(reopened_plaintext.as_slice(), original_plaintext.as_slice());
+
+        assert_eq!(reopened_plaintext.as_slice(), TEST_PAYLOAD);
+    }
+
+    #[test]
+    fn repeated_master_password_rewrap_uses_fresh_randomness() {
+        const NEW_PASSWORD: &str = "new-master-password-randomness-test-only";
+
+        let original = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        let (vault_key, _plaintext) = open_envelope_with_key(MASTER_PASSWORD, &original).unwrap();
+
+        let first = rewrap_envelope_master_password(&original, &vault_key, NEW_PASSWORD).unwrap();
+
+        let second = rewrap_envelope_master_password(&original, &vault_key, NEW_PASSWORD).unwrap();
+
+        assert_eq!(first.payload, original.payload);
+
+        assert_eq!(second.payload, original.payload);
+
+        assert_ne!(first.kdf_salt, second.kdf_salt);
+
+        assert_ne!(first.wrapped_vault_key, second.wrapped_vault_key);
+    }
     #[test]
     fn serialized_envelope_contains_no_plaintext_secrets() {
         let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();

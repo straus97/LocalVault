@@ -58,6 +58,7 @@ pub fn run() {
             commands::get_vault_status,
             commands::create_vault,
             commands::unlock_vault,
+            commands::credentials::change_master_password,
             commands::lock_vault,
             commands::touch_vault_activity,
             commands::backups::create_vault_backup,

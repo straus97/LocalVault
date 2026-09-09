@@ -40,6 +40,18 @@ export function unlockVault(
 export function lockVault(): Promise<VaultStatus> {
   return invoke<VaultStatus>("lock_vault");
 }
+export function changeMasterPassword(
+  currentMasterPassword: string,
+  newMasterPassword: string,
+): Promise<void> {
+  return invoke<void>(
+    "change_master_password",
+    {
+      currentMasterPassword,
+      newMasterPassword,
+    },
+  );
+}
 
 export function createVaultBackup(
   path: string,

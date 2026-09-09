@@ -61,6 +61,7 @@ pub fn remember_recent_vault(path: String, app: AppHandle) -> Result<Vec<String>
 pub struct DeleteVaultResult {
     pub recent_vaults: Vec<String>,
     pub internal_backup_removed: bool,
+    pub lock_file_removed: bool,
 }
 
 #[tauri::command]
@@ -95,6 +96,7 @@ pub fn delete_closed_vault(
     Ok(DeleteVaultResult {
         recent_vaults,
         internal_backup_removed: outcome.internal_backup_removed,
+        lock_file_removed: outcome.lock_file_removed,
     })
 }
 #[cfg(test)]

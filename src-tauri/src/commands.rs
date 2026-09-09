@@ -1,5 +1,6 @@
 pub(crate) mod backups;
 pub(crate) mod categories;
+pub(crate) mod credentials;
 pub(crate) mod entries;
 pub(crate) mod passwords;
 pub(crate) mod recent_vaults;
@@ -161,6 +162,22 @@ impl From<AppStateError> for CommandError {
                 Self::new("invalidSystemClock", "The system clock is unavailable.")
             }
 
+            AppStateError::Session(SessionError::CurrentMasterPasswordInvalid) => Self::new(
+                "currentMasterPasswordInvalid",
+                "The current master password is invalid.",
+            ),
+
+            AppStateError::Session(SessionError::NewMasterPasswordMatchesCurrent) => Self::new(
+                "newMasterPasswordMatchesCurrent",
+                "The new master password must differ from the current password.",
+            ),
+
+            AppStateError::Session(
+                SessionError::InternalBackupInvalid | SessionError::PasswordChangeRollbackFailed,
+            ) => Self::new(
+                "masterPasswordChangeFailed",
+                "The master password could not be changed safely.",
+            ),
             AppStateError::Session(SessionError::AlreadyExists) => Self::new(
                 "vaultAlreadyExists",
                 "A vault already exists at this location.",
@@ -254,7 +271,7 @@ pub fn get_vault_status(state: State<'_, AppState>) -> Result<VaultStatus, Comma
     state.status().map_err(CommandError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn create_vault(
     path: String,
     master_password: String,
@@ -269,7 +286,7 @@ pub fn create_vault(
         .map_err(CommandError::from)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn unlock_vault(
     path: String,
     master_password: String,

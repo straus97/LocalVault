@@ -2,6 +2,7 @@ mod backups;
 mod categories;
 mod entries;
 mod lifecycle;
+mod master_password;
 
 use std::{
     path::PathBuf,

@@ -35,6 +35,7 @@ pub enum VaultLifecycleError {
 pub struct DeletedVaultOutcome {
     pub canonical_path: PathBuf,
     pub internal_backup_removed: bool,
+    pub lock_file_removed: bool,
 }
 
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -132,7 +133,7 @@ pub fn delete_closed_vault_files(path: &Path) -> Result<DeletedVaultOutcome, Vau
      * unlocked vault session. Keep this File alive until this
      * function returns.
      */
-    let _delete_lock = acquire_delete_lock(&canonical_path)?;
+    let delete_lock = acquire_delete_lock(&canonical_path)?;
 
     /*
      * Re-check the primary target after acquiring the lock.
@@ -163,16 +164,30 @@ pub fn delete_closed_vault_files(path: &Path) -> Result<DeletedVaultOutcome, Vau
     } else {
         true
     };
+    /*
+     * The .lvault.lock file is LocalVault-owned coordination
+     * metadata. Once the vault itself has been deleted, remove
+     * the pathname while this process still owns its exclusive
+     * OS lock.
+     */
+    let lock_path = append_suffix(&canonical_path, ".lock");
+
+    let lock_file_removed = match fs::remove_file(&lock_path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    };
 
     /*
-     * Do not remove .lvault.lock here. It contains no secrets
-     * and is intentionally persistent. Removing its pathname
-     * while releasing an OS lock would introduce a race where
-     * another process could create/lock a different file.
+     * Keep the locked handle alive through the pathname
+     * cleanup attempt.
      */
+    drop(delete_lock);
+
     Ok(DeletedVaultOutcome {
         canonical_path,
         internal_backup_removed,
+        lock_file_removed,
     })
 }
 
@@ -206,6 +221,7 @@ mod tests {
         assert!(user_backup.exists());
 
         assert!(outcome.internal_backup_removed);
+        assert!(outcome.lock_file_removed);
     }
 
     #[test]
@@ -281,8 +297,9 @@ mod tests {
 
         assert!(!vault.exists());
 
-        assert!(lock_path.exists());
+        assert!(!lock_path.exists());
 
         assert!(outcome.internal_backup_removed);
+        assert!(outcome.lock_file_removed);
     }
 }

@@ -2956,3 +2956,64 @@ input:focus-visible {
   font-size: 12.5px;
   line-height: 1.45;
 }
+/* LOCALVAULT 1K-B3 CRYPTO UX */
+
+.change-password-modal {
+  max-width: 760px;
+}
+
+.change-password-modal .backup-modal-description {
+  color: rgba(226, 232, 240, 0.86);
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+.change-password-modal .editor-field > span {
+  color: rgba(203, 213, 225, 0.9);
+  font-size: 13.5px;
+}
+
+.change-password-modal .editor-field input {
+  font-size: 15px;
+}
+
+.change-password-modal .editor-security-note {
+  color: rgba(203, 213, 225, 0.78);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.change-password-modal .editor-security-note strong {
+  color: rgba(226, 232, 240, 0.94);
+}
+
+.crypto-progress-note {
+  display: flex;
+  align-items: center;
+  min-height: 42px;
+  padding: 10px 12px;
+  border: 1px solid rgba(111, 140, 255, 0.24);
+  border-radius: 10px;
+  background: rgba(111, 140, 255, 0.07);
+  color: rgba(226, 232, 240, 0.9);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.crypto-spinner {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  display: inline-block;
+  margin-right: 7px;
+  border: 2px solid rgba(255, 255, 255, 0.28);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: localvault-crypto-spin 0.75s linear infinite;
+}
+
+@keyframes localvault-crypto-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

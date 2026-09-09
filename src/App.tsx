@@ -13,6 +13,7 @@ import {
 import { listen } from "@tauri-apps/api/event";
 
 import BackupRestoreDialog from "./BackupRestoreDialog";
+import ChangeMasterPasswordDialog from "./ChangeMasterPasswordDialog";
 import CategoryEditor from "./CategoryEditor";
 import EntryEditor from "./EntryEditor";
 import "./App.css";
@@ -215,6 +216,11 @@ function App() {
     setRestoreDialogOpen,
   ] = useState(false);
 
+  const [
+    changePasswordDialogOpen,
+    setChangePasswordDialogOpen,
+  ] = useState(false);
+
   const [gateMode, setGateMode] =
     useState<GateMode | null>(null);
 
@@ -326,6 +332,7 @@ const [
     setCategories([]);
     setSearch("");
     setFilter({ type: "all" });
+    setChangePasswordDialogOpen(false);
   }
 
   function applyAutoLockedUi() {
@@ -729,14 +736,15 @@ ${path}
       );
 
       if (
-        result.internalBackupRemoved
+        result.internalBackupRemoved &&
+        result.lockFileRemoved
       ) {
         setSuccessMessage(
-          `Хранилище «${name}» удалено. Пользовательские .lvbackup не затронуты.`,
+          `Хранилище «${name}» полностью удалено. Служебные .lvault.backup и .lvault.lock очищены. Пользовательские .lvbackup не затронуты.`,
         );
       } else {
         setErrorMessage(
-          `Основной сейф «${name}» удалён, но внутренний файл .lvault.backup не удалось удалить. Его нужно удалить вручную. Пользовательские .lvbackup не затронуты.`,
+          `Основной сейф «${name}» удалён, но не все служебные файлы удалось очистить. Закройте LocalVault и удалите оставшиеся .lvault.backup или .lvault.lock вручную. Пользовательские .lvbackup не затронуты.`,
         );
       }
     } catch (error) {
@@ -1665,7 +1673,7 @@ ${path}
                 disabled={busy}
               >
                 {busy
-                  ? "Подождите…"
+                  ? "Проверяем защиту…"
                   : gateMode === "create"
                     ? "Создать и открыть"
                     : "Разблокировать"}
@@ -1752,6 +1760,24 @@ ${path}
               ◫
             </span>
             Резервная копия
+          </button>
+          <button
+            type="button"
+            className="backup-button"
+            disabled={busy}
+            onClick={() => {
+              clearSecretView();
+              setErrorMessage(null);
+              setSuccessMessage(null);
+              setChangePasswordDialogOpen(
+                true,
+              );
+            }}
+          >
+            <span aria-hidden="true">
+              ↻
+            </span>
+            Сменить пароль
           </button>
           <button
             type="button"
@@ -2286,6 +2312,26 @@ ${path}
           )}
         </section>
       </div>
+      {changePasswordDialogOpen && (
+        <ChangeMasterPasswordDialog
+          onCancel={() =>
+            setChangePasswordDialogOpen(
+              false,
+            )
+          }
+          onChanged={() => {
+            setChangePasswordDialogOpen(
+              false,
+            );
+
+            setErrorMessage(null);
+
+            setSuccessMessage(
+              "Мастер-пароль успешно изменён. Старые пользовательские .lvbackup по-прежнему открываются прежним паролем — рекомендуется создать новую резервную копию.",
+            );
+          }}
+        />
+      )}
       {categoryEditorMode && (
         <CategoryEditor
           key={

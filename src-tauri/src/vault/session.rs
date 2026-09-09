@@ -2,6 +2,7 @@ mod backups;
 mod categories;
 pub use categories::{CategoryInput, CategorySummary};
 mod entries;
+mod master_password;
 pub use entries::{EntryDetails, EntryInput, EntrySummary};
 
 use std::{
@@ -37,6 +38,18 @@ pub enum SessionError {
 
     #[error("vault contains pending unsaved changes")]
     PendingUnsavedChanges,
+
+    #[error("current master password is invalid")]
+    CurrentMasterPasswordInvalid,
+
+    #[error("new master password matches the current password")]
+    NewMasterPasswordMatchesCurrent,
+
+    #[error("internal previous-version backup is invalid for password rotation")]
+    InternalBackupInvalid,
+
+    #[error("master-password change rollback failed")]
+    PasswordChangeRollbackFailed,
 
     #[error("vault entry was not found")]
     EntryNotFound,
