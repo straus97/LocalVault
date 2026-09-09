@@ -1,0 +1,76 @@
+LocalVault Proprietary License
+Version 1.0
+
+Copyright © 2026 Штраус Никита Алексеевич
+All rights reserved.
+
+1. Ownership
+
+LocalVault, including its original source code, application-specific
+documentation, graphical assets, design elements, and other original
+materials contained in this repository, is owned by Штраус Никита
+Алексеевич, except where third-party ownership is explicitly indicated.
+
+2. No general license granted
+
+Except for rights necessarily provided through the GitHub Terms of Service
+for content hosted on GitHub, no license or permission is granted to any
+person or organization to use this software or its source code.
+
+Without prior explicit written permission from the copyright holder, you
+may not:
+
+- use the source code or software in another project, product, or service;
+- copy or reproduce the source code outside permissions necessarily
+  provided by the hosting platform;
+- modify, adapt, translate, or create derivative works;
+- redistribute, publish, sublicense, sell, rent, or otherwise transfer
+  the software or source code;
+- incorporate any substantial portion of the project into another work;
+- use the project or substantial portions of its source code for
+  commercial purposes;
+- represent this project or a derivative of it as your own work.
+
+3. Viewing and evaluation
+
+Where the repository is publicly accessible, the source code may be viewed
+for personal review, security evaluation, educational inspection, and
+evaluation of the software.
+
+Such access does not grant permission to reuse the source code.
+
+4. Permission requests
+
+Permission for any use not expressly permitted by this license must be
+obtained from the copyright holder in writing.
+
+Copyright holder:
+
+Штраус Никита Алексеевич
+
+5. Third-party software
+
+This license applies only to original LocalVault materials owned by the
+copyright holder.
+
+Third-party libraries, dependencies, frameworks, tools, and other
+third-party materials are governed by their respective licenses and
+copyright notices.
+
+Nothing in this license restricts rights independently granted by the
+owners of those third-party components.
+
+6. No warranty
+
+THE SOFTWARE AND SOURCE CODE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE COPYRIGHT HOLDER
+SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM
+THE SOFTWARE OR ITS USE.
+
+7. Reservation of rights
+
+All rights not expressly granted in this license are reserved by the
+copyright holder.
