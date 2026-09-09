@@ -13,6 +13,8 @@ const SECURE_CLIPBOARD_CLEAR_AFTER: Duration =
 
 const SECURE_CLIPBOARD_RETRY_AFTER: Duration = Duration::from_millis(250);
 
+const OWNERSHIP_MARKER_BYTES: usize = 16;
+
 #[derive(Debug, Error)]
 pub enum SecureClipboardError {
     #[error("system clipboard is unavailable")]
@@ -24,11 +26,20 @@ pub enum SecureClipboardError {
     #[error("clipboard privacy protection is unavailable")]
     PrivacyProtectionUnavailable,
 
+    #[error("clipboard ownership marker is unavailable")]
+    OwnershipMarkerUnavailable,
+
     #[error("secure clipboard state is unavailable")]
     StateUnavailable,
 
     #[error("secure clipboard is unsupported on this platform")]
     Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClipboardOwnership {
+    sequence: u32,
+    marker: [u8; OWNERSHIP_MARKER_BYTES],
 }
 
 #[derive(Clone)]
@@ -44,27 +55,27 @@ struct ClipboardShared {
 #[derive(Default)]
 struct ClipboardState {
     generation: u64,
-    expected_sequence: Option<u32>,
+    expected_ownership: Option<ClipboardOwnership>,
     deadline: Option<Instant>,
 }
 
 impl ClipboardState {
-    fn record_copy(&mut self, sequence: u32, deadline: Instant) -> u64 {
+    fn record_copy(&mut self, ownership: ClipboardOwnership, deadline: Instant) -> u64 {
         self.generation = self.generation.wrapping_add(1);
 
         if self.generation == 0 {
             self.generation = 1;
         }
 
-        self.expected_sequence = Some(sequence);
+        self.expected_ownership = Some(ownership);
 
         self.deadline = Some(deadline);
 
         self.generation
     }
 
-    fn task(&self) -> Option<(u64, u32, Instant)> {
-        Some((self.generation, self.expected_sequence?, self.deadline?))
+    fn task(&self) -> Option<(u64, ClipboardOwnership, Instant)> {
+        Some((self.generation, self.expected_ownership?, self.deadline?))
     }
 
     fn finish_generation(&mut self, generation: u64) {
@@ -72,15 +83,28 @@ impl ClipboardState {
             return;
         }
 
-        self.expected_sequence = None;
+        self.expected_ownership = None;
+
         self.deadline = None;
     }
 
     fn retry_generation(&mut self, generation: u64, deadline: Instant) {
-        if self.generation == generation && self.expected_sequence.is_some() {
+        if self.generation == generation && self.expected_ownership.is_some() {
             self.deadline = Some(deadline);
         }
     }
+}
+
+fn ownership_matches(
+    expected: ClipboardOwnership,
+    current_sequence: u32,
+    current_marker: Option<&[u8]>,
+) -> bool {
+    if current_sequence == expected.sequence {
+        return true;
+    }
+
+    current_marker.is_some_and(|marker| marker == expected.marker.as_slice())
 }
 
 impl Default for SecureClipboard {
@@ -109,19 +133,19 @@ impl SecureClipboard {
     }
 
     pub fn copy_secret(&self, secret: &str) -> Result<u64, SecureClipboardError> {
-        let sequence = platform::write_secret(secret)?;
+        let ownership = platform::write_secret(secret)?;
 
         let mut state = match self.shared.state.lock() {
             Ok(state) => state,
 
             Err(_) => {
-                let _ = platform::clear_if_sequence(sequence);
+                let _ = platform::clear_if_owned(ownership);
 
                 return Err(SecureClipboardError::StateUnavailable);
             }
         };
 
-        state.record_copy(sequence, Instant::now() + SECURE_CLIPBOARD_CLEAR_AFTER);
+        state.record_copy(ownership, Instant::now() + SECURE_CLIPBOARD_CLEAR_AFTER);
 
         self.shared.wake.notify_all();
 
@@ -129,21 +153,21 @@ impl SecureClipboard {
     }
 
     pub fn clear_owned(&self) -> Result<bool, SecureClipboardError> {
-        let (generation, sequence) = {
+        let (generation, ownership) = {
             let state = self.lock_state()?;
 
-            let Some((generation, sequence, _)) = state.task() else {
+            let Some((generation, ownership, _)) = state.task() else {
                 return Ok(false);
             };
 
-            (generation, sequence)
+            (generation, ownership)
         };
 
-        let result = platform::clear_if_sequence(sequence);
+        let result = platform::clear_if_owned(ownership);
 
         let mut state = self.lock_state()?;
 
-        if state.generation == generation && state.expected_sequence == Some(sequence) {
+        if state.generation == generation && state.expected_ownership == Some(ownership) {
             match &result {
                 Ok(_) => {
                     state.finish_generation(generation);
@@ -177,7 +201,7 @@ impl SecureClipboard {
 
 fn clipboard_worker(shared: Arc<ClipboardShared>) {
     loop {
-        let (generation, sequence) = {
+        let (generation, ownership) = {
             let mut state = match shared.state.lock() {
                 Ok(state) => state,
 
@@ -185,7 +209,7 @@ fn clipboard_worker(shared: Arc<ClipboardShared>) {
             };
 
             loop {
-                let Some((generation, sequence, deadline)) = state.task() else {
+                let Some((generation, ownership, deadline)) = state.task() else {
                     state = match shared.wake.wait(state) {
                         Ok(state) => state,
 
@@ -211,11 +235,11 @@ fn clipboard_worker(shared: Arc<ClipboardShared>) {
                     continue;
                 }
 
-                break (generation, sequence);
+                break (generation, ownership);
             }
         };
 
-        let result = platform::clear_if_sequence(sequence);
+        let result = platform::clear_if_owned(ownership);
 
         let mut state = match shared.state.lock() {
             Ok(state) => state,
@@ -223,7 +247,7 @@ fn clipboard_worker(shared: Arc<ClipboardShared>) {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        if state.generation != generation || state.expected_sequence != Some(sequence) {
+        if state.generation != generation || state.expected_ownership != Some(ownership) {
             continue;
         }
 
@@ -243,7 +267,9 @@ fn clipboard_worker(shared: Arc<ClipboardShared>) {
 mod platform {
     use clipboard_win::{raw, Clipboard};
 
-    use super::SecureClipboardError;
+    use super::{
+        ownership_matches, ClipboardOwnership, SecureClipboardError, OWNERSHIP_MARKER_BYTES,
+    };
 
     const EXCLUDE_FROM_MONITOR_FORMAT: &str = "ExcludeClipboardContentFromMonitorProcessing";
 
@@ -251,13 +277,16 @@ mod platform {
 
     const UPLOAD_TO_CLOUD_FORMAT: &str = "CanUploadToCloudClipboard";
 
-    struct PrivacyFormats {
+    const OWNERSHIP_FORMAT: &str = "LocalVaultSecureClipboardOwnershipV1";
+
+    struct ClipboardFormats {
         exclude_from_monitor: u32,
         include_in_history: u32,
         upload_to_cloud: u32,
+        ownership: u32,
     }
 
-    fn privacy_formats() -> Result<PrivacyFormats, SecureClipboardError> {
+    fn clipboard_formats() -> Result<ClipboardFormats, SecureClipboardError> {
         let exclude_from_monitor = raw::register_format(EXCLUDE_FROM_MONITOR_FORMAT)
             .ok_or(SecureClipboardError::PrivacyProtectionUnavailable)?
             .get();
@@ -270,15 +299,25 @@ mod platform {
             .ok_or(SecureClipboardError::PrivacyProtectionUnavailable)?
             .get();
 
-        Ok(PrivacyFormats {
+        let ownership = raw::register_format(OWNERSHIP_FORMAT)
+            .ok_or(SecureClipboardError::OwnershipMarkerUnavailable)?
+            .get();
+
+        Ok(ClipboardFormats {
             exclude_from_monitor,
             include_in_history,
             upload_to_cloud,
+            ownership,
         })
     }
 
-    pub fn write_secret(secret: &str) -> Result<u32, SecureClipboardError> {
-        let privacy = privacy_formats()?;
+    pub fn write_secret(secret: &str) -> Result<ClipboardOwnership, SecureClipboardError> {
+        let formats = clipboard_formats()?;
+
+        let mut marker = [0_u8; OWNERSHIP_MARKER_BYTES];
+
+        getrandom::fill(&mut marker)
+            .map_err(|_| SecureClipboardError::OwnershipMarkerUnavailable)?;
 
         let _clipboard =
             Clipboard::new_attempts(10).map_err(|_| SecureClipboardError::Unavailable)?;
@@ -295,11 +334,12 @@ mod platform {
 
         let disabled = 0_u32.to_ne_bytes();
 
-        let privacy_result = raw::set_without_clear(privacy.exclude_from_monitor, &exclude_marker)
-            .and_then(|_| raw::set_without_clear(privacy.include_in_history, &disabled))
-            .and_then(|_| raw::set_without_clear(privacy.upload_to_cloud, &disabled));
+        let write_result = raw::set_without_clear(formats.exclude_from_monitor, &exclude_marker)
+            .and_then(|_| raw::set_without_clear(formats.include_in_history, &disabled))
+            .and_then(|_| raw::set_without_clear(formats.upload_to_cloud, &disabled))
+            .and_then(|_| raw::set_without_clear(formats.ownership, &marker));
 
-        if privacy_result.is_err() {
+        if write_result.is_err() {
             let _ = raw::empty();
 
             return Err(SecureClipboardError::PrivacyProtectionUnavailable);
@@ -311,10 +351,15 @@ mod platform {
             return Err(SecureClipboardError::SequenceUnavailable);
         };
 
-        Ok(sequence.get())
+        Ok(ClipboardOwnership {
+            sequence: sequence.get(),
+            marker,
+        })
     }
 
-    pub fn clear_if_sequence(expected_sequence: u32) -> Result<bool, SecureClipboardError> {
+    pub fn clear_if_owned(expected: ClipboardOwnership) -> Result<bool, SecureClipboardError> {
+        let formats = clipboard_formats()?;
+
         let _clipboard =
             Clipboard::new_attempts(10).map_err(|_| SecureClipboardError::Unavailable)?;
 
@@ -322,7 +367,31 @@ mod platform {
             return Err(SecureClipboardError::SequenceUnavailable);
         };
 
-        if current_sequence.get() != expected_sequence {
+        if current_sequence.get() == expected.sequence {
+            raw::empty().map_err(|_| SecureClipboardError::Unavailable)?;
+
+            return Ok(true);
+        }
+
+        /*
+         * Windows or clipboard services may legitimately alter
+         * the sequence after our write. In that situation the
+         * private random ownership format is the stronger proof
+         * that the current clipboard still belongs to LocalVault.
+         *
+         * A normal user copy empties/replaces the clipboard and
+         * removes this private format, so unrelated newer content
+         * is preserved.
+         */
+        let mut current_marker = [0_u8; OWNERSHIP_MARKER_BYTES];
+
+        let marker = match raw::get(formats.ownership, &mut current_marker) {
+            Ok(read) if read == current_marker.len() => Some(current_marker.as_slice()),
+
+            _ => None,
+        };
+
+        if !ownership_matches(expected, current_sequence.get(), marker) {
             return Ok(false);
         }
 
@@ -334,13 +403,13 @@ mod platform {
 
 #[cfg(not(target_os = "windows"))]
 mod platform {
-    use super::SecureClipboardError;
+    use super::{ClipboardOwnership, SecureClipboardError};
 
-    pub fn write_secret(_secret: &str) -> Result<u32, SecureClipboardError> {
+    pub fn write_secret(_secret: &str) -> Result<ClipboardOwnership, SecureClipboardError> {
         Err(SecureClipboardError::Unsupported)
     }
 
-    pub fn clear_if_sequence(_expected_sequence: u32) -> Result<bool, SecureClipboardError> {
+    pub fn clear_if_owned(_expected: ClipboardOwnership) -> Result<bool, SecureClipboardError> {
         Err(SecureClipboardError::Unsupported)
     }
 }
@@ -348,6 +417,13 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ownership(sequence: u32, marker: u8) -> ClipboardOwnership {
+        ClipboardOwnership {
+            sequence,
+            marker: [marker; OWNERSHIP_MARKER_BYTES],
+        }
+    }
 
     #[test]
     fn clipboard_state_starts_without_owned_content() {
@@ -362,17 +438,17 @@ mod tests {
 
         let now = Instant::now();
 
-        let first = state.record_copy(101, now + Duration::from_secs(10));
+        let first = state.record_copy(ownership(101, 1), now + Duration::from_secs(10));
 
-        let second = state.record_copy(202, now + Duration::from_secs(20));
+        let second = state.record_copy(ownership(202, 2), now + Duration::from_secs(20));
 
         assert_ne!(first, second);
 
-        let (generation, sequence, _) = state.task().unwrap();
+        let (generation, current, _) = state.task().unwrap();
 
         assert_eq!(generation, second);
 
-        assert_eq!(sequence, 202);
+        assert_eq!(current, ownership(202, 2));
     }
 
     #[test]
@@ -381,16 +457,49 @@ mod tests {
 
         let now = Instant::now();
 
-        let first = state.record_copy(101, now + Duration::from_secs(10));
+        let first = state.record_copy(ownership(101, 1), now + Duration::from_secs(10));
 
-        let second = state.record_copy(202, now + Duration::from_secs(20));
+        let second = state.record_copy(ownership(202, 2), now + Duration::from_secs(20));
 
         state.finish_generation(first);
 
-        let (generation, sequence, _) = state.task().unwrap();
+        let (generation, current, _) = state.task().unwrap();
 
         assert_eq!(generation, second);
 
-        assert_eq!(sequence, 202);
+        assert_eq!(current, ownership(202, 2));
+    }
+
+    #[test]
+    fn same_sequence_proves_ownership_without_marker_fallback() {
+        let expected = ownership(101, 7);
+
+        assert!(ownership_matches(expected, 101, None,));
+    }
+
+    #[test]
+    fn matching_private_marker_proves_ownership_after_sequence_change() {
+        let expected = ownership(101, 7);
+
+        assert!(ownership_matches(
+            expected,
+            202,
+            Some(expected.marker.as_slice(),),
+        ));
+    }
+
+    #[test]
+    fn newer_unrelated_clipboard_is_not_owned() {
+        let expected = ownership(101, 7);
+
+        let different = ownership(202, 9);
+
+        assert!(!ownership_matches(expected, 202, None,));
+
+        assert!(!ownership_matches(
+            expected,
+            202,
+            Some(different.marker.as_slice(),),
+        ));
     }
 }

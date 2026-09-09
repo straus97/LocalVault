@@ -3017,3 +3017,13 @@ input:focus-visible {
     transform: rotate(360deg);
   }
 }
+
+/* LOCALVAULT 1L CATEGORY SPACING */
+
+.sidebar-label-row {
+  margin-bottom: 6px;
+}
+
+.add-category-button {
+  transform: translateY(-2px);
+}
