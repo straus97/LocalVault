@@ -17,6 +17,8 @@ use super::CommandError;
 #[serde(rename_all = "camelCase")]
 pub struct EntryCommandInput {
     pub title: String,
+    #[serde(default)]
+    pub profile_name: String,
     pub url: String,
     pub username: String,
     pub password: String,
@@ -34,6 +36,7 @@ pub struct ClipboardCopyResult {
 impl Drop for EntryCommandInput {
     fn drop(&mut self) {
         self.title.zeroize();
+        self.profile_name.zeroize();
         self.url.zeroize();
         self.username.zeroize();
         self.password.zeroize();
@@ -62,6 +65,7 @@ impl EntryCommandInput {
 
         Ok(EntryInput {
             title: mem::take(&mut self.title),
+            profile_name: mem::take(&mut self.profile_name),
             url: mem::take(&mut self.url),
             username: mem::take(&mut self.username),
             password: mem::take(&mut self.password),
@@ -157,6 +161,7 @@ mod tests {
     fn command_input(category_id: Option<String>) -> EntryCommandInput {
         EntryCommandInput {
             title: "IPC Entry".to_owned(),
+            profile_name: "Work".to_owned(),
             url: "https://ipc.example.test".to_owned(),
             username: "ipc-user".to_owned(),
             password: "IPC_ENTRY_SECRET".to_owned(),

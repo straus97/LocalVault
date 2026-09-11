@@ -11,6 +11,7 @@ pub const MAX_ENTRIES: usize = 50_000;
 pub const MAX_CATEGORIES: usize = 512;
 
 pub const MAX_TITLE_CHARS: usize = 256;
+pub const MAX_PROFILE_NAME_CHARS: usize = 128;
 pub const MAX_USERNAME_CHARS: usize = 1_024;
 pub const MAX_PASSWORD_CHARS: usize = 16_384;
 pub const MAX_URL_CHARS: usize = 4_096;
@@ -54,6 +55,9 @@ pub enum VaultDataError {
 
     #[error("entry title is too long")]
     EntryTitleTooLong(Uuid),
+
+    #[error("entry profile name is too long")]
+    EntryProfileNameTooLong(Uuid),
 
     #[error("entry username is too long")]
     EntryUsernameTooLong(Uuid),
@@ -109,6 +113,8 @@ pub struct VaultData {
 pub struct VaultEntry {
     pub id: Uuid,
     pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile_name: String,
     pub url: String,
     pub username: String,
     pub password: String,
@@ -193,6 +199,7 @@ impl VaultData {
     pub(crate) fn zeroize_sensitive_fields(&mut self) {
         for entry in &mut self.entries {
             entry.title.zeroize();
+            entry.profile_name.zeroize();
             entry.url.zeroize();
             entry.username.zeroize();
             entry.password.zeroize();
@@ -221,6 +228,7 @@ impl Drop for VaultData {
 impl VaultEntry {
     pub(crate) fn zeroize_sensitive_fields(&mut self) {
         self.title.zeroize();
+        self.profile_name.zeroize();
         self.url.zeroize();
         self.username.zeroize();
         self.password.zeroize();
@@ -260,6 +268,7 @@ impl VaultEntry {
         let entry = Self {
             id: Uuid::new_v4(),
             title: title.into(),
+            profile_name: String::new(),
             url: String::new(),
             username: String::new(),
             password: String::new(),
@@ -339,6 +348,10 @@ fn validate_entry(entry: &VaultEntry, category_ids: &HashSet<Uuid>) -> Result<()
 
     if char_count(&entry.title) > MAX_TITLE_CHARS {
         return Err(VaultDataError::EntryTitleTooLong(entry.id));
+    }
+
+    if char_count(&entry.profile_name) > MAX_PROFILE_NAME_CHARS {
+        return Err(VaultDataError::EntryProfileNameTooLong(entry.id));
     }
 
     if char_count(&entry.username) > MAX_USERNAME_CHARS {
@@ -425,6 +438,7 @@ mod tests {
 
         let mut entry = VaultEntry::new("Example Account", NOW_MS).unwrap();
 
+        entry.profile_name = "Personal".to_owned();
         entry.url = "https://example.test".to_owned();
         entry.username = "user@example.test".to_owned();
         entry.password = MODEL_TEST_SECRET.to_owned();
@@ -618,6 +632,7 @@ mod tests {
     fn individual_entry_sensitive_fields_can_be_zeroized() {
         let mut entry = VaultEntry::new("Sensitive title", NOW_MS).unwrap();
 
+        entry.profile_name = "Sensitive profile".to_owned();
         entry.url = "https://sensitive.example".to_owned();
         entry.username = "sensitive-user".to_owned();
         entry.password = "sensitive-password".to_owned();
@@ -627,11 +642,43 @@ mod tests {
         entry.zeroize_sensitive_fields();
 
         assert!(entry.title.is_empty());
+        assert!(entry.profile_name.is_empty());
         assert!(entry.url.is_empty());
         assert!(entry.username.is_empty());
         assert!(entry.password.is_empty());
         assert!(entry.notes.is_empty());
         assert!(entry.tags.is_empty());
+    }
+
+    #[test]
+    fn legacy_entry_without_profile_name_deserializes_as_empty() {
+        let data = valid_sample_data();
+
+        let mut value = serde_json::to_value(&data).unwrap();
+
+        let entry = value["entries"][0].as_object_mut().unwrap();
+
+        assert!(entry.remove("profile_name").is_some());
+
+        let restored: VaultData = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.schema_version, VAULT_DATA_SCHEMA_VERSION);
+
+        assert!(restored.entries[0].profile_name.is_empty());
+
+        restored.validate().unwrap();
+    }
+
+    #[test]
+    fn oversized_profile_name_is_rejected() {
+        let mut data = valid_sample_data();
+
+        data.entries[0].profile_name = "x".repeat(MAX_PROFILE_NAME_CHARS + 1);
+
+        assert!(matches!(
+            data.validate(),
+            Err(VaultDataError::EntryProfileNameTooLong(_))
+        ));
     }
 
     #[test]

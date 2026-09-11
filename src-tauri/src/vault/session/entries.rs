@@ -10,6 +10,7 @@ use super::{SessionError, UnlockedVaultSession};
 
 pub struct EntryInput {
     pub title: String,
+    pub profile_name: String,
     pub url: String,
     pub username: String,
     pub password: String,
@@ -22,6 +23,7 @@ pub struct EntryInput {
 impl Drop for EntryInput {
     fn drop(&mut self) {
         self.title.zeroize();
+        self.profile_name.zeroize();
         self.url.zeroize();
         self.username.zeroize();
         self.password.zeroize();
@@ -40,6 +42,7 @@ impl Drop for EntryInput {
 pub struct EntrySummary {
     pub id: Uuid,
     pub title: String,
+    pub profile_name: String,
     pub url: String,
     pub username: String,
     pub category_id: Option<Uuid>,
@@ -50,6 +53,7 @@ pub struct EntrySummary {
 impl Drop for EntrySummary {
     fn drop(&mut self) {
         self.title.zeroize();
+        self.profile_name.zeroize();
         self.url.zeroize();
         self.username.zeroize();
     }
@@ -60,6 +64,7 @@ impl Drop for EntrySummary {
 pub struct EntryDetails {
     pub id: Uuid,
     pub title: String,
+    pub profile_name: String,
     pub url: String,
     pub username: String,
     pub password: String,
@@ -74,6 +79,7 @@ pub struct EntryDetails {
 impl Drop for EntryDetails {
     fn drop(&mut self) {
         self.title.zeroize();
+        self.profile_name.zeroize();
         self.url.zeroize();
         self.username.zeroize();
         self.password.zeroize();
@@ -92,6 +98,7 @@ impl EntrySummary {
         Self {
             id: entry.id,
             title: entry.title.clone(),
+            profile_name: entry.profile_name.clone(),
             url: entry.url.clone(),
             username: entry.username.clone(),
             category_id: entry.category_id,
@@ -106,6 +113,7 @@ impl EntryDetails {
         Self {
             id: entry.id,
             title: entry.title.clone(),
+            profile_name: entry.profile_name.clone(),
             url: entry.url.clone(),
             username: entry.username.clone(),
             password: entry.password.clone(),
@@ -125,6 +133,7 @@ impl EntryInput {
 
         let mut entry = VaultEntry::new(title, now_ms).map_err(SessionError::InvalidEntry)?;
 
+        entry.profile_name = mem::take(&mut self.profile_name);
         entry.url = mem::take(&mut self.url);
         entry.username = mem::take(&mut self.username);
         entry.password = mem::take(&mut self.password);
@@ -145,6 +154,7 @@ impl EntryInput {
         VaultEntry {
             id,
             title: mem::take(&mut self.title),
+            profile_name: mem::take(&mut self.profile_name),
             url: mem::take(&mut self.url),
             username: mem::take(&mut self.username),
             password: mem::take(&mut self.password),
@@ -309,6 +319,7 @@ mod tests {
     fn input(title: &str) -> EntryInput {
         EntryInput {
             title: title.to_owned(),
+            profile_name: "Personal".to_owned(),
             url: "https://crud.example.test".to_owned(),
             username: "crud-user@example.test".to_owned(),
             password: ENTRY_SECRET.to_owned(),

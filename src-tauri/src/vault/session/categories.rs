@@ -224,6 +224,7 @@ mod tests {
     fn entry_input(category_id: Uuid) -> EntryInput {
         EntryInput {
             title: "Categorized Entry".to_owned(),
+            profile_name: "Work".to_owned(),
             url: "https://category.example.test".to_owned(),
             username: "category-user".to_owned(),
             password: "CATEGORY_ENTRY_SECRET".to_owned(),

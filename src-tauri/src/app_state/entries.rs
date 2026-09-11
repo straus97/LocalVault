@@ -91,6 +91,7 @@ mod tests {
     fn input(title: &str) -> EntryInput {
         EntryInput {
             title: title.to_owned(),
+            profile_name: "Personal".to_owned(),
             url: "https://state-entry.example.test".to_owned(),
             username: "state-entry-user@example.test".to_owned(),
             password: ENTRY_SECRET.to_owned(),
