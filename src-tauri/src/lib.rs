@@ -34,6 +34,7 @@ pub mod crypto;
 mod password_generator;
 mod recent_vaults;
 mod secure_clipboard;
+pub mod site_icon_fetcher;
 pub mod vault;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
