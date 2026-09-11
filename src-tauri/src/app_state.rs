@@ -3,8 +3,10 @@ mod categories;
 mod entries;
 mod lifecycle;
 mod master_password;
+mod password_health;
 mod site_icons;
 
+pub use password_health::{PasswordHealthItem, PasswordHealthReport, PasswordWeakReason};
 pub use site_icons::SiteIconSummary;
 
 use std::{

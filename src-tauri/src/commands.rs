@@ -2,6 +2,7 @@ pub(crate) mod backups;
 pub(crate) mod categories;
 pub(crate) mod credentials;
 pub(crate) mod entries;
+pub(crate) mod password_health;
 pub(crate) mod passwords;
 pub(crate) mod recent_vaults;
 pub(crate) mod site_icons;

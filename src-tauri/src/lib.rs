@@ -78,6 +78,7 @@ pub fn run() {
             commands::site_icons::list_site_icons,
             commands::site_icons::fetch_site_icon,
             commands::site_icons::delete_site_icon,
+            commands::password_health::get_password_health,
             commands::passwords::generate_password,
             commands::recent_vaults::get_recent_vaults,
             commands::recent_vaults::remember_recent_vault,
