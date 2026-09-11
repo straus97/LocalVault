@@ -213,6 +213,77 @@ function siteHostname(value: string): string {
   }
 }
 
+interface EntrySiteGroup {
+  key: string;
+  title: string;
+  hostname: string;
+  entries: EntrySummary[];
+  favorite: boolean;
+}
+
+function groupEntriesBySite(
+  entries: EntrySummary[],
+): EntrySiteGroup[] {
+  const groups =
+    new Map<string, EntrySiteGroup>();
+
+  for (const entry of entries) {
+    const hostname =
+      siteHostname(entry.url);
+
+    /*
+     * Only entries with a usable hostname are grouped.
+     * Local/URL-less records remain independent.
+     */
+    const key = hostname
+      ? `site:${hostname.toLocaleLowerCase(
+          "en-US",
+        )}`
+      : `entry:${entry.id}`;
+
+    const existing = groups.get(key);
+
+    if (existing) {
+      existing.entries.push(entry);
+      existing.favorite ||= entry.favorite;
+      continue;
+    }
+
+    groups.set(key, {
+      key,
+      title: entry.title,
+      hostname,
+      entries: [entry],
+      favorite: entry.favorite,
+    });
+  }
+
+  return Array.from(groups.values());
+}
+
+function profileCountLabel(
+  count: number,
+): string {
+  const mod10 = count % 10;
+  const mod100 = count % 100;
+
+  if (
+    mod10 === 1 &&
+    mod100 !== 11
+  ) {
+    return `${count} профиль`;
+  }
+
+  if (
+    mod10 >= 2 &&
+    mod10 <= 4 &&
+    (mod100 < 12 || mod100 > 14)
+  ) {
+    return `${count} профиля`;
+  }
+
+  return `${count} профилей`;
+}
 function formatTimestamp(value: number): string {
   return new Intl.DateTimeFormat("ru-RU", {
     day: "2-digit",
@@ -1345,6 +1416,30 @@ ${path}
     });
   }, [entries, filter, search]);
 
+  const allSiteGroups = useMemo(
+    () => groupEntriesBySite(entries),
+    [entries],
+  );
+
+  const visibleSiteGroups = useMemo(
+    () => groupEntriesBySite(visibleEntries),
+    [visibleEntries],
+  );
+
+  const selectedSiteGroup = useMemo(() => {
+    if (!selectedEntryId) {
+      return null;
+    }
+
+    return (
+      allSiteGroups.find((group) =>
+        group.entries.some(
+          (entry) =>
+            entry.id === selectedEntryId,
+        ),
+      ) ?? null
+    );
+  }, [allSiteGroups, selectedEntryId]);
   const favoriteCount = useMemo(
     () =>
       entries.filter(
@@ -2034,7 +2129,7 @@ ${path}
 
             <div className="entry-header-actions">
               <span className="entry-count">
-                {visibleEntries.length}
+                {visibleSiteGroups.length}
               </span>
 
               <button
@@ -2073,7 +2168,7 @@ ${path}
           </div>
 
           <div className="entry-list">
-            {visibleEntries.length === 0 ? (
+            {visibleSiteGroups.length === 0 ? (
               <div className="empty-list">
                 <div className="empty-icon">
                   ◫
@@ -2087,57 +2182,111 @@ ${path}
                 </span>
               </div>
             ) : (
-              visibleEntries.map(
-                (entry) => (
-                  <button
-                    type="button"
-                    className={
-                      selectedEntryId ===
-                      entry.id
-                        ? "entry-row active"
-                        : "entry-row"
-                    }
-                    key={entry.id}
-                    onClick={() =>
-                      void selectEntry(
-                        entry,
-                      )
-                    }
-                  >
-                    <span className="entry-avatar">
-                      {entry.title
-                        .trim()
-                        .slice(0, 1)
-                        .toLocaleUpperCase(
-                          "ru-RU",
-                        ) || "•"}
-                    </span>
+              visibleSiteGroups.map(
+                (group) => {
+                  const active =
+                    group.entries.some(
+                      (entry) =>
+                        entry.id ===
+                        selectedEntryId,
+                    );
 
-                    <span className="entry-row-copy">
-                      <strong>
-                        {entry.title}
-                      </strong>
-                      <small>
-                        {[
-                          siteHostname(entry.url),
-                          entry.username,
+                  const firstEntry =
+                    group.entries[0];
+
+                  const singleMeta =
+                    firstEntry
+                      ? [
+                          group.hostname,
+                          firstEntry.username,
                         ]
                           .filter(Boolean)
-                          .join(" • ") ||
-                          "Без дополнительной информации"}
-                      </small>
-                    </span>
+                          .join(" • ")
+                      : "";
 
-                    {entry.favorite && (
-                      <span
-                        className="favorite-star"
-                        aria-label="Избранное"
-                      >
-                        ★
+                  return (
+                    <button
+                      type="button"
+                      className={
+                        active
+                          ? "entry-row site-group-row active"
+                          : "entry-row site-group-row"
+                      }
+                      key={group.key}
+                      onClick={() => {
+                        const target =
+                          group.entries.find(
+                            (entry) =>
+                              entry.id ===
+                              selectedEntryId,
+                          ) ??
+                          firstEntry;
+
+                        if (target) {
+                          void selectEntry(
+                            target,
+                          );
+                        }
+                      }}
+                    >
+                      <span className="entry-avatar">
+                        {group.title
+                          .trim()
+                          .slice(0, 1)
+                          .toLocaleUpperCase(
+                            "ru-RU",
+                          ) || "•"}
                       </span>
-                    )}
-                  </button>
-                ),
+
+                      <span className="entry-row-copy">
+                        <strong>
+                          {group.title}
+                        </strong>
+
+                        <small>
+                          {group.entries.length > 1
+                            ? [
+                                group.hostname,
+                                profileCountLabel(
+                                  group.entries
+                                    .length,
+                                ),
+                              ]
+                                .filter(Boolean)
+                                .join(" • ")
+                            : singleMeta ||
+                              "Без дополнительной информации"}
+                        </small>
+                      </span>
+
+                      <span className="site-group-tail">
+                        {group.entries.length > 1 && (
+                          <span
+                            className="site-group-count"
+                            title={profileCountLabel(
+                              group.entries
+                                .length,
+                            )}
+                          >
+                            {
+                              group.entries
+                                .length
+                            }
+                          </span>
+                        )}
+
+                        {group.favorite && (
+                          <span
+                            className="favorite-star"
+                            aria-label="Есть избранный профиль"
+                          >
+                            ★
+                          </span>
+                        )}
+                      </span>
+                    </button>
+                  );
+                },
               )
             )}
           </div>
@@ -2234,6 +2383,86 @@ ${path}
                 )}
               </div>
 
+              {selectedSiteGroup &&
+                selectedSiteGroup.entries.length >
+                  1 && (
+                  <div className="site-profiles">
+                    <div className="site-profiles-header">
+                      <div>
+                        <span>
+                          Профили
+                        </span>
+                        <strong>
+                          {profileCountLabel(
+                            selectedSiteGroup
+                              .entries.length,
+                          )}
+                        </strong>
+                      </div>
+
+                      <small>
+                        {selectedSiteGroup.hostname}
+                      </small>
+                    </div>
+
+                    <div className="site-profile-list">
+                      {selectedSiteGroup.entries.map(
+                        (
+                          profile,
+                          profileIndex,
+                        ) => (
+                          <button
+                            type="button"
+                            key={profile.id}
+                            className={
+                              profile.id ===
+                              selectedEntryId
+                                ? "site-profile active"
+                                : "site-profile"
+                            }
+                            onClick={() =>
+                              void selectEntry(
+                                profile,
+                              )
+                            }
+                          >
+                            <span className="site-profile-avatar">
+                              {profileIndex + 1}
+                            </span>
+
+                            <span className="site-profile-copy">
+                              <strong>
+                                {profile.username ||
+                                  `Профиль ${
+                                    profileIndex +
+                                    1
+                                  }`}
+                              </strong>
+
+                              <small>
+                                {profile.categoryId
+                                  ? categoryNames.get(
+                                      profile.categoryId,
+                                    ) ??
+                                    "Без категории"
+                                  : "Без категории"}
+                              </small>
+                            </span>
+
+                            {profile.favorite && (
+                              <span
+                                className="site-profile-favorite"
+                                title="Избранное"
+                              >
+                                ★
+                              </span>
+                            )}
+                          </button>
+                        ),
+                      )}
+                    </div>
+                  </div>
+                )}
               <div className="detail-section">
                 <div className="detail-label">
                   Логин
