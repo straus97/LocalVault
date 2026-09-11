@@ -4281,3 +4281,466 @@ select:focus-visible {
   box-shadow:
     0 3px 10px rgba(47, 115, 242, 0.12);
 }
+/* ============================================================
+   LOCALVAULT 1N-C WORKSPACE REFERENCE POLISH
+   ============================================================ */
+
+/* Header */
+
+.vault-app {
+  grid-template-rows:
+    66px minmax(0, 1fr);
+}
+
+.app-header {
+  padding:
+    0 18px
+    0 20px;
+}
+
+.header-brand {
+  gap: 12px;
+}
+
+.header-brand strong {
+  color: #10234b;
+  font-size: 16px;
+  font-weight: 720;
+}
+
+.header-brand small {
+  max-width: 360px;
+  color: #7083a0;
+  font-size: 10.5px;
+}
+
+.header-status {
+  gap: 8px;
+}
+
+.secure-status {
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 8px;
+}
+
+.backup-button,
+.lock-button {
+  min-height: 36px;
+  padding-inline: 13px;
+}
+
+/* Main columns */
+
+.workspace {
+  grid-template-columns:
+    220px
+    minmax(340px, 380px)
+    minmax(480px, 1fr);
+}
+
+/* Sidebar */
+
+.sidebar {
+  padding:
+    18px 12px
+    14px;
+}
+
+.nav-item,
+.category-item {
+  height: 43px;
+}
+
+.sidebar-label-row {
+  margin-bottom: 7px;
+}
+
+.security-chip {
+  color: #168653;
+  letter-spacing: 0.07em;
+}
+
+.sidebar-footer {
+  padding: 12px;
+}
+
+/* Entry column */
+
+.entry-column-header {
+  padding:
+    20px 16px
+    12px;
+  align-items: center;
+}
+
+.entry-column-header h2 {
+  margin-top: 5px;
+  font-size: 24px;
+}
+
+.entry-header-actions {
+  gap: 9px;
+}
+
+.entry-count {
+  min-width: 26px;
+  height: 26px;
+  font-size: 11px;
+  border-radius: 8px;
+}
+
+.new-entry-button {
+  min-height: 38px;
+  padding-inline: 15px;
+  font-size: 12.5px;
+}
+
+.search-box {
+  height: 43px;
+  margin:
+    0 16px
+    12px;
+}
+
+.entry-list {
+  padding:
+    0 12px
+    16px;
+}
+
+.entry-row {
+  min-height: 68px;
+  margin-bottom: 7px;
+  grid-template-columns:
+    40px minmax(0, 1fr) auto;
+  gap: 11px;
+  border-radius: 11px;
+}
+
+.entry-avatar {
+  width: 40px;
+  height: 40px;
+  font-size: 13px;
+  border-radius: 11px;
+}
+
+.entry-row-copy strong {
+  font-size: 13.5px;
+}
+
+.entry-row-copy small {
+  margin-top: 4px;
+  color: #7185a1;
+  font-size: 11px;
+}
+
+.favorite-star {
+  color: #f2ad00;
+  font-size: 15px;
+}
+
+/* Empty state */
+
+.empty-icon {
+  color: #89a0bf;
+}
+
+.empty-list strong {
+  color: #294970;
+  font-size: 13px;
+}
+
+.empty-list span {
+  color: #7c8da5;
+  font-size: 11px;
+}
+
+/* Detail panel */
+
+.detail-column {
+  padding: 0;
+}
+
+.entry-detail {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding:
+    22px
+    24px
+    28px;
+
+  display: grid;
+  grid-template-columns:
+    minmax(0, 1fr)
+    auto;
+  column-gap: 16px;
+  align-content: start;
+}
+
+/*
+ * Existing DOM order remains unchanged for safety:
+ * toolbar is first in JSX, but CSS places the heading
+ * and actions on the same visual row.
+ */
+
+.detail-toolbar {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: center;
+
+  margin: 0;
+
+  display: flex;
+  gap: 8px;
+}
+
+.detail-heading {
+  grid-column: 1;
+  grid-row: 1;
+
+  min-width: 0;
+  padding:
+    4px 0
+    18px;
+
+  grid-template-columns:
+    54px
+    minmax(0, 1fr)
+    auto;
+
+  gap: 14px;
+}
+
+.detail-avatar {
+  width: 54px;
+  height: 54px;
+  border-radius: 14px;
+  font-size: 17px;
+}
+
+.detail-heading h2 {
+  font-size: 25px;
+  font-weight: 720;
+}
+
+.detail-heading > div:nth-child(2) > span {
+  margin-top: 6px;
+  color: #7185a1;
+  font-size: 11.5px;
+}
+
+.detail-favorite {
+  color: #f2ad00;
+  font-size: 18px;
+}
+
+/* Everything below the heading spans the full panel */
+
+.detail-section,
+.detail-meta {
+  grid-column: 1 / -1;
+}
+
+/* Reference-like field cards */
+
+.detail-section {
+  margin-top: 11px;
+  padding:
+    13px
+    14px
+    14px;
+
+  border-color: #dce6f1;
+  border-radius: 12px;
+
+  background: #ffffff;
+
+  box-shadow:
+    0 1px 3px rgba(31, 58, 94, 0.025);
+}
+
+.detail-label {
+  margin-bottom: 8px;
+  color: #314d74;
+  font-size: 11.5px;
+  font-weight: 700;
+}
+
+.detail-value,
+.notes-value {
+  color: #17315d;
+  font-size: 13px;
+}
+
+.detail-value {
+  min-height: 40px;
+  padding:
+    9px 11px;
+
+  display: flex;
+  align-items: center;
+
+  border: 1px solid #d8e3ef;
+  border-radius: 9px;
+
+  background: #f9fbfe;
+}
+
+.notes-value {
+  min-height: 58px;
+  padding:
+    10px 11px;
+
+  border: 1px solid #d8e3ef;
+  border-radius: 9px;
+
+  background: #f9fbfe;
+}
+
+.password-row {
+  gap: 9px;
+}
+
+.password-display {
+  height: 41px;
+  padding-inline: 11px;
+  border-radius: 9px;
+  background: #f9fbfe;
+}
+
+.reveal-button {
+  min-width: 88px;
+  border-radius: 9px;
+}
+
+.copy-disabled-note {
+  margin-top: 8px;
+}
+
+.tag-list {
+  gap: 7px;
+}
+
+.tag {
+  padding:
+    6px 10px;
+}
+
+.detail-meta {
+  padding:
+    15px 2px
+    0;
+
+  color: #8292a7;
+  font-size: 10.5px;
+}
+
+/* Detail empty state */
+
+.detail-placeholder {
+  color: #294970;
+}
+
+.detail-lock {
+  width: 58px;
+  height: 58px;
+
+  border-color: #d5e1ef;
+  border-radius: 16px;
+
+  background:
+    linear-gradient(
+      145deg,
+      #f3f8ff,
+      #e7f0fb
+    );
+
+  box-shadow:
+    0 6px 18px rgba(31, 74, 132, 0.07);
+}
+
+.detail-lock::before {
+  border-color: #6e91c2;
+}
+
+.detail-lock span {
+  background: #7fa1d0;
+}
+
+.detail-placeholder strong {
+  color: #294970;
+  font-size: 14px;
+}
+
+.detail-placeholder p {
+  color: #7a8da7;
+  font-size: 11px;
+}
+
+/* Action buttons */
+
+.detail-action {
+  min-height: 36px;
+  padding-inline: 13px;
+  border-radius: 9px;
+  font-size: 11.5px;
+}
+
+/* Moderate-size windows */
+
+@media (max-width: 1180px) {
+  .workspace {
+    grid-template-columns:
+      195px
+      minmax(305px, 335px)
+      minmax(390px, 1fr);
+  }
+
+  .entry-detail {
+    padding-left: 18px;
+    padding-right: 18px;
+  }
+
+  .detail-heading {
+    grid-template-columns:
+      48px
+      minmax(0, 1fr)
+      auto;
+  }
+
+  .detail-avatar {
+    width: 48px;
+    height: 48px;
+  }
+}
+
+/*
+ * If detail space becomes tight, place action buttons
+ * under the heading rather than squeezing the title.
+ */
+
+@media (max-width: 980px) {
+  .entry-detail {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-heading {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .detail-toolbar {
+    grid-column: 1;
+    grid-row: 2;
+
+    justify-content: flex-start;
+    margin-bottom: 3px;
+  }
+
+  .detail-section,
+  .detail-meta {
+    grid-column: 1;
+  }
+}

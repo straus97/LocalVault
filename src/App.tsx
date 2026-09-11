@@ -189,6 +189,30 @@ function basename(path: string): string {
   return segments[segments.length - 1] || path;
 }
 
+function siteHostname(value: string): string {
+  const trimmed = value.trim();
+
+  if (!trimmed) {
+    return "";
+  }
+
+  try {
+    const candidate =
+      /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed)
+        ? trimmed
+        : `https://${trimmed}`;
+
+    return new URL(candidate)
+      .hostname
+      .replace(/^www\./i, "");
+  } catch {
+    return trimmed
+      .replace(/^https?:\/\//i, "")
+      .split(/[/?#]/)[0]
+      .replace(/^www\./i, "");
+  }
+}
+
 function formatTimestamp(value: number): string {
   return new Intl.DateTimeFormat("ru-RU", {
     day: "2-digit",
@@ -1978,7 +2002,7 @@ ${path}
 
           <div className="sidebar-footer">
             <div className="security-chip">
-              LOCAL ONLY
+              ЛОКАЛЬНО
             </div>
             <p>
               Автоблокировка: 60 секунд.
@@ -2094,8 +2118,12 @@ ${path}
                         {entry.title}
                       </strong>
                       <small>
-                        {entry.username ||
-                          entry.url ||
+                        {[
+                          siteHostname(entry.url),
+                          entry.username,
+                        ]
+                          .filter(Boolean)
+                          .join(" • ") ||
                           "Без дополнительной информации"}
                       </small>
                     </span>
@@ -2180,12 +2208,19 @@ ${path}
                     {selectedEntry.title}
                   </h2>
                   <span>
-                    {selectedEntry.categoryId
-                      ? categoryNames.get(
-                          selectedEntry.categoryId,
-                        ) ??
-                        "Без категории"
-                      : "Без категории"}
+                    {[
+                      siteHostname(
+                        selectedEntry.url,
+                      ),
+                      selectedEntry.categoryId
+                        ? categoryNames.get(
+                            selectedEntry.categoryId,
+                          ) ??
+                          "Без категории"
+                        : "Без категории",
+                    ]
+                      .filter(Boolean)
+                      .join(" • ")}
                   </span>
                 </div>
 
