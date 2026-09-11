@@ -4,6 +4,7 @@ pub(crate) mod credentials;
 pub(crate) mod entries;
 pub(crate) mod passwords;
 pub(crate) mod recent_vaults;
+pub(crate) mod site_icons;
 
 use std::path::PathBuf;
 
@@ -152,6 +153,16 @@ impl From<AppStateError> for CommandError {
             AppStateError::Session(SessionError::InvalidCategory(_)) => {
                 Self::new("invalidCategory", "The vault category is invalid.")
             }
+
+            AppStateError::SiteHostnameNotReferenced => Self::new(
+                "siteHostnameNotReferenced",
+                "The site is not referenced by any credential in the vault.",
+            ),
+
+            AppStateError::SiteIconCacheFull => Self::new(
+                "siteIconCacheFull",
+                "The encrypted site icon cache is full.",
+            ),
 
             AppStateError::StateUnavailable => Self::new(
                 "stateUnavailable",

@@ -3,6 +3,9 @@ mod categories;
 mod entries;
 mod lifecycle;
 mod master_password;
+mod site_icons;
+
+pub use site_icons::SiteIconSummary;
 
 use std::{
     path::PathBuf,
@@ -75,6 +78,12 @@ pub enum AppStateError {
 
     #[error("system clock is invalid")]
     InvalidClock,
+
+    #[error("site hostname is not referenced by a vault entry")]
+    SiteHostnameNotReferenced,
+
+    #[error("encrypted site icon cache capacity is exceeded")]
+    SiteIconCacheFull,
 
     #[error("vault session operation failed")]
     Session(#[from] SessionError),
