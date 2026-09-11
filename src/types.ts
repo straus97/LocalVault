@@ -6,6 +6,7 @@ export interface VaultStatus {
 export interface EntrySummary {
   id: string;
   title: string;
+  profileName: string;
   url: string;
   username: string;
   categoryId: string | null;
@@ -16,6 +17,7 @@ export interface EntrySummary {
 export interface EntryDetails {
   id: string;
   title: string;
+  profileName: string;
   url: string;
   username: string;
   password: string;
@@ -64,6 +66,7 @@ export type VaultFilter =
   | { type: "category"; categoryId: string };
 export interface EntryCommandInput {
   title: string;
+  profileName: string;
   url: string;
   username: string;
   password: string;

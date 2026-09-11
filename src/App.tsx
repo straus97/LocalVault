@@ -384,6 +384,14 @@ const [
     );
 
   const [
+    entryCreatePreset,
+    setEntryCreatePreset,
+  ] = useState<{
+    title: string;
+    url: string;
+  } | null>(null);
+
+  const [
     entryMutationBusy,
     setEntryMutationBusy,
   ] = useState(false);
@@ -420,6 +428,7 @@ const [
     setCategoryEditorMode(null);
     setEditingCategory(null);
     setCategoryMutationError(null);
+    setEntryCreatePreset(null);
     setEntryEditorMode(null);
     setEntryMutationError(null);
     clearSecretView();
@@ -1210,6 +1219,7 @@ ${path}
         nextDetails,
       );
       setPasswordVisible(false);
+      setEntryCreatePreset(null);
       setEntryEditorMode(null);
       setEntryMutationError(null);
     } catch (error) {
@@ -1406,6 +1416,7 @@ ${path}
 
       const haystack = [
         entry.title,
+        entry.profileName,
         entry.url,
         entry.username,
       ]
@@ -2138,6 +2149,7 @@ ${path}
                 disabled={entryMutationBusy}
                 onClick={() => {
                   setEntryMutationError(null);
+                  setEntryCreatePreset(null);
                   setEntryEditorMode(
                     "create",
                   );
@@ -2162,7 +2174,7 @@ ${path}
                   event.currentTarget.value,
                 )
               }
-              placeholder="Поиск по названию, сайту или логину"
+              placeholder="Поиск по названию, профилю, сайту или логину"
               spellCheck={false}
             />
           </div>
@@ -2323,6 +2335,7 @@ ${path}
                   disabled={entryMutationBusy}
                   onClick={() => {
                     setEntryMutationError(null);
+                    setEntryCreatePreset(null);
                     setEntryEditorMode(
                       "edit",
                     );
@@ -2384,8 +2397,7 @@ ${path}
               </div>
 
               {selectedSiteGroup &&
-                selectedSiteGroup.entries.length >
-                  1 && (
+                selectedSiteGroup.hostname && (
                   <div className="site-profiles">
                     <div className="site-profiles-header">
                       <div>
@@ -2400,9 +2412,38 @@ ${path}
                         </strong>
                       </div>
 
-                      <small>
-                        {selectedSiteGroup.hostname}
-                      </small>
+                      <div className="site-profiles-actions">
+                        <small>
+                          {selectedSiteGroup.hostname}
+                        </small>
+
+                        <button
+                          type="button"
+                          className="site-profile-add"
+                          disabled={entryMutationBusy}
+                          onClick={() => {
+                            setEntryMutationError(
+                              null,
+                            );
+
+                            setEntryCreatePreset({
+                              title:
+                                selectedSiteGroup.title,
+                              url:
+                                `https://${selectedSiteGroup.hostname}`,
+                            });
+
+                            setEntryEditorMode(
+                              "create",
+                            );
+                          }}
+                        >
+                          <span aria-hidden="true">
+                            +
+                          </span>
+                          Новый профиль
+                        </button>
+                      </div>
                     </div>
 
                     <div className="site-profile-list">
@@ -2432,7 +2473,8 @@ ${path}
 
                             <span className="site-profile-copy">
                               <strong>
-                                {profile.username ||
+                                {profile.profileName ||
+                                  profile.username ||
                                   `Профиль ${
                                     profileIndex +
                                     1
@@ -2440,12 +2482,19 @@ ${path}
                               </strong>
 
                               <small>
-                                {profile.categoryId
-                                  ? categoryNames.get(
-                                      profile.categoryId,
-                                    ) ??
-                                    "Без категории"
-                                  : "Без категории"}
+                                {[
+                                  profile.profileName
+                                    ? profile.username
+                                    : "",
+                                  profile.categoryId
+                                    ? categoryNames.get(
+                                        profile.categoryId,
+                                      ) ??
+                                      "Без категории"
+                                    : "Без категории",
+                                ]
+                                  .filter(Boolean)
+                                  .join(" • ")}
                               </small>
                             </span>
 
@@ -2643,6 +2692,11 @@ ${path}
               ? selectedEntry
               : null
           }
+          createPreset={
+            entryEditorMode === "create"
+              ? entryCreatePreset
+              : null
+          }
           categories={categories}
           busy={entryMutationBusy}
           errorMessage={
@@ -2650,6 +2704,7 @@ ${path}
           }
           onCancel={() => {
             if (!entryMutationBusy) {
+              setEntryCreatePreset(null);
               setEntryEditorMode(null);
               setEntryMutationError(null);
             }

@@ -14,9 +14,15 @@ import {
   generatePassword,
 } from "./vaultApi";
 
+interface EntryCreatePreset {
+  title: string;
+  url: string;
+}
+
 interface EntryEditorProps {
   mode: "create" | "edit";
   initialEntry: EntryDetails | null;
+  createPreset: EntryCreatePreset | null;
   categories: CategorySummary[];
   busy: boolean;
   errorMessage: string | null;
@@ -51,12 +57,17 @@ function parseTags(
 export default function EntryEditor({
   mode,
   initialEntry,
+  createPreset,
   categories,
   busy,
   errorMessage,
   onCancel,
   onSubmit,
 }: EntryEditorProps) {
+  const creatingProfile =
+    mode === "create" &&
+    createPreset !== null;
+
   const passwordInputRef =
     useRef<HTMLInputElement | null>(null);
 
@@ -196,6 +207,11 @@ export default function EntryEditor({
         "title",
       ),
 
+      profileName: fieldValue(
+        formData,
+        "profileName",
+      ),
+
       url: fieldValue(
         formData,
         "url",
@@ -250,13 +266,17 @@ export default function EntryEditor({
           <div>
             <span className="editor-eyebrow">
               {mode === "create"
-                ? "Новая запись"
+                ? creatingProfile
+                  ? "Новый профиль"
+                  : "Новая запись"
                 : "Редактирование"}
             </span>
 
             <h2 id="entry-editor-title">
               {mode === "create"
-                ? "Добавить учётную запись"
+                ? creatingProfile
+                  ? "Добавить профиль"
+                  : "Добавить учётную запись"
                 : "Изменить учётную запись"}
             </h2>
           </div>
@@ -289,7 +309,7 @@ export default function EntryEditor({
           }
         >
           <div className="editor-grid">
-            <label className="editor-field span-two">
+            <label className="editor-field">
               <span>
                 Название
                 <strong>*</strong>
@@ -302,9 +322,28 @@ export default function EntryEditor({
                 required
                 maxLength={256}
                 defaultValue={
-                  initialEntry?.title ?? ""
+                  initialEntry?.title ??
+                  createPreset?.title ??
+                  ""
                 }
                 placeholder="Например, GitHub"
+                disabled={busy}
+                autoComplete="off"
+              />
+            </label>
+
+            <label className="editor-field">
+              <span>Название профиля</span>
+
+              <input
+                name="profileName"
+                type="text"
+                maxLength={128}
+                defaultValue={
+                  initialEntry?.profileName ??
+                  ""
+                }
+                placeholder="Например, Личный или Работа"
                 disabled={busy}
                 autoComplete="off"
               />
@@ -333,7 +372,9 @@ export default function EntryEditor({
                 name="url"
                 type="text"
                 defaultValue={
-                  initialEntry?.url ?? ""
+                  initialEntry?.url ??
+                  createPreset?.url ??
+                  ""
                 }
                 placeholder="https://example.com"
                 disabled={busy}
@@ -620,7 +661,9 @@ export default function EntryEditor({
               {busy
                 ? "Сохраняем…"
                 : mode === "create"
-                  ? "Создать запись"
+                  ? creatingProfile
+                    ? "Добавить профиль"
+                    : "Создать запись"
                   : "Сохранить изменения"}
             </button>
           </footer>

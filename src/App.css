@@ -4933,3 +4933,94 @@ select:focus-visible {
     grid-template-columns: 1fr;
   }
 }
+/* ============================================================
+   LOCALVAULT 1O-B2B PROFILE BUTTON POLISH
+   ============================================================ */
+
+.site-profiles .site-profile-add {
+  min-height: 32px;
+  padding: 0 12px;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+
+  appearance: none;
+
+  color: #1760c5;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+
+  border: 1px solid #b8d1f4;
+  border-radius: 9px;
+
+  background:
+    linear-gradient(
+      180deg,
+      #f5f9ff 0%,
+      #e9f3ff 100%
+    );
+
+  box-shadow:
+    0 1px 2px rgba(31, 83, 157, 0.05);
+
+  cursor: pointer;
+
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms ease;
+}
+
+.site-profiles .site-profile-add:hover:not(:disabled) {
+  color: #0f52b4;
+  border-color: #8fb8ed;
+
+  background:
+    linear-gradient(
+      180deg,
+      #edf5ff 0%,
+      #dcecff 100%
+    );
+
+  box-shadow:
+    0 3px 8px rgba(47, 115, 242, 0.10);
+}
+
+.site-profiles .site-profile-add:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow:
+    0 1px 3px rgba(47, 115, 242, 0.08);
+}
+
+.site-profiles .site-profile-add:focus-visible {
+  outline: 2px solid rgba(47, 115, 242, 0.35);
+  outline-offset: 2px;
+}
+
+.site-profiles .site-profile-add:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.site-profiles .site-profile-add > span {
+  width: 16px;
+  height: 16px;
+
+  display: grid;
+  place-items: center;
+
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+
+  border-radius: 50%;
+
+  background: #2f73f2;
+}
