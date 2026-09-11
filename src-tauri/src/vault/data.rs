@@ -1,14 +1,21 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, net::IpAddr};
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const VAULT_DATA_SCHEMA_VERSION: u16 = 1;
 
 pub const MAX_ENTRIES: usize = 50_000;
 pub const MAX_CATEGORIES: usize = 512;
+pub const MAX_SITE_ICONS: usize = 512;
+
+pub const MAX_SITE_ICON_HOSTNAME_CHARS: usize = 253;
+pub const MAX_SITE_ICON_BYTES: usize = 256 * 1024;
+pub const MAX_TOTAL_SITE_ICON_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_SITE_ICON_BASE64_CHARS: usize = MAX_SITE_ICON_BYTES.div_ceil(3) * 4;
 
 pub const MAX_TITLE_CHARS: usize = 256;
 pub const MAX_PROFILE_NAME_CHARS: usize = 128;
@@ -40,6 +47,33 @@ pub enum VaultDataError {
 
     #[error("vault contains too many categories")]
     TooManyCategories,
+
+    #[error("vault contains too many cached site icons")]
+    TooManySiteIcons,
+
+    #[error("duplicate cached site icon hostname")]
+    DuplicateSiteIconHostname,
+
+    #[error("cached site icon hostname is invalid")]
+    InvalidSiteIconHostname,
+
+    #[error("cached site icon data is empty")]
+    EmptySiteIconData,
+
+    #[error("cached site icon data is too large")]
+    SiteIconDataTooLarge,
+
+    #[error("cached site icon data is not valid base64")]
+    InvalidSiteIconBase64,
+
+    #[error("cached site icon is not normalized PNG data")]
+    InvalidSiteIconPng,
+
+    #[error("total cached site icon data is too large")]
+    TotalSiteIconDataTooLarge,
+
+    #[error("cached site icon timestamp is invalid")]
+    InvalidSiteIconTimestamp,
 
     #[error("duplicate entry id")]
     DuplicateEntryId(Uuid),
@@ -107,6 +141,15 @@ pub struct VaultData {
     pub updated_at_ms: i64,
     pub entries: Vec<VaultEntry>,
     pub categories: Vec<VaultCategory>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub site_icons: Vec<SiteIcon>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SiteIcon {
+    pub hostname: String,
+    pub png_base64: String,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -147,6 +190,7 @@ impl VaultData {
             updated_at_ms: now_ms,
             entries: Vec::new(),
             categories: Vec::new(),
+            site_icons: Vec::new(),
         })
     }
 
@@ -169,6 +213,28 @@ impl VaultData {
 
         if self.categories.len() > MAX_CATEGORIES {
             return Err(VaultDataError::TooManyCategories);
+        }
+
+        if self.site_icons.len() > MAX_SITE_ICONS {
+            return Err(VaultDataError::TooManySiteIcons);
+        }
+
+        let mut site_icon_hostnames = HashSet::with_capacity(self.site_icons.len());
+
+        let mut total_site_icon_bytes = 0usize;
+
+        for site_icon in &self.site_icons {
+            let icon_bytes = validate_site_icon(site_icon)?;
+
+            if !site_icon_hostnames.insert(site_icon.hostname.as_str()) {
+                return Err(VaultDataError::DuplicateSiteIconHostname);
+            }
+
+            total_site_icon_bytes = total_site_icon_bytes.saturating_add(icon_bytes);
+
+            if total_site_icon_bytes > MAX_TOTAL_SITE_ICON_BYTES {
+                return Err(VaultDataError::TotalSiteIconDataTooLarge);
+            }
         }
 
         let mut category_ids = HashSet::with_capacity(self.categories.len());
@@ -197,6 +263,10 @@ impl VaultData {
 
 impl VaultData {
     pub(crate) fn zeroize_sensitive_fields(&mut self) {
+        for site_icon in &mut self.site_icons {
+            site_icon.zeroize_sensitive_fields();
+        }
+
         for entry in &mut self.entries {
             entry.title.zeroize();
             entry.profile_name.zeroize();
@@ -218,6 +288,7 @@ impl VaultData {
 
         self.entries.clear();
         self.categories.clear();
+        self.site_icons.clear();
     }
 }
 impl Drop for VaultData {
@@ -225,6 +296,19 @@ impl Drop for VaultData {
         self.zeroize_sensitive_fields();
     }
 }
+impl SiteIcon {
+    pub(crate) fn zeroize_sensitive_fields(&mut self) {
+        self.hostname.zeroize();
+        self.png_base64.zeroize();
+    }
+}
+
+impl Drop for SiteIcon {
+    fn drop(&mut self) {
+        self.zeroize_sensitive_fields();
+    }
+}
+
 impl VaultEntry {
     pub(crate) fn zeroize_sensitive_fields(&mut self) {
         self.title.zeroize();
@@ -315,6 +399,67 @@ impl VaultCategory {
 
         Ok(category)
     }
+}
+
+fn validate_site_icon(icon: &SiteIcon) -> Result<usize, VaultDataError> {
+    if !valid_site_icon_hostname(&icon.hostname) {
+        return Err(VaultDataError::InvalidSiteIconHostname);
+    }
+
+    if icon.png_base64.is_empty() {
+        return Err(VaultDataError::EmptySiteIconData);
+    }
+
+    if icon.png_base64.len() > MAX_SITE_ICON_BASE64_CHARS {
+        return Err(VaultDataError::SiteIconDataTooLarge);
+    }
+
+    let decoded = Zeroizing::new(
+        BASE64_STANDARD
+            .decode(icon.png_base64.as_bytes())
+            .map_err(|_| VaultDataError::InvalidSiteIconBase64)?,
+    );
+
+    if decoded.len() > MAX_SITE_ICON_BYTES {
+        return Err(VaultDataError::SiteIconDataTooLarge);
+    }
+
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+    if !decoded.as_slice().starts_with(PNG_SIGNATURE) {
+        return Err(VaultDataError::InvalidSiteIconPng);
+    }
+
+    if icon.updated_at_ms < 0 {
+        return Err(VaultDataError::InvalidSiteIconTimestamp);
+    }
+
+    Ok(decoded.len())
+}
+
+fn valid_site_icon_hostname(hostname: &str) -> bool {
+    if hostname.is_empty()
+        || hostname != hostname.trim()
+        || hostname.len() > MAX_SITE_ICON_HOSTNAME_CHARS
+        || hostname.ends_with('.')
+        || hostname != hostname.to_ascii_lowercase()
+    {
+        return false;
+    }
+
+    if hostname.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+
+    hostname.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
 }
 
 fn validate_category(category: &VaultCategory) -> Result<(), VaultDataError> {
@@ -455,6 +600,23 @@ mod tests {
         data
     }
 
+    fn test_site_icon() -> SiteIcon {
+        SiteIcon {
+            hostname: "github.com".to_owned(),
+
+            /*
+             * PNG signature + ASCII "TEST".
+             *
+             * Full image decoding belongs to the hardened
+             * fetch/normalization boundary. The data model
+             * only accepts normalized PNG-shaped cache data.
+             */
+            png_base64: "iVBORw0KGgpURVNU".to_owned(),
+
+            updated_at_ms: NOW_MS,
+        }
+    }
+
     #[test]
     fn new_vault_has_valid_defaults() {
         let data = VaultData::new(NOW_MS).unwrap();
@@ -463,6 +625,7 @@ mod tests {
         assert!(!data.vault_id.is_nil());
         assert!(data.entries.is_empty());
         assert!(data.categories.is_empty());
+        assert!(data.site_icons.is_empty());
         assert!(data.validate().is_ok());
     }
 
@@ -679,6 +842,79 @@ mod tests {
             data.validate(),
             Err(VaultDataError::EntryProfileNameTooLong(_))
         ));
+    }
+
+    #[test]
+    fn valid_cached_site_icon_is_accepted() {
+        let mut data = valid_sample_data();
+
+        data.site_icons.push(test_site_icon());
+
+        assert!(data.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_vault_without_site_icons_deserializes_as_empty() {
+        let mut data = valid_sample_data();
+
+        data.site_icons.push(test_site_icon());
+
+        let mut value = serde_json::to_value(&data).unwrap();
+
+        let object = value.as_object_mut().unwrap();
+
+        assert!(object.remove("site_icons").is_some());
+
+        let restored: VaultData = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.schema_version, VAULT_DATA_SCHEMA_VERSION);
+
+        assert!(restored.site_icons.is_empty());
+        restored.validate().unwrap();
+    }
+
+    #[test]
+    fn duplicate_site_icon_hostname_is_rejected() {
+        let mut data = valid_sample_data();
+
+        let icon = test_site_icon();
+
+        data.site_icons.push(icon.clone());
+        data.site_icons.push(icon);
+
+        assert!(matches!(
+            data.validate(),
+            Err(VaultDataError::DuplicateSiteIconHostname)
+        ));
+    }
+
+    #[test]
+    fn non_png_site_icon_data_is_rejected() {
+        let mut data = valid_sample_data();
+
+        let mut icon = test_site_icon();
+
+        icon.png_base64 = "VEVTVA==".to_owned();
+
+        data.site_icons.push(icon);
+
+        assert!(matches!(
+            data.validate(),
+            Err(VaultDataError::InvalidSiteIconPng)
+        ));
+    }
+
+    #[test]
+    fn site_icon_metadata_can_be_zeroized() {
+        let mut icon = test_site_icon();
+
+        assert!(!icon.hostname.is_empty());
+        assert!(!icon.png_base64.is_empty());
+
+        icon.zeroize_sensitive_fields();
+
+        assert!(icon.hostname.is_empty());
+        assert!(icon.png_base64.is_empty());
     }
 
     #[test]
