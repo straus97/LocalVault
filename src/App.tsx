@@ -24,6 +24,7 @@ import type {
   EntryCommandInput,
   EntryDetails,
   EntrySummary,
+  SiteIconSummary,
   VaultFilter,
   VaultStatus,
 } from "./types";
@@ -35,12 +36,15 @@ import {
   deleteCategory,
   deleteClosedVault,
   deleteEntry,
+  deleteSiteIcon,
   copyEntryPassword,
+  fetchSiteIcon,
   getEntry,
   getRecentVaults,
   getVaultStatus,
   listCategories,
   listEntries,
+  listSiteIcons,
   lockVault,
   rememberRecentVault,
   updateCategory,
@@ -213,6 +217,42 @@ function siteHostname(value: string): string {
   }
 }
 
+function SiteIconAvatar({
+  title,
+  icon,
+}: {
+  title: string;
+  icon?: SiteIconSummary;
+}) {
+  const fallback =
+    title
+      .trim()
+      .slice(0, 1)
+      .toLocaleUpperCase("ru-RU") || "•";
+
+  return (
+    <span
+      className={
+        icon
+          ? "entry-avatar has-site-icon"
+          : "entry-avatar"
+      }
+      aria-hidden="true"
+    >
+      {icon ? (
+        <img
+          className="site-icon-image"
+          src={`data:image/png;base64,${icon.pngBase64}`}
+          alt=""
+          draggable={false}
+        />
+      ) : (
+        fallback
+      )}
+    </span>
+  );
+}
+
 interface EntrySiteGroup {
   key: string;
   title: string;
@@ -334,6 +374,15 @@ const [entries, setEntries] =
   const [categories, setCategories] =
     useState<CategorySummary[]>([]);
 
+  const [siteIcons, setSiteIcons] =
+    useState<SiteIconSummary[]>([]);
+
+  const [siteIconBusy, setSiteIconBusy] =
+    useState<{
+      hostname: string;
+      action: "fetch" | "delete";
+    } | null>(null);
+
   const [filter, setFilter] =
     useState<VaultFilter>({ type: "all" });
 
@@ -402,16 +451,22 @@ const [
   ] = useState<string | null>(null);
 
   const detailsRequest = useRef(0);
+  const siteIconRequest = useRef(0);
 
   async function loadUnlockedData() {
-    const [nextEntries, nextCategories] =
-      await Promise.all([
-        listEntries(),
-        listCategories(),
-      ]);
+    const [
+      nextEntries,
+      nextCategories,
+      nextSiteIcons,
+    ] = await Promise.all([
+      listEntries(),
+      listCategories(),
+      listSiteIcons(),
+    ]);
 
     setEntries(nextEntries);
     setCategories(nextCategories);
+    setSiteIcons(nextSiteIcons);
   }
 
   function clearSecretView() {
@@ -432,8 +487,11 @@ const [
     setEntryEditorMode(null);
     setEntryMutationError(null);
     clearSecretView();
+    siteIconRequest.current += 1;
+    setSiteIconBusy(null);
     setEntries([]);
     setCategories([]);
+    setSiteIcons([]);
     setSearch("");
     setFilter({ type: "all" });
     setChangePasswordDialogOpen(false);
@@ -1377,6 +1435,126 @@ ${path}
     }
   }
 
+  async function handleFetchSiteIcon(
+    hostname: string,
+  ) {
+    const key =
+      hostname.toLocaleLowerCase("en-US");
+
+    const request =
+      ++siteIconRequest.current;
+
+    setSiteIconBusy({
+      hostname: key,
+      action: "fetch",
+    });
+
+    setErrorMessage(null);
+    setSuccessMessage(null);
+
+    try {
+      const nextIcon =
+        await fetchSiteIcon(hostname);
+
+      if (
+        request !== siteIconRequest.current
+      ) {
+        return;
+      }
+
+      const nextKey =
+        nextIcon.hostname.toLocaleLowerCase(
+          "en-US",
+        );
+
+      setSiteIcons((current) => [
+        ...current.filter(
+          (icon) =>
+            icon.hostname.toLocaleLowerCase(
+              "en-US",
+            ) !== nextKey,
+        ),
+        nextIcon,
+      ]);
+
+      setSuccessMessage(
+        `Значок ${nextIcon.hostname} сохранён в зашифрованном хранилище.`,
+      );
+    } catch (error) {
+      if (
+        request !== siteIconRequest.current
+      ) {
+        return;
+      }
+
+      setErrorMessage(
+        friendlyError(error),
+      );
+    } finally {
+      if (
+        request === siteIconRequest.current
+      ) {
+        setSiteIconBusy(null);
+      }
+    }
+  }
+
+  async function handleDeleteSiteIcon(
+    hostname: string,
+  ) {
+    const key =
+      hostname.toLocaleLowerCase("en-US");
+
+    const request =
+      ++siteIconRequest.current;
+
+    setSiteIconBusy({
+      hostname: key,
+      action: "delete",
+    });
+
+    setErrorMessage(null);
+    setSuccessMessage(null);
+
+    try {
+      await deleteSiteIcon(hostname);
+
+      if (
+        request !== siteIconRequest.current
+      ) {
+        return;
+      }
+
+      setSiteIcons((current) =>
+        current.filter(
+          (icon) =>
+            icon.hostname.toLocaleLowerCase(
+              "en-US",
+            ) !== key,
+        ),
+      );
+
+      setSuccessMessage(
+        `Сохранённый значок ${hostname} удалён.`,
+      );
+    } catch (error) {
+      if (
+        request !== siteIconRequest.current
+      ) {
+        return;
+      }
+
+      setErrorMessage(
+        friendlyError(error),
+      );
+    } finally {
+      if (
+        request === siteIconRequest.current
+      ) {
+        setSiteIconBusy(null);
+      }
+    }
+  }
   const categoryNames = useMemo(
     () =>
       new Map(
@@ -1386,6 +1564,19 @@ ${path}
         ]),
       ),
     [categories],
+  );
+
+  const siteIconByHostname = useMemo(
+    () =>
+      new Map(
+        siteIcons.map((icon) => [
+          icon.hostname.toLocaleLowerCase(
+            "en-US",
+          ),
+          icon,
+        ]),
+      ),
+    [siteIcons],
   );
 
   const visibleEntries = useMemo(() => {
@@ -1451,6 +1642,24 @@ ${path}
       ) ?? null
     );
   }, [allSiteGroups, selectedEntryId]);
+
+  const selectedSiteIcon = useMemo(() => {
+    if (!selectedSiteGroup?.hostname) {
+      return null;
+    }
+
+    return (
+      siteIconByHostname.get(
+        selectedSiteGroup.hostname.toLocaleLowerCase(
+          "en-US",
+        ),
+      ) ?? null
+    );
+  }, [
+    selectedSiteGroup,
+    siteIconByHostname,
+  ]);
+
   const favoriteCount = useMemo(
     () =>
       entries.filter(
@@ -2241,14 +2450,18 @@ ${path}
                         }
                       }}
                     >
-                      <span className="entry-avatar">
-                        {group.title
-                          .trim()
-                          .slice(0, 1)
-                          .toLocaleUpperCase(
-                            "ru-RU",
-                          ) || "•"}
-                      </span>
+                      <SiteIconAvatar
+                        title={group.title}
+                        icon={
+                          group.hostname
+                            ? siteIconByHostname.get(
+                                group.hostname.toLocaleLowerCase(
+                                  "en-US",
+                                ),
+                              )
+                            : undefined
+                        }
+                      />
 
                       <span className="entry-row-copy">
                         <strong>
@@ -2416,6 +2629,56 @@ ${path}
                         <small>
                           {selectedSiteGroup.hostname}
                         </small>
+
+                        <button
+                          type="button"
+                          className="site-icon-action"
+                          disabled={
+                            entryMutationBusy ||
+                            siteIconBusy !== null
+                          }
+                          onClick={() =>
+                            void handleFetchSiteIcon(
+                              selectedSiteGroup.hostname,
+                            )
+                          }
+                        >
+                          {siteIconBusy?.hostname ===
+                            selectedSiteGroup.hostname.toLocaleLowerCase(
+                              "en-US",
+                            ) &&
+                          siteIconBusy.action ===
+                            "fetch"
+                            ? "Загрузка…"
+                            : selectedSiteIcon
+                              ? "Обновить значок"
+                              : "Получить значок"}
+                        </button>
+
+                        {selectedSiteIcon && (
+                          <button
+                            type="button"
+                            className="site-icon-delete"
+                            disabled={
+                              entryMutationBusy ||
+                              siteIconBusy !== null
+                            }
+                            onClick={() =>
+                              void handleDeleteSiteIcon(
+                                selectedSiteGroup.hostname,
+                              )
+                            }
+                          >
+                            {siteIconBusy?.hostname ===
+                              selectedSiteGroup.hostname.toLocaleLowerCase(
+                                "en-US",
+                              ) &&
+                            siteIconBusy.action ===
+                              "delete"
+                              ? "Удаление…"
+                              : "Удалить значок"}
+                          </button>
+                        )}
 
                         <button
                           type="button"

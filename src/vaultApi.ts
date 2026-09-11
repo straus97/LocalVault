@@ -10,6 +10,7 @@ import type {
   EntryCommandInput,
   EntrySummary,
   PasswordGeneratorInput,
+  SiteIconSummary,
   VaultStatus,
 } from "./types";
 
@@ -89,6 +90,29 @@ export function getEntry(
 export function listCategories(): Promise<CategorySummary[]> {
   return invoke<CategorySummary[]>("list_categories");
 }
+
+export function listSiteIcons(): Promise<SiteIconSummary[]> {
+  return invoke<SiteIconSummary[]>("list_site_icons");
+}
+
+export function fetchSiteIcon(
+  hostname: string,
+): Promise<SiteIconSummary> {
+  return invoke<SiteIconSummary>(
+    "fetch_site_icon",
+    { hostname },
+  );
+}
+
+export function deleteSiteIcon(
+  hostname: string,
+): Promise<boolean> {
+  return invoke<boolean>(
+    "delete_site_icon",
+    { hostname },
+  );
+}
+
 export function deleteClosedVault(
   path: string,
 ): Promise<DeleteVaultResult> {

@@ -36,6 +36,12 @@ export interface CategorySummary {
   updatedAtMs: number;
 }
 
+export interface SiteIconSummary {
+  hostname: string;
+  pngBase64: string;
+  updatedAtMs: number;
+}
+
 export interface CommandError {
   code: string;
   message: string;

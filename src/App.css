@@ -5024,3 +5024,119 @@ select:focus-visible {
 
   background: #2f73f2;
 }
+/* ============================================================
+   LOCALVAULT 1P-B3B SITE ICON UI
+   ============================================================ */
+
+.entry-avatar.has-site-icon {
+  overflow: hidden;
+
+  padding: 5px;
+
+  border-color: #d5e0ed;
+  background: #ffffff;
+}
+
+.site-icon-image {
+  width: 100%;
+  height: 100%;
+
+  display: block;
+
+  object-fit: contain;
+
+  user-select: none;
+  pointer-events: none;
+}
+
+.site-profiles-header > .site-profiles-actions {
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+
+.site-profiles-actions > small {
+  margin-right: 2px;
+}
+
+.site-icon-action,
+.site-icon-delete {
+  min-height: 28px;
+  padding: 0 9px;
+
+  appearance: none;
+
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 680;
+  line-height: 1;
+
+  border-radius: 8px;
+
+  cursor: pointer;
+
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease,
+    box-shadow 120ms ease,
+    opacity 120ms ease;
+}
+
+.site-icon-action {
+  color: #1d5fb9;
+
+  border: 1px solid #bfd4ef;
+
+  background:
+    linear-gradient(
+      180deg,
+      #f8fbff 0%,
+      #edf5ff 100%
+    );
+}
+
+.site-icon-action:hover:not(:disabled) {
+  color: #124f9f;
+
+  border-color: #94b9e9;
+
+  background:
+    linear-gradient(
+      180deg,
+      #f2f8ff 0%,
+      #dfedff 100%
+    );
+
+  box-shadow:
+    0 2px 6px rgba(47, 115, 242, 0.08);
+}
+
+.site-icon-delete {
+  color: #9a4b4b;
+
+  border: 1px solid #e2caca;
+
+  background: #fffafa;
+}
+
+.site-icon-delete:hover:not(:disabled) {
+  color: #813838;
+
+  border-color: #d8adad;
+
+  background: #fff4f4;
+}
+
+.site-icon-action:focus-visible,
+.site-icon-delete:focus-visible {
+  outline: 2px solid rgba(47, 115, 242, 0.30);
+  outline-offset: 2px;
+}
+
+.site-icon-action:disabled,
+.site-icon-delete:disabled {
+  opacity: 0.52;
+  cursor: default;
+}
