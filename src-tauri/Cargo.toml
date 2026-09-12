@@ -26,6 +26,10 @@ argon2 = { version = "0.6.0", features = ["zeroize"] }
 chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 getrandom = "0.4.3"
 base64 = "0.23.1"
+data-encoding = "2"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
 zeroize = "1.9.0"
 thiserror = "2.0.20"
 atomic-write-file = "0.3.1"

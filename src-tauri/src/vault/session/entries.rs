@@ -4,7 +4,7 @@ use serde::Serialize;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::vault::data::VaultEntry;
+use crate::vault::data::{TotpConfig, VaultEntry, VAULT_DATA_SCHEMA_VERSION};
 
 use super::{SessionError, UnlockedVaultSession};
 
@@ -37,6 +37,12 @@ impl Drop for EntryInput {
     }
 }
 
+pub enum TotpUpdate {
+    Keep,
+    Replace(TotpConfig),
+    Remove,
+}
+
 #[derive(Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct EntrySummary {
@@ -45,6 +51,7 @@ pub struct EntrySummary {
     pub profile_name: String,
     pub url: String,
     pub username: String,
+    pub totp_enabled: bool,
     pub category_id: Option<Uuid>,
     pub favorite: bool,
     pub updated_at_ms: i64,
@@ -68,6 +75,7 @@ pub struct EntryDetails {
     pub url: String,
     pub username: String,
     pub password: String,
+    pub totp_enabled: bool,
     pub notes: String,
     pub category_id: Option<Uuid>,
     pub tags: Vec<String>,
@@ -101,6 +109,7 @@ impl EntrySummary {
             profile_name: entry.profile_name.clone(),
             url: entry.url.clone(),
             username: entry.username.clone(),
+            totp_enabled: entry.totp.is_some(),
             category_id: entry.category_id,
             favorite: entry.favorite,
             updated_at_ms: entry.updated_at_ms,
@@ -117,6 +126,7 @@ impl EntryDetails {
             url: entry.url.clone(),
             username: entry.username.clone(),
             password: entry.password.clone(),
+            totp_enabled: entry.totp.is_some(),
             notes: entry.notes.clone(),
             category_id: entry.category_id,
             tags: entry.tags.clone(),
@@ -150,6 +160,7 @@ impl EntryInput {
         id: Uuid,
         created_at_ms: i64,
         updated_at_ms: i64,
+        totp: Option<TotpConfig>,
     ) -> VaultEntry {
         VaultEntry {
             id,
@@ -158,6 +169,7 @@ impl EntryInput {
             url: mem::take(&mut self.url),
             username: mem::take(&mut self.username),
             password: mem::take(&mut self.password),
+            totp,
             notes: mem::take(&mut self.notes),
             category_id: self.category_id,
             tags: mem::take(&mut self.tags),
@@ -231,6 +243,44 @@ impl UnlockedVaultSession {
         Ok(details)
     }
 
+    pub fn create_entry_with_totp(
+        &mut self,
+        input: EntryInput,
+        totp: TotpConfig,
+        now_ms: i64,
+    ) -> Result<EntrySummary, SessionError> {
+        if self.is_dirty() {
+            return Err(SessionError::PendingUnsavedChanges);
+        }
+
+        let mut entry = input.into_new_entry(now_ms)?;
+
+        entry.totp = Some(totp);
+
+        let entry_id = entry.id;
+
+        let mut candidate = self.data().clone();
+
+        candidate.entries.push(entry);
+
+        candidate.schema_version = VAULT_DATA_SCHEMA_VERSION;
+
+        candidate.updated_at_ms = candidate.updated_at_ms.max(now_ms);
+
+        candidate.validate().map_err(SessionError::InvalidEntry)?;
+
+        let summary = candidate
+            .entries
+            .iter()
+            .find(|entry| entry.id == entry_id)
+            .map(EntrySummary::from_entry)
+            .ok_or(SessionError::EntryNotFound)?;
+
+        self.commit_candidate(candidate)?;
+
+        Ok(summary)
+    }
+
     pub fn update_entry(
         &mut self,
         id: Uuid,
@@ -255,7 +305,10 @@ impl UnlockedVaultSession {
 
         let effective_updated_at_ms = now_ms.max(previous_updated_at_ms);
 
-        let replacement = input.into_existing_entry(id, created_at_ms, effective_updated_at_ms);
+        let totp = candidate.entries[index].totp.take();
+
+        let replacement =
+            input.into_existing_entry(id, created_at_ms, effective_updated_at_ms, totp);
 
         candidate.entries[index] = replacement;
 
@@ -268,6 +321,59 @@ impl UnlockedVaultSession {
         self.commit_candidate(candidate)?;
 
         Ok(details)
+    }
+
+    pub fn update_entry_with_totp(
+        &mut self,
+        id: Uuid,
+        input: EntryInput,
+        totp_update: TotpUpdate,
+        now_ms: i64,
+    ) -> Result<EntrySummary, SessionError> {
+        if self.is_dirty() {
+            return Err(SessionError::PendingUnsavedChanges);
+        }
+
+        let mut candidate = self.data().clone();
+
+        let index = candidate
+            .entries
+            .iter()
+            .position(|entry| entry.id == id)
+            .ok_or(SessionError::EntryNotFound)?;
+
+        let created_at_ms = candidate.entries[index].created_at_ms;
+
+        let previous_updated_at_ms = candidate.entries[index].updated_at_ms;
+
+        let effective_updated_at_ms = now_ms.max(previous_updated_at_ms);
+
+        let previous_totp = candidate.entries[index].totp.take();
+
+        let next_totp = match totp_update {
+            TotpUpdate::Keep => previous_totp,
+
+            TotpUpdate::Replace(config) => Some(config),
+
+            TotpUpdate::Remove => None,
+        };
+
+        let replacement =
+            input.into_existing_entry(id, created_at_ms, effective_updated_at_ms, next_totp);
+
+        candidate.entries[index] = replacement;
+
+        candidate.schema_version = VAULT_DATA_SCHEMA_VERSION;
+
+        candidate.updated_at_ms = candidate.updated_at_ms.max(effective_updated_at_ms);
+
+        candidate.validate().map_err(SessionError::InvalidEntry)?;
+
+        let summary = EntrySummary::from_entry(&candidate.entries[index]);
+
+        self.commit_candidate(candidate)?;
+
+        Ok(summary)
     }
 
     pub fn delete_entry(&mut self, id: Uuid, now_ms: i64) -> Result<(), SessionError> {

@@ -1,7 +1,10 @@
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::vault::session::{EntryDetails, EntryInput, EntrySummary};
+use crate::vault::{
+    data::TotpConfig,
+    session::{EntryDetails, EntryInput, EntrySummary, TotpUpdate},
+};
 
 use super::{unix_time_ms, AppState, AppStateError};
 
@@ -46,6 +49,22 @@ impl AppState {
             .map_err(AppStateError::from)
     }
 
+    pub fn create_entry_with_totp(
+        &self,
+        input: EntryInput,
+        totp: TotpConfig,
+    ) -> Result<EntrySummary, AppStateError> {
+        let now_ms = unix_time_ms()?;
+
+        let mut guard = self.active_session_guard()?;
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        session
+            .create_entry_with_totp(input, totp, now_ms)
+            .map_err(AppStateError::from)
+    }
+
     pub fn update_entry(&self, id: Uuid, input: EntryInput) -> Result<EntrySummary, AppStateError> {
         let now_ms = unix_time_ms()?;
 
@@ -55,6 +74,23 @@ impl AppState {
 
         session
             .update_entry(id, input, now_ms)
+            .map_err(AppStateError::from)
+    }
+
+    pub fn update_entry_with_totp(
+        &self,
+        id: Uuid,
+        input: EntryInput,
+        totp_update: TotpUpdate,
+    ) -> Result<EntrySummary, AppStateError> {
+        let now_ms = unix_time_ms()?;
+
+        let mut guard = self.active_session_guard()?;
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        session
+            .update_entry_with_totp(id, input, totp_update, now_ms)
             .map_err(AppStateError::from)
     }
 

@@ -35,6 +35,7 @@ mod password_generator;
 mod recent_vaults;
 mod secure_clipboard;
 pub mod site_icon_fetcher;
+pub mod totp;
 pub mod vault;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -67,6 +68,8 @@ pub fn run() {
             commands::entries::list_entries,
             commands::entries::get_entry,
             commands::entries::copy_entry_password,
+            commands::totp::get_entry_totp_code,
+            commands::totp::copy_entry_totp,
             commands::entries::create_entry,
             commands::entries::update_entry,
             commands::entries::delete_entry,

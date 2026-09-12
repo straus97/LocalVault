@@ -6,6 +6,7 @@ pub(crate) mod password_health;
 pub(crate) mod passwords;
 pub(crate) mod recent_vaults;
 pub(crate) mod site_icons;
+pub(crate) mod totp;
 
 use std::path::PathBuf;
 
@@ -18,6 +19,7 @@ use crate::{
     crypto::CryptoError,
     password_generator::PasswordGeneratorError,
     secure_clipboard::{SecureClipboard, SecureClipboardError},
+    totp::TotpError,
     vault::{
         backup::BackupError, format::VaultError, lifecycle::VaultLifecycleError,
         session::SessionError, storage::StorageError,
@@ -165,6 +167,16 @@ impl From<AppStateError> for CommandError {
                 "The encrypted site icon cache is full.",
             ),
 
+            AppStateError::TotpNotConfigured => Self::new(
+                "totpNotConfigured",
+                "Two-factor authentication is not configured for this entry.",
+            ),
+
+            AppStateError::TotpGenerationFailed => Self::new(
+                "totpGenerationFailed",
+                "The two-factor authentication code could not be generated.",
+            ),
+
             AppStateError::StateUnavailable => Self::new(
                 "stateUnavailable",
                 "LocalVault state is temporarily unavailable.",
@@ -249,6 +261,36 @@ impl From<AppStateError> for CommandError {
                 "vaultOperationFailed",
                 "The vault operation could not be completed.",
             ),
+        }
+    }
+}
+
+impl From<TotpError> for CommandError {
+    fn from(error: TotpError) -> Self {
+        match error {
+            TotpError::EmptyInput
+            | TotpError::InvalidUri
+            | TotpError::UnsupportedType
+            | TotpError::MissingSecret
+            | TotpError::InvalidSecret
+            | TotpError::InvalidAlgorithm
+            | TotpError::InvalidDigits
+            | TotpError::InvalidPeriod => Self::new(
+                "invalidTotpSetup",
+                "The two-factor authentication setup is invalid.",
+            ),
+
+            TotpError::ConflictingUpdate => Self::new(
+                "invalidTotpUpdate",
+                "The two-factor authentication update is invalid.",
+            ),
+
+            TotpError::InvalidTime | TotpError::InvalidConfig | TotpError::Computation => {
+                Self::new(
+                    "totpGenerationFailed",
+                    "The two-factor authentication code could not be generated.",
+                )
+            }
         }
     }
 }

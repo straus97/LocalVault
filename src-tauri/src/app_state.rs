@@ -5,9 +5,11 @@ mod lifecycle;
 mod master_password;
 mod password_health;
 mod site_icons;
+mod totp;
 
 pub use password_health::{PasswordHealthItem, PasswordHealthReport, PasswordWeakReason};
 pub use site_icons::SiteIconSummary;
+pub use totp::TotpCode;
 
 use std::{
     path::PathBuf,
@@ -86,6 +88,12 @@ pub enum AppStateError {
 
     #[error("encrypted site icon cache capacity is exceeded")]
     SiteIconCacheFull,
+
+    #[error("TOTP is not configured for this entry")]
+    TotpNotConfigured,
+
+    #[error("TOTP code generation failed")]
+    TotpGenerationFailed,
 
     #[error("vault session operation failed")]
     Session(#[from] SessionError),

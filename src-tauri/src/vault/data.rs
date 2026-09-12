@@ -6,7 +6,8 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const VAULT_DATA_SCHEMA_VERSION: u16 = 1;
+pub const LEGACY_VAULT_DATA_SCHEMA_VERSION: u16 = 1;
+pub const VAULT_DATA_SCHEMA_VERSION: u16 = 2;
 
 pub const MAX_ENTRIES: usize = 50_000;
 pub const MAX_CATEGORIES: usize = 512;
@@ -23,6 +24,11 @@ pub const MAX_USERNAME_CHARS: usize = 1_024;
 pub const MAX_PASSWORD_CHARS: usize = 16_384;
 pub const MAX_URL_CHARS: usize = 4_096;
 pub const MAX_NOTES_CHARS: usize = 262_144;
+
+pub const MIN_TOTP_SECRET_BYTES: usize = 10;
+pub const MAX_TOTP_SECRET_BYTES: usize = 128;
+pub const MAX_TOTP_SECRET_BASE64_CHARS: usize = MAX_TOTP_SECRET_BYTES.div_ceil(3) * 4;
+pub const MAX_TOTP_PERIOD_SECONDS: u32 = 300;
 
 pub const MAX_CATEGORY_NAME_CHARS: usize = 128;
 pub const MAX_TAGS_PER_ENTRY: usize = 64;
@@ -99,6 +105,15 @@ pub enum VaultDataError {
     #[error("entry password is too long")]
     EntryPasswordTooLong(Uuid),
 
+    #[error("legacy vault schema contains TOTP data")]
+    LegacySchemaContainsTotp(Uuid),
+
+    #[error("entry TOTP secret is invalid")]
+    InvalidTotpSecret(Uuid),
+
+    #[error("entry TOTP settings are invalid")]
+    InvalidTotpSettings(Uuid),
+
     #[error("entry URL is too long")]
     EntryUrlTooLong(Uuid),
 
@@ -152,6 +167,38 @@ pub struct SiteIcon {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TotpAlgorithm {
+    #[serde(rename = "SHA1")]
+    Sha1,
+
+    #[serde(rename = "SHA256")]
+    Sha256,
+
+    #[serde(rename = "SHA512")]
+    Sha512,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TotpConfig {
+    pub secret_base64: String,
+    pub algorithm: TotpAlgorithm,
+    pub digits: u8,
+    pub period_seconds: u32,
+}
+
+impl TotpConfig {
+    pub(crate) fn zeroize_sensitive_fields(&mut self) {
+        self.secret_base64.zeroize();
+    }
+}
+
+impl Drop for TotpConfig {
+    fn drop(&mut self) {
+        self.zeroize_sensitive_fields();
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VaultEntry {
     pub id: Uuid,
@@ -161,6 +208,8 @@ pub struct VaultEntry {
     pub url: String,
     pub username: String,
     pub password: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp: Option<TotpConfig>,
     pub notes: String,
     pub category_id: Option<Uuid>,
     pub tags: Vec<String>,
@@ -195,7 +244,9 @@ impl VaultData {
     }
 
     pub fn validate(&self) -> Result<(), VaultDataError> {
-        if self.schema_version != VAULT_DATA_SCHEMA_VERSION {
+        if self.schema_version != LEGACY_VAULT_DATA_SCHEMA_VERSION
+            && self.schema_version != VAULT_DATA_SCHEMA_VERSION
+        {
             return Err(VaultDataError::UnsupportedSchemaVersion);
         }
 
@@ -250,6 +301,10 @@ impl VaultData {
         let mut entry_ids = HashSet::with_capacity(self.entries.len());
 
         for entry in &self.entries {
+            if self.schema_version == LEGACY_VAULT_DATA_SCHEMA_VERSION && entry.totp.is_some() {
+                return Err(VaultDataError::LegacySchemaContainsTotp(entry.id));
+            }
+
             validate_entry(entry, &category_ids)?;
 
             if !entry_ids.insert(entry.id) {
@@ -273,6 +328,12 @@ impl VaultData {
             entry.url.zeroize();
             entry.username.zeroize();
             entry.password.zeroize();
+
+            if let Some(totp) = entry.totp.as_mut() {
+                totp.zeroize_sensitive_fields();
+            }
+
+            entry.totp = None;
             entry.notes.zeroize();
 
             for tag in &mut entry.tags {
@@ -316,6 +377,12 @@ impl VaultEntry {
         self.url.zeroize();
         self.username.zeroize();
         self.password.zeroize();
+
+        if let Some(totp) = self.totp.as_mut() {
+            totp.zeroize_sensitive_fields();
+        }
+
+        self.totp = None;
         self.notes.zeroize();
 
         for tag in &mut self.tags {
@@ -356,6 +423,7 @@ impl VaultEntry {
             url: String::new(),
             username: String::new(),
             password: String::new(),
+            totp: None,
             notes: String::new(),
             category_id: None,
             tags: Vec::new(),
@@ -462,6 +530,31 @@ fn valid_site_icon_hostname(hostname: &str) -> bool {
     })
 }
 
+fn validate_totp_config(entry_id: Uuid, config: &TotpConfig) -> Result<(), VaultDataError> {
+    if config.secret_base64.is_empty() || config.secret_base64.len() > MAX_TOTP_SECRET_BASE64_CHARS
+    {
+        return Err(VaultDataError::InvalidTotpSecret(entry_id));
+    }
+
+    let decoded = Zeroizing::new(
+        BASE64_STANDARD
+            .decode(config.secret_base64.as_bytes())
+            .map_err(|_| VaultDataError::InvalidTotpSecret(entry_id))?,
+    );
+
+    if decoded.len() < MIN_TOTP_SECRET_BYTES || decoded.len() > MAX_TOTP_SECRET_BYTES {
+        return Err(VaultDataError::InvalidTotpSecret(entry_id));
+    }
+
+    if !matches!(config.digits, 6 | 8)
+        || !(1..=MAX_TOTP_PERIOD_SECONDS).contains(&config.period_seconds)
+    {
+        return Err(VaultDataError::InvalidTotpSettings(entry_id));
+    }
+
+    Ok(())
+}
+
 fn validate_category(category: &VaultCategory) -> Result<(), VaultDataError> {
     if category.id.is_nil() {
         return Err(VaultDataError::NilCategoryId);
@@ -505,6 +598,10 @@ fn validate_entry(entry: &VaultEntry, category_ids: &HashSet<Uuid>) -> Result<()
 
     if char_count(&entry.password) > MAX_PASSWORD_CHARS {
         return Err(VaultDataError::EntryPasswordTooLong(entry.id));
+    }
+
+    if let Some(totp) = entry.totp.as_ref() {
+        validate_totp_config(entry.id, totp)?;
     }
 
     if char_count(&entry.url) > MAX_URL_CHARS {
@@ -915,6 +1012,63 @@ mod tests {
 
         assert!(icon.hostname.is_empty());
         assert!(icon.png_base64.is_empty());
+    }
+
+    #[test]
+    fn current_schema_accepts_valid_totp_config() {
+        let mut data = valid_sample_data();
+
+        data.entries[0].totp = Some(TotpConfig {
+            secret_base64: "MTIzNDU2Nzg5MDEyMzQ1Njc4OTA=".to_owned(),
+            algorithm: TotpAlgorithm::Sha1,
+            digits: 6,
+            period_seconds: 30,
+        });
+
+        data.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_schema_without_totp_remains_readable() {
+        let mut data = valid_sample_data();
+
+        data.schema_version = LEGACY_VAULT_DATA_SCHEMA_VERSION;
+        data.entries[0].totp = None;
+
+        data.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_schema_cannot_carry_totp_secret() {
+        let mut data = valid_sample_data();
+
+        data.schema_version = LEGACY_VAULT_DATA_SCHEMA_VERSION;
+
+        data.entries[0].totp = Some(TotpConfig {
+            secret_base64: "MTIzNDU2Nzg5MDEyMzQ1Njc4OTA=".to_owned(),
+            algorithm: TotpAlgorithm::Sha1,
+            digits: 6,
+            period_seconds: 30,
+        });
+
+        assert!(matches!(
+            data.validate(),
+            Err(VaultDataError::LegacySchemaContainsTotp(_))
+        ));
+    }
+
+    #[test]
+    fn individual_totp_secret_can_be_zeroized() {
+        let mut config = TotpConfig {
+            secret_base64: "MTIzNDU2Nzg5MDEyMzQ1Njc4OTA=".to_owned(),
+            algorithm: TotpAlgorithm::Sha1,
+            digits: 6,
+            period_seconds: 30,
+        };
+
+        config.zeroize_sensitive_fields();
+
+        assert!(config.secret_base64.is_empty());
     }
 
     #[test]

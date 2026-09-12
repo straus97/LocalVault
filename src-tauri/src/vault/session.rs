@@ -3,7 +3,7 @@ mod categories;
 pub use categories::{CategoryInput, CategorySummary};
 mod entries;
 mod master_password;
-pub use entries::{EntryDetails, EntryInput, EntrySummary};
+pub use entries::{EntryDetails, EntryInput, EntrySummary, TotpUpdate};
 
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
@@ -17,7 +17,9 @@ use zeroize::Zeroizing;
 use crate::crypto::keys::SecretKey;
 
 use super::{
-    data::{VaultData, VaultDataError},
+    data::{
+        VaultData, VaultDataError, LEGACY_VAULT_DATA_SCHEMA_VERSION, VAULT_DATA_SCHEMA_VERSION,
+    },
     format::{
         create_envelope_with_key, open_envelope_with_key, reseal_envelope, VaultEnvelope,
         VaultError,
@@ -204,6 +206,10 @@ impl UnlockedVaultSession {
             return Ok(false);
         }
 
+        if self.data.schema_version == LEGACY_VAULT_DATA_SCHEMA_VERSION {
+            self.data.schema_version = VAULT_DATA_SCHEMA_VERSION;
+        }
+
         self.data.validate()?;
 
         // Refuse to overwrite a vault which changed after
@@ -228,9 +234,16 @@ impl UnlockedVaultSession {
         Ok(true)
     }
 
-    pub(crate) fn commit_candidate(&mut self, candidate: VaultData) -> Result<(), SessionError> {
+    pub(crate) fn commit_candidate(
+        &mut self,
+        mut candidate: VaultData,
+    ) -> Result<(), SessionError> {
         if self.dirty {
             return Err(SessionError::PendingUnsavedChanges);
+        }
+
+        if candidate.schema_version == LEGACY_VAULT_DATA_SCHEMA_VERSION {
+            candidate.schema_version = VAULT_DATA_SCHEMA_VERSION;
         }
 
         candidate.validate()?;
