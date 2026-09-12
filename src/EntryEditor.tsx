@@ -8,6 +8,7 @@ import type {
   CategorySummary,
   EntryCommandInput,
   EntryDetails,
+  TotpUpdateMode,
 } from "./types";
 
 import {
@@ -71,6 +72,14 @@ export default function EntryEditor({
   const passwordInputRef =
     useRef<HTMLInputElement | null>(null);
 
+  /*
+   * Keep the TOTP setup secret outside React state.
+   * JavaScript strings cannot be reliably zeroized,
+   * so minimise its lifetime and number of references.
+   */
+  const totpInputRef =
+    useRef<HTMLInputElement | null>(null);
+
   const [passwordVisible, setPasswordVisible] =
     useState(false);
 
@@ -94,6 +103,24 @@ export default function EntryEditor({
 
   const [includeSymbols, setIncludeSymbols] =
     useState(true);
+
+  const [
+    totpUpdate,
+    setTotpUpdate,
+  ] = useState<TotpUpdateMode>("keep");
+
+  function clearTotpInput() {
+    if (totpInputRef.current) {
+      totpInputRef.current.value = "";
+    }
+  }
+
+  function chooseTotpUpdate(
+    next: TotpUpdateMode,
+  ) {
+    clearTotpInput();
+    setTotpUpdate(next);
+  }
 
   async function handleGeneratePassword() {
     if (busy || generatorBusy) {
@@ -227,6 +254,16 @@ export default function EntryEditor({
         "password",
       ),
 
+      totpUpdate,
+
+      totpInput:
+        totpUpdate === "replace"
+          ? fieldValue(
+              formData,
+              "totpInput",
+            )
+          : "",
+
       notes: fieldValue(
         formData,
         "notes",
@@ -248,7 +285,18 @@ export default function EntryEditor({
         ),
     };
 
-    await onSubmit(input);
+    /*
+     * Clear the DOM field before awaiting IPC.
+     * The input object necessarily retains one JS string
+     * until the command returns.
+     */
+    clearTotpInput();
+
+    try {
+      await onSubmit(input);
+    } finally {
+      input.totpInput = "";
+    }
   }
 
   return (
@@ -560,6 +608,172 @@ export default function EntryEditor({
               </div>
             </label>
 
+            <div className="totp-editor-card span-two">
+              <div className="totp-editor-heading">
+                <div>
+                  <span className="totp-editor-eyebrow">
+                    Двухфакторная защита
+                  </span>
+
+                  <strong>
+                    Код аутентификатора (TOTP)
+                  </strong>
+                </div>
+
+                <span
+                  className={
+                    initialEntry?.totpEnabled &&
+                    totpUpdate !== "remove"
+                      ? "totp-status enabled"
+                      : "totp-status"
+                  }
+                >
+                  {initialEntry?.totpEnabled &&
+                  totpUpdate !== "remove"
+                    ? "Настроено"
+                    : totpUpdate === "replace"
+                      ? "Будет добавлено"
+                      : "Не настроено"}
+                </span>
+              </div>
+
+              <p className="totp-editor-description">
+                Вставьте секрет из настроек
+                аутентификатора или целую ссылку{" "}
+                <code>otpauth://totp/...</code>.
+                Генерация кодов выполняется локально.
+              </p>
+
+              {initialEntry?.totpEnabled ? (
+                <div className="totp-editor-actions">
+                  <button
+                    type="button"
+                    className={
+                      totpUpdate === "keep"
+                        ? "totp-choice active"
+                        : "totp-choice"
+                    }
+                    disabled={busy}
+                    onClick={() =>
+                      chooseTotpUpdate("keep")
+                    }
+                  >
+                    Оставить текущий
+                  </button>
+
+                  <button
+                    type="button"
+                    className={
+                      totpUpdate === "replace"
+                        ? "totp-choice active"
+                        : "totp-choice"
+                    }
+                    disabled={busy}
+                    onClick={() =>
+                      chooseTotpUpdate(
+                        "replace",
+                      )
+                    }
+                  >
+                    Заменить
+                  </button>
+
+                  <button
+                    type="button"
+                    className={
+                      totpUpdate === "remove"
+                        ? "totp-choice danger active"
+                        : "totp-choice danger"
+                    }
+                    disabled={busy}
+                    onClick={() =>
+                      chooseTotpUpdate(
+                        "remove",
+                      )
+                    }
+                  >
+                    Удалить 2FA
+                  </button>
+                </div>
+              ) : (
+                <div className="totp-editor-actions">
+                  <button
+                    type="button"
+                    className={
+                      totpUpdate === "replace"
+                        ? "totp-choice active"
+                        : "totp-choice"
+                    }
+                    disabled={busy}
+                    onClick={() =>
+                      chooseTotpUpdate(
+                        "replace",
+                      )
+                    }
+                  >
+                    Добавить 2FA
+                  </button>
+
+                  {totpUpdate === "replace" && (
+                    <button
+                      type="button"
+                      className="totp-choice"
+                      disabled={busy}
+                      onClick={() =>
+                        chooseTotpUpdate(
+                          "keep",
+                        )
+                      }
+                    >
+                      Не добавлять
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {totpUpdate === "replace" && (
+                <label className="totp-secret-field">
+                  <span>
+                    Секрет или otpauth-ссылка
+                  </span>
+
+                  <input
+                    ref={totpInputRef}
+                    name="totpInput"
+                    type="password"
+                    required
+                    disabled={busy}
+                    autoComplete="off"
+                    spellCheck={false}
+                    placeholder="Например, JBSWY3DPEHPK3PXP"
+                  />
+
+                  <small>
+                    После сохранения LocalVault больше
+                    не показывает этот секрет. Для
+                    кодов используется только
+                    зашифрованная копия внутри сейфа.
+                  </small>
+                </label>
+              )}
+
+              {totpUpdate === "remove" && (
+                <div className="totp-remove-warning">
+                  После сохранения сохранённый
+                  TOTP-секрет будет удалён из этой
+                  записи. Восстановить его через
+                  LocalVault будет нельзя.
+                </div>
+              )}
+
+              <div className="totp-security-note">
+                Пароль и секрет 2FA хранятся в одном
+                зашифрованном сейфе. Это удобно, но
+                даёт меньшую независимость второго
+                фактора, чем отдельное приложение-
+                аутентификатор.
+              </div>
+            </div>
             <label className="editor-field">
               <span>Категория</span>
 

@@ -5140,3 +5140,386 @@ select:focus-visible {
   opacity: 0.52;
   cursor: default;
 }
+
+/* LocalVault 1R-C1 TOTP editor */
+
+.totp-editor-card {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid rgba(82, 132, 204, 0.2);
+  border-radius: 16px;
+  background:
+    linear-gradient(
+      145deg,
+      rgba(244, 249, 255, 0.96),
+      rgba(255, 255, 255, 0.98)
+    );
+  box-shadow:
+    0 10px 28px rgba(52, 93, 148, 0.07);
+}
+
+.totp-editor-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.totp-editor-heading > div {
+  display: grid;
+  gap: 4px;
+}
+
+.totp-editor-heading strong {
+  color: #1d3557;
+  font-size: 15px;
+}
+
+.totp-editor-eyebrow {
+  color: #6b7f99;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.totp-status {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border: 1px solid rgba(99, 125, 158, 0.2);
+  border-radius: 999px;
+  background: #f5f7fa;
+  color: #66768b;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.totp-status.enabled {
+  border-color: rgba(44, 143, 102, 0.22);
+  background: rgba(224, 247, 237, 0.9);
+  color: #287653;
+}
+
+.totp-editor-description,
+.totp-security-note {
+  margin: 0;
+  color: #617086;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.totp-editor-description code {
+  padding: 2px 5px;
+  border-radius: 5px;
+  background: rgba(61, 102, 158, 0.08);
+  color: #385c8c;
+  font-family:
+    "Cascadia Code",
+    "Consolas",
+    monospace;
+  font-size: 11px;
+}
+
+.totp-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.totp-choice {
+  min-height: 34px;
+  padding: 7px 12px;
+  border: 1px solid rgba(83, 116, 158, 0.2);
+  border-radius: 9px;
+  background: #ffffff;
+  color: #46617f;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.totp-choice:hover:not(:disabled) {
+  border-color: rgba(64, 120, 191, 0.42);
+  background: #f5f9ff;
+}
+
+.totp-choice.active {
+  border-color: rgba(50, 111, 191, 0.42);
+  background: rgba(225, 239, 255, 0.9);
+  color: #285f9e;
+}
+
+.totp-choice.danger {
+  color: #a24f54;
+}
+
+.totp-choice.danger.active {
+  border-color: rgba(187, 77, 83, 0.3);
+  background: rgba(255, 236, 237, 0.9);
+  color: #9a3f45;
+}
+
+.totp-choice:disabled {
+  cursor: default;
+  opacity: 0.58;
+}
+
+.totp-secret-field {
+  display: grid;
+  gap: 7px;
+}
+
+.totp-secret-field > span {
+  color: #40546e;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.totp-secret-field input {
+  width: 100%;
+  min-height: 42px;
+  box-sizing: border-box;
+  padding: 9px 11px;
+  border: 1px solid rgba(77, 111, 154, 0.22);
+  border-radius: 10px;
+  outline: none;
+  background: #ffffff;
+  color: #24364d;
+  font: inherit;
+}
+
+.totp-secret-field input:focus {
+  border-color: rgba(55, 119, 202, 0.55);
+  box-shadow:
+    0 0 0 3px rgba(69, 135, 220, 0.1);
+}
+
+.totp-secret-field small {
+  color: #7b899a;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.totp-remove-warning {
+  padding: 10px 12px;
+  border: 1px solid rgba(186, 81, 86, 0.18);
+  border-radius: 10px;
+  background: rgba(255, 241, 242, 0.8);
+  color: #985057;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.totp-security-note {
+  padding-top: 12px;
+  border-top: 1px solid rgba(92, 119, 154, 0.14);
+}
+
+@media (max-width: 720px) {
+  .totp-editor-heading {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .totp-status {
+    align-self: flex-start;
+  }
+}
+
+/* LocalVault 1R-C2 live TOTP */
+
+.totp-detail-section {
+  display: grid;
+  gap: 10px;
+}
+
+.totp-live-card {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid rgba(62, 125, 199, 0.18);
+  border-radius: 15px;
+  background:
+    linear-gradient(
+      145deg,
+      rgba(239, 247, 255, 0.96),
+      rgba(250, 253, 255, 0.98)
+    );
+  box-shadow:
+    0 10px 26px rgba(50, 91, 142, 0.07);
+}
+
+.totp-live-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.totp-live-code {
+  min-width: 0;
+  color: #183f70;
+  font-family:
+    "Cascadia Mono",
+    "Cascadia Code",
+    "Consolas",
+    monospace;
+  font-size: clamp(28px, 3vw, 38px);
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.totp-copy-button {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 8px 12px;
+  border: 1px solid rgba(55, 116, 192, 0.25);
+  border-radius: 9px;
+  background: #ffffff;
+  color: #2f629e;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.totp-copy-button:hover:not(:disabled) {
+  border-color: rgba(55, 116, 192, 0.48);
+  background: #f5f9ff;
+}
+
+.totp-copy-button:disabled {
+  cursor: default;
+  opacity: 0.58;
+}
+
+.totp-countdown {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: #6b7b90;
+  font-size: 12px;
+}
+
+.totp-countdown strong {
+  color: #355d8e;
+  font-variant-numeric: tabular-nums;
+}
+
+.totp-progress {
+  position: relative;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(71, 116, 171, 0.11);
+}
+
+.totp-progress-value {
+  height: 100%;
+  border-radius: inherit;
+  background:
+    linear-gradient(
+      90deg,
+      #72a9e8,
+      #477fc5
+    );
+  transition:
+    width 450ms linear;
+}
+
+.totp-live-meta {
+  color: #8090a3;
+  font-size: 11px;
+}
+
+.totp-copy-note {
+  margin-top: 0;
+}
+
+.totp-live-loading,
+.totp-live-error {
+  padding: 14px;
+  border: 1px solid rgba(91, 120, 156, 0.14);
+  border-radius: 12px;
+  background: rgba(247, 250, 253, 0.9);
+  color: #66788e;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.totp-live-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+@media (max-width: 760px) {
+  .totp-live-top {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .totp-copy-button {
+    width: 100%;
+  }
+
+  .totp-live-code {
+    font-size: 30px;
+  }
+}
+
+/* LocalVault 1R-C2.1 TOTP editor layout polish */
+
+/*
+ * TOTP is not an ordinary half-width form field.
+ * It is a complete security section, so it spans the
+ * entire editor grid just like the password generator
+ * and notes.
+ */
+.editor-grid > .totp-editor-card.span-two {
+  grid-column: 1 / -1;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/*
+ * On a wide editor keep the security card comfortable
+ * to read without making individual lines unnecessarily
+ * long.
+ */
+.totp-editor-card {
+  align-self: start;
+}
+
+.totp-editor-description {
+  max-width: 760px;
+}
+
+.totp-security-note {
+  max-width: 820px;
+}
+
+.totp-secret-field {
+  width: 100%;
+  max-width: 100%;
+}
+
+.totp-editor-actions {
+  align-items: center;
+}
+
+/*
+ * The editor becomes single-column on narrow windows,
+ * so the explicit full-width rule remains harmless.
+ */
+@media (max-width: 720px) {
+  .editor-grid > .totp-editor-card.span-two {
+    grid-column: 1;
+  }
+}

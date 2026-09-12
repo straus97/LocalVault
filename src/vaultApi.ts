@@ -12,6 +12,7 @@ import type {
   PasswordGeneratorInput,
   PasswordHealthReport,
   SiteIconSummary,
+  TotpCode,
   VaultStatus,
 } from "./types";
 
@@ -156,6 +157,24 @@ export function copyEntryPassword(
     { id },
   );
 }
+export function getEntryTotpCode(
+  id: string,
+): Promise<TotpCode> {
+  return invoke<TotpCode>(
+    "get_entry_totp_code",
+    { id },
+  );
+}
+
+export function copyEntryTotp(
+  id: string,
+): Promise<ClipboardCopyResult> {
+  return invoke<ClipboardCopyResult>(
+    "copy_entry_totp",
+    { id },
+  );
+}
+
 export function createEntry(
   input: EntryCommandInput,
 ): Promise<EntrySummary> {

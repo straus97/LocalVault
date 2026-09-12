@@ -27,6 +27,7 @@ import type {
   EntrySummary,
   PasswordHealthReport,
   SiteIconSummary,
+  TotpCode,
   VaultFilter,
   VaultStatus,
 } from "./types";
@@ -39,9 +40,11 @@ import {
   deleteClosedVault,
   deleteEntry,
   deleteSiteIcon,
+  copyEntryTotp,
   copyEntryPassword,
   fetchSiteIcon,
   getEntry,
+  getEntryTotpCode,
   getPasswordHealth,
   getRecentVaults,
   getVaultStatus,
@@ -134,6 +137,14 @@ const friendlyErrors: Record<string, string> = {
     "Не удалось подтвердить резервную копию.",
   invalidBackup:
     "Резервная копия повреждена или имеет неподдерживаемый формат.",
+  invalidTotpSetup:
+    "Не удалось настроить 2FA. Проверьте секрет или ссылку otpauth.",
+  invalidTotpUpdate:
+    "Не удалось изменить настройку 2FA.",
+  totpNotConfigured:
+    "Для этой записи двухфакторная защита не настроена.",
+  totpGenerationFailed:
+    "Не удалось создать одноразовый код. Проверьте системное время.",
   stateUnavailable:
     "Внутреннее состояние LocalVault временно недоступно.",
   invalidSystemClock:
@@ -337,6 +348,62 @@ function formatTimestamp(value: number): string {
   }).format(new Date(value));
 }
 
+function formatTotpCode(
+  value: string,
+): string {
+  if (value.length === 6) {
+    return `${value.slice(0, 3)} ${value.slice(3)}`;
+  }
+
+  if (value.length === 8) {
+    return `${value.slice(0, 4)} ${value.slice(4)}`;
+  }
+
+  return value;
+}
+
+function totpSecondsRemaining(
+  code: TotpCode,
+  nowMs: number,
+): number {
+  return Math.max(
+    0,
+    Math.ceil(
+      (code.expiresAtMs - nowMs) /
+        1_000,
+    ),
+  );
+}
+
+function totpProgressPercent(
+  code: TotpCode,
+  nowMs: number,
+): number {
+  const periodMs =
+    code.periodSeconds * 1_000;
+
+  if (periodMs <= 0) {
+    return 0;
+  }
+
+  const remainingMs =
+    Math.max(
+      0,
+      code.expiresAtMs - nowMs,
+    );
+
+  return Math.max(
+    0,
+    Math.min(
+      100,
+      (remainingMs / periodMs) *
+        100,
+    ),
+  );
+}
+
+/* LocalVault 1R-C2 */
+
 function App() {
   const [status, setStatus] =
     useState<VaultStatus>(initialStatus);
@@ -427,6 +494,33 @@ const [entries, setEntries] =
 
   const [copyMessage, setCopyMessage] =
     useState<string | null>(null);
+
+  const [totpCode, setTotpCode] =
+    useState<TotpCode | null>(null);
+
+  const [totpLoading, setTotpLoading] =
+    useState(false);
+
+  const [totpError, setTotpError] =
+    useState<string | null>(null);
+
+  const [
+    totpCopyBusy,
+    setTotpCopyBusy,
+  ] = useState(false);
+
+  const [
+    totpCopyMessage,
+    setTotpCopyMessage,
+  ] = useState<string | null>(null);
+
+  const [totpNowMs, setTotpNowMs] =
+    useState(() => Date.now());
+
+  const [
+    totpReloadToken,
+    setTotpReloadToken,
+  ] = useState(0);
 const [
     categoryEditorMode,
     setCategoryEditorMode,
@@ -474,6 +568,8 @@ const [
   ] = useState<string | null>(null);
 
   const detailsRequest = useRef(0);
+  const totpRequest = useRef(0);
+  const totpCopyRequest = useRef(0);
   const siteIconRequest = useRef(0);
   const passwordHealthRequest = useRef(0);
 
@@ -495,13 +591,183 @@ const [
 
   function clearSecretView() {
     detailsRequest.current += 1;
+    totpRequest.current += 1;
+    totpCopyRequest.current += 1;
+
     setSelectedEntry(null);
     setSelectedEntryId(null);
     setPasswordVisible(false);
     setDetailsLoading(false);
     setCopyBusy(false);
     setCopyMessage(null);
+
+    /*
+     * TOTP codes are derived secrets. Never retain one in
+     * WebView state after the selected secret view closes.
+     */
+    setTotpCode(null);
+    setTotpLoading(false);
+    setTotpError(null);
+    setTotpCopyBusy(false);
+    setTotpCopyMessage(null);
+    setTotpNowMs(Date.now());
   }
+
+  useEffect(() => {
+    const entryId =
+      status.unlocked &&
+      selectedEntry?.totpEnabled
+        ? selectedEntry.id
+        : null;
+
+    const request =
+      ++totpRequest.current;
+
+    /*
+     * A selection change invalidates both the displayed
+     * code and any in-flight copy notification.
+     */
+    totpCopyRequest.current += 1;
+
+    setTotpCode(null);
+    setTotpError(null);
+    setTotpLoading(
+      entryId !== null,
+    );
+    setTotpCopyBusy(false);
+    setTotpCopyMessage(null);
+    setTotpNowMs(Date.now());
+
+    if (!entryId) {
+      return;
+    }
+
+    /*
+     * Capture the narrowed identifier before entering the
+     * nested async function. TypeScript does not preserve
+     * the outer null narrowing through that closure.
+     */
+    const activeEntryId = entryId;
+
+    let active = true;
+
+    let refreshTimer:
+      | number
+      | undefined;
+
+    const clockTimer =
+      window.setInterval(
+        () => {
+          if (active) {
+            setTotpNowMs(
+              Date.now(),
+            );
+          }
+        },
+        500,
+      );
+
+    async function loadCode(
+      initial: boolean,
+    ) {
+      if (
+        initial &&
+        active &&
+        request ===
+          totpRequest.current
+      ) {
+        setTotpLoading(true);
+      }
+
+      try {
+        const nextCode =
+          await getEntryTotpCode(
+            activeEntryId,
+          );
+
+        if (
+          !active ||
+          request !==
+            totpRequest.current
+        ) {
+          nextCode.code = "";
+          return;
+        }
+
+        setTotpCode(nextCode);
+        setTotpError(null);
+
+        const now =
+          Date.now();
+
+        setTotpNowMs(now);
+
+        /*
+         * Refresh just after the backend's exact TOTP
+         * boundary. The Rust command is passive and does
+         * not extend the vault auto-lock deadline.
+         */
+        const delay =
+          Math.max(
+            100,
+            nextCode.expiresAtMs -
+              now +
+              120,
+          );
+
+        refreshTimer =
+          window.setTimeout(
+            () => {
+              void loadCode(false);
+            },
+            delay,
+          );
+      } catch (error) {
+        if (
+          active &&
+          request ===
+            totpRequest.current
+        ) {
+          setTotpCode(null);
+          setTotpError(
+            friendlyError(error),
+          );
+        }
+      } finally {
+        if (
+          active &&
+          request ===
+            totpRequest.current
+        ) {
+          setTotpLoading(false);
+        }
+      }
+    }
+
+    void loadCode(true);
+
+    return () => {
+      active = false;
+
+      window.clearInterval(
+        clockTimer,
+      );
+
+      if (
+        refreshTimer !== undefined
+      ) {
+        window.clearTimeout(
+          refreshTimer,
+        );
+      }
+    };
+  }, [
+    status.unlocked,
+    selectedEntry?.id,
+    selectedEntry?.totpEnabled,
+    selectedEntry?.updatedAtMs,
+    totpReloadToken,
+  ]);
 
   function activateVaultFilter(
     nextFilter: VaultFilter,
@@ -1452,6 +1718,61 @@ ${path}
       setCopyBusy(false);
     }
   }
+  async function handleCopyTotp() {
+    if (
+      !selectedEntry ||
+      !selectedEntry.totpEnabled ||
+      totpCopyBusy
+    ) {
+      return;
+    }
+
+    const entryId =
+      selectedEntry.id;
+
+    const request =
+      ++totpCopyRequest.current;
+
+    setTotpCopyBusy(true);
+    setTotpCopyMessage(null);
+
+    try {
+      /*
+       * The code is generated and copied entirely in Rust.
+       * The copied value is not returned to this handler.
+       */
+      const result =
+        await copyEntryTotp(
+          entryId,
+        );
+
+      if (
+        request ===
+          totpCopyRequest.current
+      ) {
+        setTotpCopyMessage(
+          `Код скопирован. Буфер автоматически очистится через ${result.clearAfterSeconds} сек., если вы не скопируете что-то другое.`,
+        );
+      }
+    } catch (error) {
+      if (
+        request ===
+          totpCopyRequest.current
+      ) {
+        setTotpCopyMessage(
+          friendlyError(error),
+        );
+      }
+    } finally {
+      if (
+        request ===
+          totpCopyRequest.current
+      ) {
+        setTotpCopyBusy(false);
+      }
+    }
+  }
+
   async function handleDeleteSelectedEntry() {
     if (!selectedEntry) {
       return;
@@ -3028,6 +3349,113 @@ ${path}
                     "Защищённое копирование: автоочистка через 30 секунд; новое содержимое буфера LocalVault не удаляет."}
                 </div>
               </div>
+              {selectedEntry.totpEnabled && (
+                <div className="detail-section totp-detail-section">
+                  <div className="detail-label">
+                    Двухфакторный код
+                  </div>
+
+                  {totpLoading &&
+                  !totpCode &&
+                  !totpError ? (
+                    <div className="totp-live-loading">
+                      Создаём локальный код…
+                    </div>
+                  ) : totpError ? (
+                    <div className="totp-live-error">
+                      <span>
+                        {totpError}
+                      </span>
+
+                      <button
+                        type="button"
+                        className="reveal-button"
+                        onClick={() =>
+                          setTotpReloadToken(
+                            (value) =>
+                              value + 1,
+                          )
+                        }
+                      >
+                        Повторить
+                      </button>
+                    </div>
+                  ) : totpCode ? (
+                    <div className="totp-live-card">
+                      <div className="totp-live-top">
+                        <div
+                          className="totp-live-code"
+                          aria-live="polite"
+                          aria-label={`Одноразовый код ${totpCode.code}`}
+                        >
+                          {formatTotpCode(
+                            totpCode.code,
+                          )}
+                        </div>
+
+                        <button
+                          type="button"
+                          className="totp-copy-button"
+                          disabled={
+                            totpCopyBusy
+                          }
+                          onClick={() =>
+                            void handleCopyTotp()
+                          }
+                        >
+                          {totpCopyBusy
+                            ? "Копируем…"
+                            : "Копировать код"}
+                        </button>
+                      </div>
+
+                      <div className="totp-countdown">
+                        <span>
+                          Новый код через
+                        </span>
+
+                        <strong>
+                          {totpSecondsRemaining(
+                            totpCode,
+                            totpNowMs,
+                          )}{" "}
+                          сек.
+                        </strong>
+                      </div>
+
+                      <div
+                        className="totp-progress"
+                        aria-hidden="true"
+                      >
+                        <div
+                          className="totp-progress-value"
+                          style={{
+                            width: `${totpProgressPercent(
+                              totpCode,
+                              totpNowMs,
+                            )}%`,
+                          }}
+                        />
+                      </div>
+
+                      <div className="totp-live-meta">
+                        {totpCode.digits} цифр
+                        {" • "}
+                        период{" "}
+                        {
+                          totpCode.periodSeconds
+                        }{" "}
+                        сек.
+                      </div>
+
+                      <div className="copy-disabled-note totp-copy-note">
+                        {totpCopyMessage ??
+                          "Код создаётся локально. Защищённое копирование очищает принадлежащее LocalVault содержимое буфера через 30 секунд."}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              )}
               <div className="detail-section">
                 <div className="detail-label">
                   Сайт

@@ -9,6 +9,7 @@ export interface EntrySummary {
   profileName: string;
   url: string;
   username: string;
+  totpEnabled: boolean;
   categoryId: string | null;
   favorite: boolean;
   updatedAtMs: number;
@@ -21,6 +22,7 @@ export interface EntryDetails {
   url: string;
   username: string;
   password: string;
+  totpEnabled: boolean;
   notes: string;
   categoryId: string | null;
   tags: string[];
@@ -92,6 +94,19 @@ export interface DeleteVaultResult {
 export interface ClipboardCopyResult {
   clearAfterSeconds: number;
 }
+
+export interface TotpCode {
+  code: string;
+  expiresAtMs: number;
+  periodSeconds: number;
+  digits: number;
+}
+
+export type TotpUpdateMode =
+  | "keep"
+  | "replace"
+  | "remove";
+
 export type VaultFilter =
   | { type: "all" }
   | { type: "favorite" }
@@ -102,6 +117,8 @@ export interface EntryCommandInput {
   url: string;
   username: string;
   password: string;
+  totpUpdate: TotpUpdateMode;
+  totpInput: string;
   notes: string;
   categoryId: string | null;
   tags: string[];
