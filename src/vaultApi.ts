@@ -10,6 +10,7 @@ import type {
   EntryCommandInput,
   EntrySummary,
   PasswordGeneratorInput,
+  PasswordHealthReport,
   SiteIconSummary,
   VaultStatus,
 } from "./types";
@@ -93,6 +94,12 @@ export function listCategories(): Promise<CategorySummary[]> {
 
 export function listSiteIcons(): Promise<SiteIconSummary[]> {
   return invoke<SiteIconSummary[]>("list_site_icons");
+}
+
+export function getPasswordHealth(): Promise<PasswordHealthReport> {
+  return invoke<PasswordHealthReport>(
+    "get_password_health",
+  );
 }
 
 export function fetchSiteIcon(

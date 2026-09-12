@@ -42,6 +42,32 @@ export interface SiteIconSummary {
   updatedAtMs: number;
 }
 
+export type PasswordWeakReason =
+  | "empty"
+  | "tooShort"
+  | "commonPassword"
+  | "lowVariety"
+  | "singleCharacterClass";
+
+export interface PasswordHealthItem {
+  entryId: string;
+  title: string;
+  profileName: string;
+  url: string;
+  username: string;
+  weak: boolean;
+  reused: boolean;
+  weakReasons: PasswordWeakReason[];
+}
+
+export interface PasswordHealthReport {
+  totalEntries: number;
+  weakEntries: number;
+  reusedEntries: number;
+  affectedEntries: number;
+  items: PasswordHealthItem[];
+}
+
 export interface CommandError {
   code: string;
   message: string;

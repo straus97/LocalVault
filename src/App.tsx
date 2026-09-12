@@ -16,6 +16,7 @@ import BackupRestoreDialog from "./BackupRestoreDialog";
 import ChangeMasterPasswordDialog from "./ChangeMasterPasswordDialog";
 import CategoryEditor from "./CategoryEditor";
 import EntryEditor from "./EntryEditor";
+import PasswordHealthPanel from "./PasswordHealthPanel";
 import "./App.css";
 import type {
   CategoryCommandInput,
@@ -24,6 +25,7 @@ import type {
   EntryCommandInput,
   EntryDetails,
   EntrySummary,
+  PasswordHealthReport,
   SiteIconSummary,
   VaultFilter,
   VaultStatus,
@@ -40,6 +42,7 @@ import {
   copyEntryPassword,
   fetchSiteIcon,
   getEntry,
+  getPasswordHealth,
   getRecentVaults,
   getVaultStatus,
   listCategories,
@@ -383,6 +386,26 @@ const [entries, setEntries] =
       action: "fetch" | "delete";
     } | null>(null);
 
+  const [workspaceMode, setWorkspaceMode] =
+    useState<"vault" | "security">("vault");
+
+  const [
+    passwordHealth,
+    setPasswordHealth,
+  ] = useState<PasswordHealthReport | null>(
+    null,
+  );
+
+  const [
+    passwordHealthBusy,
+    setPasswordHealthBusy,
+  ] = useState(false);
+
+  const [
+    passwordHealthError,
+    setPasswordHealthError,
+  ] = useState<string | null>(null);
+
   const [filter, setFilter] =
     useState<VaultFilter>({ type: "all" });
 
@@ -452,6 +475,7 @@ const [
 
   const detailsRequest = useRef(0);
   const siteIconRequest = useRef(0);
+  const passwordHealthRequest = useRef(0);
 
   async function loadUnlockedData() {
     const [
@@ -479,6 +503,108 @@ const [
     setCopyMessage(null);
   }
 
+  function activateVaultFilter(
+    nextFilter: VaultFilter,
+  ) {
+    passwordHealthRequest.current += 1;
+
+    setPasswordHealthBusy(false);
+    setPasswordHealthError(null);
+    setPasswordHealth(null);
+
+    setWorkspaceMode("vault");
+    setFilter(nextFilter);
+  }
+
+  async function refreshPasswordHealth() {
+    const request =
+      ++passwordHealthRequest.current;
+
+    setPasswordHealthBusy(true);
+    setPasswordHealthError(null);
+
+    try {
+      const report =
+        await getPasswordHealth();
+
+      if (
+        request ===
+        passwordHealthRequest.current
+      ) {
+        setPasswordHealth(report);
+      }
+    } catch (error) {
+      if (
+        request ===
+        passwordHealthRequest.current
+      ) {
+        setPasswordHealthError(
+          friendlyError(error),
+        );
+      }
+    } finally {
+      if (
+        request ===
+        passwordHealthRequest.current
+      ) {
+        setPasswordHealthBusy(false);
+      }
+    }
+  }
+
+  function openPasswordHealth() {
+    /*
+     * Do not keep full EntryDetails, including the
+     * selected password, mounted while Security
+     * Center is visible.
+     */
+    clearSecretView();
+
+    setEntryCreatePreset(null);
+    setEntryEditorMode(null);
+    setEntryMutationError(null);
+
+    setEditingCategory(null);
+    setCategoryEditorMode(null);
+    setCategoryMutationError(null);
+
+    setWorkspaceMode("security");
+    setPasswordHealth(null);
+    setPasswordHealthError(null);
+
+    void refreshPasswordHealth();
+  }
+
+  function openHealthEntry(
+    entryId: string,
+  ) {
+    const entry =
+      entries.find(
+        (candidate) =>
+          candidate.id === entryId,
+      );
+
+    if (!entry) {
+      setPasswordHealthError(
+        "Запись больше не существует.",
+      );
+
+      return;
+    }
+
+    passwordHealthRequest.current += 1;
+
+    setPasswordHealthBusy(false);
+    setPasswordHealthError(null);
+    setPasswordHealth(null);
+
+    setWorkspaceMode("vault");
+    setFilter({ type: "all" });
+    setSearch("");
+
+    void selectEntry(entry);
+  }
+
   function clearUnlockedData() {
     setCategoryEditorMode(null);
     setEditingCategory(null);
@@ -487,8 +613,17 @@ const [
     setEntryEditorMode(null);
     setEntryMutationError(null);
     clearSecretView();
+
     siteIconRequest.current += 1;
+    passwordHealthRequest.current += 1;
+
     setSiteIconBusy(null);
+
+    setPasswordHealthBusy(false);
+    setPasswordHealthError(null);
+    setPasswordHealth(null);
+    setWorkspaceMode("vault");
+
     setEntries([]);
     setCategories([]);
     setSiteIcons([]);
@@ -2180,12 +2315,13 @@ ${path}
             <button
               type="button"
               className={
+                workspaceMode === "vault" &&
                 filter.type === "all"
                   ? "nav-item active"
                   : "nav-item"
               }
               onClick={() =>
-                setFilter({
+                activateVaultFilter({
                   type: "all",
                 })
               }
@@ -2200,12 +2336,13 @@ ${path}
             <button
               type="button"
               className={
+                workspaceMode === "vault" &&
                 filter.type === "favorite"
                   ? "nav-item active"
                   : "nav-item"
               }
               onClick={() =>
-                setFilter({
+                activateVaultFilter({
                   type: "favorite",
                 })
               }
@@ -2215,6 +2352,32 @@ ${path}
               </span>
               <span>Избранное</span>
               <small>{favoriteCount}</small>
+            </button>
+
+            <button
+              type="button"
+              className={
+                workspaceMode === "security"
+                  ? "nav-item active"
+                  : "nav-item"
+              }
+              onClick={openPasswordHealth}
+            >
+              <span
+                className="nav-symbol"
+                aria-hidden="true"
+              >
+                ◇
+              </span>
+
+              <span>Безопасность</span>
+
+              <small>
+                {workspaceMode === "security" &&
+                passwordHealth
+                  ? passwordHealth.affectedEntries
+                  : ""}
+              </small>
             </button>
           </nav>
 
@@ -2262,6 +2425,8 @@ ${path}
                       ).length;
 
                     const active =
+                      workspaceMode ===
+                        "vault" &&
                       filter.type ===
                         "category" &&
                       filter.categoryId ===
@@ -2277,7 +2442,7 @@ ${path}
                         }
                         key={category.id}
                         onClick={() =>
-                          setFilter({
+                          activateVaultFilter({
                             type:
                               "category",
                             categoryId:
@@ -2297,7 +2462,8 @@ ${path}
               </div>
             )}
           </div>
-          {filter.type === "category" && (
+          {workspaceMode === "vault" &&
+            filter.type === "category" && (
             <button
               type="button"
               className="manage-category-button"
@@ -2328,7 +2494,25 @@ ${path}
           </div>
         </aside>
 
-        <section className="entry-column">
+        {workspaceMode === "security" && (
+          <PasswordHealthPanel
+            report={passwordHealth}
+            loading={passwordHealthBusy}
+            error={passwordHealthError}
+            onRefresh={() =>
+              void refreshPasswordHealth()
+            }
+            onOpenEntry={openHealthEntry}
+          />
+        )}
+
+        <section
+          className={
+            workspaceMode === "security"
+              ? "entry-column workspace-column-hidden"
+              : "entry-column"
+          }
+        >
           <div className="entry-column-header">
             <div>
               <span className="column-eyebrow">
@@ -2517,7 +2701,13 @@ ${path}
           </div>
         </section>
 
-        <section className="detail-column">
+        <section
+          className={
+            workspaceMode === "security"
+              ? "detail-column workspace-column-hidden"
+              : "detail-column"
+          }
+        >
           {detailsLoading ? (
             <div className="detail-placeholder">
               <div className="detail-spinner" />
