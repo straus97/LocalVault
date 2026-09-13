@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "crates/localvault-core"]
+default-members = ["src-tauri"]
+
+# Moved unchanged from src-tauri/Cargo.toml: in a Cargo workspace, [profile.*]
+# tables are only honored at the workspace root, so this had to relocate here
+# to keep release build behavior identical to before the workspace existed.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

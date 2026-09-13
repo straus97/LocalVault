@@ -1,0 +1,6 @@
+[build]
+# Keep using the existing target directory (previously the implicit default
+# when src-tauri/Cargo.toml was the only manifest) so introducing the
+# workspace root does not relocate build output or invalidate the existing
+# incremental build cache.
+target-dir = "src-tauri/target"

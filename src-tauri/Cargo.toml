@@ -45,12 +45,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "=5.4.1"
 
-[profile.release]
-codegen-units = 1
-lto = true
-opt-level = 3
-panic = "abort"
-strip = true
+# [profile.release] moved to the workspace root Cargo.toml — Cargo only
+# honors profile tables from the workspace root, not member manifests.
 
 [dev-dependencies]
 tempfile = "3.27.0"

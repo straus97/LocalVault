@@ -1,0 +1,12 @@
+[package]
+name = "localvault-core"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable LocalVault core (skeleton — no logic yet)"
+authors = ["Штраус Никита Алексеевич"]
+publish = false
+
+[lib]
+name = "localvault_core"
+
+[dependencies]
