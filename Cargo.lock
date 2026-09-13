@@ -2089,15 +2089,14 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 name = "localvault"
 version = "1.0.0"
 dependencies = [
- "argon2",
  "atomic-write-file",
  "base64 0.23.1",
- "chacha20poly1305",
  "clipboard-win",
  "data-encoding",
  "getrandom 0.4.3",
  "hmac",
  "image",
+ "localvault-core",
  "reqwest 0.12.28",
  "scraper",
  "serde",
@@ -2118,6 +2117,15 @@ dependencies = [
 [[package]]
 name = "localvault-core"
 version = "0.1.0"
+dependencies = [
+ "argon2",
+ "chacha20poly1305",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "zeroize",
+]
 
 [[package]]
 name = "lock_api"

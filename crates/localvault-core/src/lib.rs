@@ -1,4 +1,9 @@
-//! Skeleton for the future shared LocalVault core crate.
+//! Shared LocalVault core crate.
 //!
-//! No production logic lives here yet; see docs/ARCHITECTURE.md for the
-//! planned extraction boundary.
+//! Holds the platform-independent vault cryptography and format layer.
+//! See docs/ARCHITECTURE.md for the target extraction boundary; the `crypto`
+//! module is intentionally not public — only the narrow set of types its
+//! public interfaces require flow out through `vault::format`.
+
+mod crypto;
+pub mod vault;

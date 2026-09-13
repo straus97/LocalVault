@@ -4,20 +4,16 @@ use zeroize::Zeroizing;
 
 use super::{SessionError, UnlockedVaultSession};
 
-use crate::{
-    crypto::CryptoError,
-    vault::{
-        format::{
-            open_envelope_with_key, rewrap_envelope_master_password, VaultEnvelope, VaultError,
-        },
-        storage::{load_envelope, save_envelope_atomic, StorageError},
-    },
+use crate::vault::storage::{load_envelope, save_envelope_atomic, StorageError};
+use localvault_core::vault::format::{
+    open_envelope_with_key, rewrap_envelope_master_password, CryptoError, SecretKey, VaultEnvelope,
+    VaultError,
 };
 
 fn authenticate_current_password(
     password: &str,
     envelope: &VaultEnvelope,
-) -> Result<crate::crypto::keys::SecretKey, SessionError> {
+) -> Result<SecretKey, SessionError> {
     match open_envelope_with_key(password, envelope) {
         Ok((vault_key, _plaintext)) => Ok(vault_key),
 
@@ -153,9 +149,9 @@ mod tests {
 
     use crate::vault::{
         data::VaultEntry,
-        format::open_envelope,
         storage::{load_envelope, save_envelope_atomic},
     };
+    use localvault_core::vault::format::open_envelope;
 
     const OLD_PASSWORD: &str = "old-master-password-test-only";
 
@@ -308,7 +304,8 @@ mod tests {
         let mut session = session_with_saved_entry(&path);
 
         let replacement =
-            crate::vault::format::create_envelope(OLD_PASSWORD, b"external replacement").unwrap();
+            localvault_core::vault::format::create_envelope(OLD_PASSWORD, b"external replacement")
+                .unwrap();
 
         save_envelope_atomic(&path, &replacement).unwrap();
 

@@ -660,10 +660,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::vault::{
-        format::{create_envelope, open_envelope},
-        storage::{load_envelope, save_envelope_atomic},
-    };
+    use crate::vault::storage::{load_envelope, save_envelope_atomic};
+    use localvault_core::vault::format::{create_envelope, open_envelope};
 
     const NOW_MS: i64 = 1_700_000_000_000;
 

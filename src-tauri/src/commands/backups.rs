@@ -40,9 +40,9 @@ mod tests {
 
     use crate::{
         app_state::AppStateError,
-        crypto::CryptoError,
-        vault::{backup::BackupError, format::VaultError, storage::StorageError},
+        vault::{backup::BackupError, storage::StorageError},
     };
+    use localvault_core::vault::format::{CryptoError, VaultError};
 
     #[test]
     fn existing_backup_destination_has_stable_error() {

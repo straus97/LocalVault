@@ -9,7 +9,7 @@ use atomic_write_file::AtomicWriteFile;
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::format::{VaultEnvelope, VaultError};
+use localvault_core::vault::format::{VaultEnvelope, VaultError};
 
 pub const MAX_VAULT_FILE_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -383,7 +383,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::vault::format::{create_envelope, open_envelope, VAULT_MAGIC};
+    use localvault_core::vault::format::{create_envelope, open_envelope, VAULT_MAGIC};
 
     const MASTER_PASSWORD: &str = "storage-layer-master-password-test-only";
 

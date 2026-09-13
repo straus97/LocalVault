@@ -2,11 +2,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub use crate::crypto::{cipher::EncryptedBlob, kdf::KdfParams, keys::SecretKey, CryptoError};
 use crate::crypto::{
-    cipher::{decrypt, encrypt, EncryptedBlob},
-    kdf::{derive_master_key, KdfParams},
-    keys::{random_salt, random_secret_key, SecretKey, KEY_LEN, SALT_LEN},
-    CryptoError,
+    cipher::{decrypt, encrypt},
+    kdf::derive_master_key,
+    keys::{random_salt, random_secret_key, KEY_LEN, SALT_LEN},
 };
 
 pub const VAULT_MAGIC: &str = "LOCALVAULT";
@@ -52,7 +52,7 @@ impl VaultEnvelope {
     }
 }
 
-pub(crate) fn create_envelope_with_key(
+pub fn create_envelope_with_key(
     master_password: &str,
     plaintext: &[u8],
 ) -> Result<(VaultEnvelope, SecretKey), VaultError> {
@@ -92,7 +92,7 @@ pub fn create_envelope(
     Ok(envelope)
 }
 
-pub(crate) fn open_envelope_with_key(
+pub fn open_envelope_with_key(
     master_password: &str,
     envelope: &VaultEnvelope,
 ) -> Result<(SecretKey, Zeroizing<Vec<u8>>), VaultError> {
@@ -119,7 +119,7 @@ pub(crate) fn open_envelope_with_key(
     Ok((vault_key, plaintext))
 }
 
-pub(crate) fn reseal_envelope(
+pub fn reseal_envelope(
     envelope: &VaultEnvelope,
     vault_key: &[u8; KEY_LEN],
     plaintext: &[u8],
@@ -133,7 +133,7 @@ pub(crate) fn reseal_envelope(
     Ok(updated)
 }
 
-pub(crate) fn rewrap_envelope_master_password(
+pub fn rewrap_envelope_master_password(
     envelope: &VaultEnvelope,
     vault_key: &SecretKey,
     new_master_password: &str,

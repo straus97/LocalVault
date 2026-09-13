@@ -16,15 +16,15 @@ use zeroize::Zeroizing;
 
 use crate::{
     app_state::{AppState, AppStateError, VaultStatus},
-    crypto::CryptoError,
     password_generator::PasswordGeneratorError,
     secure_clipboard::{SecureClipboard, SecureClipboardError},
     totp::TotpError,
     vault::{
-        backup::BackupError, format::VaultError, lifecycle::VaultLifecycleError,
-        session::SessionError, storage::StorageError,
+        backup::BackupError, lifecycle::VaultLifecycleError, session::SessionError,
+        storage::StorageError,
     },
 };
+use localvault_core::vault::format::{CryptoError, VaultError};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

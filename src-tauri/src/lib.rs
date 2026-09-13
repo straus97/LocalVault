@@ -30,7 +30,6 @@ fn start_auto_lock_watcher(app: AppHandle) {
 }
 pub mod app_state;
 pub mod commands;
-pub mod crypto;
 mod password_generator;
 mod recent_vaults;
 mod secure_clipboard;

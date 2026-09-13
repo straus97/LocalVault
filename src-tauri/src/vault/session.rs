@@ -14,15 +14,14 @@ use std::{
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::crypto::keys::SecretKey;
+use localvault_core::vault::format::{
+    create_envelope_with_key, open_envelope_with_key, reseal_envelope, SecretKey, VaultEnvelope,
+    VaultError,
+};
 
 use super::{
     data::{
         VaultData, VaultDataError, LEGACY_VAULT_DATA_SCHEMA_VERSION, VAULT_DATA_SCHEMA_VERSION,
-    },
-    format::{
-        create_envelope_with_key, open_envelope_with_key, reseal_envelope, VaultEnvelope,
-        VaultError,
     },
     storage::{load_envelope, save_envelope_atomic_with_backup, StorageError},
 };
@@ -324,14 +323,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{
-        crypto::CryptoError,
-        vault::{
-            data::VaultEntry,
-            format::{create_envelope, open_envelope, VaultError},
-            storage::{load_envelope, save_envelope_atomic},
-        },
+    use crate::vault::{
+        data::VaultEntry,
+        storage::{load_envelope, save_envelope_atomic},
     };
+    use localvault_core::vault::format::{create_envelope, open_envelope, CryptoError, VaultError};
 
     const NOW_MS: i64 = 1_700_000_000_000;
 

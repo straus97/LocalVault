@@ -5,9 +5,9 @@ use zeroize::Zeroizing;
 
 use super::{
     data::{VaultData, VaultDataError},
-    format::{open_envelope, VaultError},
     storage::{ensure_distinct_paths, load_envelope, save_envelope_atomic_new, StorageError},
 };
+use localvault_core::vault::format::{open_envelope, VaultError};
 
 #[derive(Debug, Error)]
 pub enum BackupError {
@@ -68,20 +68,17 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{
-        crypto::CryptoError,
-        vault::{
-            data::{VaultData, VaultEntry},
-            format::{create_envelope, VaultError},
-            storage::{load_envelope, save_envelope_atomic, StorageError},
-        },
+    use crate::vault::{
+        data::{VaultData, VaultEntry},
+        storage::{load_envelope, save_envelope_atomic, StorageError},
     };
+    use localvault_core::vault::format::{create_envelope, CryptoError, VaultError};
 
     const NOW_MS: i64 = 1_700_000_000_000;
 
     const MASTER_PASSWORD: &str = "backup-restore-master-test-only";
 
-    fn valid_envelope() -> crate::vault::format::VaultEnvelope {
+    fn valid_envelope() -> localvault_core::vault::format::VaultEnvelope {
         let mut data = VaultData::new(NOW_MS).unwrap();
 
         let mut entry = VaultEntry::new("Backup test", NOW_MS + 1).unwrap();
