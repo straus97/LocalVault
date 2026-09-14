@@ -1,14 +1,14 @@
 # Project Status
 
-Authoritative as of the 1R (local TOTP) checkpoint. Update this file whenever a checkpoint, branch, or HEAD changes — do not let it drift.
+Authoritative as of the 1S-C3 (TOTP module core extraction) checkpoint. Update this file whenever a checkpoint, branch, or HEAD changes — do not let it drift.
 
-## Branch / HEAD
+## Branch / implementation checkpoint
 
 - Repository: https://github.com/straus97/LocalVault
 - Current development branch: `redesign/light-ui-v1.1`
-- Current authoritative HEAD: `47c23158591218131c97d3ab27940cddd5b731c9` — `feat: add local TOTP authentication UI`
-- Previous commit: `af1b2e657438e94830a941f07ff375103cd65c46` — `feat: add local TOTP authentication backend`
-- Working tree at the 1R checkpoint: clean
+- Current implementation checkpoint: `8f0d5a36c73cc8d7bbee936f6df6a55bd1533aff` — `refactor: extract TOTP module into core`
+- Preceding checkpoints on this branch: `bfd7fec` (extract persisted vault data into core, 1S-C2), `4721b05` (extract crypto and vault format into core, 1S-C1), `07e15fd` (add LocalVault core workspace skeleton), `bcdb1ad` (add pre-extraction compatibility safety net, 1S-B1), `c5eb5e6` (record 1R completion and Android roadmap), `47c2315` (1R frontend), `af1b2e6` (1R backend)
+- Working tree at this checkpoint: clean
 - Nothing here should be assumed pushed unless `git status`/`git log` against the remote explicitly confirms it.
 
 ## Existing v1.0.0 release (do not overwrite)
@@ -51,14 +51,24 @@ Authoritative as of the 1R (local TOTP) checkpoint. Update this file whenever a 
 - Frontend: `47c23158591218131c97d3ab27940cddd5b731c9`
 - Full design/QA/security detail: `@docs/HANDOFF_1R_COMPLETE.md`
 
-## Test / gate status (at 1R checkpoint)
+### 1S — Multi-platform core preparation (IN PROGRESS)
+
+Not complete — see `@docs/ROADMAP.md` for full 1S scope and what remains open. Checkpoints landed so far, in order:
+
+- **1S-B1** — `bcdb1ad`: pre-extraction compatibility safety net (`src-tauri/tests/compat_baseline.rs`, committed schema-1/schema-2 fixtures) committed before any code moved, to catch a regression in persisted-format compatibility during extraction.
+- **1S-C1** — `4721b05`: extracted crypto primitives (Argon2id KDF, XChaCha20-Poly1305 AEAD, key/salt helpers — kept private) and the authenticated vault envelope/format layer into `localvault-core` (`localvault_core::vault::format`).
+- **1S-C2** — `bfd7fec`: extracted the persisted vault domain/data model (`VaultData`, entries, categories, site icons, `TotpConfig`/`TotpAlgorithm`, schema validation, zeroization) into `localvault_core::vault::data`.
+- **1S-C3** — `8f0d5a3`: extracted the TOTP RFC 6238 parser/generator into `localvault_core::totp`, as a strict mechanical move (no API/behavior redesign).
+- Each C1-C3 checkpoint is a pure ownership/module-boundary move — no cryptographic, parsing, validation, or error-semantics changes; ordinary Rust tests (unit + `compat_baseline` + `data_storage_integration`) were used as the compatibility gate at every step.
+- **Still open within 1S** (not yet extracted or decided): password-health placement, password-generator placement, and any further core/adapter boundary work. See `@docs/ARCHITECTURE.md` for exactly what remains outside `localvault-core` today.
+- **1T (Android) has not started.**
+
+## Test / gate status (at the 1S-C3 checkpoint)
 
 - Frontend production build: PASS
-- Rust tests: 222 PASS
-- Strict clippy (`-D warnings`): PASS
-- `cargo check`: PASS
-- `cargo check --release`: PASS
-- Manual TOTP QA: PASS
+- Rust tests: 228 PASS (`localvault-core` lib 43, `localvault` lib 178, `compat_baseline` 6, `data_storage_integration` 1)
+- Strict clippy (`-D warnings`, workspace): PASS
+- `cargo check` / `cargo check --release` (workspace): PASS
 - Working tree: CLEAN
 
 ## Vault schema
@@ -71,4 +81,4 @@ Authoritative as of the 1R (local TOTP) checkpoint. Update this file whenever a 
 
 ## Immediate next phase
 
-**1S — Multi-platform core preparation**, starting with **1S-A: architecture audit** (audit/design only, no large refactor yet). See `@docs/ROADMAP.md` for full scope and `@docs/ARCHITECTURE.md` for the target module boundary. See `@docs/HANDOFF_1R_COMPLETE.md` for the exact handoff state and audit checklist for 1S-A.
+Still **1S — Multi-platform core preparation**. Crypto/vault-format (1S-C1), persisted vault data (1S-C2), and TOTP (1S-C3) are extracted into `localvault-core`; password-health placement, password-generator placement, and the remainder of the core/adapter boundary are still undecided. See `@docs/ROADMAP.md` for full scope and open items, and `@docs/ARCHITECTURE.md` for the current (not merely target) module boundary. `@docs/HANDOFF_1R_COMPLETE.md` remains useful for pre-1S historical context but its "next task: 1S-A" framing is superseded by this section.

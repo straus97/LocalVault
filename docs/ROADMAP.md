@@ -26,9 +26,11 @@ Stages 1S through 1X. Each stage depends on the prior stage's exit criteria bein
 - mobile constraints
 - future sync constraints
 
-Output of 1S-A: a low-risk extraction plan for a reusable Rust crate/library (working name `localvault-core` — do not finalize the name without inspecting repository/crate-registry conventions first). 1S must also prepare for future sync metadata but must **not** implement synchronization prematurely.
+Output of 1S-A was a low-risk extraction plan for the reusable Rust crate/library now established as `localvault-core`. 1S must also prepare for future sync metadata but must **not** implement synchronization prematurely.
 
-**Depends on:** nothing outstanding — this is the current next stage after 1R.
+**Depends on:** 1R (complete). 1S is the current in-progress stage; see the progress record below.
+
+**Progress (extraction checkpoints, in order):** `localvault-core` exists as a workspace member (`bcdb1ad` compatibility safety net, `07e15fd` workspace skeleton), and three low-risk mechanical extractions have landed into it: crypto primitives + vault envelope/format (1S-C1, `4721b05`), the persisted vault domain/data model (1S-C2, `bfd7fec`), and the TOTP RFC 6238 parser/generator (1S-C3, `8f0d5a3`). These are ownership/module-boundary moves only, with no cryptographic or behavioral changes. 1S is **not** complete: password-health placement and password-generator placement are still undecided, and the rest of the audit checklist above (AppState dependencies, filesystem boundary, mobile constraints, future sync constraints, etc.) has not been re-verified against the post-extraction state. 1T has not started.
 
 ## 1T — Android mobile MVP
 

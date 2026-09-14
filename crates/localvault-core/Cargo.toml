@@ -2,7 +2,7 @@
 name = "localvault-core"
 version = "0.1.0"
 edition = "2021"
-description = "Reusable LocalVault core (skeleton — no logic yet)"
+description = "Portable LocalVault security and vault-domain core: crypto, vault format, data model, and TOTP"
 authors = ["Штраус Никита Алексеевич"]
 publish = false
 

@@ -1,5 +1,7 @@
 # Security Model
 
+As of the 1S-C1/C2/C3 checkpoints, the cryptography, vault format, persisted data model, and TOTP engine described below live in `localvault-core` (`crates/localvault-core/src/crypto`, `vault::format`, `vault::data`, `totp` — see `@docs/ARCHITECTURE.md`) rather than directly in `src-tauri`. This was an ownership/module-boundary move only: every security property on this page held before that extraction and holds unchanged after it.
+
 ## Cryptographic model
 
 - **Master password:** never stored. Used to derive a Master Key via Argon2id.
