@@ -4,10 +4,9 @@ use serde::Serialize;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{
-    totp::generate_totp,
-    vault::session::{SessionError, UnlockedVaultSession},
-};
+use localvault_core::totp::generate_totp;
+
+use crate::vault::session::{SessionError, UnlockedVaultSession};
 
 use super::{unix_time_ms, AppState, AppStateError};
 
@@ -102,7 +101,9 @@ mod tests {
     use tempfile::tempdir;
     use zeroize::Zeroizing;
 
-    use crate::{totp::parse_totp_input, vault::session::EntryInput};
+    use localvault_core::totp::parse_totp_input;
+
+    use crate::vault::session::EntryInput;
 
     use super::*;
 

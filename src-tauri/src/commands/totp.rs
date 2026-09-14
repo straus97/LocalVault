@@ -47,7 +47,9 @@ pub fn copy_entry_totp(
 
 #[cfg(test)]
 mod tests {
-    use crate::{app_state::AppStateError, totp::TotpError};
+    use localvault_core::totp::TotpError;
+
+    use crate::app_state::AppStateError;
 
     use super::*;
 

@@ -5,10 +5,11 @@ use tauri::State;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use localvault_core::totp::{parse_totp_input, TotpError};
+
 use crate::{
     app_state::AppState,
     secure_clipboard::SecureClipboard,
-    totp::{parse_totp_input, TotpError},
     vault::session::{EntryDetails, EntryInput, EntrySummary, TotpUpdate},
 };
 

@@ -7,7 +7,7 @@ use thiserror::Error;
 use url::form_urlencoded;
 use zeroize::{Zeroize, Zeroizing};
 
-use localvault_core::vault::data::{
+use crate::vault::data::{
     TotpAlgorithm, TotpConfig, MAX_TOTP_PERIOD_SECONDS, MAX_TOTP_SECRET_BYTES,
     MIN_TOTP_SECRET_BYTES,
 };

@@ -3,7 +3,7 @@
 //! These integration tests exist to protect LocalVault's persisted vault
 //! format and upgrade-on-write behavior ahead of the `localvault-core`
 //! extraction (1S). They exercise the CURRENT, unmodified public vault API
-//! (`localvault_lib::vault::*`, `localvault_lib::totp::*`) against two
+//! (`localvault_lib::vault::*`, `localvault_core::totp::*`) against two
 //! committed synthetic fixtures:
 //!
 //! - `fixtures/compat/schema2_baseline.envelope.json` -- schema version 2,
@@ -53,6 +53,7 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use localvault_core::totp::generate_totp;
 use localvault_core::vault::{
     data::{
         SiteIcon, TotpAlgorithm, TotpConfig, VaultCategory, VaultData, VaultEntry,
@@ -60,12 +61,9 @@ use localvault_core::vault::{
     },
     format::open_envelope,
 };
-use localvault_lib::{
-    totp::generate_totp,
-    vault::{
-        session::{CategoryInput, UnlockedVaultSession},
-        storage::load_envelope,
-    },
+use localvault_lib::vault::{
+    session::{CategoryInput, UnlockedVaultSession},
+    storage::load_envelope,
 };
 use uuid::Uuid;
 use zeroize::Zeroizing;

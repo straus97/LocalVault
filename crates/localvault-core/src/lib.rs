@@ -6,4 +6,5 @@
 //! public interfaces require flow out through `vault::format`.
 
 mod crypto;
+pub mod totp;
 pub mod vault;

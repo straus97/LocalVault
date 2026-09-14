@@ -18,13 +18,15 @@ use crate::{
     app_state::{AppState, AppStateError, VaultStatus},
     password_generator::PasswordGeneratorError,
     secure_clipboard::{SecureClipboard, SecureClipboardError},
-    totp::TotpError,
     vault::{
         backup::BackupError, lifecycle::VaultLifecycleError, session::SessionError,
         storage::StorageError,
     },
 };
-use localvault_core::vault::format::{CryptoError, VaultError};
+use localvault_core::{
+    totp::TotpError,
+    vault::format::{CryptoError, VaultError},
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
