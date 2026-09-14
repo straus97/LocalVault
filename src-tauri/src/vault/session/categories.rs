@@ -4,7 +4,7 @@ use serde::Serialize;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use crate::vault::data::VaultCategory;
+use localvault_core::vault::data::VaultCategory;
 
 use super::{SessionError, UnlockedVaultSession};
 

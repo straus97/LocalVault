@@ -3,10 +3,8 @@ use serde::Serialize;
 use url::Url;
 use zeroize::Zeroize;
 
-use crate::vault::{
-    data::{SiteIcon, VaultData, VaultDataError},
-    session::SessionError,
-};
+use crate::vault::session::SessionError;
+use localvault_core::vault::data::{SiteIcon, VaultData, VaultDataError};
 
 use super::{unix_time_ms, AppState, AppStateError};
 

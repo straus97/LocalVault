@@ -3,11 +3,13 @@ use std::path::Path;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use super::{
-    data::{VaultData, VaultDataError},
-    storage::{ensure_distinct_paths, load_envelope, save_envelope_atomic_new, StorageError},
+use super::storage::{
+    ensure_distinct_paths, load_envelope, save_envelope_atomic_new, StorageError,
 };
-use localvault_core::vault::format::{open_envelope, VaultError};
+use localvault_core::vault::{
+    data::{VaultData, VaultDataError},
+    format::{open_envelope, VaultError},
+};
 
 #[derive(Debug, Error)]
 pub enum BackupError {
@@ -68,11 +70,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::vault::{
+    use crate::vault::storage::{load_envelope, save_envelope_atomic, StorageError};
+    use localvault_core::vault::{
         data::{VaultData, VaultEntry},
-        storage::{load_envelope, save_envelope_atomic, StorageError},
+        format::{create_envelope, CryptoError, VaultError},
     };
-    use localvault_core::vault::format::{create_envelope, CryptoError, VaultError};
 
     const NOW_MS: i64 = 1_700_000_000_000;
 

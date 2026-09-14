@@ -88,12 +88,10 @@ pub fn delete_category(id: String, state: State<'_, AppState>) -> Result<(), Com
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        app_state::AppStateError,
-        vault::{data::VaultDataError, session::SessionError},
-    };
+    use crate::{app_state::AppStateError, vault::session::SessionError};
 
     use super::*;
+    use localvault_core::vault::data::VaultDataError;
 
     #[test]
     fn valid_category_id_parses() {

@@ -147,11 +147,8 @@ mod tests {
 
     use super::*;
 
-    use crate::vault::{
-        data::VaultEntry,
-        storage::{load_envelope, save_envelope_atomic},
-    };
-    use localvault_core::vault::format::open_envelope;
+    use crate::vault::storage::{load_envelope, save_envelope_atomic};
+    use localvault_core::vault::{data::VaultEntry, format::open_envelope};
 
     const OLD_PASSWORD: &str = "old-master-password-test-only";
 

@@ -16,7 +16,7 @@ use thiserror::Error;
 use tokio::net::lookup_host;
 use url::Url;
 
-use crate::vault::data::MAX_SITE_ICON_BYTES;
+use localvault_core::vault::data::MAX_SITE_ICON_BYTES;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 

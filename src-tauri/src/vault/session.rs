@@ -14,17 +14,17 @@ use std::{
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use localvault_core::vault::format::{
-    create_envelope_with_key, open_envelope_with_key, reseal_envelope, SecretKey, VaultEnvelope,
-    VaultError,
-};
-
-use super::{
+use localvault_core::vault::{
     data::{
         VaultData, VaultDataError, LEGACY_VAULT_DATA_SCHEMA_VERSION, VAULT_DATA_SCHEMA_VERSION,
     },
-    storage::{load_envelope, save_envelope_atomic_with_backup, StorageError},
+    format::{
+        create_envelope_with_key, open_envelope_with_key, reseal_envelope, SecretKey,
+        VaultEnvelope, VaultError,
+    },
 };
+
+use super::storage::{load_envelope, save_envelope_atomic_with_backup, StorageError};
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -323,11 +323,11 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::vault::{
+    use crate::vault::storage::{load_envelope, save_envelope_atomic};
+    use localvault_core::vault::{
         data::VaultEntry,
-        storage::{load_envelope, save_envelope_atomic},
+        format::{create_envelope, open_envelope, CryptoError, VaultError},
     };
-    use localvault_core::vault::format::{create_envelope, open_envelope, CryptoError, VaultError};
 
     const NOW_MS: i64 = 1_700_000_000_000;
 

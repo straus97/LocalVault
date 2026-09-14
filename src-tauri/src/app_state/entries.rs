@@ -1,12 +1,10 @@
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::vault::{
-    data::TotpConfig,
-    session::{EntryDetails, EntryInput, EntrySummary, TotpUpdate},
-};
+use crate::vault::session::{EntryDetails, EntryInput, EntrySummary, TotpUpdate};
 
 use super::{unix_time_ms, AppState, AppStateError};
+use localvault_core::vault::data::TotpConfig;
 
 impl AppState {
     pub fn list_entries(&self) -> Result<Vec<EntrySummary>, AppStateError> {

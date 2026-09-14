@@ -4,7 +4,7 @@ use serde::Serialize;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use crate::vault::data::VaultData;
+use localvault_core::vault::data::VaultData;
 
 use super::{AppState, AppStateError};
 
@@ -236,7 +236,8 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
-    use crate::vault::{data::VaultEntry, session::EntryInput};
+    use crate::vault::session::EntryInput;
+    use localvault_core::vault::data::VaultEntry;
 
     const NOW_MS: i64 = 1_700_000_000_000;
 

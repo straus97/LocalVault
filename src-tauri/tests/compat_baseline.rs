@@ -44,22 +44,25 @@
 //! `#[cfg(test)]` module, because every API needed --
 //! `UnlockedVaultSession::{unlock, create, data, list_categories,
 //! create_category}`, `localvault_core::vault::format::open_envelope`,
-//! `vault::storage::load_envelope`, `vault::data::*`, and `totp::*` -- is
-//! already `pub`. No production visibility changes were needed or made
-//! beyond the four `localvault-core` extraction functions documented in
-//! the 1S-C1 extraction task.
+//! `localvault_core::vault::data::*`, `vault::storage::load_envelope`, and
+//! `totp::*` -- is already `pub`. No production visibility changes were
+//! needed or made beyond the four `localvault-core` extraction functions
+//! documented in the 1S-C1 extraction task and the persisted `vault::data`
+//! model extraction documented in 1S-C2.
 
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use localvault_core::vault::format::open_envelope;
+use localvault_core::vault::{
+    data::{
+        SiteIcon, TotpAlgorithm, TotpConfig, VaultCategory, VaultData, VaultEntry,
+        LEGACY_VAULT_DATA_SCHEMA_VERSION, VAULT_DATA_SCHEMA_VERSION,
+    },
+    format::open_envelope,
+};
 use localvault_lib::{
     totp::generate_totp,
     vault::{
-        data::{
-            SiteIcon, TotpAlgorithm, TotpConfig, VaultCategory, VaultData, VaultEntry,
-            LEGACY_VAULT_DATA_SCHEMA_VERSION, VAULT_DATA_SCHEMA_VERSION,
-        },
         session::{CategoryInput, UnlockedVaultSession},
         storage::load_envelope,
     },

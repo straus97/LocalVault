@@ -655,17 +655,9 @@ fn char_count(value: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
-    use tempfile::tempdir;
-
     use super::*;
-    use crate::vault::storage::{load_envelope, save_envelope_atomic};
-    use localvault_core::vault::format::{create_envelope, open_envelope};
 
     const NOW_MS: i64 = 1_700_000_000_000;
-
-    const MASTER_PASSWORD: &str = "model-layer-master-password-test-only";
 
     const MODEL_TEST_SECRET: &str = "MODEL_TEST_ONLY_SECRET";
 
@@ -833,37 +825,6 @@ mod tests {
         let json = serde_json::to_vec(&data).unwrap();
 
         let restored: VaultData = serde_json::from_slice(&json).unwrap();
-
-        restored.validate().unwrap();
-
-        assert!(restored == data);
-    }
-
-    #[test]
-    fn encrypted_storage_round_trip_preserves_model_and_hides_secrets() {
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("model.lvault");
-
-        let data = valid_sample_data();
-
-        let plaintext = serde_json::to_vec(&data).unwrap();
-
-        let envelope = create_envelope(MASTER_PASSWORD, &plaintext).unwrap();
-
-        save_envelope_atomic(&path, &envelope).unwrap();
-
-        let raw = fs::read_to_string(&path).unwrap();
-
-        assert!(!raw.contains(MASTER_PASSWORD));
-        assert!(!raw.contains(MODEL_TEST_SECRET));
-        assert!(!raw.contains("user@example.test"));
-        assert!(!raw.contains("https://example.test"));
-
-        let loaded = load_envelope(&path).unwrap();
-
-        let decrypted = open_envelope(MASTER_PASSWORD, &loaded).unwrap();
-
-        let restored: VaultData = serde_json::from_slice(decrypted.as_slice()).unwrap();
 
         restored.validate().unwrap();
 

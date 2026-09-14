@@ -4,7 +4,7 @@ use serde::Serialize;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::vault::data::{TotpConfig, VaultEntry, VAULT_DATA_SCHEMA_VERSION};
+use localvault_core::vault::data::{TotpConfig, VaultEntry, VAULT_DATA_SCHEMA_VERSION};
 
 use super::{SessionError, UnlockedVaultSession};
 

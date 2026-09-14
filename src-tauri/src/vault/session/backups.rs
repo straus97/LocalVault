@@ -43,11 +43,8 @@ mod tests {
 
     use super::*;
 
-    use crate::vault::{
-        data::VaultEntry,
-        storage::{load_envelope, save_envelope_atomic, StorageError},
-    };
-    use localvault_core::vault::format::create_envelope;
+    use crate::vault::storage::{load_envelope, save_envelope_atomic, StorageError};
+    use localvault_core::vault::{data::VaultEntry, format::create_envelope};
 
     const NOW_MS: i64 = 1_700_000_000_000;
 

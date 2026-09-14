@@ -355,8 +355,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::vault::{data::VaultEntry, storage::save_envelope_atomic};
-    use localvault_core::vault::format::create_envelope;
+    use crate::vault::storage::save_envelope_atomic;
+    use localvault_core::vault::{data::VaultEntry, format::create_envelope};
 
     const MASTER_PASSWORD: &str = "app-state-master-password-test-only";
 
