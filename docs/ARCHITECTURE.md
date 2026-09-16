@@ -76,6 +76,8 @@ The following are still implemented only in `src-tauri`. Some are genuine platfo
 
 The subset of this list that is a permanent platform-adapter responsibility (not just "not yet extracted") is listed separately below in "What must stay outside the shared core."
 
+Neither password-health nor password-generator placement is a prerequisite for 1T/Android MVP: the 1S remaining-work audit (see `@docs/PROJECT_STATUS.md`, `@docs/HANDOFF_1S_COMPLETE.md`) found both to be pure, low-coupling modules that can be extracted later, without schema or cryptography risk, if and when Android needs them. They are deferred long-term architecture decisions, not blockers that hold 1S open.
+
 ## Target boundary: `localvault-core`
 
 LocalVault must not duplicate vault cryptography independently per platform. The intended long-term shape (partially realized — see "Completed core extraction" above):
@@ -90,7 +92,7 @@ localvault-core (Rust, no Tauri/platform dependency)
     +-- validation                            [DONE — 1S-C2]
     +-- migrations (schema 1 -> 2 -> ...)      [schema constants/validation DONE — 1S-C2;
     |                                           upgrade-on-write orchestration still in src-tauri/vault/session.rs]
-    +-- password health                        [NOT STARTED — placement undecided]
+    +-- password health                        [NOT STARTED — placement undecided; deferred, not required before 1T]
     +-- TOTP (RFC 6238 generation/validation)  [DONE — 1S-C3]
     +-- future sync metadata and merge/conflict semantics  [NOT STARTED]
     |
@@ -118,7 +120,7 @@ localvault-core (Rust, no Tauri/platform dependency)
 
 ## Future mobile architecture
 
-Android (1T) gets a thin adapter analogous to the current `src-tauri` adapter: platform UI on top, calling into `localvault-core` for vault/crypto/TOTP logic (currently extracted) and whatever else has landed in core by the time 1T starts. Mobile-only concerns (autofill, biometrics, camera-based QR scanning, platform secure storage for convenience unlock) live entirely in the adapter, not in the core. Password-health and password-generator placement are undecided as of this checkpoint (see "What still remains outside core" above) and are not assumed resolved by 1T.
+Android (1T) gets a thin adapter analogous to the current `src-tauri` adapter: platform UI on top, calling into `localvault-core` for vault/crypto/TOTP logic (currently extracted) and whatever else has landed in core by the time 1T starts. Mobile-only concerns (autofill, biometrics, camera-based QR scanning, platform secure storage for convenience unlock) live entirely in the adapter, not in the core. Password-health and password-generator placement are undecided as of this checkpoint (see "What still remains outside core" above); the 1S remaining-work audit confirmed neither is required to be resolved before 1T, though either could still move into core later if a concrete Android need arises.
 
 ## Future sync abstraction
 

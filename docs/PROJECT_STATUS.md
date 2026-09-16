@@ -1,12 +1,13 @@
 # Project Status
 
-Authoritative as of the 1S-C3 (TOTP module core extraction) checkpoint. Update this file whenever a checkpoint, branch, or HEAD changes — do not let it drift.
+Authoritative as of Stage 1S closure (1S remaining-work audit, evaluated against repository state `962f2a7`). Update this file when the active stage, branch, or implementation checkpoint changes — do not let it drift.
 
 ## Branch / implementation checkpoint
 
 - Repository: https://github.com/straus97/LocalVault
 - Current development branch: `redesign/light-ui-v1.1`
-- Current implementation checkpoint: `8f0d5a36c73cc8d7bbee936f6df6a55bd1533aff` — `refactor: extract TOTP module into core`
+- Current implementation checkpoint (production/core code): `8f0d5a36c73cc8d7bbee936f6df6a55bd1533aff` — `refactor: extract TOTP module into core` (1S-C3, the last checkpoint that touched `localvault-core` or `src-tauri` source)
+- Documentation/audit baseline: `962f2a7` — `docs: record completed core extraction checkpoints`. The 1S remaining-work audit was performed against this repository state and concluded Stage 1S is complete (decision A — close 1S now). The closure-documentation commit hash is intentionally not embedded in this file; obtain it from `git log` after the commit lands.
 - Preceding checkpoints on this branch: `bfd7fec` (extract persisted vault data into core, 1S-C2), `4721b05` (extract crypto and vault format into core, 1S-C1), `07e15fd` (add LocalVault core workspace skeleton), `bcdb1ad` (add pre-extraction compatibility safety net, 1S-B1), `c5eb5e6` (record 1R completion and Android roadmap), `47c2315` (1R frontend), `af1b2e6` (1R backend)
 - Working tree at this checkpoint: clean
 - Nothing here should be assumed pushed unless `git status`/`git log` against the remote explicitly confirms it.
@@ -51,16 +52,17 @@ Authoritative as of the 1S-C3 (TOTP module core extraction) checkpoint. Update t
 - Frontend: `47c23158591218131c97d3ab27940cddd5b731c9`
 - Full design/QA/security detail: `@docs/HANDOFF_1R_COMPLETE.md`
 
-### 1S — Multi-platform core preparation (IN PROGRESS)
+### 1S — Multi-platform core preparation (COMPLETE)
 
-Not complete — see `@docs/ROADMAP.md` for full 1S scope and what remains open. Checkpoints landed so far, in order:
+See `@docs/ROADMAP.md` for full 1S scope and `@docs/HANDOFF_1S_COMPLETE.md` for the closure handoff. Checkpoints landed so far, in order:
 
 - **1S-B1** — `bcdb1ad`: pre-extraction compatibility safety net (`src-tauri/tests/compat_baseline.rs`, committed schema-1/schema-2 fixtures) committed before any code moved, to catch a regression in persisted-format compatibility during extraction.
 - **1S-C1** — `4721b05`: extracted crypto primitives (Argon2id KDF, XChaCha20-Poly1305 AEAD, key/salt helpers — kept private) and the authenticated vault envelope/format layer into `localvault-core` (`localvault_core::vault::format`).
 - **1S-C2** — `bfd7fec`: extracted the persisted vault domain/data model (`VaultData`, entries, categories, site icons, `TotpConfig`/`TotpAlgorithm`, schema validation, zeroization) into `localvault_core::vault::data`.
 - **1S-C3** — `8f0d5a3`: extracted the TOTP RFC 6238 parser/generator into `localvault_core::totp`, as a strict mechanical move (no API/behavior redesign).
 - Each C1-C3 checkpoint is a pure ownership/module-boundary move — no cryptographic, parsing, validation, or error-semantics changes; ordinary Rust tests (unit + `compat_baseline` + `data_storage_integration`) were used as the compatibility gate at every step.
-- **Still open within 1S** (not yet extracted or decided): password-health placement, password-generator placement, and any further core/adapter boundary work. See `@docs/ARCHITECTURE.md` for exactly what remains outside `localvault-core` today.
+- **1S remaining-work audit** — performed at `962f2a7`: re-verified the full 1S-A checklist (module boundaries, core dependencies, `AppState` dependencies, Tauri/Windows-only dependencies, clipboard/filesystem/timing/network/backup boundaries, TOTP placement, reusable-crate boundary, test coverage, mobile constraints, future-sync constraints) against the post-extraction state and found no blocker to starting 1T. Decision: **close 1S now**.
+- **Deferred, non-blocking** (long-term placement questions, not 1T prerequisites): password-health placement and password-generator placement remain undecided — both are pure, low-coupling modules that the audit found extractable later, without schema/crypto risk, if and when Android actually needs them. See `@docs/ARCHITECTURE.md` for exactly what remains outside `localvault-core` today.
 - **1T (Android) has not started.**
 
 ## Test / gate status (at the 1S-C3 checkpoint)
@@ -81,4 +83,6 @@ Not complete — see `@docs/ROADMAP.md` for full 1S scope and what remains open.
 
 ## Immediate next phase
 
-Still **1S — Multi-platform core preparation**. Crypto/vault-format (1S-C1), persisted vault data (1S-C2), and TOTP (1S-C3) are extracted into `localvault-core`; password-health placement, password-generator placement, and the remainder of the core/adapter boundary are still undecided. See `@docs/ROADMAP.md` for full scope and open items, and `@docs/ARCHITECTURE.md` for the current (not merely target) module boundary. `@docs/HANDOFF_1R_COMPLETE.md` remains useful for pre-1S historical context but its "next task: 1S-A" framing is superseded by this section.
+**1S is complete.** Crypto/vault-format (1S-C1), persisted vault data (1S-C2), and TOTP (1S-C3) are extracted into `localvault-core`, and the 1S remaining-work audit confirmed no further extraction is required before Android work begins. Password-health placement and password-generator placement remain deferred, non-blocking long-term questions — see `@docs/ARCHITECTURE.md` for the current (not merely target) module boundary.
+
+**Next stage: 1T — Android mobile MVP architecture/bootstrap.** 1T has **not** started; no Android project, language/FFI binding (Kotlin/JNI/UniFFI), Tauri-Mobile-vs-native choice, or Android filesystem/secure-storage design exists yet. See `@docs/ROADMAP.md` for 1T scope and `@docs/HANDOFF_1S_COMPLETE.md` for the closure handoff a fresh 1T planning session should start from. `@docs/HANDOFF_1R_COMPLETE.md` remains useful for pre-1S historical context only.

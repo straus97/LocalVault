@@ -2,7 +2,7 @@
 
 Stages 1S through 1X. Each stage depends on the prior stage's exit criteria being met — do not skip ahead or parallelize stages that share a dependency below.
 
-## 1S — Multi-platform core preparation
+## 1S — Multi-platform core preparation (COMPLETE)
 
 **Goal:** prepare LocalVault's architecture for Windows + Android before any mobile UI work begins.
 
@@ -28,9 +28,9 @@ Stages 1S through 1X. Each stage depends on the prior stage's exit criteria bein
 
 Output of 1S-A was a low-risk extraction plan for the reusable Rust crate/library now established as `localvault-core`. 1S must also prepare for future sync metadata but must **not** implement synchronization prematurely.
 
-**Depends on:** 1R (complete). 1S is the current in-progress stage; see the progress record below.
+**Depends on:** 1R (complete). **Stage status:** 1S complete; 1T is next and has not started.
 
-**Progress (extraction checkpoints, in order):** `localvault-core` exists as a workspace member (`bcdb1ad` compatibility safety net, `07e15fd` workspace skeleton), and three low-risk mechanical extractions have landed into it: crypto primitives + vault envelope/format (1S-C1, `4721b05`), the persisted vault domain/data model (1S-C2, `bfd7fec`), and the TOTP RFC 6238 parser/generator (1S-C3, `8f0d5a3`). These are ownership/module-boundary moves only, with no cryptographic or behavioral changes. 1S is **not** complete: password-health placement and password-generator placement are still undecided, and the rest of the audit checklist above (AppState dependencies, filesystem boundary, mobile constraints, future sync constraints, etc.) has not been re-verified against the post-extraction state. 1T has not started.
+**Progress (extraction checkpoints, in order):** `localvault-core` exists as a workspace member (`bcdb1ad` compatibility safety net, `07e15fd` workspace skeleton), and three low-risk mechanical extractions have landed into it: crypto primitives + vault envelope/format (1S-C1, `4721b05`), the persisted vault domain/data model (1S-C2, `bfd7fec`), and the TOTP RFC 6238 parser/generator (1S-C3, `8f0d5a3`). These are ownership/module-boundary moves only, with no cryptographic or behavioral changes. A subsequent remaining-work audit (performed at `962f2a7`) re-verified the full 1S-A checklist above — including `AppState` dependencies, filesystem boundary, mobile constraints, and future sync constraints — against the post-extraction state, and found no blocker to starting 1T. **Stage 1S is complete.** Password-health placement and password-generator placement remain undecided long-term architecture questions, but neither is a 1T prerequisite: both are pure, low-coupling modules the audit found extractable later without schema/crypto risk if and when Android actually needs them. See `@docs/HANDOFF_1S_COMPLETE.md` for the closure handoff. 1T has not started.
 
 ## 1T — Android mobile MVP
 
@@ -48,7 +48,7 @@ Scope:
 - local TOTP rotation
 - basic mobile UX
 
-**Depends on:** stable core extraction from 1S (1S-A audit plus whatever low-risk extraction it recommends).
+**Depends on:** 1S (complete — see the 1S section above and `@docs/HANDOFF_1S_COMPLETE.md`).
 
 ## 1U — Sync foundation
 
