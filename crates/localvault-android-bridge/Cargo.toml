@@ -1,0 +1,32 @@
+[package]
+name = "localvault-android-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "1T-B1b architecture-proof-only Android FFI adapter: exposes exactly one synchronous, non-secret compatibility-check operation from localvault-core to Kotlin via stable UniFFI/JNA bindings. Not a general-purpose Android vault API yet."
+authors = ["Штраус Никита Алексеевич"]
+publish = false
+
+[lib]
+name = "localvault_android_bridge"
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+localvault-core = { path = "../localvault-core" }
+uniffi = "=0.32.0"
+serde_json = "1"
+thiserror = "2"
+zeroize = "1.9.0"
+
+[dev-dependencies]
+sha2 = "0.10"
+
+[features]
+# Host-only: generates Kotlin bindings via `uniffi-bindgen`. Kept out of the
+# cdylib shipped to Android so CLI tooling (clap, camino, uniffi_bindgen)
+# never links into the runtime library.
+bindgen = ["uniffi/cli"]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["bindgen"]
