@@ -1,4 +1,51 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Fallback (English) strings. Russian lives in values-ru/strings.xml. Error
+     texts are deliberately generic: they never distinguish a wrong master
+     password from a corrupted vault, and never carry internal error detail. -->
 <resources>
     <string name="app_name">LocalVault</string>
+    <string name="tagline">Local password manager</string>
+
+    <string name="choose_vault">Choose vault</string>
+    <string name="choose_another_vault">Choose a different vault</string>
+    <string name="recent_vaults">Recent vaults</string>
+    <string name="recent_vaults_empty">Vaults you open will appear here.</string>
+    <string name="remove_from_history">Remove from history</string>
+
+    <string name="vault_label">Vault</string>
+    <string name="default_vault_name">Selected vault</string>
+    <string name="master_password">Master password</string>
+    <string name="unlock">Unlock</string>
+    <string name="unlocking">Unlocking...</string>
+    <string name="lock">Lock</string>
+    <string name="back">‹ Back</string>
+
+    <string name="search">Search</string>
+    <string name="search_hint">Title, username or website</string>
+    <string name="no_entries">This vault has no entries.</string>
+    <string name="no_search_results">Nothing found.</string>
+    <plurals name="entries_count">
+        <item quantity="one">%d entry</item>
+        <item quantity="other">%d entries</item>
+    </plurals>
+
+    <string name="username">Username</string>
+    <string name="password">Password</string>
+    <string name="website">Website</string>
+    <string name="profile">Profile</string>
+    <string name="not_set">Not set</string>
+    <string name="show_password">Show password</string>
+    <string name="hide_password">Hide password</string>
+    <string name="copy_username">Copy username</string>
+    <string name="copy_password">Copy password</string>
+    <string name="copied">Copied</string>
+    <string name="clipboard_hint">Copied values are removed after 30 seconds when Android lets LocalVault check the clipboard safely. Other copied content is never touched.</string>
+
+    <string name="msg_auth">Unable to unlock vault. Check the master password and file.</string>
+    <string name="msg_format">This file is not a supported LocalVault vault.</string>
+    <string name="msg_read">Unable to read the selected file.</string>
+    <string name="msg_generic">Unable to unlock vault.</string>
+    <string name="msg_empty_password">Enter the master password.</string>
+    <string name="msg_recent_unavailable">This vault is no longer available and was removed from recent vaults.</string>
+    <string name="msg_action_failed">Something went wrong.</string>
 </resources>

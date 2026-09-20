@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="lv_background">#F3F6FB</color>
+    <color name="lv_surface">#FFFFFF</color>
+    <color name="lv_primary">#2563EB</color>
+    <color name="lv_on_primary">#FFFFFF</color>
+    <color name="lv_text">#0F172A</color>
+    <color name="lv_text_secondary">#475569</color>
+    <color name="lv_text_tertiary">#64748B</color>
+    <color name="lv_border">#DDE3EC</color>
+    <color name="lv_error">#B42318</color>
+    <color name="lv_error_bg">#FDECEA</color>
+    <color name="lv_ripple">#1F2563EB</color>
+    <color name="lv_ripple_on_primary">#33FFFFFF</color>
+</resources>

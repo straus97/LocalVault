@@ -2,15 +2,17 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!-- No permissions: the vault is chosen through the system document picker
-         (Storage Access Framework), which grants access to that one document. -->
+         (Storage Access Framework), which grants read access to that one
+         document (persisted read-only for the recent-vault list). -->
 
     <application
         android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
         android:label="@string/app_name"
-        android:theme="@android:style/Theme.Material.Light">
+        android:theme="@style/Theme.LocalVault">
 
         <!-- configChanges: rotating the phone must not destroy the Activity,
-             since that would drop the (deliberately memory-only) vault choice. -->
+             since that would drop the (deliberately memory-only) unlock state. -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|uiMode"

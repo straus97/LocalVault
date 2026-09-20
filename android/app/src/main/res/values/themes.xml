@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Framework Material light theme without an ActionBar (the screen draws
+         its own header; with targetSdk 36 the window is edge-to-edge and an
+         ActionBar overlay would cover the body). -->
+    <style name="Theme.LocalVault" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/lv_background</item>
+        <item name="android:colorAccent">@color/lv_primary</item>
+        <item name="android:textColorPrimary">@color/lv_text</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+    </style>
+</resources>

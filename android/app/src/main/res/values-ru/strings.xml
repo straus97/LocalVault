@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Русские строки. Тексты ошибок намеренно общие: они не различают неверный
+     мастер-пароль и повреждённое хранилище и не раскрывают внутренних деталей. -->
+<resources>
+    <string name="app_name">LocalVault</string>
+    <string name="tagline">Локальный менеджер паролей</string>
+
+    <string name="choose_vault">Выбрать хранилище</string>
+    <string name="choose_another_vault">Выбрать другое хранилище</string>
+    <string name="recent_vaults">Недавние хранилища</string>
+    <string name="recent_vaults_empty">Здесь появятся хранилища, которые вы откроете.</string>
+    <string name="remove_from_history">Удалить из истории</string>
+
+    <string name="vault_label">Хранилище</string>
+    <string name="default_vault_name">Выбранное хранилище</string>
+    <string name="master_password">Мастер-пароль</string>
+    <string name="unlock">Разблокировать</string>
+    <string name="unlocking">Разблокировка...</string>
+    <string name="lock">Заблокировать</string>
+    <string name="back">‹ Назад</string>
+
+    <string name="search">Поиск</string>
+    <string name="search_hint">Название, логин или сайт</string>
+    <string name="no_entries">В хранилище пока нет записей.</string>
+    <string name="no_search_results">Ничего не найдено.</string>
+    <plurals name="entries_count">
+        <item quantity="one">%d запись</item>
+        <item quantity="few">%d записи</item>
+        <item quantity="many">%d записей</item>
+        <item quantity="other">%d записи</item>
+    </plurals>
+
+    <string name="username">Логин</string>
+    <string name="password">Пароль</string>
+    <string name="website">Сайт</string>
+    <string name="profile">Профиль</string>
+    <string name="not_set">Не указан</string>
+    <string name="show_password">Показать пароль</string>
+    <string name="hide_password">Скрыть пароль</string>
+    <string name="copy_username">Копировать логин</string>
+    <string name="copy_password">Копировать пароль</string>
+    <string name="copied">Скопировано</string>
+    <string name="clipboard_hint">LocalVault удаляет скопированное значение через 30 секунд, когда Android позволяет безопасно проверить буфер обмена. Чужое содержимое не затрагивается.</string>
+
+    <string name="msg_auth">Не удалось разблокировать хранилище. Проверьте мастер-пароль и файл.</string>
+    <string name="msg_format">Этот файл не является поддерживаемым хранилищем LocalVault.</string>
+    <string name="msg_read">Не удалось прочитать выбранный файл.</string>
+    <string name="msg_generic">Не удалось разблокировать хранилище.</string>
+    <string name="msg_empty_password">Введите мастер-пароль.</string>
+    <string name="msg_recent_unavailable">Это хранилище больше недоступно и удалено из недавних.</string>
+    <string name="msg_action_failed">Что-то пошло не так.</string>
+</resources>

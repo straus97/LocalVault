@@ -2,48 +2,62 @@ package com.localvault.android.proof
 
 import android.app.Activity
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.text.Editable
 import android.text.InputType
+import android.text.TextUtils
+import android.text.TextWatcher
+import android.view.Gravity
 import android.view.View
-import android.view.Window
 import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
+import android.window.OnBackInvokedDispatcher
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import uniffi.localvault_android_bridge.BridgeException
+import uniffi.localvault_android_bridge.EntryDetails
 import uniffi.localvault_android_bridge.EntrySummary
 import uniffi.localvault_android_bridge.VaultSession
 import uniffi.localvault_android_bridge.openVault
 
 /**
- * First real LocalVault Android slice (1T-B2): pick an existing vault with the
- * system document picker, unlock it through localvault-core (via the Rust
- * bridge, off the main thread), show a read-only entry list, and lock.
+ * LocalVault Android read-only client (1T-B3): pick or re-open a recent vault,
+ * unlock it through localvault-core (via the Rust bridge, off the main thread),
+ * search the entry list, open an entry, show/copy its credentials, and lock.
  *
  * Security shape:
  *  - The decrypted vault lives only inside the Rust-owned [VaultSession]. Kotlin
- *    holds only non-secret [EntrySummary] rows, and only while unlocked.
+ *    holds only non-secret [EntrySummary]/[EntryDetails] values, and only while
+ *    unlocked. Passwords are fetched one at a time, only on an explicit
+ *    show/copy, and are never stored in a field, saved, or logged.
  *  - The master password is read from the input, the input is wiped, and the
  *    String is passed straight to the synchronous bridge call on a background
- *    thread. It is never stored, saved, logged or shown. The JVM cannot
- *    deterministically zeroize Strings, so no erasure of that copy is claimed.
- *  - The vault is locked whenever the Activity leaves the foreground.
- *  - The document Uri is kept in memory only (no persisted permission).
+ *    thread. It is never stored, saved, logged or shown.
+ *  - The JVM cannot deterministically zeroize Strings (the master password, or
+ *    a fetched entry password once it is a Java String or in a TextView), so
+ *    no erasure of those copies is claimed; lifetimes are kept narrow instead.
+ *  - The vault is locked whenever the Activity leaves the foreground, on Back
+ *    from the list, and on explicit Lock.
+ *  - Only non-secret metadata (document Uri + display name) is persisted, for
+ *    the recent-vault list, with a persistable READ-only Uri grant.
  *  - This slice is read-only: the vault file is never written.
  */
 class MainActivity : Activity() {
 
-    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, UNLOCKED }
+    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL }
 
     private class VaultReadException : Exception()
 
@@ -53,23 +67,33 @@ class MainActivity : Activity() {
         // Mirrors the desktop adapter's vault file size bound.
         const val MAX_VAULT_FILE_BYTES = 32L * 1024 * 1024
 
-        const val MSG_AUTH = "Unable to unlock vault. Check the master password and file."
-        const val MSG_FORMAT = "This file is not a supported LocalVault vault."
-        const val MSG_READ = "Unable to read the selected file."
-        const val MSG_GENERIC = "Unable to unlock vault."
-        const val MSG_EMPTY_PASSWORD = "Enter the master password."
+        const val PASSWORD_MASK = "••••••••"
     }
 
     private lateinit var content: LinearLayout
+    private lateinit var scroll: ScrollView
+    private lateinit var recents: RecentVaultStore
+    private lateinit var clipboard: SecureClipboard
 
     private var screen = Screen.NO_FILE
     private var vaultUri: Uri? = null
     private var vaultName: String = ""
-    private var statusMessage: String? = null
+    private var statusRes: Int = 0
 
     private var session: VaultSession? = null
     private var entries: List<EntrySummary> = emptyList()
+    private var searchQuery: String = ""
+    private var listScrollY: Int = 0
+    private var detail: EntryDetails? = null
+
+    // Views that hold user-entered or revealed text; nulled on every render.
     private var passwordField: EditText? = null
+    private var searchField: EditText? = null
+    private var rowsContainer: LinearLayout? = null
+    private var countView: TextView? = null
+    private var passwordValueView: TextView? = null
+    private var passwordToggleButton: Button? = null
+    private var passwordShown = false
 
     // Bumped on every lock/stop/destroy so a late background result for an
     // abandoned unlock is discarded (and its session closed) instead of shown.
@@ -78,25 +102,27 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // The framework ActionBar is dropped: with targetSdk 36 the window is
-        // edge-to-edge (enforced on Android 15+), and the ActionBar overlay was
-        // drawn on top of the body, hiding the first controls. The screen draws
-        // its own "LocalVault" heading instead. Must precede setContentView.
-        requestWindowFeature(Window.FEATURE_NO_TITLE)
+        // Screenshots and recents thumbnails are blocked in every build except
+        // a debuggable one (so development screenshots stay possible). This is
+        // derived from the app's real debuggable state, not a hard-coded flag.
+        val debuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        if (!debuggable) {
+            window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        }
 
-        // Keep entry text out of screenshots and the recent-apps thumbnail.
-        // (Intentional: this also blocks screenshots and is unrelated to layout.)
-        window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
+        recents = RecentVaultStore(this)
+        clipboard = SecureClipboard.get(this)
 
         content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
-        content.setPadding(dp(16), dp(16), dp(16), dp(32))
+        content.setPadding(dp(20), dp(16), dp(20), dp(32))
 
-        val scroll = ScrollView(this)
+        scroll = ScrollView(this)
+        scroll.isFillViewport = true
         scroll.addView(content)
 
-        // Edge-to-edge: inset the body by the system bars, display cutout and
-        // keyboard so nothing is drawn under them.
+        // Edge-to-edge (targetSdk 36): inset the body by the system bars,
+        // display cutout and keyboard so nothing is drawn under them.
         scroll.setOnApplyWindowInsetsListener { view, insets ->
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val bars =
@@ -120,13 +146,43 @@ class MainActivity : Activity() {
 
         setContentView(scroll)
 
+        // Predictive back (targetSdk 36) no longer calls onBackPressed().
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+            ) { handleBack() }
+        }
+
         render()
+    }
+
+    @Deprecated("Used only below API 33; newer APIs use OnBackInvokedCallback.")
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        handleBack()
+    }
+
+    override fun onResume() {
+        super.onResume()
+
+        // Catch-up: if a LocalVault-owned clip expired while the app could not
+        // read the clipboard, finish the cleanup now (ownership-verified).
+        clipboard.cleanupExpiredOwnedClipIfPossible()
+    }
+
+    // Clipboard reads are only possible while the window has focus (Android 10+).
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+
+        clipboard.setAppFocused(hasFocus)
     }
 
     override fun onStop() {
         super.onStop()
 
-        if (screen == Screen.UNLOCKED || screen == Screen.UNLOCKING) {
+        clipboard.setAppFocused(false)
+
+        if (screen == Screen.LIST || screen == Screen.DETAIL || screen == Screen.UNLOCKING) {
             lockVault()
         } else {
             passwordField?.let { wipe(it) }
@@ -138,6 +194,7 @@ class MainActivity : Activity() {
         val current = session
         session = null
         entries = emptyList()
+        detail = null
         closeQuietly(current)
 
         super.onDestroy()
@@ -150,22 +207,97 @@ class MainActivity : Activity() {
         if (requestCode != REQUEST_PICK_VAULT || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
 
-        vaultUri = uri
-        vaultName = queryDisplayName(uri) ?: "Selected vault"
-        statusMessage = null
-        screen = Screen.FILE_SELECTED
-        render()
+        val name = queryDisplayName(uri) ?: getString(R.string.default_vault_name)
+
+        // Remember the vault only if a persistable READ grant was actually
+        // taken; otherwise the Uri would just go stale after a restart.
+        if (takePersistableRead(uri, data.flags)) {
+            rememberVault(RecentVault(uri, name))
+        }
+
+        selectVault(uri, name)
     }
 
-    // ---------------------------------------------------------------- actions
+    // ---------------------------------------------------------------- back
+
+    private fun handleBack() {
+        when (screen) {
+            Screen.DETAIL -> closeDetail()
+            Screen.LIST, Screen.UNLOCKING -> lockVault()
+            Screen.FILE_SELECTED -> {
+                vaultUri = null
+                vaultName = ""
+                statusRes = 0
+                screen = Screen.NO_FILE
+                render()
+            }
+            Screen.NO_FILE -> finish()
+        }
+    }
+
+    // ---------------------------------------------------------------- vault choice
 
     @Suppress("DEPRECATION")
     private fun openPicker() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
         intent.addCategory(Intent.CATEGORY_OPENABLE)
         intent.type = "*/*"
+        // Read access only; ask for a grant that survives process restarts.
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         startActivityForResult(intent, REQUEST_PICK_VAULT)
     }
+
+    private fun selectVault(uri: Uri, name: String) {
+        vaultUri = uri
+        vaultName = name
+        statusRes = 0
+        screen = Screen.FILE_SELECTED
+        render()
+    }
+
+    private fun selectRecent(vault: RecentVault) {
+        val stillGranted =
+            contentResolver.persistedUriPermissions.any { it.uri == vault.uri && it.isReadPermission }
+
+        if (!stillGranted) {
+            forgetVault(vault.uri)
+            statusRes = R.string.msg_recent_unavailable
+            render()
+            return
+        }
+
+        rememberVault(vault)
+        selectVault(vault.uri, vault.name)
+    }
+
+    private fun takePersistableRead(uri: Uri, flags: Int): Boolean {
+        if ((flags and Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION) == 0) return false
+
+        return try {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            true
+        } catch (error: Exception) {
+            false
+        }
+    }
+
+    private fun rememberVault(vault: RecentVault) {
+        for (evicted in recents.promote(vault)) releaseGrant(evicted.uri)
+    }
+
+    private fun forgetVault(uri: Uri) {
+        recents.remove(uri)
+        releaseGrant(uri)
+    }
+
+    private fun releaseGrant(uri: Uri) {
+        try {
+            contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        } catch (ignored: Exception) {
+        }
+    }
+
+    // ---------------------------------------------------------------- unlock / lock
 
     private fun startUnlock() {
         val uri = vaultUri ?: return
@@ -173,7 +305,7 @@ class MainActivity : Activity() {
 
         val password = field.text.toString()
         if (password.isEmpty()) {
-            statusMessage = MSG_EMPTY_PASSWORD
+            statusRes = R.string.msg_empty_password
             render()
             return
         }
@@ -181,59 +313,48 @@ class MainActivity : Activity() {
         wipe(field)
 
         val generation = ++unlockGeneration
-        statusMessage = null
+        statusRes = 0
         screen = Screen.UNLOCKING
         render()
 
         Thread { runUnlock(uri, password, generation) }.start()
     }
 
-    private fun lockVault() {
-        unlockGeneration++
-
-        val current = session
-        session = null
-        entries = emptyList()
-        closeQuietly(current)
-
-        statusMessage = null
-        screen = if (vaultUri != null) Screen.FILE_SELECTED else Screen.NO_FILE
-        render()
-    }
-
-    // ------------------------------------------------------ background unlock
-
     /** Runs on a dedicated background thread: file read + Argon2id + list. */
     private fun runUnlock(uri: Uri, password: String, generation: Int) {
         var opened: VaultSession? = null
         var rows: List<EntrySummary> = emptyList()
-        var message: String? = null
+        var messageRes = 0
+        var unreadable = false
 
         try {
             val envelopeBytes = readVaultBytes(uri)
             opened = openVault(envelopeBytes, password)
             rows = opened.listEntries()
         } catch (error: BridgeException.AuthenticationFailed) {
-            message = MSG_AUTH
+            messageRes = R.string.msg_auth
         } catch (error: BridgeException.UnsupportedFormat) {
-            message = MSG_FORMAT
+            messageRes = R.string.msg_format
         } catch (error: VaultReadException) {
-            message = MSG_READ
+            messageRes = R.string.msg_read
+            unreadable = true
         } catch (error: IOException) {
-            message = MSG_READ
+            messageRes = R.string.msg_read
+            unreadable = true
         } catch (error: SecurityException) {
-            message = MSG_READ
+            messageRes = R.string.msg_read
+            unreadable = true
         } catch (error: Throwable) {
-            message = MSG_GENERIC
+            messageRes = R.string.msg_generic
         }
 
-        if (message != null) {
+        if (messageRes != 0) {
             closeQuietly(opened)
             opened = null
         }
 
         val result = opened
-        runOnUiThread { finishUnlock(generation, result, rows, message) }
+        runOnUiThread { finishUnlock(generation, uri, result, rows, messageRes, unreadable) }
     }
 
     private fun readVaultBytes(uri: Uri): ByteArray {
@@ -261,25 +382,53 @@ class MainActivity : Activity() {
     /** Back on the main thread. */
     private fun finishUnlock(
         generation: Int,
+        uri: Uri,
         opened: VaultSession?,
         rows: List<EntrySummary>,
-        message: String?,
+        messageRes: Int,
+        unreadable: Boolean,
     ) {
         if (generation != unlockGeneration || screen != Screen.UNLOCKING || isFinishing || isDestroyed) {
             closeQuietly(opened)
             return
         }
 
-        if (opened == null) {
-            statusMessage = message ?: MSG_GENERIC
-            screen = Screen.FILE_SELECTED
-        } else {
+        if (opened != null) {
             session = opened
             entries = rows
-            statusMessage = null
-            screen = Screen.UNLOCKED
+            searchQuery = ""
+            listScrollY = 0
+            statusRes = 0
+            screen = Screen.LIST
+        } else if (unreadable && recents.load().any { it.uri == uri }) {
+            // A remembered vault that can no longer be read is stale: forget it.
+            forgetVault(uri)
+            vaultUri = null
+            vaultName = ""
+            statusRes = R.string.msg_recent_unavailable
+            screen = Screen.NO_FILE
+        } else {
+            statusRes = if (messageRes != 0) messageRes else R.string.msg_generic
+            screen = Screen.FILE_SELECTED
         }
 
+        render()
+    }
+
+    private fun lockVault() {
+        unlockGeneration++
+
+        val current = session
+        session = null
+        entries = emptyList()
+        detail = null
+        searchQuery = ""
+        listScrollY = 0
+        clearRevealedPassword()
+        closeQuietly(current)
+
+        statusRes = 0
+        screen = if (vaultUri != null) Screen.FILE_SELECTED else Screen.NO_FILE
         render()
     }
 
@@ -295,6 +444,97 @@ class MainActivity : Activity() {
             target.close()
         } catch (ignored: Throwable) {
         }
+    }
+
+    // ---------------------------------------------------------------- detail
+
+    private fun openDetail(entryId: String) {
+        val current = session ?: return
+
+        try {
+            detail = current.entryDetails(entryId)
+        } catch (error: BridgeException.SessionLocked) {
+            lockVault()
+            return
+        } catch (error: Throwable) {
+            toast(R.string.msg_action_failed)
+            return
+        }
+
+        listScrollY = scroll.scrollY
+        screen = Screen.DETAIL
+        render()
+    }
+
+    private fun closeDetail() {
+        clearRevealedPassword()
+        detail = null
+        screen = Screen.LIST
+        render()
+        scroll.post { scroll.scrollTo(0, listScrollY) }
+    }
+
+    private fun togglePassword() {
+        if (passwordShown) {
+            clearRevealedPassword()
+            return
+        }
+
+        val entryId = detail?.id ?: return
+        val view = passwordValueView ?: return
+
+        // Fetched only now, on an explicit Show; it goes straight into the one
+        // view and is not kept in any field.
+        val revealed = fetchPassword(entryId) ?: return
+        view.text = revealed
+        passwordShown = true
+        passwordToggleButton?.setText(R.string.hide_password)
+    }
+
+    private fun copyPassword() {
+        val entryId = detail?.id ?: return
+        val value = fetchPassword(entryId) ?: return
+
+        clipboard.copy(getString(R.string.app_name), value, sensitive = true)
+        confirmCopied()
+    }
+
+    private fun copyUsername() {
+        val username = detail?.username ?: return
+        if (username.isEmpty()) return
+
+        clipboard.copy(getString(R.string.app_name), username, sensitive = false)
+        confirmCopied()
+    }
+
+    private fun fetchPassword(entryId: String): String? {
+        val current = session ?: return null
+
+        return try {
+            current.entryPassword(entryId)
+        } catch (error: BridgeException.SessionLocked) {
+            lockVault()
+            null
+        } catch (error: Throwable) {
+            toast(R.string.msg_action_failed)
+            null
+        }
+    }
+
+    /** Hides and clears any revealed password text and drops its UI state. */
+    private fun clearRevealedPassword() {
+        passwordValueView?.text = PASSWORD_MASK
+        passwordToggleButton?.setText(R.string.show_password)
+        passwordShown = false
+    }
+
+    private fun confirmCopied() {
+        // Android 13+ shows its own clipboard confirmation.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) toast(R.string.copied)
+    }
+
+    private fun toast(messageRes: Int) {
+        Toast.makeText(this, messageRes, Toast.LENGTH_SHORT).show()
     }
 
     // ---------------------------------------------------------------- helpers
@@ -319,79 +559,313 @@ class MainActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
+    private fun matchesQuery(entry: EntrySummary, query: String): Boolean =
+        entry.title.contains(query, ignoreCase = true) ||
+            entry.username.contains(query, ignoreCase = true) ||
+            entry.url.contains(query, ignoreCase = true) ||
+            entry.profileName.contains(query, ignoreCase = true)
+
     // ---------------------------------------------------------------- render
 
     private fun render() {
         content.removeAllViews()
         passwordField = null
-
-        addText("LocalVault", bold = true, size = 24f, topMargin = 0)
+        searchField = null
+        rowsContainer = null
+        countView = null
+        passwordValueView = null
+        passwordToggleButton = null
+        passwordShown = false
 
         when (screen) {
-            Screen.NO_FILE -> {
-                addStatus()
-                addButton("Choose vault") { openPicker() }
-            }
-
-            Screen.FILE_SELECTED -> {
-                addText("Vault:", bold = true)
-                addText(vaultName)
-                addText("Master password:", bold = true, topMargin = 16)
-                addPasswordField()
-                addStatus()
-                addButton("Unlock", topMargin = 16) { startUnlock() }
-                addButton("Choose a different vault") { openPicker() }
-            }
-
-            Screen.UNLOCKING -> {
-                addText("Unlocking...", bold = true)
-            }
-
-            Screen.UNLOCKED -> {
-                addText(vaultName, bold = true)
-                addButton("Lock") { lockVault() }
-                addText(if (entries.isEmpty()) "No entries." else "Entries: ${entries.size}", topMargin = 8)
-
-                for (entry in entries) {
-                    addText(entry.title, bold = true, topMargin = 12)
-
-                    val detail =
-                        listOf(entry.profileName, entry.username, entry.url)
-                            .filter { it.isNotBlank() }
-                            .joinToString(" · ")
-                    if (detail.isNotEmpty()) addText(detail, size = 13f)
-                }
-            }
+            Screen.NO_FILE -> renderNoFile()
+            Screen.FILE_SELECTED -> renderFileSelected()
+            Screen.UNLOCKING -> renderUnlocking()
+            Screen.LIST -> renderList()
+            Screen.DETAIL -> renderDetail()
         }
     }
 
-    private fun addText(text: String, bold: Boolean = false, size: Float = 16f, topMargin: Int = 0) {
+    private fun renderNoFile() {
+        addHeader()
+        addStatus()
+        addPrimaryButton(getString(R.string.choose_vault), topMargin = 24) { openPicker() }
+
+        addSectionTitle(getString(R.string.recent_vaults))
+
+        val items = recents.load()
+        if (items.isEmpty()) {
+            addBody(getString(R.string.recent_vaults_empty), color = R.color.lv_text_tertiary, topMargin = 4)
+            return
+        }
+
+        for (vault in items) {
+            val card = newCard(clickable = true)
+            card.setOnClickListener { selectRecent(vault) }
+
+            card.addView(newText(vault.name.ifEmpty { getString(R.string.default_vault_name) }, size = 16f, bold = true))
+            card.addView(
+                newTextButton(getString(R.string.remove_from_history)) {
+                    forgetVault(vault.uri)
+                    statusRes = 0
+                    render()
+                },
+                wrapParams(top = 8, gravity = Gravity.END),
+            )
+
+            addToContent(card, topMargin = 8)
+        }
+    }
+
+    private fun renderFileSelected() {
+        addHeader()
+
+        val card = newCard()
+        card.addView(newText(getString(R.string.vault_label), size = 13f, color = R.color.lv_text_tertiary))
+        card.addView(newText(vaultName, size = 17f, bold = true), matchParams(top = 2))
+        card.addView(
+            newText(getString(R.string.master_password), size = 13f, color = R.color.lv_text_tertiary),
+            matchParams(top = 16),
+        )
+
+        val field = newPasswordField()
+        passwordField = field
+        card.addView(field, matchParams(top = 6))
+        addToContent(card, topMargin = 20)
+
+        addStatus()
+        addPrimaryButton(getString(R.string.unlock), topMargin = 16) { startUnlock() }
+        addSecondaryButton(getString(R.string.choose_another_vault), topMargin = 10) { openPicker() }
+    }
+
+    private fun renderUnlocking() {
+        addHeader()
+
+        val card = newCard()
+        card.gravity = Gravity.CENTER_HORIZONTAL
+        card.addView(ProgressBar(this), wrapParams(top = 8, gravity = Gravity.CENTER_HORIZONTAL))
+        card.addView(
+            newText(getString(R.string.unlocking), size = 16f, bold = true),
+            wrapParams(top = 12, gravity = Gravity.CENTER_HORIZONTAL),
+        )
+        addToContent(card, topMargin = 24)
+    }
+
+    private fun renderList() {
+        // Stable heading + Lock on one row; the (possibly long) vault file name
+        // sits below on its own single, end-ellipsized line so it can never
+        // wrap awkwardly next to the button.
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.HORIZONTAL
+        header.gravity = Gravity.CENTER_VERTICAL
+
+        val title = newText(getString(R.string.app_name), size = 22f, bold = true)
+        header.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() })
+        addToContent(header, topMargin = 4)
+
+        val fileName = newText(vaultName, size = 14f, color = R.color.lv_text_secondary)
+        fileName.setSingleLine()
+        fileName.ellipsize = TextUtils.TruncateAt.END
+        addToContent(fileName, topMargin = 2)
+
+        val search = newSearchField()
+        searchField = search
+        addToContent(search, topMargin = 16)
+
+        val count = newText("", size = 13f, color = R.color.lv_text_tertiary)
+        countView = count
+        addToContent(count, topMargin = 12)
+
+        val container = LinearLayout(this)
+        container.orientation = LinearLayout.VERTICAL
+        rowsContainer = container
+        addToContent(container, topMargin = 4)
+
+        renderRows()
+    }
+
+    private fun renderRows() {
+        val container = rowsContainer ?: return
+        container.removeAllViews()
+
+        val query = searchQuery.trim()
+        val visible = if (query.isEmpty()) entries else entries.filter { matchesQuery(it, query) }
+
+        countView?.text = resources.getQuantityString(R.plurals.entries_count, visible.size, visible.size)
+
+        if (entries.isEmpty()) {
+            container.addView(newText(getString(R.string.no_entries), color = R.color.lv_text_tertiary), matchParams(top = 12))
+            return
+        }
+        if (visible.isEmpty()) {
+            container.addView(newText(getString(R.string.no_search_results), color = R.color.lv_text_tertiary), matchParams(top = 12))
+            return
+        }
+
+        for (entry in visible) {
+            container.addView(newEntryRow(entry), matchParams(top = 8))
+        }
+    }
+
+    private fun renderDetail() {
+        val current = detail
+        if (current == null) {
+            screen = Screen.LIST
+            renderList()
+            return
+        }
+
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER_VERTICAL
+        bar.addView(newTextButton(getString(R.string.back)) { closeDetail() })
+        bar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
+        bar.addView(newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() })
+        addToContent(bar, topMargin = 0)
+
+        addToContent(newText(current.title, size = 24f, bold = true), topMargin = 12)
+
+        val info = newCard()
+        var first = true
+        if (current.profileName.isNotBlank()) {
+            addField(info, getString(R.string.profile), current.profileName, first)
+            first = false
+        }
+        if (current.url.isNotBlank()) {
+            addField(info, getString(R.string.website), current.url, first)
+            first = false
+        }
+        addField(info, getString(R.string.username), current.username.ifBlank { getString(R.string.not_set) }, first)
+        if (current.username.isNotEmpty()) {
+            info.addView(
+                newSecondaryButton(getString(R.string.copy_username), compact = true) { copyUsername() },
+                wrapParams(top = 12, gravity = Gravity.START),
+            )
+        }
+        addToContent(info, topMargin = 16)
+
+        val secret = newCard()
+        secret.addView(newText(getString(R.string.password), size = 13f, color = R.color.lv_text_tertiary))
+
+        val value = newText(PASSWORD_MASK, size = 18f)
+        value.typeface = Typeface.MONOSPACE
+        value.setTextIsSelectable(false)
+        value.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+        passwordValueView = value
+        secret.addView(value, matchParams(top = 4))
+
+        val buttons = LinearLayout(this)
+        buttons.orientation = LinearLayout.HORIZONTAL
+        val toggle = newSecondaryButton(getString(R.string.show_password), compact = true) { togglePassword() }
+        passwordToggleButton = toggle
+        buttons.addView(toggle)
+        buttons.addView(
+            newSecondaryButton(getString(R.string.copy_password), compact = true) { copyPassword() },
+            wrapParams(left = 8),
+        )
+        secret.addView(buttons, matchParams(top = 12))
+        addToContent(secret, topMargin = 12)
+
+        addToContent(
+            newText(getString(R.string.clipboard_hint), size = 12f, color = R.color.lv_text_tertiary),
+            topMargin = 12,
+        )
+    }
+
+    private fun addField(card: LinearLayout, label: String, value: String, first: Boolean) {
+        card.addView(newText(label, size = 13f, color = R.color.lv_text_tertiary), matchParams(top = if (first) 0 else 14))
+        card.addView(newText(value, size = 16f), matchParams(top = 2))
+    }
+
+    // ---------------------------------------------------------------- view factories
+
+    private fun newEntryRow(entry: EntrySummary): View {
+        val row = newCard(clickable = true)
+        row.setOnClickListener { openDetail(entry.id) }
+
+        row.addView(newText(entry.title, size = 16f, bold = true))
+
+        if (entry.username.isNotBlank()) {
+            row.addView(newText(entry.username, size = 14f, color = R.color.lv_text_secondary), matchParams(top = 2))
+        }
+
+        val site = listOf(entry.url, entry.profileName).filter { it.isNotBlank() }.joinToString(" · ")
+        if (site.isNotEmpty()) {
+            row.addView(newText(site, size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 2))
+        }
+
+        return row
+    }
+
+    private fun newCard(clickable: Boolean = false): LinearLayout {
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.setPadding(dp(16), dp(14), dp(16), dp(14))
+        card.background = getDrawable(if (clickable) R.drawable.bg_row else R.drawable.bg_card)
+        card.isClickable = clickable
+        return card
+    }
+
+    private fun newText(
+        text: String,
+        size: Float = 16f,
+        bold: Boolean = false,
+        color: Int = R.color.lv_text,
+    ): TextView {
         val view = TextView(this)
         view.text = text
         view.textSize = size
+        view.setTextColor(getColor(color))
         if (bold) view.setTypeface(view.typeface, Typeface.BOLD)
-        addToContent(view, topMargin)
+        return view
     }
 
-    private fun addStatus() {
-        val message = statusMessage ?: return
-        addText(message, topMargin = 8)
+    private fun newPrimaryButton(label: String, onClick: () -> Unit): Button {
+        val button = newButton(label, R.drawable.bg_button_primary, R.color.lv_on_primary)
+        button.setOnClickListener { onClick() }
+        return button
     }
 
-    private fun addButton(label: String, topMargin: Int = 8, onClick: () -> Unit) {
+    private fun newSecondaryButton(label: String, compact: Boolean = false, onClick: () -> Unit): Button {
+        val button = newButton(label, R.drawable.bg_button_secondary, R.color.lv_primary)
+        if (compact) {
+            button.minHeight = dp(40)
+            button.minimumHeight = dp(40)
+            button.setPadding(dp(14), 0, dp(14), 0)
+        }
+        button.setOnClickListener { onClick() }
+        return button
+    }
+
+    private fun newTextButton(label: String, onClick: () -> Unit): Button {
+        val button = newButton(label, R.drawable.bg_button_text, R.color.lv_primary)
+        button.minHeight = dp(40)
+        button.minimumHeight = dp(40)
+        button.minWidth = 0
+        button.minimumWidth = 0
+        button.setPadding(dp(10), 0, dp(10), 0)
+        button.setOnClickListener { onClick() }
+        return button
+    }
+
+    private fun newButton(label: String, backgroundRes: Int, textColorRes: Int): Button {
         val button = Button(this)
         button.text = label
-        button.setOnClickListener { onClick() }
-        addToContent(button, topMargin)
+        button.isAllCaps = false
+        button.textSize = 15f
+        button.setTextColor(getColor(textColorRes))
+        button.background = getDrawable(backgroundRes)
+        button.stateListAnimator = null
+        button.minHeight = dp(48)
+        button.minimumHeight = dp(48)
+        return button
     }
 
-    private fun addPasswordField() {
-        val field = EditText(this)
+    private fun newPasswordField(): EditText {
+        val field = newField()
         field.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
         field.imeOptions = EditorInfo.IME_ACTION_DONE or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
-        field.setSingleLine()
-        field.isSaveEnabled = false
-        field.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
         field.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_DONE) {
                 startUnlock()
@@ -400,18 +874,100 @@ class MainActivity : Activity() {
                 false
             }
         }
+        return field
+    }
 
-        passwordField = field
-        addToContent(field, 0)
+    private fun newSearchField(): EditText {
+        val field = newField()
+        field.hint = getString(R.string.search_hint)
+        field.contentDescription = getString(R.string.search)
+        field.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        field.imeOptions = EditorInfo.IME_ACTION_SEARCH or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        field.setText(searchQuery)
+        field.setSelection(field.text.length)
+        field.addTextChangedListener(
+            object : TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+
+                override fun afterTextChanged(s: Editable?) {
+                    searchQuery = s?.toString() ?: ""
+                    renderRows()
+                }
+            },
+        )
+        return field
+    }
+
+    private fun newField(): EditText {
+        val field = EditText(this)
+        field.setSingleLine()
+        field.textSize = 16f
+        field.setTextColor(getColor(R.color.lv_text))
+        field.setHintTextColor(getColor(R.color.lv_text_tertiary))
+        field.background = getDrawable(R.drawable.bg_field)
+        field.setPadding(dp(14), dp(12), dp(14), dp(12))
+        field.isSaveEnabled = false
+        field.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+        return field
+    }
+
+    // ---------------------------------------------------------------- layout helpers
+
+    private fun addHeader() {
+        addToContent(newText(getString(R.string.app_name), size = 30f, bold = true), topMargin = 8)
+        addToContent(newText(getString(R.string.tagline), size = 14f, color = R.color.lv_text_secondary), topMargin = 2)
+    }
+
+    private fun addSectionTitle(text: String) {
+        addToContent(newText(text, size = 14f, bold = true, color = R.color.lv_text_secondary), topMargin = 32)
+    }
+
+    private fun addBody(text: String, color: Int = R.color.lv_text, topMargin: Int = 0) {
+        addToContent(newText(text, color = color), topMargin = topMargin)
+    }
+
+    private fun addStatus() {
+        if (statusRes == 0) return
+
+        val message = newText(getString(statusRes), size = 14f, color = R.color.lv_error)
+        message.setPadding(dp(14), dp(12), dp(14), dp(12))
+        message.background = getDrawable(R.drawable.bg_error)
+        addToContent(message, topMargin = 16)
+    }
+
+    private fun addPrimaryButton(label: String, topMargin: Int, onClick: () -> Unit) {
+        addToContent(newPrimaryButton(label, onClick), topMargin = topMargin)
+    }
+
+    private fun addSecondaryButton(label: String, topMargin: Int, onClick: () -> Unit) {
+        addToContent(newSecondaryButton(label, onClick = onClick), topMargin = topMargin)
     }
 
     private fun addToContent(view: View, topMargin: Int) {
+        content.addView(view, matchParams(top = topMargin))
+    }
+
+    private fun matchParams(top: Int = 0): LinearLayout.LayoutParams {
         val params =
             LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             )
-        params.topMargin = dp(topMargin)
-        content.addView(view, params)
+        params.topMargin = dp(top)
+        return params
+    }
+
+    private fun wrapParams(top: Int = 0, left: Int = 0, gravity: Int = Gravity.NO_GRAVITY): LinearLayout.LayoutParams {
+        val params =
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            )
+        params.topMargin = dp(top)
+        params.leftMargin = dp(left)
+        params.gravity = gravity
+        return params
     }
 }

@@ -44,6 +44,21 @@ pub struct EntrySummary {
     pub username: String,
 }
 
+/// Non-secret detail for one entry, fetched only when the user opens it.
+///
+/// Deliberately excludes the password (fetched separately, and only on an
+/// explicit show/copy via [`VaultSession::entry_password`]), notes, TOTP
+/// configuration/secrets, tags and key material. Opening an entry card
+/// therefore never moves that entry's password across the FFI boundary.
+#[derive(uniffi::Record)]
+pub struct EntryDetails {
+    pub id: String,
+    pub title: String,
+    pub profile_name: String,
+    pub url: String,
+    pub username: String,
+}
+
 /// Structured, oracle-safe bridge error.
 ///
 /// `localvault-core` does not distinguish "wrong master password" from
@@ -64,6 +79,8 @@ pub enum BridgeError {
     AuthenticationFailed,
     #[error("vault session is locked")]
     SessionLocked,
+    #[error("entry not found")]
+    EntryNotFound,
 }
 
 fn map_vault_error(err: VaultError) -> BridgeError {
@@ -96,6 +113,16 @@ impl VaultSession {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn find_entry<'a>(
+    data: &'a VaultData,
+    entry_id: &str,
+) -> Result<&'a localvault_core::vault::data::VaultEntry, BridgeError> {
+    data.entries
+        .iter()
+        .find(|entry| entry.id.to_string() == entry_id)
+        .ok_or(BridgeError::EntryNotFound)
 }
 
 /// Synchronously open an encrypted vault envelope (`.lvault` file bytes) with
@@ -148,6 +175,34 @@ impl VaultSession {
                 username: entry.username.clone(),
             })
             .collect())
+    }
+
+    /// Non-secret details of one entry (no password, notes or TOTP).
+    pub fn entry_details(&self, entry_id: String) -> Result<EntryDetails, BridgeError> {
+        let guard = self.guard();
+        let data = guard.as_ref().ok_or(BridgeError::SessionLocked)?;
+        let entry = find_entry(data, &entry_id)?;
+
+        Ok(EntryDetails {
+            id: entry.id.to_string(),
+            title: entry.title.clone(),
+            profile_name: entry.profile_name.clone(),
+            url: entry.url.clone(),
+            username: entry.username.clone(),
+        })
+    }
+
+    /// The entry's password. Call only for an explicit user show/copy action.
+    ///
+    /// The returned `String` necessarily becomes a JVM string; neither side of
+    /// that boundary can deterministically zeroize it, so callers must keep its
+    /// lifetime narrow.
+    pub fn entry_password(&self, entry_id: String) -> Result<String, BridgeError> {
+        let guard = self.guard();
+        let data = guard.as_ref().ok_or(BridgeError::SessionLocked)?;
+        let entry = find_entry(data, &entry_id)?;
+
+        Ok(entry.password.clone())
     }
 
     /// Drop (and thereby zeroize) the decrypted vault data. Idempotent.
@@ -376,6 +431,150 @@ mod tests {
         assert_eq!(
             session.list_entries().err(),
             Some(BridgeError::SessionLocked)
+        );
+    }
+
+    fn id_of(session: &VaultSession, title: &str) -> String {
+        session
+            .list_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.title == title)
+            .expect("fixture entry exists")
+            .id
+    }
+
+    #[test]
+    fn entry_details_return_non_secret_fields_for_a_known_entry() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let details = session.entry_details(id.clone()).unwrap();
+
+        assert_eq!(details.id, id);
+        assert_eq!(details.title, "Fixture Login");
+        assert_eq!(details.profile_name, "Fixture Profile");
+        assert_eq!(details.username, "fixture.user@example.com");
+    }
+
+    #[test]
+    fn entry_details_carry_no_secret_fields() {
+        let session = open_ok(schema2());
+
+        // Exhaustive destructuring pins the exact field set: adding a field
+        // (for example a password) fails to compile until consciously updated.
+        let id = id_of(&session, "Fixture TOTP Account");
+        let EntryDetails {
+            id: _,
+            title: _,
+            profile_name: _,
+            url: _,
+            username: _,
+        } = session.entry_details(id).unwrap();
+
+        // Value check against every real secret held by the session. All
+        // details are gathered before taking the guard (the mutex is not
+        // re-entrant).
+        let all_details: Vec<EntryDetails> = session
+            .list_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| session.entry_details(entry.id).unwrap())
+            .collect();
+        assert_eq!(all_details.len(), 2);
+
+        let guard = session.guard();
+        let data = guard.as_ref().unwrap();
+
+        for details in &all_details {
+            for entry in &data.entries {
+                let mut secrets: Vec<&str> = vec![entry.password.as_str()];
+                if !entry.notes.is_empty() {
+                    secrets.push(entry.notes.as_str());
+                }
+                if let Some(totp) = entry.totp.as_ref() {
+                    secrets.push(totp.secret_base64.as_str());
+                }
+
+                for secret in secrets {
+                    for field in [
+                        &details.id,
+                        &details.title,
+                        &details.profile_name,
+                        &details.url,
+                        &details.username,
+                    ] {
+                        assert!(!field.contains(secret), "a secret leaked into details");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn password_is_returned_only_by_the_explicit_password_call() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let password = session.entry_password(id).unwrap();
+
+        // Compared without ever placing the value in an assertion message.
+        assert!(
+            password == "FixtureBaselinePassword123!",
+            "unexpected password"
+        );
+    }
+
+    #[test]
+    fn unknown_or_malformed_entry_ids_return_entry_not_found() {
+        let session = open_ok(schema2());
+
+        for bad in [
+            "",
+            "not-a-uuid",
+            "00000000-0000-0000-0000-000000000000",
+            "FIXTURE LOGIN",
+        ] {
+            assert_eq!(
+                session.entry_details(bad.to_owned()).err(),
+                Some(BridgeError::EntryNotFound)
+            );
+            assert_eq!(
+                session.entry_password(bad.to_owned()).err(),
+                Some(BridgeError::EntryNotFound)
+            );
+        }
+    }
+
+    #[test]
+    fn locked_session_cannot_return_details_or_password() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        session.lock();
+
+        assert_eq!(
+            session.entry_details(id.clone()).err(),
+            Some(BridgeError::SessionLocked)
+        );
+        assert_eq!(
+            session.entry_password(id).err(),
+            Some(BridgeError::SessionLocked)
+        );
+    }
+
+    #[test]
+    fn legacy_schema1_entry_details_and_password_work() {
+        let session = open_ok(schema1());
+        let id = id_of(&session, "Legacy Fixture Login");
+
+        assert_eq!(
+            session.entry_details(id.clone()).unwrap().username,
+            "legacy.user@example.com"
+        );
+        assert!(
+            session.entry_password(id).unwrap() == "LegacyBaselinePassword123!",
+            "unexpected password"
         );
     }
 }
