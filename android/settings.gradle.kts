@@ -14,5 +14,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "localvault-android-proof"
+rootProject.name = "localvault-android"
 include(":app")

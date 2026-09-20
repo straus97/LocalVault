@@ -1,25 +1,23 @@
-// 1T-B1b architecture-proof app module. Intentionally tiny: one Activity,
-// no Compose, no navigation, no DI, no database, no networking, no
-// preferences, no ViewModel, no coroutines. It exists to prove the FFI
-// boundary works, not to be the real LocalVault Android UI.
+// LocalVault Android app module. Native framework views only: no Compose, no
+// navigation, no DI, no database, no networking, no preferences, no ViewModel,
+// no coroutines. Vault cryptography lives entirely in Rust (localvault-core),
+// reached through the stable UniFFI Kotlin/JNA bridge.
 // AGP 9.x compiles Kotlin natively; do not apply org.jetbrains.kotlin.android
 // here (see build.gradle.kts at the repo-android root for why).
 plugins {
     id("com.android.application")
 }
 
-// Generated-only locations for 1T-B1b build artifacts that must never be
-// committed: the cross-compiled bridge .so, the UniFFI-generated Kotlin
-// binding, and the verified copy of the canonical compat fixture. The
-// PowerShell proof script (scripts/build-b1b-proof.ps1) populates these
-// before Gradle runs; Gradle only ever reads from them.
+// Generated-only locations that must never be committed: the cross-compiled
+// bridge .so and the UniFFI-generated Kotlin binding. The PowerShell build
+// script (scripts/build-android-debug.ps1) populates these before Gradle
+// runs; Gradle only ever reads from them. No test fixture is packaged.
 // Plain `File`s (not Gradle `Provider`s): AGP 9's legacy sourceSet API
-// rejects Providers for jniLibs/kotlin/assets srcDirs (it cannot tell
-// whether a Provider points at generated vs. static content), so these are
-// resolved eagerly at configuration time instead.
-val b1bGeneratedJniLibs = File(project.buildDir, "generated/b1bJniLibs")
-val b1bGeneratedKotlin = File(project.buildDir, "generated/b1bKotlin")
-val b1bGeneratedAssets = File(project.buildDir, "generated/b1bAssets")
+// rejects Providers for jniLibs/kotlin srcDirs (it cannot tell whether a
+// Provider points at generated vs. static content), so these are resolved
+// eagerly at configuration time instead.
+val generatedJniLibs = File(project.buildDir, "generated/jniLibs")
+val generatedUniffiKotlin = File(project.buildDir, "generated/uniffiKotlin")
 
 android {
     namespace = "com.localvault.android.proof"
@@ -30,10 +28,9 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 1
-        versionName = "1t-b1b-proof"
+        versionName = "1t-b2"
 
-        // B1b proves arm64-v8a only, matching the approved 1T-B1a/1T-B1b
-        // scope (no additional ABIs are added merely for completeness).
+        // arm64-v8a only for now (no additional ABIs added for completeness).
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -46,8 +43,7 @@ android {
     }
 
     // AGP 9.x compiles Kotlin natively; jvmTarget defaults to
-    // targetCompatibility below, so no separate Kotlin compiler-options
-    // block is needed for this minimal proof app.
+    // targetCompatibility below.
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -55,9 +51,8 @@ android {
 
     sourceSets {
         getByName("main") {
-            jniLibs.srcDir(b1bGeneratedJniLibs)
-            kotlin.srcDir(b1bGeneratedKotlin)
-            assets.srcDir(b1bGeneratedAssets)
+            jniLibs.srcDir(generatedJniLibs)
+            kotlin.srcDir(generatedUniffiKotlin)
         }
     }
 

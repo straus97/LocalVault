@@ -1,13 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- No permissions: the vault is chosen through the system document picker
+         (Storage Access Framework), which grants access to that one document. -->
+
     <application
         android:allowBackup="false"
         android:label="@string/app_name"
         android:theme="@android:style/Theme.Material.Light">
 
+        <!-- configChanges: rotating the phone must not destroy the Activity,
+             since that would drop the (deliberately memory-only) vault choice. -->
         <activity
-            android:name=".ProofActivity"
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|uiMode"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

@@ -1,9 +1,5 @@
-// 1T-B1b architecture-proof root build file. Deliberately minimal: this is
-// not the real LocalVault Android app yet, just the smallest project that
-// proves Kotlin -> stable UniFFI/JNA -> localvault-android-bridge ->
-// localvault-core works end to end. See docs/ROADMAP.md (1T) and the
-// 1T-A / 1T-A2 / 1T-B1a audits for the approved architecture this
-// implements.
+// LocalVault Android root build file. Architecture: native Kotlin UI ->
+// stable UniFFI/JNA bindings -> localvault-android-bridge -> localvault-core.
 // AGP 9.x has built-in Kotlin support; the separate
 // org.jetbrains.kotlin.android plugin is no longer applied (it is
 // incompatible with AGP 9's DSL -- see
