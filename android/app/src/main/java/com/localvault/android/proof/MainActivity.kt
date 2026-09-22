@@ -3,10 +3,15 @@ package com.localvault.android.proof
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.content.res.ColorStateList
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.animation.ValueAnimator
+import android.os.Handler
+import android.os.Looper
+import android.view.animation.LinearInterpolator
 import android.provider.OpenableColumns
 import android.text.Editable
 import android.text.InputType
@@ -20,6 +25,7 @@ import android.view.inputmethod.EditorInfo
 import android.window.OnBackInvokedDispatcher
 import android.widget.Button
 import android.widget.EditText
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -28,6 +34,7 @@ import android.widget.Toast
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import uniffi.localvault_android_bridge.BridgeException
+import uniffi.localvault_android_bridge.CategorySummary
 import uniffi.localvault_android_bridge.EntryDetails
 import uniffi.localvault_android_bridge.EntrySummary
 import uniffi.localvault_android_bridge.VaultSession
@@ -61,6 +68,15 @@ class MainActivity : Activity() {
 
     private class VaultReadException : Exception()
 
+    /** Transient UI filter; "uncategorized" is a real state of the model (no category id). */
+    private sealed class CategoryFilter {
+        object All : CategoryFilter()
+
+        object Uncategorized : CategoryFilter()
+
+        class Category(val id: String) : CategoryFilter()
+    }
+
     private companion object {
         const val REQUEST_PICK_VAULT = 1
 
@@ -68,6 +84,9 @@ class MainActivity : Activity() {
         const val MAX_VAULT_FILE_BYTES = 32L * 1024 * 1024
 
         const val PASSWORD_MASK = "••••••••"
+
+        // Fine-grained so the animated bar has no visible one-second steps.
+        const val TOTP_PROGRESS_MAX = 10_000
     }
 
     private lateinit var content: LinearLayout
@@ -82,6 +101,8 @@ class MainActivity : Activity() {
 
     private var session: VaultSession? = null
     private var entries: List<EntrySummary> = emptyList()
+    private var categories: List<CategorySummary> = emptyList()
+    private var categoryFilter: CategoryFilter = CategoryFilter.All
     private var searchQuery: String = ""
     private var listScrollY: Int = 0
     private var detail: EntryDetails? = null
@@ -94,6 +115,18 @@ class MainActivity : Activity() {
     private var passwordValueView: TextView? = null
     private var passwordToggleButton: Button? = null
     private var passwordShown = false
+    private var chipsContainer: LinearLayout? = null
+
+    // Live TOTP display. Only non-secret timing is kept in fields; the code
+    // itself lives solely in the visible view and is cleared with it.
+    private val totpHandler = Handler(Looper.getMainLooper())
+    private var totpTicker: Runnable? = null
+    private var totpCodeView: TextView? = null
+    private var totpRemainingView: TextView? = null
+    private var totpProgress: ProgressBar? = null
+    private var totpProgressAnimator: ValueAnimator? = null
+    private var totpExpiresAtMs = 0L
+    private var totpPeriodSeconds = 30
 
     // Bumped on every lock/stop/destroy so a late background result for an
     // abandoned unlock is discarded (and its session closed) instead of shown.
@@ -190,10 +223,12 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        stopTotp()
         unlockGeneration++
         val current = session
         session = null
         entries = emptyList()
+        categories = emptyList()
         detail = null
         closeQuietly(current)
 
@@ -324,6 +359,7 @@ class MainActivity : Activity() {
     private fun runUnlock(uri: Uri, password: String, generation: Int) {
         var opened: VaultSession? = null
         var rows: List<EntrySummary> = emptyList()
+        var cats: List<CategorySummary> = emptyList()
         var messageRes = 0
         var unreadable = false
 
@@ -331,6 +367,7 @@ class MainActivity : Activity() {
             val envelopeBytes = readVaultBytes(uri)
             opened = openVault(envelopeBytes, password)
             rows = opened.listEntries()
+            cats = opened.listCategories()
         } catch (error: BridgeException.AuthenticationFailed) {
             messageRes = R.string.msg_auth
         } catch (error: BridgeException.UnsupportedFormat) {
@@ -354,7 +391,7 @@ class MainActivity : Activity() {
         }
 
         val result = opened
-        runOnUiThread { finishUnlock(generation, uri, result, rows, messageRes, unreadable) }
+        runOnUiThread { finishUnlock(generation, uri, result, rows, cats, messageRes, unreadable) }
     }
 
     private fun readVaultBytes(uri: Uri): ByteArray {
@@ -385,6 +422,7 @@ class MainActivity : Activity() {
         uri: Uri,
         opened: VaultSession?,
         rows: List<EntrySummary>,
+        cats: List<CategorySummary>,
         messageRes: Int,
         unreadable: Boolean,
     ) {
@@ -396,6 +434,8 @@ class MainActivity : Activity() {
         if (opened != null) {
             session = opened
             entries = rows
+            categories = cats
+            categoryFilter = CategoryFilter.All
             searchQuery = ""
             listScrollY = 0
             statusRes = 0
@@ -421,6 +461,8 @@ class MainActivity : Activity() {
         val current = session
         session = null
         entries = emptyList()
+        categories = emptyList()
+        categoryFilter = CategoryFilter.All
         detail = null
         searchQuery = ""
         listScrollY = 0
@@ -521,6 +563,147 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------------------------------------------------------------- TOTP
+
+    /**
+     * Starts the live TOTP display for the visible detail screen.
+     *
+     * Two independent cadences share the same wall-clock-derived expiry:
+     *  - a main-thread Handler ticking about once a second updates the
+     *    "Обновление через N с" text and re-fetches the code (through
+     *    localvault-core, via the bridge) only when the period rolls over;
+     *  - a [ValueAnimator] animates the progress bar continuously between
+     *    those fetches, so it shrinks smoothly instead of stepping once a
+     *    second. It never decides the code or the expiry -- both remain
+     *    derived from the wall clock and the core-reported period.
+     *
+     * Neither runs off-screen, and passive ticks/frames are deliberately not
+     * user activity.
+     */
+    private fun startTotp(entryId: String) {
+        stopTotp()
+
+        val ticker =
+            object : Runnable {
+                override fun run() {
+                    if (screen != Screen.DETAIL || detail?.id != entryId) return
+
+                    val nowMs = System.currentTimeMillis()
+                    if (nowMs >= totpExpiresAtMs && !fetchTotp(entryId, nowMs)) return
+
+                    updateTotpCountdown(nowMs)
+                    totpHandler.postDelayed(this, 1000L - (System.currentTimeMillis() % 1000L) + 20L)
+                }
+            }
+
+        totpTicker = ticker
+        ticker.run()
+    }
+
+    private fun fetchTotp(entryId: String, nowMs: Long): Boolean {
+        val current = session ?: return false
+
+        return try {
+            val nowSeconds = nowMs / 1000L
+            val status = current.totpStatus(entryId, nowSeconds)
+
+            totpExpiresAtMs = (nowSeconds + status.remainingSeconds.toLong()) * 1000L
+            totpPeriodSeconds = status.periodSeconds.toInt().coerceAtLeast(1)
+            totpCodeView?.text = groupCode(status.code)
+            startProgressAnimation(nowMs)
+            true
+        } catch (error: BridgeException.SessionLocked) {
+            lockVault()
+            false
+        } catch (error: Throwable) {
+            cancelProgressAnimation()
+            totpCodeView?.text = ""
+            totpProgress?.visibility = View.GONE
+            totpRemainingView?.setText(R.string.msg_totp_failed)
+            false
+        }
+    }
+
+    /** Text only; changes once a second. The bar's own smooth position comes from [startProgressAnimation]. */
+    private fun updateTotpCountdown(nowMs: Long) {
+        val remaining = ((totpExpiresAtMs - nowMs + 999L) / 1000L).toInt().coerceIn(0, totpPeriodSeconds)
+        totpRemainingView?.text = getString(R.string.totp_refresh_in, remaining)
+    }
+
+    /**
+     * (Re)starts a linear animation of the progress bar from its exact current
+     * wall-clock fraction down to empty, reaching zero exactly at
+     * [totpExpiresAtMs]. Called only when a fetch establishes a fresh expiry
+     * (entering the screen, resuming, or a period rollover) -- never once per
+     * animation frame -- so at a period boundary the freshly-fetched, still
+     * (almost) full remaining time naturally makes the bar restart at full.
+     */
+    private fun startProgressAnimation(nowMs: Long) {
+        val progress = totpProgress ?: return
+        cancelProgressAnimation()
+
+        val remainingMs = (totpExpiresAtMs - nowMs).coerceAtLeast(0L)
+        val periodMs = totpPeriodSeconds * 1000L
+        val startValue = ((remainingMs.toDouble() / periodMs) * TOTP_PROGRESS_MAX)
+            .toInt()
+            .coerceIn(0, TOTP_PROGRESS_MAX)
+
+        progress.visibility = View.VISIBLE
+        progress.max = TOTP_PROGRESS_MAX
+        progress.progress = startValue
+
+        if (remainingMs <= 0L) return
+
+        val animator = ValueAnimator.ofInt(startValue, 0)
+        animator.duration = remainingMs
+        animator.interpolator = LinearInterpolator()
+        animator.addUpdateListener { progress.progress = it.animatedValue as Int }
+        totpProgressAnimator = animator
+        animator.start()
+    }
+
+    private fun cancelProgressAnimation() {
+        totpProgressAnimator?.cancel()
+        totpProgressAnimator = null
+    }
+
+    /** Stops the ticker and animation and clears the displayed code. Safe to call repeatedly. */
+    private fun stopTotp() {
+        totpTicker?.let { totpHandler.removeCallbacks(it) }
+        totpTicker = null
+        cancelProgressAnimation()
+        totpCodeView?.text = ""
+        totpExpiresAtMs = 0L
+    }
+
+    private fun copyTotp() {
+        val entryId = detail?.id ?: return
+        val current = session ?: return
+
+        val code =
+            try {
+                current.totpStatus(entryId, System.currentTimeMillis() / 1000L).code
+            } catch (error: BridgeException.SessionLocked) {
+                lockVault()
+                return
+            } catch (error: Throwable) {
+                toast(R.string.msg_totp_failed)
+                return
+            }
+
+        // The raw code (no grouping space) goes through the same protected
+        // clipboard as passwords; it is not kept after this call.
+        clipboard.copy(getString(R.string.app_name), code, sensitive = true)
+        confirmCopied()
+    }
+
+    private fun groupCode(code: String): String =
+        if (code.length >= 6 && code.length % 2 == 0) {
+            code.substring(0, code.length / 2) + " " + code.substring(code.length / 2)
+        } else {
+            code
+        }
+
     /** Hides and clears any revealed password text and drops its UI state. */
     private fun clearRevealedPassword() {
         passwordValueView?.text = PASSWORD_MASK
@@ -559,6 +742,13 @@ class MainActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
+    private fun matchesCategory(entry: EntrySummary): Boolean =
+        when (val filter = categoryFilter) {
+            CategoryFilter.All -> true
+            CategoryFilter.Uncategorized -> entry.categoryId == null
+            is CategoryFilter.Category -> entry.categoryId == filter.id
+        }
+
     private fun matchesQuery(entry: EntrySummary, query: String): Boolean =
         entry.title.contains(query, ignoreCase = true) ||
             entry.username.contains(query, ignoreCase = true) ||
@@ -568,6 +758,7 @@ class MainActivity : Activity() {
     // ---------------------------------------------------------------- render
 
     private fun render() {
+        stopTotp()
         content.removeAllViews()
         passwordField = null
         searchField = null
@@ -576,6 +767,10 @@ class MainActivity : Activity() {
         passwordValueView = null
         passwordToggleButton = null
         passwordShown = false
+        chipsContainer = null
+        totpCodeView = null
+        totpRemainingView = null
+        totpProgress = null
 
         when (screen) {
             Screen.NO_FILE -> renderNoFile()
@@ -673,6 +868,15 @@ class MainActivity : Activity() {
         searchField = search
         addToContent(search, topMargin = 16)
 
+        val chipScroll = HorizontalScrollView(this)
+        chipScroll.isHorizontalScrollBarEnabled = false
+        val chipRow = LinearLayout(this)
+        chipRow.orientation = LinearLayout.HORIZONTAL
+        chipsContainer = chipRow
+        chipScroll.addView(chipRow)
+        addToContent(chipScroll, topMargin = 12)
+        renderChips()
+
         val count = newText("", size = 13f, color = R.color.lv_text_tertiary)
         countView = count
         addToContent(count, topMargin = 12)
@@ -690,7 +894,7 @@ class MainActivity : Activity() {
         container.removeAllViews()
 
         val query = searchQuery.trim()
-        val visible = if (query.isEmpty()) entries else entries.filter { matchesQuery(it, query) }
+        val visible = entries.filter { matchesCategory(it) && (query.isEmpty() || matchesQuery(it, query)) }
 
         countView?.text = resources.getQuantityString(R.plurals.entries_count, visible.size, visible.size)
 
@@ -699,13 +903,54 @@ class MainActivity : Activity() {
             return
         }
         if (visible.isEmpty()) {
-            container.addView(newText(getString(R.string.no_search_results), color = R.color.lv_text_tertiary), matchParams(top = 12))
+            val emptyRes =
+                if (query.isEmpty() && categoryFilter != CategoryFilter.All) {
+                    R.string.category_empty
+                } else {
+                    R.string.no_search_results
+                }
+            container.addView(newText(getString(emptyRes), color = R.color.lv_text_tertiary), matchParams(top = 12))
             return
         }
 
         for (entry in visible) {
             container.addView(newEntryRow(entry), matchParams(top = 8))
         }
+    }
+
+    /** Category chips: All, each category in stored order, then Uncategorized (only if any exist). */
+    private fun renderChips() {
+        val row = chipsContainer ?: return
+        row.removeAllViews()
+
+        row.addView(
+            newChip(getString(R.string.category_all), categoryFilter == CategoryFilter.All) {
+                selectCategory(CategoryFilter.All)
+            },
+        )
+
+        for (category in categories) {
+            val selected = (categoryFilter as? CategoryFilter.Category)?.id == category.id
+            row.addView(
+                newChip(category.name, selected) { selectCategory(CategoryFilter.Category(category.id)) },
+                wrapParams(left = 8),
+            )
+        }
+
+        if (categories.isNotEmpty() && entries.any { it.categoryId == null }) {
+            row.addView(
+                newChip(getString(R.string.category_uncategorized), categoryFilter == CategoryFilter.Uncategorized) {
+                    selectCategory(CategoryFilter.Uncategorized)
+                },
+                wrapParams(left = 8),
+            )
+        }
+    }
+
+    private fun selectCategory(filter: CategoryFilter) {
+        categoryFilter = filter
+        renderChips()
+        renderRows()
     }
 
     private fun renderDetail() {
@@ -767,6 +1012,35 @@ class MainActivity : Activity() {
         secret.addView(buttons, matchParams(top = 12))
         addToContent(secret, topMargin = 12)
 
+        if (current.totpEnabled) {
+            val totp = newCard()
+            totp.addView(newText(getString(R.string.totp_title), size = 13f, color = R.color.lv_text_tertiary))
+
+            val code = newText("", size = 28f, bold = true)
+            code.typeface = Typeface.MONOSPACE
+            code.setTextIsSelectable(false)
+            code.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+            totpCodeView = code
+            totp.addView(code, matchParams(top = 4))
+
+            val progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+            progress.progressTintList = ColorStateList.valueOf(getColor(R.color.lv_primary))
+            totpProgress = progress
+            totp.addView(progress, matchParams(top = 8))
+
+            val remaining = newText("", size = 13f, color = R.color.lv_text_secondary)
+            totpRemainingView = remaining
+            totp.addView(remaining, matchParams(top = 4))
+
+            totp.addView(
+                newSecondaryButton(getString(R.string.totp_copy), compact = true) { copyTotp() },
+                wrapParams(top = 12, gravity = Gravity.START),
+            )
+            addToContent(totp, topMargin = 12)
+
+            startTotp(current.id)
+        }
+
         addToContent(
             newText(getString(R.string.clipboard_hint), size = 12f, color = R.color.lv_text_tertiary),
             topMargin = 12,
@@ -796,6 +1070,25 @@ class MainActivity : Activity() {
         }
 
         return row
+    }
+
+    private fun newChip(label: String, selected: Boolean, onClick: () -> Unit): TextView {
+        val chip = TextView(this)
+        chip.text = label
+        chip.textSize = 14f
+        chip.gravity = Gravity.CENTER
+        chip.setSingleLine()
+        chip.ellipsize = TextUtils.TruncateAt.END
+        chip.maxWidth = dp(220)
+        chip.minHeight = dp(40)
+        chip.setPadding(dp(16), dp(8), dp(16), dp(8))
+        chip.isClickable = true
+        chip.isSelected = selected
+        chip.background = getDrawable(if (selected) R.drawable.bg_chip_selected else R.drawable.bg_chip)
+        chip.setTextColor(getColor(if (selected) R.color.lv_on_primary else R.color.lv_text))
+        if (selected) chip.setTypeface(chip.typeface, Typeface.BOLD)
+        chip.setOnClickListener { onClick() }
+        return chip
     }
 
     private fun newCard(clickable: Boolean = false): LinearLayout {

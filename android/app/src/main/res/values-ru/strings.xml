@@ -42,6 +42,15 @@
     <string name="copied">Скопировано</string>
     <string name="clipboard_hint">LocalVault удаляет скопированное значение через 30 секунд, когда Android позволяет безопасно проверить буфер обмена. Чужое содержимое не затрагивается.</string>
 
+    <string name="category_all">Все</string>
+    <string name="category_uncategorized">Без категории</string>
+    <string name="category_empty">Нет записей в этой категории.</string>
+
+    <string name="totp_title">Код 2FA</string>
+    <string name="totp_copy">Копировать код</string>
+    <string name="totp_refresh_in">Обновление через %1$d с</string>
+    <string name="msg_totp_failed">Не удалось создать код 2FA.</string>
+
     <string name="msg_auth">Не удалось разблокировать хранилище. Проверьте мастер-пароль и файл.</string>
     <string name="msg_format">Этот файл не является поддерживаемым хранилищем LocalVault.</string>
     <string name="msg_read">Не удалось прочитать выбранный файл.</string>

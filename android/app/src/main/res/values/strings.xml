@@ -41,6 +41,15 @@
     <string name="copied">Copied</string>
     <string name="clipboard_hint">Copied values are removed after 30 seconds when Android lets LocalVault check the clipboard safely. Other copied content is never touched.</string>
 
+    <string name="category_all">All</string>
+    <string name="category_uncategorized">Uncategorized</string>
+    <string name="category_empty">No entries in this category.</string>
+
+    <string name="totp_title">2FA code</string>
+    <string name="totp_copy">Copy code</string>
+    <string name="totp_refresh_in">Refreshes in %1$d s</string>
+    <string name="msg_totp_failed">Unable to generate the 2FA code.</string>
+
     <string name="msg_auth">Unable to unlock vault. Check the master password and file.</string>
     <string name="msg_format">This file is not a supported LocalVault vault.</string>
     <string name="msg_read">Unable to read the selected file.</string>
