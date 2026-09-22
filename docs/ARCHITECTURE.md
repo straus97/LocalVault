@@ -1,6 +1,6 @@
 # Architecture
 
-## Current architecture (as of 1S-C3)
+## Current architecture (desktop as of 1S-C3; Android added at 1T-B1b–B4)
 
 - **Frontend:** Tauri 2 + React + TypeScript (`src/`). Performs no vault cryptography — it calls Tauri commands and renders results.
 - **Shared core:** Rust, no Tauri/platform dependency (`crates/localvault-core/src/`, lib name `localvault_core`). Workspace member alongside `src-tauri`, declared in the root `Cargo.toml`.
@@ -35,6 +35,14 @@ src-tauri/src/
   secure_clipboard.rs                 # Windows clipboard integration
   site_icon_fetcher.rs                # the one sanctioned network path (favicons)
   main.rs, lib.rs
+
+crates/localvault-android-bridge/src/  # Android FFI adapter (1T-B1b onward) — see "Android adapter" below
+  lib.rs                               # UniFFI 0.32.0 proc-macro interface + VaultSession (Rust-owned),
+                                        # depends on localvault-core only; no Android/JVM code
+
+android/                               # native Kotlin app (1T-B1b onward) — no Compose, no AndroidX
+  app/src/main/java/.../MainActivity.kt, RecentVaults.kt, SecureClipboard.kt
+  scripts/build-android-debug.ps1      # explicit cargo-ndk + UniFFI-bindgen + Gradle pipeline
 ```
 
 Key dependencies:
@@ -71,7 +79,7 @@ The following are still implemented only in `src-tauri`. Some are genuine platfo
 - frontend (`src/`)
 - password-health orchestration and current implementation (`app_state/password_health.rs`, `commands/password_health.rs`) — placement undecided
 - password generator (`password_generator.rs`) — placement undecided
-- Android adapter — does not exist yet (1T not started)
+- Android adapter (`crates/localvault-android-bridge/`, `android/`) — exists and is read-only as of 1T-B4 (`4a42ffc`); write/create/CRUD is not yet implemented (1T-B5, not started) — see `@docs/HANDOFF_1T_PROGRESS.md`
 - synchronization — does not exist yet (1U/1V not started)
 
 The subset of this list that is a permanent platform-adapter responsibility (not just "not yet extracted") is listed separately below in "What must stay outside the shared core."
@@ -118,9 +126,38 @@ localvault-core (Rust, no Tauri/platform dependency)
 - Adapters must not implement or re-implement cryptography, KDF, AEAD, vault format parsing, migrations, or TOTP generation — all of that stays in the core.
 - The favicon network path (`site_icon_fetcher.rs`) is a desktop-only, explicit, narrow exception and should not be assumed available on constrained mobile contexts without re-review; it must not be treated as precedent for adding network dependencies elsewhere.
 
-## Future mobile architecture
+## Android architecture (1T, implemented as of 1T-B4)
 
-Android (1T) gets a thin adapter analogous to the current `src-tauri` adapter: platform UI on top, calling into `localvault-core` for vault/crypto/TOTP logic (currently extracted) and whatever else has landed in core by the time 1T starts. Mobile-only concerns (autofill, biometrics, camera-based QR scanning, platform secure storage for convenience unlock) live entirely in the adapter, not in the core. Password-health and password-generator placement are undecided as of this checkpoint (see "What still remains outside core" above); the 1S remaining-work audit confirmed neither is required to be resolved before 1T, though either could still move into core later if a concrete Android need arises.
+Android gets a thin adapter analogous to the current `src-tauri` adapter, chosen by the 1T-A/1T-A2 architecture audits and implemented starting at 1T-B1b:
+
+```
+Native Android Kotlin UI (android/app/src/main/java/...)
+    |  plain framework views only — no Compose, no AndroidX added for this
+    v
+stable UniFFI 0.32.0 Kotlin/JNA generated bindings
+    |  JNA is an Android/Gradle-side dependency only — never added to
+    |  localvault-core or the bridge crate's own Cargo.toml
+    v
+crates/localvault-android-bridge (Rust, depends only on localvault-core)
+    |  thin FFI adapter: VaultSession (Rust-owned decrypted state), non-secret
+    |  summary/detail records, structured oracle-safe errors
+    v
+localvault-core (unchanged — same crypto/format/schema/TOTP as desktop)
+```
+
+Explicitly **not** used: the experimental `uniffi-bindgen-kotlin-jni` backend, hand-written JNI, Tauri Mobile, or async UniFFI (see the 1T-A2 audit rationale, summarized in `@docs/HANDOFF_1T_PROGRESS.md`).
+
+**Session/security boundary** (unchanged since 1T-B1b, extended by B2–B4, all still true):
+- The decrypted `VaultData` never crosses FFI; it lives only inside the Rust-owned `VaultSession` (`crates/localvault-android-bridge/src/lib.rs`).
+- The Master Key and Vault Key never cross FFI at all — `open_vault` uses `localvault_core::vault::format::open_envelope` (not `_with_key`), so neither key is even retained bridge-side.
+- The master password enters through one narrow `open_vault(envelope_bytes, master_password)` call; the bridge wraps it in `Zeroizing` as early as practical. This does not erase the JVM/JNA-side copy — see `@docs/SECURITY_MODEL.md`.
+- Individual entry passwords cross FFI only on an explicit user show/copy action (`VaultSession::entry_password`), never as part of any list/summary call.
+- The TOTP secret/configuration never crosses FFI; only a generated code + timing (`VaultSession::totp_status`, backed by `localvault_core::totp::generate_totp`) crosses, and only while the detail screen is visible.
+- Category data (`VaultSession::list_categories`) is non-secret metadata only (id/name/entry-count).
+
+**Read-only as of 1T-B4.** Vault writes, creation, and mutation (entries, categories, TOTP setup) are **not implemented** — that is the entire scope of the next task, 1T-B5. Mobile-only concerns not yet built (autofill, biometrics, camera-based QR scanning, platform secure storage for convenience unlock) remain out of scope until 1W and would live entirely in the Android adapter, never in core, per the existing "What must stay outside the shared core" rule below. Password-health and password-generator placement remain undecided as of this checkpoint (see "What still remains outside core" above); neither is required before 1T, though either could still move into core later if a concrete Android need arises.
+
+Full toolchain pins (Rust/NDK/AGP/Gradle/Kotlin/UniFFI/JNA versions), the storage/SAF model, the clipboard model, and the complete B1a–B4 history live in `@docs/HANDOFF_1T_PROGRESS.md` — this section only records the architecture shape and security boundary.
 
 ## Future sync abstraction
 
