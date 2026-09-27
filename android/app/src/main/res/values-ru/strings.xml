@@ -7,6 +7,15 @@
 
     <string name="choose_vault">Выбрать хранилище</string>
     <string name="choose_another_vault">Выбрать другое хранилище</string>
+    <string name="create_new_vault">Создать хранилище</string>
+    <string name="create_vault_action">Создать хранилище</string>
+    <string name="creating_vault">Создание хранилища...</string>
+    <string name="confirm_master_password">Подтвердите мастер-пароль</string>
+    <string name="default_new_vault_filename">LocalVault.lvault</string>
+    <string name="msg_password_mismatch">Пароли не совпадают.</string>
+    <string name="msg_create_vault_not_writable">Выбранное расположение не поддерживает запись. Выберите другое место.</string>
+    <string name="msg_create_vault_failed">Не удалось создать хранилище.</string>
+    <string name="msg_create_vault_manual_cleanup">Не удалось создать хранилище. Удалите файл «%1$s» вручную.</string>
     <string name="recent_vaults">Недавние хранилища</string>
     <string name="recent_vaults_empty">Здесь появятся хранилища, которые вы откроете.</string>
     <string name="remove_from_history">Удалить из истории</string>

@@ -8,6 +8,15 @@
 
     <string name="choose_vault">Choose vault</string>
     <string name="choose_another_vault">Choose a different vault</string>
+    <string name="create_new_vault">Create new vault</string>
+    <string name="create_vault_action">Create vault</string>
+    <string name="creating_vault">Creating vault...</string>
+    <string name="confirm_master_password">Confirm master password</string>
+    <string name="default_new_vault_filename">LocalVault.lvault</string>
+    <string name="msg_password_mismatch">Passwords do not match.</string>
+    <string name="msg_create_vault_not_writable">The selected location does not support write access. Choose a different location.</string>
+    <string name="msg_create_vault_failed">Unable to create the vault.</string>
+    <string name="msg_create_vault_manual_cleanup">Vault creation failed. Please manually delete \"%1$s\".</string>
     <string name="recent_vaults">Recent vaults</string>
     <string name="recent_vaults_empty">Vaults you open will appear here.</string>
     <string name="remove_from_history">Remove from history</string>

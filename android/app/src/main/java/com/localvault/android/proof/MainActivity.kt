@@ -13,6 +13,7 @@ import android.animation.ValueAnimator
 import android.os.Handler
 import android.os.Looper
 import android.view.animation.LinearInterpolator
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.text.Editable
 import android.text.InputType
@@ -25,6 +26,7 @@ import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.window.OnBackInvokedDispatcher
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -40,6 +42,7 @@ import uniffi.localvault_android_bridge.BridgeException
 import uniffi.localvault_android_bridge.CategorySummary
 import uniffi.localvault_android_bridge.EntryDetails
 import uniffi.localvault_android_bridge.EntrySummary
+import uniffi.localvault_android_bridge.PendingVaultCreationInterface
 import uniffi.localvault_android_bridge.VaultSession
 import uniffi.localvault_android_bridge.openVault
 
@@ -74,7 +77,7 @@ import uniffi.localvault_android_bridge.openVault
  */
 class MainActivity : Activity() {
 
-    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL }
+    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS }
 
     private class VaultReadException : Exception()
 
@@ -95,6 +98,13 @@ class MainActivity : Activity() {
         // onActivityResult can apply the accepted grant-intersection logic
         // (Revision 3, section 3) instead of the plain read-only path.
         const val REQUEST_ENABLE_WRITE = 2
+
+        // 1T-B5b-3: `ACTION_CREATE_DOCUMENT` for a brand-new vault. Distinct
+        // from both codes above so onActivityResult can apply the
+        // create-specific grant-intersection + live-writability check
+        // (section C of the accepted vault-creation-UI task) before ever
+        // showing the master-password screen.
+        const val REQUEST_CREATE_VAULT = 3
 
         // Mirrors the desktop adapter's vault file size bound.
         const val MAX_VAULT_FILE_BYTES = 32L * 1024 * 1024
@@ -133,8 +143,56 @@ class MainActivity : Activity() {
     private var listScrollY: Int = 0
     private var detail: EntryDetails? = null
 
+    // 1T-B5b-3 vault-creation state. Holds only non-secret bookkeeping for
+    // the document currently being created: its Uri/display name, and
+    // exactly which persistable grant flag(s) THIS creation attempt itself
+    // took (so terminal cleanup releases only those, never a merely
+    // requested flag -- accepted task section C/F). No master password or
+    // Rust secret state is ever held in an Activity field; the master
+    // password lives only in the password/confirm EditTexts until the
+    // background creation thread reads and discards them, exactly like
+    // startUnlock's existing pattern.
+    private var createDocumentUri: Uri? = null
+    private var createDocumentName: String = ""
+    private var createTookPersistableRead: Boolean = false
+    private var createTookPersistableWrite: Boolean = false
+
+    // Bumped whenever an in-flight creation attempt is abandoned (onStop or
+    // Back while CREATE_IN_PROGRESS, or onDestroy) so a late background
+    // result is resolved as abandoned rather than shown -- the same pattern
+    // unlockGeneration already uses for runUnlock/finishUnlock.
+    private var createGeneration = 0
+
+    // Ownership record for whichever PendingVaultCreation the background
+    // creation thread has most recently registered via
+    // VaultCreationCoordinator's onPendingCreated hook. Generation-scoped
+    // (not a bare reference) and guarded by createLock so that:
+    //  - a registration racing behind an onStop/onDestroy-driven
+    //    abandonment can never store a pending object for a generation that
+    //    is already stale -- it observes the bumped createGeneration under
+    //    the same lock and discards immediately instead;
+    //  - an onStop/onDestroy abandonment can never miss a pending object
+    //    that is registered concurrently -- the two paths take the same
+    //    lock, so exactly one of them observes the "current" state and acts
+    //    on it, with no window where an abandoned generation's pending
+    //    exists but is unreachable by either side;
+    //  - a late-finishing OLD attempt's cleanup can only ever detach a slot
+    //    that still records its OWN generation, so it can never clear,
+    //    discard or overwrite a NEWER attempt's live pending reference.
+    // pending.discard() itself (a JNA/native call) is always performed
+    // OUTSIDE this lock, once ownership has already been decided under it.
+    private class PendingCreationSlot(val generation: Int, val pending: PendingVaultCreationInterface)
+
+    private val createLock = Any()
+    private var activePendingSlot: PendingCreationSlot? = null
+
+    // Debug-only, opt-in via a checkbox on CREATE_PASSWORD (never default
+    // behavior even in a debuggable build -- see renderCreatePassword).
+    private var qaPauseAfterInitialWrite: Boolean = false
+
     // Views that hold user-entered or revealed text; nulled on every render.
     private var passwordField: EditText? = null
+    private var confirmPasswordField: EditText? = null
     private var searchField: EditText? = null
     private var rowsContainer: LinearLayout? = null
     private var countView: TextView? = null
@@ -245,10 +303,19 @@ class MainActivity : Activity() {
 
         clipboard.setAppFocused(false)
 
-        if (screen == Screen.LIST || screen == Screen.DETAIL || screen == Screen.UNLOCKING) {
-            lockVault()
-        } else {
-            passwordField?.let { wipe(it) }
+        when (screen) {
+            Screen.LIST, Screen.DETAIL, Screen.UNLOCKING -> lockVault()
+            Screen.CREATE_IN_PROGRESS -> abandonCreateInProgress()
+            else -> {
+                // CREATE_PASSWORD included: no Rust secret state exists yet
+                // at this screen (PendingVaultCreation is only ever
+                // constructed inside submitCreatePassword's background call),
+                // so -- like FILE_SELECTED before it -- backgrounding here
+                // only needs to wipe the typed-but-uncommitted password
+                // text, not abandon the already-created document/grant.
+                passwordField?.let { wipe(it) }
+                confirmPasswordField?.let { wipe(it) }
+            }
         }
     }
 
@@ -262,6 +329,12 @@ class MainActivity : Activity() {
         detail = null
         closeQuietly(current)
 
+        // Defense in depth alongside onStop's abandonCreateInProgress(),
+        // which normally already runs first in the ordinary Activity
+        // lifecycle: never leave a Rust PendingVaultCreation reachable past
+        // this Activity's destruction.
+        abandonActivePendingCreation()?.let { discardPendingQuietly(it) }
+
         super.onDestroy()
     }
 
@@ -271,6 +344,11 @@ class MainActivity : Activity() {
 
         if (requestCode == REQUEST_ENABLE_WRITE) {
             finishEnableWriteAccess(resultCode, data)
+            return
+        }
+
+        if (requestCode == REQUEST_CREATE_VAULT) {
+            finishCreateVaultPicker(resultCode, data)
             return
         }
 
@@ -316,6 +394,8 @@ class MainActivity : Activity() {
         when (screen) {
             Screen.DETAIL -> closeDetail()
             Screen.LIST, Screen.UNLOCKING -> lockVault()
+            Screen.CREATE_IN_PROGRESS -> abandonCreateInProgress()
+            Screen.CREATE_PASSWORD -> cancelCreatePassword()
             Screen.FILE_SELECTED -> {
                 vaultUri = null
                 vaultName = ""
@@ -463,6 +543,414 @@ class MainActivity : Activity() {
             )
         } catch (ignored: Exception) {
         }
+    }
+
+    // ---------------------------------------------------------------- vault creation
+    //
+    // 1T-B5b-3. Hard ordering invariant (accepted task, section A): the
+    // picker launches with NO master password collected and NO Rust secret
+    // state of any kind constructed; only after it returns, the app is
+    // foreground again, and this specific attempt has proven a durable
+    // persisted write grant plus a live writable document, is the password
+    // screen ever shown; only then is begin_create_vault ever called.
+
+    @Suppress("DEPRECATION")
+    private fun startCreateVault() {
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.type = "*/*"
+        intent.putExtra(Intent.EXTRA_TITLE, getString(R.string.default_new_vault_filename))
+        intent.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+        )
+        startActivityForResult(intent, REQUEST_CREATE_VAULT)
+    }
+
+    /**
+     * Picker result for a brand-new document (section C). Evaluated only
+     * from the ACTUAL returned `Intent` flags -- never assumed from what was
+     * requested. A cancelled/no-result picker is a pure no-op: nothing was
+     * created, nothing to clean up.
+     */
+    private fun finishCreateVaultPicker(resultCode: Int, data: Intent?) {
+        if (resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+
+        val granted = grantedPermissionsFrom(data.flags)
+        val tookRead = granted.persistable && granted.read && tryTakeCreatedPersistable(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        val tookWrite = granted.persistable && granted.write && tryTakeCreatedPersistable(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+
+        // Both a durable persisted write grant actually taken by THIS
+        // attempt, and a live provider write-capability check, are required
+        // before the password screen may ever appear (section C).
+        if (!tookWrite || !documentIo.supportsWrite(uri.toString())) {
+            cleanUpFailedCreation(
+                uri,
+                queryDisplayName(uri) ?: getString(R.string.default_vault_name),
+                tookRead,
+                tookWrite,
+                failureMessageRes = R.string.msg_create_vault_not_writable,
+            )
+            screen = if (vaultUri != null) Screen.FILE_SELECTED else Screen.NO_FILE
+            render()
+            return
+        }
+
+        createDocumentUri = uri
+        createDocumentName = queryDisplayName(uri) ?: getString(R.string.default_vault_name)
+        createTookPersistableRead = tookRead
+        createTookPersistableWrite = tookWrite
+        qaPauseAfterInitialWrite = false
+        statusRes = 0
+        screen = Screen.CREATE_PASSWORD
+        render()
+    }
+
+    private fun tryTakeCreatedPersistable(uri: Uri, flag: Int): Boolean {
+        return try {
+            contentResolver.takePersistableUriPermission(uri, flag)
+            true
+        } catch (ignored: SecurityException) {
+            false
+        }
+    }
+
+    private fun cancelCreatePassword() {
+        val uri = createDocumentUri
+        if (uri != null) {
+            cleanUpFailedCreation(uri, createDocumentName, createTookPersistableRead, createTookPersistableWrite)
+        }
+        clearCreateState()
+        screen = if (vaultUri != null) Screen.FILE_SELECTED else Screen.NO_FILE
+        render()
+    }
+
+    private fun submitCreatePassword() {
+        val uri = createDocumentUri ?: return
+        val pwField = passwordField ?: return
+        val confirmField = confirmPasswordField ?: return
+
+        val password = pwField.text.toString()
+        val confirm = confirmField.text.toString()
+
+        // UI-level-only validation (section D): purely local, no bridge
+        // call, same document/grant retained, stays on CREATE_PASSWORD.
+        // Matching "empty master password" client-side is deliberate here,
+        // not an invented policy -- localvault-core's create_envelope_with_key
+        // already rejects an empty master password unconditionally
+        // (VaultError::EmptyMasterPassword), so this only avoids a doomed
+        // round trip; no password-strength rule beyond emptiness is added.
+        if (password.isEmpty()) {
+            wipeCreatePasswordFields()
+            statusRes = R.string.msg_empty_password
+            render()
+            return
+        }
+        if (password != confirm) {
+            wipeCreatePasswordFields()
+            statusRes = R.string.msg_password_mismatch
+            render()
+            return
+        }
+
+        wipeCreatePasswordFields()
+
+        val name = createDocumentName
+        val tookRead = createTookPersistableRead
+        val tookWrite = createTookPersistableWrite
+        val pauseAfterWrite = isDebuggable && qaPauseAfterInitialWrite
+
+        val generation = synchronized(createLock) { ++createGeneration }
+        statusRes = 0
+        screen = Screen.CREATE_IN_PROGRESS
+        render()
+
+        Thread {
+            val outcome =
+                try {
+                    VaultCreationCoordinator(documentIo).createVault(
+                        uri.toString(),
+                        password,
+                        System.currentTimeMillis(),
+                        onPendingCreated = { pending -> registerPendingCreation(generation, pending) },
+                        onAfterInitialWrite = if (pauseAfterWrite) { { awaitQaCreatePause() } } else null,
+                    )
+                } catch (error: Exception) {
+                    CreateVaultOutcome.UnexpectedError(error)
+                }
+
+            runOnUiThread { finishCreateVault(generation, uri, name, tookRead, tookWrite, outcome) }
+        }.start()
+    }
+
+    /**
+     * [VaultCreationCoordinator]'s `onPendingCreated` hook, invoked from the
+     * background creation thread the instant a real `PendingVaultCreation`
+     * exists -- possibly well after `begin_create_vault`'s Argon2id
+     * derivation, which can outlast an intervening onStop/Back/onDestroy.
+     *
+     * Registration is atomic with respect to abandonment: both this method
+     * and [abandonActivePendingCreation] take [createLock] around their
+     * compound check-and-mutate step, so exactly one of "this generation is
+     * still current, store the slot" or "this generation was already
+     * abandoned, discard immediately" is ever true for a given attempt --
+     * there is no window where an abandoned generation's pending state
+     * exists but is unreachable by both sides. [pending.discard] itself
+     * (a JNA/native call) always runs outside the lock.
+     */
+    private fun registerPendingCreation(generation: Int, pending: PendingVaultCreationInterface) {
+        val discardNow =
+            synchronized(createLock) {
+                if (generation == createGeneration) {
+                    activePendingSlot = PendingCreationSlot(generation, pending)
+                    false
+                } else {
+                    // Already abandoned by the time beginCreateVault
+                    // returned: never store it as the live in-flight
+                    // pending, and never touch activePendingSlot, which may
+                    // already legitimately belong to a newer attempt.
+                    true
+                }
+            }
+        if (discardNow) discardPendingQuietly(pending)
+    }
+
+    /**
+     * Resolves one [VaultCreationCoordinator.createVault] result (section E's
+     * outcome matrix). [uri]/[name]/[tookRead]/[tookWrite] are exactly the
+     * values captured at the start of this specific attempt in
+     * [submitCreatePassword] -- never re-read from the current
+     * `createDocumentUri` field, which may already belong to a newer
+     * attempt by the time this runs.
+     *
+     * When [generation] no longer matches [createGeneration] (the app was
+     * backgrounded or the user pressed Back mid-attempt --
+     * [abandonCreateInProgress] already ran), this never re-shows
+     * CREATE_PASSWORD/CREATE_IN_PROGRESS or touches the current screen at
+     * all: it only disposes of whatever this now-abandoned attempt produced
+     * (closes a session that did finalize, or runs the shared cleanup for a
+     * document that did not) -- exactly mirroring finishUnlock's existing
+     * stale-generation handling for runUnlock.
+     */
+    private fun finishCreateVault(
+        generation: Int,
+        uri: Uri,
+        name: String,
+        tookRead: Boolean,
+        tookWrite: Boolean,
+        outcome: CreateVaultOutcome,
+    ) {
+        // Bookkeeping only: this generation's PendingVaultCreation has
+        // already been resolved one way or another by the coordinator
+        // itself (consumed by verify_and_finalize, or discarded on a
+        // failure path) -- or, if abandonment raced ahead first, was never
+        // stored here at all. Only detach the slot if it still belongs to
+        // THIS generation, so a late-finishing OLD attempt can never clear
+        // a NEWER attempt's live pending reference (guarded, not a bare
+        // unconditional clear).
+        clearPendingCreationSlotIfOwnedBy(generation)
+        val stale = generation != createGeneration || isFinishing || isDestroyed
+        // Guards state-clearing against a newer attempt already having
+        // reused createDocumentUri/grant-tracking fields while this
+        // (stale) attempt's background thread was still resolving.
+        val sameAttempt = createDocumentUri == uri
+
+        when (outcome) {
+            is CreateVaultOutcome.Success -> {
+                // Unconditional per the accepted invariant: a vault is
+                // added to recents if and only if verify_and_finalize
+                // returned success -- independent of whether this Activity
+                // is still showing this attempt.
+                rememberVault(RecentVault(uri, name, VaultGrant.READ_WRITE))
+
+                if (stale) {
+                    // The vault by itself is genuinely valid and durable on
+                    // disk; only this Activity's live, unlocked view of it
+                    // is dropped -- matching "the vault is locked whenever
+                    // the Activity leaves the foreground" unconditionally.
+                    closeQuietly(outcome.session)
+                    if (sameAttempt) clearCreateState()
+                    return
+                }
+
+                clearCreateState()
+                closeQuietly(session)
+                session = outcome.session
+                entries = emptyList()
+                categories = emptyList()
+                categoryFilter = CategoryFilter.All
+                searchQuery = ""
+                listScrollY = 0
+                vaultUri = uri
+                vaultName = name
+                statusRes = 0
+                screen = Screen.LIST
+            }
+
+            is CreateVaultOutcome.ValidationFailedBeforeWrite -> {
+                // Retryable only for the still-live, non-stale attempt: no
+                // document write ever happened, so the same document/grant
+                // may safely retry. A stale (abandoned) attempt is always
+                // resolved as terminal instead -- it must never resurrect
+                // CREATE_PASSWORD after the user has already backed out or
+                // backgrounded the app.
+                if (!stale) {
+                    wipeCreatePasswordFields()
+                    statusRes = R.string.msg_create_vault_failed
+                    screen = Screen.CREATE_PASSWORD
+                } else {
+                    cleanUpFailedCreation(uri, name, tookRead, tookWrite)
+                    if (sameAttempt) clearCreateState()
+                    return
+                }
+            }
+
+            CreateVaultOutcome.ProviderNotWritable,
+            CreateVaultOutcome.WriteFailed,
+            is CreateVaultOutcome.ValidationFailedAfterWrite,
+            is CreateVaultOutcome.UnexpectedError,
+            -> {
+                cleanUpFailedCreation(uri, name, tookRead, tookWrite)
+                if (sameAttempt) clearCreateState()
+                if (stale) return
+                screen = if (vaultUri != null) Screen.FILE_SELECTED else Screen.NO_FILE
+            }
+        }
+
+        render()
+    }
+
+    private fun abandonCreateInProgress() {
+        abandonActivePendingCreation()?.let { discardPendingQuietly(it) }
+        statusRes = 0
+        screen = if (vaultUri != null) Screen.FILE_SELECTED else Screen.NO_FILE
+        // createDocumentUri/grant-tracking fields are deliberately left set:
+        // the (now-invalidated) background attempt still owns resolving the
+        // document/grant/recents fate for itself once its outcome is known
+        // -- see finishCreateVault's stale branch above.
+        render()
+    }
+
+    /**
+     * Atomically bumps [createGeneration] and detaches whatever
+     * [PendingCreationSlot] is currently registered -- which, once the bump
+     * has happened under the same lock, necessarily belongs to the now-stale
+     * prior generation, never to a generation that has not started yet.
+     * Used by both onStop's [abandonCreateInProgress] and `onDestroy`. The
+     * returned pending (if any) is discarded by the caller OUTSIDE this
+     * lock, per [PendingCreationSlot]'s own documentation.
+     */
+    private fun abandonActivePendingCreation(): PendingVaultCreationInterface? =
+        synchronized(createLock) {
+            createGeneration++
+            val slot = activePendingSlot
+            activePendingSlot = null
+            slot?.pending
+        }
+
+    private fun clearPendingCreationSlotIfOwnedBy(generation: Int) {
+        synchronized(createLock) {
+            if (activePendingSlot?.generation == generation) {
+                activePendingSlot = null
+            }
+        }
+    }
+
+    private fun discardPendingQuietly(pending: PendingVaultCreationInterface) {
+        try {
+            pending.discard()
+        } catch (ignored: Throwable) {
+        }
+    }
+
+    /**
+     * Shared terminal cleanup (section F): best-effort delete of the newly
+     * created document, then release of only the persistable flag(s) THIS
+     * attempt itself took -- never a merely requested flag. Never touches
+     * recents. Sets [statusRes] to [failureMessageRes] on a successful
+     * delete, or shows a manual-cleanup [Toast] naming only the display
+     * filename (never secret material) when delete failed or is
+     * unsupported -- that message is always the generic one, since a
+     * manual-cleanup instruction is itself the more specific, actionable
+     * detail at that point.
+     */
+    private fun cleanUpFailedCreation(
+        uri: Uri,
+        name: String,
+        tookRead: Boolean,
+        tookWrite: Boolean,
+        failureMessageRes: Int = R.string.msg_create_vault_failed,
+    ) {
+        val deleted =
+            try {
+                DocumentsContract.deleteDocument(contentResolver, uri)
+            } catch (ignored: Exception) {
+                false
+            }
+
+        if (tookRead) releaseCreatedGrant(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        if (tookWrite) releaseCreatedGrant(uri, Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+
+        if (deleted) {
+            statusRes = failureMessageRes
+        } else {
+            statusRes = 0
+            Toast.makeText(this, getString(R.string.msg_create_vault_manual_cleanup, name), Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun releaseCreatedGrant(uri: Uri, flag: Int) {
+        try {
+            contentResolver.releasePersistableUriPermission(uri, flag)
+        } catch (ignored: Exception) {
+        }
+    }
+
+    private fun clearCreateState() {
+        createDocumentUri = null
+        createDocumentName = ""
+        createTookPersistableRead = false
+        createTookPersistableWrite = false
+        qaPauseAfterInitialWrite = false
+    }
+
+    private fun wipeCreatePasswordFields() {
+        passwordField?.let { wipe(it) }
+        confirmPasswordField?.let { wipe(it) }
+    }
+
+    /**
+     * Debug-only QA pause point (opt-in via the CREATE_PASSWORD checkbox
+     * above; never reachable in a non-debuggable build), mirroring the
+     * existing QA save harness's [awaitQaResume] pattern: blocks only the
+     * background creation thread until the tester responds, right after the
+     * initial ciphertext has been physically written but before readback
+     * verification or finalize -- so a tester can force-stop the app here to
+     * confirm the newly created vault still opens normally via the ordinary
+     * `open_vault` path after a cold restart. Holds no plaintext or key
+     * material of its own (everything from this point on is ciphertext the
+     * coordinator already computed) and does not touch, delay, or
+     * special-case onStop's own immediate PendingVaultCreation discard.
+     */
+    private fun awaitQaCreatePause() {
+        val latch = CountDownLatch(1)
+
+        runOnUiThread {
+            AlertDialog.Builder(this)
+                .setCancelable(false)
+                .setTitle("QA: initial vault write completed, not yet verified")
+                .setMessage(
+                    "The new vault document was just written but not yet verified/finalized. " +
+                        "Force-stop the app now (Settings > Apps > LocalVault > Force stop) to test that " +
+                        "the vault still opens normally after a cold restart. Tap Resume to continue normally.",
+                )
+                .setPositiveButton("Resume normally") { _, _ -> latch.countDown() }
+                .show()
+        }
+
+        latch.await()
     }
 
     // ---------------------------------------------------------------- unlock / lock
@@ -932,6 +1420,7 @@ class MainActivity : Activity() {
         stopTotp()
         content.removeAllViews()
         passwordField = null
+        confirmPasswordField = null
         searchField = null
         rowsContainer = null
         countView = null
@@ -949,6 +1438,8 @@ class MainActivity : Activity() {
             Screen.UNLOCKING -> renderUnlocking()
             Screen.LIST -> renderList()
             Screen.DETAIL -> renderDetail()
+            Screen.CREATE_PASSWORD -> renderCreatePassword()
+            Screen.CREATE_IN_PROGRESS -> renderCreateInProgress()
         }
     }
 
@@ -956,6 +1447,7 @@ class MainActivity : Activity() {
         addHeader()
         addStatus()
         addPrimaryButton(getString(R.string.choose_vault), topMargin = 24) { openPicker() }
+        addSecondaryButton(getString(R.string.create_new_vault), topMargin = 10) { startCreateVault() }
 
         addSectionTitle(getString(R.string.recent_vaults))
 
@@ -1008,6 +1500,7 @@ class MainActivity : Activity() {
         addStatus()
         addPrimaryButton(getString(R.string.unlock), topMargin = 16) { startUnlock() }
         addSecondaryButton(getString(R.string.choose_another_vault), topMargin = 10) { openPicker() }
+        addSecondaryButton(getString(R.string.create_new_vault), topMargin = 10) { startCreateVault() }
     }
 
     private fun renderUnlocking() {
@@ -1018,6 +1511,73 @@ class MainActivity : Activity() {
         card.addView(ProgressBar(this), wrapParams(top = 8, gravity = Gravity.CENTER_HORIZONTAL))
         card.addView(
             newText(getString(R.string.unlocking), size = 16f, bold = true),
+            wrapParams(top = 12, gravity = Gravity.CENTER_HORIZONTAL),
+        )
+        addToContent(card, topMargin = 24)
+    }
+
+    private fun renderCreatePassword() {
+        addHeader()
+
+        val card = newCard()
+        card.addView(newText(getString(R.string.vault_label), size = 13f, color = R.color.lv_text_tertiary))
+        card.addView(newText(createDocumentName, size = 17f, bold = true), matchParams(top = 2))
+
+        card.addView(
+            newText(getString(R.string.master_password), size = 13f, color = R.color.lv_text_tertiary),
+            matchParams(top = 16),
+        )
+        val field = newField()
+        field.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        field.imeOptions = EditorInfo.IME_ACTION_NEXT or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        passwordField = field
+        card.addView(field, matchParams(top = 6))
+
+        card.addView(
+            newText(getString(R.string.confirm_master_password), size = 13f, color = R.color.lv_text_tertiary),
+            matchParams(top = 16),
+        )
+        val confirmField = newField()
+        confirmField.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        confirmField.imeOptions = EditorInfo.IME_ACTION_DONE or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        confirmField.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_DONE) {
+                submitCreatePassword()
+                true
+            } else {
+                false
+            }
+        }
+        confirmPasswordField = confirmField
+        card.addView(confirmField, matchParams(top = 6))
+
+        // Debug-only, opt-in fault-injection affordance (accepted task
+        // section I) -- off by default even in a debuggable build, gated on
+        // the app's real ApplicationInfo.FLAG_DEBUGGABLE, never a
+        // hard-coded flag, and absent entirely from a non-debuggable build.
+        if (isDebuggable) {
+            val checkbox = CheckBox(this)
+            checkbox.text = "QA: pause after initial write"
+            checkbox.isChecked = qaPauseAfterInitialWrite
+            checkbox.setOnCheckedChangeListener { _, checked -> qaPauseAfterInitialWrite = checked }
+            card.addView(checkbox, matchParams(top = 12))
+        }
+
+        addToContent(card, topMargin = 20)
+
+        addStatus()
+        addPrimaryButton(getString(R.string.create_vault_action), topMargin = 16) { submitCreatePassword() }
+        addSecondaryButton(getString(android.R.string.cancel), topMargin = 10) { cancelCreatePassword() }
+    }
+
+    private fun renderCreateInProgress() {
+        addHeader()
+
+        val card = newCard()
+        card.gravity = Gravity.CENTER_HORIZONTAL
+        card.addView(ProgressBar(this), wrapParams(top = 8, gravity = Gravity.CENTER_HORIZONTAL))
+        card.addView(
+            newText(getString(R.string.creating_vault), size = 16f, bold = true),
             wrapParams(top = 12, gravity = Gravity.CENTER_HORIZONTAL),
         )
         addToContent(card, topMargin = 24)
