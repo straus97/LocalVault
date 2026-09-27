@@ -26,7 +26,7 @@ use std::{
 use localvault_core::{
     totp::generate_totp,
     vault::{
-        data::{VaultData, VaultEntry},
+        data::{VaultCategory, VaultData, VaultEntry},
         format::{
             create_envelope_with_key, open_envelope_with_key, reseal_envelope, CryptoError,
             SecretKey, VaultEnvelope, VaultError,
@@ -122,6 +122,18 @@ pub enum BridgeError {
     SessionLocked,
     #[error("entry not found")]
     EntryNotFound,
+    /// Mirrors desktop's `SessionError::CategoryNotFound`. Ordinary
+    /// business-state, observable locally via `list_categories` -- no
+    /// oracle concern.
+    #[error("category not found")]
+    CategoryNotFound,
+    /// Mirrors desktop's `SessionError::CategoryInUse`
+    /// (`src-tauri/src/vault/session/categories.rs`): at least one entry
+    /// still references this category, so deletion is blocked rather than
+    /// cascading or reassigning. Ordinary business-state, observable
+    /// locally via `list_categories`/`list_entries` -- no oracle concern.
+    #[error("category is in use by one or more entries")]
+    CategoryInUse,
     #[error("entry has no TOTP configured")]
     TotpNotConfigured,
     #[error("TOTP configuration is invalid")]
@@ -461,6 +473,319 @@ impl VaultSession {
         Ok(bytes)
     }
 
+    /// Stage the creation of a new entry, producing the resealed candidate
+    /// envelope's bytes for Kotlin to write. Does not modify the committed
+    /// session state -- see `commit_staged_save` and `discard_staged_save`.
+    ///
+    /// `now_ms` is caller-supplied (this crate reads no clock). The new
+    /// entry has no TOTP configuration -- TOTP setup is 1T-B5c's scope, not
+    /// B5b's.
+    ///
+    /// Only one staged mutation may be outstanding at a time.
+    pub fn stage_create_entry(
+        &self,
+        input: EntryInput,
+        now_ms: i64,
+    ) -> Result<Vec<u8>, BridgeError> {
+        if now_ms < 0 {
+            return Err(BridgeError::InvalidInput);
+        }
+
+        let category_id = parse_optional_category_id(&input.category_id)?;
+
+        let mut guard = self.guard();
+        let state = guard.as_mut().ok_or(BridgeError::SessionLocked)?;
+
+        if state.staged.is_some() {
+            return Err(BridgeError::PendingUnsavedChanges);
+        }
+
+        let mut candidate = state.data.clone();
+
+        let mut entry =
+            VaultEntry::new(input.title, now_ms).map_err(|_| BridgeError::InvalidInput)?;
+        entry.profile_name = input.profile_name;
+        entry.url = input.url;
+        entry.username = input.username;
+        entry.password = input.password;
+        entry.notes = input.notes;
+        entry.category_id = category_id;
+        entry.tags = input.tags;
+        entry.favorite = input.favorite;
+
+        candidate.entries.push(entry);
+
+        candidate.updated_at_ms = candidate.updated_at_ms.max(now_ms);
+
+        candidate.upgrade_legacy_schema_for_write();
+        candidate
+            .validate()
+            .map_err(|_| BridgeError::InvalidInput)?;
+
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
+        );
+
+        let candidate_envelope = reseal_envelope(&state.envelope, &state.vault_key, &plaintext)
+            .map_err(|_| BridgeError::OperationFailed)?;
+
+        let bytes =
+            serde_json::to_vec(&candidate_envelope).map_err(|_| BridgeError::OperationFailed)?;
+
+        state.staged = Some((candidate, candidate_envelope));
+
+        Ok(bytes)
+    }
+
+    /// Stage the removal of an existing entry, producing the resealed
+    /// candidate envelope's bytes for Kotlin to write. Does not modify the
+    /// committed session state -- see `commit_staged_save` and
+    /// `discard_staged_save`.
+    ///
+    /// `now_ms` is caller-supplied (this crate reads no clock).
+    ///
+    /// Only one staged mutation may be outstanding at a time.
+    pub fn stage_delete_entry(
+        &self,
+        entry_id: String,
+        now_ms: i64,
+    ) -> Result<Vec<u8>, BridgeError> {
+        if now_ms < 0 {
+            return Err(BridgeError::InvalidInput);
+        }
+
+        let mut guard = self.guard();
+        let state = guard.as_mut().ok_or(BridgeError::SessionLocked)?;
+
+        if state.staged.is_some() {
+            return Err(BridgeError::PendingUnsavedChanges);
+        }
+
+        let mut candidate = state.data.clone();
+
+        let index = candidate
+            .entries
+            .iter()
+            .position(|entry| entry.id.to_string() == entry_id)
+            .ok_or(BridgeError::EntryNotFound)?;
+
+        candidate.entries.remove(index);
+
+        candidate.updated_at_ms = candidate.updated_at_ms.max(now_ms);
+
+        candidate.upgrade_legacy_schema_for_write();
+        candidate
+            .validate()
+            .map_err(|_| BridgeError::InvalidInput)?;
+
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
+        );
+
+        let candidate_envelope = reseal_envelope(&state.envelope, &state.vault_key, &plaintext)
+            .map_err(|_| BridgeError::OperationFailed)?;
+
+        let bytes =
+            serde_json::to_vec(&candidate_envelope).map_err(|_| BridgeError::OperationFailed)?;
+
+        state.staged = Some((candidate, candidate_envelope));
+
+        Ok(bytes)
+    }
+
+    /// Stage the creation of a new category, producing the resealed
+    /// candidate envelope's bytes for Kotlin to write. Does not modify the
+    /// committed session state -- see `commit_staged_save` and
+    /// `discard_staged_save`.
+    ///
+    /// `now_ms` is caller-supplied (this crate reads no clock).
+    ///
+    /// Only one staged mutation may be outstanding at a time.
+    pub fn stage_create_category(
+        &self,
+        input: CategoryInput,
+        now_ms: i64,
+    ) -> Result<Vec<u8>, BridgeError> {
+        if now_ms < 0 {
+            return Err(BridgeError::InvalidInput);
+        }
+
+        let mut guard = self.guard();
+        let state = guard.as_mut().ok_or(BridgeError::SessionLocked)?;
+
+        if state.staged.is_some() {
+            return Err(BridgeError::PendingUnsavedChanges);
+        }
+
+        let mut candidate = state.data.clone();
+
+        let category =
+            VaultCategory::new(input.name, now_ms).map_err(|_| BridgeError::InvalidInput)?;
+
+        candidate.categories.push(category);
+
+        candidate.updated_at_ms = candidate.updated_at_ms.max(now_ms);
+
+        candidate.upgrade_legacy_schema_for_write();
+        candidate
+            .validate()
+            .map_err(|_| BridgeError::InvalidInput)?;
+
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
+        );
+
+        let candidate_envelope = reseal_envelope(&state.envelope, &state.vault_key, &plaintext)
+            .map_err(|_| BridgeError::OperationFailed)?;
+
+        let bytes =
+            serde_json::to_vec(&candidate_envelope).map_err(|_| BridgeError::OperationFailed)?;
+
+        state.staged = Some((candidate, candidate_envelope));
+
+        Ok(bytes)
+    }
+
+    /// Stage a rename of an existing category, producing the resealed
+    /// candidate envelope's bytes for Kotlin to write. Does not modify the
+    /// committed session state -- see `commit_staged_save` and
+    /// `discard_staged_save`.
+    ///
+    /// `now_ms` is caller-supplied (this crate reads no clock).
+    ///
+    /// Only one staged mutation may be outstanding at a time.
+    pub fn stage_update_category(
+        &self,
+        category_id: String,
+        input: CategoryInput,
+        now_ms: i64,
+    ) -> Result<Vec<u8>, BridgeError> {
+        if now_ms < 0 {
+            return Err(BridgeError::InvalidInput);
+        }
+
+        let id = Uuid::parse_str(&category_id).map_err(|_| BridgeError::InvalidInput)?;
+
+        let mut guard = self.guard();
+        let state = guard.as_mut().ok_or(BridgeError::SessionLocked)?;
+
+        if state.staged.is_some() {
+            return Err(BridgeError::PendingUnsavedChanges);
+        }
+
+        let mut candidate = state.data.clone();
+
+        let index = candidate
+            .categories
+            .iter()
+            .position(|category| category.id == id)
+            .ok_or(BridgeError::CategoryNotFound)?;
+
+        let created_at_ms = candidate.categories[index].created_at_ms;
+        let previous_updated_at_ms = candidate.categories[index].updated_at_ms;
+        let effective_updated_at_ms = now_ms.max(previous_updated_at_ms);
+
+        candidate.categories[index] = VaultCategory {
+            id,
+            name: input.name,
+            created_at_ms,
+            updated_at_ms: effective_updated_at_ms,
+        };
+
+        candidate.updated_at_ms = candidate.updated_at_ms.max(effective_updated_at_ms);
+
+        candidate.upgrade_legacy_schema_for_write();
+        candidate
+            .validate()
+            .map_err(|_| BridgeError::InvalidInput)?;
+
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
+        );
+
+        let candidate_envelope = reseal_envelope(&state.envelope, &state.vault_key, &plaintext)
+            .map_err(|_| BridgeError::OperationFailed)?;
+
+        let bytes =
+            serde_json::to_vec(&candidate_envelope).map_err(|_| BridgeError::OperationFailed)?;
+
+        state.staged = Some((candidate, candidate_envelope));
+
+        Ok(bytes)
+    }
+
+    /// Stage the removal of an existing category, producing the resealed
+    /// candidate envelope's bytes for Kotlin to write. Does not modify the
+    /// committed session state -- see `commit_staged_save` and
+    /// `discard_staged_save`.
+    ///
+    /// Blocks deletion (`BridgeError::CategoryInUse`) if any entry still
+    /// references this category, mirroring desktop's
+    /// `UnlockedVaultSession::delete_category`
+    /// (`src-tauri/src/vault/session/categories.rs`) exactly -- no
+    /// cascading deletion and no automatic reassignment to "uncategorized".
+    ///
+    /// `now_ms` is caller-supplied (this crate reads no clock).
+    ///
+    /// Only one staged mutation may be outstanding at a time.
+    pub fn stage_delete_category(
+        &self,
+        category_id: String,
+        now_ms: i64,
+    ) -> Result<Vec<u8>, BridgeError> {
+        if now_ms < 0 {
+            return Err(BridgeError::InvalidInput);
+        }
+
+        let id = Uuid::parse_str(&category_id).map_err(|_| BridgeError::InvalidInput)?;
+
+        let mut guard = self.guard();
+        let state = guard.as_mut().ok_or(BridgeError::SessionLocked)?;
+
+        if state.staged.is_some() {
+            return Err(BridgeError::PendingUnsavedChanges);
+        }
+
+        let mut candidate = state.data.clone();
+
+        let index = candidate
+            .categories
+            .iter()
+            .position(|category| category.id == id)
+            .ok_or(BridgeError::CategoryNotFound)?;
+
+        if candidate
+            .entries
+            .iter()
+            .any(|entry| entry.category_id == Some(id))
+        {
+            return Err(BridgeError::CategoryInUse);
+        }
+
+        candidate.categories.remove(index);
+
+        candidate.updated_at_ms = candidate.updated_at_ms.max(now_ms);
+
+        candidate.upgrade_legacy_schema_for_write();
+        candidate
+            .validate()
+            .map_err(|_| BridgeError::InvalidInput)?;
+
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
+        );
+
+        let candidate_envelope = reseal_envelope(&state.envelope, &state.vault_key, &plaintext)
+            .map_err(|_| BridgeError::OperationFailed)?;
+
+        let bytes =
+            serde_json::to_vec(&candidate_envelope).map_err(|_| BridgeError::OperationFailed)?;
+
+        state.staged = Some((candidate, candidate_envelope));
+
+        Ok(bytes)
+    }
+
     /// Promote the single staged candidate into the session's committed
     /// state. Call only after Kotlin has written the bytes `stage_*`
     /// returned, re-read them back, and confirmed exact byte equality --
@@ -520,6 +845,14 @@ pub struct EntryInput {
     pub category_id: Option<String>,
     pub tags: Vec<String>,
     pub favorite: bool,
+}
+
+/// Input for creating or renaming a category. Mirrors desktop's
+/// `CategoryInput` field-for-field (`src-tauri/src/vault/session/
+/// categories.rs`).
+#[derive(uniffi::Record)]
+pub struct CategoryInput {
+    pub name: String,
 }
 
 /// Rust-owned state for a vault creation in progress. Never exposed as a
@@ -1529,6 +1862,467 @@ mod tests {
     fn begin_create_vault_rejects_negative_timestamp() {
         assert_eq!(
             begin_create_vault(CREATE_MASTER_PASSWORD.to_owned(), -1).err(),
+            Some(BridgeError::InvalidInput)
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 1T-B5b: stage_create_entry, stage_delete_entry, category CRUD.
+    // -----------------------------------------------------------------
+
+    fn create_input(title: &str) -> EntryInput {
+        EntryInput {
+            title: title.to_owned(),
+            profile_name: "New Profile".to_owned(),
+            url: "https://created.example.test".to_owned(),
+            username: "created-user@example.test".to_owned(),
+            password: "CREATED_STAGE_TEST_SECRET".to_owned(),
+            notes: "CREATED_STAGE_TEST_NOTE".to_owned(),
+            category_id: None,
+            tags: vec!["created".to_owned()],
+            favorite: false,
+        }
+    }
+
+    fn category_id_of(session: &VaultSession, name: &str) -> String {
+        session
+            .list_categories()
+            .unwrap()
+            .into_iter()
+            .find(|category| category.name == name)
+            .expect("fixture category exists")
+            .id
+    }
+
+    #[test]
+    fn stage_create_entry_succeeds_and_generates_new_id() {
+        let session = open_ok(schema2());
+        let before_count = session.list_entries().unwrap().len();
+
+        let staged_bytes = session
+            .stage_create_entry(create_input("New Entry"), UPDATE_NOW_MS)
+            .unwrap();
+
+        // The committed session is untouched until commit_staged_save runs.
+        assert_eq!(session.list_entries().unwrap().len(), before_count);
+
+        let staged_session = reopen_bytes(&staged_bytes);
+        let entries = staged_session.list_entries().unwrap();
+        assert_eq!(entries.len(), before_count + 1);
+
+        let created = entries
+            .iter()
+            .find(|entry| entry.title == "New Entry")
+            .expect("new entry present");
+        assert_eq!(created.id.len(), 36);
+        // Never collides with an existing fixture entry's id.
+        assert!(
+            entries
+                .iter()
+                .filter(|entry| entry.id == created.id)
+                .count()
+                == 1
+        );
+
+        let details = staged_session.entry_details(created.id.clone()).unwrap();
+        assert!(!details.totp_enabled);
+    }
+
+    #[test]
+    fn stage_create_entry_rejects_invalid_input() {
+        let session = open_ok(schema2());
+
+        let result = session.stage_create_entry(create_input("   "), UPDATE_NOW_MS);
+
+        assert_eq!(result.err(), Some(BridgeError::InvalidInput));
+    }
+
+    #[test]
+    fn stage_create_entry_rejects_unknown_category() {
+        let session = open_ok(schema2());
+
+        let mut input = create_input("Dangling Category Entry");
+        input.category_id = Some(Uuid::new_v4().to_string());
+
+        let result = session.stage_create_entry(input, UPDATE_NOW_MS);
+
+        assert_eq!(result.err(), Some(BridgeError::InvalidInput));
+    }
+
+    #[test]
+    fn stage_create_entry_rejects_when_session_locked() {
+        let session = open_ok(schema2());
+        session.lock();
+
+        let result = session.stage_create_entry(create_input("Locked"), UPDATE_NOW_MS);
+
+        assert_eq!(result.err(), Some(BridgeError::SessionLocked));
+    }
+
+    #[test]
+    fn stage_create_entry_rejects_when_pending_unsaved_changes() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        session
+            .stage_update_entry(id, update_input("First Stage"), UPDATE_NOW_MS)
+            .unwrap();
+
+        let result = session.stage_create_entry(create_input("Blocked"), UPDATE_NOW_MS);
+
+        assert_eq!(result.err(), Some(BridgeError::PendingUnsavedChanges));
+    }
+
+    #[test]
+    fn stage_create_entry_bytes_never_contain_the_plaintext_password_or_notes() {
+        let session = open_ok(schema2());
+
+        let mut input = create_input("Ciphertext Check");
+        input.password = "CREATE_PLAINTEXT_MUST_NOT_LEAK".to_owned();
+        input.notes = "CREATE_NOTE_MUST_NOT_LEAK".to_owned();
+
+        let staged_bytes = session.stage_create_entry(input, UPDATE_NOW_MS).unwrap();
+
+        let raw = String::from_utf8_lossy(&staged_bytes);
+        assert!(!raw.contains("CREATE_PLAINTEXT_MUST_NOT_LEAK"));
+        assert!(!raw.contains("CREATE_NOTE_MUST_NOT_LEAK"));
+    }
+
+    #[test]
+    fn commit_staged_save_promotes_a_staged_create_entry() {
+        let session = open_ok(schema2());
+
+        session
+            .stage_create_entry(create_input("Committed New Entry"), UPDATE_NOW_MS)
+            .unwrap();
+        session.commit_staged_save().unwrap();
+
+        assert!(session
+            .list_entries()
+            .unwrap()
+            .iter()
+            .any(|entry| entry.title == "Committed New Entry"));
+    }
+
+    #[test]
+    fn stage_delete_entry_succeeds_and_removes_entry() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let staged_bytes = session
+            .stage_delete_entry(id.clone(), UPDATE_NOW_MS)
+            .unwrap();
+
+        // The committed session is untouched until commit_staged_save runs.
+        assert!(session.entry_details(id.clone()).is_ok());
+
+        let staged_session = reopen_bytes(&staged_bytes);
+        assert_eq!(
+            staged_session.entry_details(id).err(),
+            Some(BridgeError::EntryNotFound)
+        );
+    }
+
+    #[test]
+    fn stage_delete_entry_rejects_unknown_entry_id() {
+        let session = open_ok(schema2());
+
+        let result = session.stage_delete_entry(
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+            UPDATE_NOW_MS,
+        );
+
+        assert_eq!(result.err(), Some(BridgeError::EntryNotFound));
+    }
+
+    #[test]
+    fn stage_delete_entry_rejects_when_pending_unsaved_changes() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        session
+            .stage_update_entry(id.clone(), update_input("First Stage"), UPDATE_NOW_MS)
+            .unwrap();
+
+        let result = session.stage_delete_entry(id, UPDATE_NOW_MS);
+
+        assert_eq!(result.err(), Some(BridgeError::PendingUnsavedChanges));
+    }
+
+    #[test]
+    fn stage_create_category_succeeds() {
+        let session = open_ok(schema2());
+        let before_count = session.list_categories().unwrap().len();
+
+        let staged_bytes = session
+            .stage_create_category(
+                CategoryInput {
+                    name: "New Category".to_owned(),
+                },
+                UPDATE_NOW_MS,
+            )
+            .unwrap();
+
+        assert_eq!(session.list_categories().unwrap().len(), before_count);
+
+        let staged_session = reopen_bytes(&staged_bytes);
+        let categories = staged_session.list_categories().unwrap();
+        assert_eq!(categories.len(), before_count + 1);
+        assert!(categories.iter().any(|c| c.name == "New Category"));
+    }
+
+    #[test]
+    fn stage_create_category_rejects_empty_name() {
+        let session = open_ok(schema2());
+
+        let result = session.stage_create_category(
+            CategoryInput {
+                name: "   ".to_owned(),
+            },
+            UPDATE_NOW_MS,
+        );
+
+        assert_eq!(result.err(), Some(BridgeError::InvalidInput));
+    }
+
+    #[test]
+    fn stage_update_category_preserves_identity_and_creation_time() {
+        let session = open_ok(schema2());
+
+        session
+            .stage_create_category(
+                CategoryInput {
+                    name: "Before Rename".to_owned(),
+                },
+                UPDATE_NOW_MS,
+            )
+            .unwrap();
+        session.commit_staged_save().unwrap();
+
+        let id = category_id_of(&session, "Before Rename");
+        let created_at_ms = session
+            .guard()
+            .as_ref()
+            .unwrap()
+            .data
+            .categories
+            .iter()
+            .find(|c| c.id.to_string() == id)
+            .unwrap()
+            .created_at_ms;
+
+        let staged_bytes = session
+            .stage_update_category(
+                id.clone(),
+                CategoryInput {
+                    name: "After Rename".to_owned(),
+                },
+                UPDATE_NOW_MS + 1,
+            )
+            .unwrap();
+
+        let staged_session = reopen_bytes(&staged_bytes);
+        let renamed = staged_session
+            .list_categories()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == id)
+            .expect("category identity preserved");
+        assert_eq!(renamed.name, "After Rename");
+
+        let reopened_created_at_ms = staged_session
+            .guard()
+            .as_ref()
+            .unwrap()
+            .data
+            .categories
+            .iter()
+            .find(|c| c.id.to_string() == id)
+            .unwrap()
+            .created_at_ms;
+        assert_eq!(reopened_created_at_ms, created_at_ms);
+    }
+
+    #[test]
+    fn stage_update_category_rejects_unknown_category_id() {
+        let session = open_ok(schema2());
+
+        let result = session.stage_update_category(
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+            CategoryInput {
+                name: "Nobody".to_owned(),
+            },
+            UPDATE_NOW_MS,
+        );
+
+        assert_eq!(result.err(), Some(BridgeError::CategoryNotFound));
+    }
+
+    #[test]
+    fn stage_delete_category_succeeds_when_unused() {
+        let session = open_ok(schema2());
+
+        session
+            .stage_create_category(
+                CategoryInput {
+                    name: "Temporary".to_owned(),
+                },
+                UPDATE_NOW_MS,
+            )
+            .unwrap();
+        session.commit_staged_save().unwrap();
+        let id = category_id_of(&session, "Temporary");
+
+        let staged_bytes = session
+            .stage_delete_category(id.clone(), UPDATE_NOW_MS + 1)
+            .unwrap();
+
+        let staged_session = reopen_bytes(&staged_bytes);
+        assert!(!staged_session
+            .list_categories()
+            .unwrap()
+            .iter()
+            .any(|c| c.id == id));
+    }
+
+    #[test]
+    fn stage_delete_category_rejects_when_in_use() {
+        let session = open_ok(schema2());
+
+        session
+            .stage_create_category(
+                CategoryInput {
+                    name: "Used".to_owned(),
+                },
+                UPDATE_NOW_MS,
+            )
+            .unwrap();
+        session.commit_staged_save().unwrap();
+        let category_id = category_id_of(&session, "Used");
+
+        let mut entry_input = create_input("Entry In Used Category");
+        entry_input.category_id = Some(category_id.clone());
+        session
+            .stage_create_entry(entry_input, UPDATE_NOW_MS + 1)
+            .unwrap();
+        session.commit_staged_save().unwrap();
+
+        let result = session.stage_delete_category(category_id, UPDATE_NOW_MS + 2);
+
+        assert_eq!(result.err(), Some(BridgeError::CategoryInUse));
+        // Nothing was staged -- mirrors desktop's fail-closed-before-any-
+        // mutation behavior for this rejection.
+        assert_eq!(
+            session.commit_staged_save().err(),
+            Some(BridgeError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn stage_delete_category_rejects_unknown_category_id() {
+        let session = open_ok(schema2());
+
+        let result = session.stage_delete_category(
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+            UPDATE_NOW_MS,
+        );
+
+        assert_eq!(result.err(), Some(BridgeError::CategoryNotFound));
+    }
+
+    #[test]
+    fn stage_update_category_and_delete_category_reject_malformed_id() {
+        let session = open_ok(schema2());
+
+        assert_eq!(
+            session
+                .stage_update_category(
+                    "not-a-uuid".to_owned(),
+                    CategoryInput {
+                        name: "X".to_owned()
+                    },
+                    UPDATE_NOW_MS,
+                )
+                .err(),
+            Some(BridgeError::InvalidInput)
+        );
+        assert_eq!(
+            session
+                .stage_delete_category("not-a-uuid".to_owned(), UPDATE_NOW_MS)
+                .err(),
+            Some(BridgeError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn discard_staged_save_undoes_a_staged_delete_category() {
+        let session = open_ok(schema2());
+
+        session
+            .stage_create_category(
+                CategoryInput {
+                    name: "Keep Me".to_owned(),
+                },
+                UPDATE_NOW_MS,
+            )
+            .unwrap();
+        session.commit_staged_save().unwrap();
+        let id = category_id_of(&session, "Keep Me");
+
+        session
+            .stage_delete_category(id.clone(), UPDATE_NOW_MS + 1)
+            .unwrap();
+        session.discard_staged_save();
+
+        assert!(session
+            .list_categories()
+            .unwrap()
+            .iter()
+            .any(|c| c.id == id));
+    }
+
+    #[test]
+    fn all_new_stage_methods_reject_negative_timestamp() {
+        let session = open_ok(schema2());
+        let entry_id = id_of(&session, "Fixture Login");
+
+        assert_eq!(
+            session
+                .stage_create_entry(create_input("Bad Time"), -1)
+                .err(),
+            Some(BridgeError::InvalidInput)
+        );
+        assert_eq!(
+            session.stage_delete_entry(entry_id, -1).err(),
+            Some(BridgeError::InvalidInput)
+        );
+        assert_eq!(
+            session
+                .stage_create_category(
+                    CategoryInput {
+                        name: "Bad Time".to_owned()
+                    },
+                    -1,
+                )
+                .err(),
+            Some(BridgeError::InvalidInput)
+        );
+
+        let category_id = category_id_of(&session, "Fixture Category");
+        assert_eq!(
+            session
+                .stage_update_category(
+                    category_id.clone(),
+                    CategoryInput {
+                        name: "Bad Time".to_owned()
+                    },
+                    -1,
+                )
+                .err(),
+            Some(BridgeError::InvalidInput)
+        );
+        assert_eq!(
+            session.stage_delete_category(category_id, -1).err(),
             Some(BridgeError::InvalidInput)
         );
     }
