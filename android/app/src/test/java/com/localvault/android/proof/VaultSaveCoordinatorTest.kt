@@ -5,6 +5,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.localvault_android_bridge.BridgeException
+import uniffi.localvault_android_bridge.CategoryInput
 import uniffi.localvault_android_bridge.EntryInput
 import java.io.IOException
 
@@ -377,5 +378,166 @@ class VaultSaveCoordinatorTest {
 
         assertEquals(SaveOutcome.Success, secondOutcome)
         assertEquals(2, session.commitCount)
+    }
+
+    // -- 1T-B5b: generalized wrappers (saveCreateEntry, saveDeleteEntry,
+    // saveCreateCategory, saveUpdateCategory, saveDeleteCategory), all
+    // delegating to the same private runStagedSave core saveUpdateEntry
+    // already proved above. ------------------------------------------
+
+    private fun createEntryInput(title: String) = EntryInput(
+        title = title,
+        profileName = "",
+        url = "",
+        username = "user",
+        password = "pass",
+        notes = "",
+        categoryId = null,
+        tags = emptyList(),
+        favorite = false,
+    )
+
+    private fun categoryInput(name: String) = CategoryInput(name = name)
+
+    @Test
+    fun each_wrapper_stages_only_its_own_bridge_call_and_commits_exactly_once() {
+        // One shared-core proof for all six public methods: each must
+        // reach runStagedSave, invoke exactly its own stage_* call (never
+        // a different one), and commit exactly once on success -- proving
+        // the mechanical extraction routes correctly without repeating the
+        // full transactional sequence's assertions six times over.
+        val cases: List<Pair<String, (VaultSaveCoordinator) -> SaveOutcome>> = listOf(
+            "stageUpdateEntry" to { c: VaultSaveCoordinator ->
+                c.saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+            },
+            "stageCreateEntry" to { c: VaultSaveCoordinator ->
+                c.saveCreateEntry(vaultUri, createEntryInput("New"), 1_000L)
+            },
+            "stageDeleteEntry" to { c: VaultSaveCoordinator ->
+                c.saveDeleteEntry(vaultUri, "entry-1", 1_000L)
+            },
+            "stageCreateCategory" to { c: VaultSaveCoordinator ->
+                c.saveCreateCategory(vaultUri, categoryInput("New"), 1_000L)
+            },
+            "stageUpdateCategory" to { c: VaultSaveCoordinator ->
+                c.saveUpdateCategory(vaultUri, "category-1", categoryInput("Renamed"), 1_000L)
+            },
+            "stageDeleteCategory" to { c: VaultSaveCoordinator ->
+                c.saveDeleteCategory(vaultUri, "category-1", 1_000L)
+            },
+        )
+
+        for ((expectedMethod, invoke) in cases) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            val recovery = FakeRecoverySnapshotStore()
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+            val outcome = invoke(coordinator(io, recovery, session))
+
+            assertEquals("$expectedMethod outcome", SaveOutcome.Success, outcome)
+            assertEquals(
+                "$expectedMethod should be the only stage call made",
+                listOf(expectedMethod),
+                session.stagedMethodCalls,
+            )
+            assertEquals("$expectedMethod commit count", 1, session.commitCount)
+            assertEquals("$expectedMethod discard count", 0, session.discardCount)
+            assertEquals("$expectedMethod write count", 1, io.writes.size)
+        }
+    }
+
+    @Test
+    fun saveCreateEntry_success_advances_the_baseline_for_the_next_attempt() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+        val save = coordinator(io, recovery, session)
+
+        assertEquals(
+            SaveOutcome.Success,
+            save.saveCreateEntry(vaultUri, createEntryInput("First"), 1_000L),
+        )
+        assertTrue(io.contentOf(vaultUri)!!.contentEquals(stagedBytes))
+
+        // If the coordinator still believed the baseline was the original
+        // bytes, this second attempt would incorrectly report
+        // ChangedExternally even though nothing external happened -- only
+        // this coordinator's own prior save changed the primary.
+        val secondOutcome = save.saveCreateEntry(vaultUri, createEntryInput("Second"), 2_000L)
+
+        assertEquals(SaveOutcome.Success, secondOutcome)
+        assertEquals(2, session.commitCount)
+    }
+
+    @Test
+    fun saveCreateEntry_first_stale_check_mismatch_does_not_stage_or_write() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to "externally-changed-bytes".toByteArray()))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+        val outcome = coordinator(io, recovery, session)
+            .saveCreateEntry(vaultUri, createEntryInput("New"), 1_000L)
+
+        assertEquals(SaveOutcome.ChangedExternally, outcome)
+        assertEquals(0, session.stageCount)
+        assertEquals(0, io.writes.size)
+        assertNull(recovery.readMarker(vaultUri))
+    }
+
+    @Test
+    fun saveDeleteEntry_write_failure_leaves_the_marker_unresolved_for_next_unlock_reconciliation() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        io.writeException = IOException("provider write failed")
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+        val outcome = coordinator(io, recovery, session)
+            .saveDeleteEntry(vaultUri, "entry-1", 1_000L)
+
+        assertEquals(SaveOutcome.WriteFailed, outcome)
+        // Deliberately still present: the outcome here is genuinely
+        // unknown until the next unlock reconciles it against disk truth.
+        assertEquals(0, session.commitCount)
+        assertTrue(recovery.hasUnresolvedMarker(vaultUri))
+    }
+
+    @Test
+    fun saveDeleteCategory_categoryInUse_surfaces_as_validationFailed_and_never_commits() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stageException = BridgeException.CategoryInUse())
+
+        val outcome = coordinator(io, recovery, session)
+            .saveDeleteCategory(vaultUri, "category-1", 1_000L)
+
+        assertTrue(outcome is SaveOutcome.ValidationFailed)
+        assertTrue((outcome as SaveOutcome.ValidationFailed).error is BridgeException.CategoryInUse)
+        // A rejected stage never opens/writes the primary and never commits.
+        assertEquals(0, io.writes.size)
+        assertEquals(0, session.commitCount)
+        assertEquals(0, recovery.writeAndVerifyCallCount)
+    }
+
+    @Test
+    fun saveCreateCategory_second_stale_check_still_catches_a_race_after_generalization() {
+        // Mirrors second_stale_check_catches_a_change_injected_after_staging_and_never_opens_the_primary
+        // above, but through a non-update wrapper -- proves the extraction
+        // preserved the shared marker/stale-check ordering for every
+        // mutation type, not only stageUpdateEntry.
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(
+            stagedBytes = stagedBytes,
+            onStage = { io.setContent(vaultUri, "raced-external-write".toByteArray()) },
+        )
+
+        val outcome = coordinator(io, recovery, session)
+            .saveCreateCategory(vaultUri, categoryInput("New"), 1_000L)
+
+        assertEquals(SaveOutcome.ChangedExternally, outcome)
+        // The primary must never be opened for writing once this is caught.
+        assertEquals(0, io.writes.size)
+        assertEquals(1, session.discardCount)
+        assertNull(recovery.readMarker(vaultUri))
     }
 }

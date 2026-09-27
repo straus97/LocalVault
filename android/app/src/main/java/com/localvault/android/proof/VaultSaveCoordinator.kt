@@ -1,6 +1,7 @@
 package com.localvault.android.proof
 
 import uniffi.localvault_android_bridge.BridgeException
+import uniffi.localvault_android_bridge.CategoryInput
 import uniffi.localvault_android_bridge.EntryInput
 import uniffi.localvault_android_bridge.VaultSessionInterface
 
@@ -30,7 +31,8 @@ sealed class SaveOutcome {
     object RecoverySnapshotFailed : SaveOutcome()
 
     /** The staged mutation itself was rejected by the bridge (validation,
-     * an already-pending stage, a locked session, ...). */
+     * an already-pending stage, a locked session, an unknown/in-use
+     * category, ...). */
     data class ValidationFailed(val error: BridgeException) : SaveOutcome()
 
     /** The primary write, its readback, or the byte-equality check failed.
@@ -60,7 +62,7 @@ sealed class SaveOutcome {
  * flow in `MainActivity` for what must happen first).
  *
  * Execution context: this class does no threading of its own -- callers
- * must invoke [saveUpdateEntry] off the main thread, exactly as
+ * must invoke any `save*` method off the main thread, exactly as
  * `MainActivity.runUnlock` already does for `openVault` via a plain
  * `Thread { ... }.start()`. That existing pattern already satisfies the
  * accepted review's requirement that an in-flight write not be
@@ -68,6 +70,12 @@ sealed class SaveOutcome {
  * bare `Thread` is not parented to the Activity lifecycle at all, so no new
  * executor/coroutine/WorkManager/foreground-service mechanism is introduced
  * here (Revision 3, section 12's resolution of that question).
+ *
+ * 1T-B5b generalizes the single `saveUpdateEntry` method 1T-B5a proved this
+ * sequence against into six thin wrappers, all delegating to the private
+ * [runStagedSave] core below -- a purely mechanical extraction (the
+ * sequence, its branches, and every [SaveOutcome] meaning are unchanged)
+ * that parameterizes only which `stage_*` bridge call step 3 makes.
  */
 class VaultSaveCoordinator(
     private val session: VaultSessionInterface,
@@ -79,9 +87,103 @@ class VaultSaveCoordinator(
     private var baselineSha256: String = Sha256.hex(initialEnvelopeBytes)
 
     /**
-     * Stages, saves and commits a non-TOTP update to [entryId]. [nowMs] is
-     * caller-supplied wall-clock time; this class reads no clock, matching
-     * the bridge's own convention.
+     * Stages, saves and commits a non-TOTP update to [entryId]. See
+     * [runStagedSave] for the shared sequence and the meaning of the two
+     * QA-only hooks.
+     */
+    fun saveUpdateEntry(
+        vaultUri: String,
+        entryId: String,
+        input: EntryInput,
+        nowMs: Long,
+        onAfterMarkerWritten: (() -> Unit)? = null,
+        onAfterPrimaryWrite: (() -> Unit)? = null,
+    ): SaveOutcome = runStagedSave(vaultUri, nowMs, onAfterMarkerWritten, onAfterPrimaryWrite) {
+        session.stageUpdateEntry(entryId, input, nowMs)
+    }
+
+    /**
+     * Stages, saves and commits the creation of a new entry. See
+     * [runStagedSave] for the shared sequence.
+     */
+    fun saveCreateEntry(
+        vaultUri: String,
+        input: EntryInput,
+        nowMs: Long,
+        onAfterMarkerWritten: (() -> Unit)? = null,
+        onAfterPrimaryWrite: (() -> Unit)? = null,
+    ): SaveOutcome = runStagedSave(vaultUri, nowMs, onAfterMarkerWritten, onAfterPrimaryWrite) {
+        session.stageCreateEntry(input, nowMs)
+    }
+
+    /**
+     * Stages, saves and commits the removal of [entryId]. See
+     * [runStagedSave] for the shared sequence.
+     */
+    fun saveDeleteEntry(
+        vaultUri: String,
+        entryId: String,
+        nowMs: Long,
+        onAfterMarkerWritten: (() -> Unit)? = null,
+        onAfterPrimaryWrite: (() -> Unit)? = null,
+    ): SaveOutcome = runStagedSave(vaultUri, nowMs, onAfterMarkerWritten, onAfterPrimaryWrite) {
+        session.stageDeleteEntry(entryId, nowMs)
+    }
+
+    /**
+     * Stages, saves and commits the creation of a new category. See
+     * [runStagedSave] for the shared sequence.
+     */
+    fun saveCreateCategory(
+        vaultUri: String,
+        input: CategoryInput,
+        nowMs: Long,
+        onAfterMarkerWritten: (() -> Unit)? = null,
+        onAfterPrimaryWrite: (() -> Unit)? = null,
+    ): SaveOutcome = runStagedSave(vaultUri, nowMs, onAfterMarkerWritten, onAfterPrimaryWrite) {
+        session.stageCreateCategory(input, nowMs)
+    }
+
+    /**
+     * Stages, saves and commits a rename of [categoryId]. See
+     * [runStagedSave] for the shared sequence.
+     */
+    fun saveUpdateCategory(
+        vaultUri: String,
+        categoryId: String,
+        input: CategoryInput,
+        nowMs: Long,
+        onAfterMarkerWritten: (() -> Unit)? = null,
+        onAfterPrimaryWrite: (() -> Unit)? = null,
+    ): SaveOutcome = runStagedSave(vaultUri, nowMs, onAfterMarkerWritten, onAfterPrimaryWrite) {
+        session.stageUpdateCategory(categoryId, input, nowMs)
+    }
+
+    /**
+     * Stages, saves and commits the removal of [categoryId]. Blocked
+     * bridge-side (`BridgeException.CategoryInUse`, surfaced here as
+     * [SaveOutcome.ValidationFailed] like any other staging rejection) if
+     * any entry still references it -- see [runStagedSave] for the shared
+     * sequence. This checkpoint does not add any UI-facing message for
+     * that case; it only transports the structured bridge error through
+     * unchanged.
+     */
+    fun saveDeleteCategory(
+        vaultUri: String,
+        categoryId: String,
+        nowMs: Long,
+        onAfterMarkerWritten: (() -> Unit)? = null,
+        onAfterPrimaryWrite: (() -> Unit)? = null,
+    ): SaveOutcome = runStagedSave(vaultUri, nowMs, onAfterMarkerWritten, onAfterPrimaryWrite) {
+        session.stageDeleteCategory(categoryId, nowMs)
+    }
+
+    /**
+     * The shared transactional save sequence (1T-B5 storage/mutation
+     * architecture review, Revision 3, section 4), unchanged from 1T-B5a's
+     * original `saveUpdateEntry` body except that [stage] now
+     * parameterizes step 3's single bridge call so all six `save*` methods
+     * above share this one implementation instead of repeating it.
      *
      * [onAfterMarkerWritten], when non-null, is invoked exactly once, after
      * the durable recovery snapshot and marker (steps 4-5) already exist on
@@ -107,16 +209,14 @@ class VaultSaveCoordinator(
      * rather than merely NOT_SAVED.
      *
      * Both hooks leave this method's behavior identical to before either
-     * existed when left `null` (every real production call site, until
-     * 1T-B5b deliberately wires one).
+     * existed when left `null` (every real production call site).
      */
-    fun saveUpdateEntry(
+    private fun runStagedSave(
         vaultUri: String,
-        entryId: String,
-        input: EntryInput,
         nowMs: Long,
-        onAfterMarkerWritten: (() -> Unit)? = null,
-        onAfterPrimaryWrite: (() -> Unit)? = null,
+        onAfterMarkerWritten: (() -> Unit)?,
+        onAfterPrimaryWrite: (() -> Unit)?,
+        stage: () -> ByteArray,
     ): SaveOutcome {
         if (!io.hasPersistedWriteGrant(vaultUri) || !io.supportsWrite(vaultUri)) {
             return SaveOutcome.ProviderNotWritable
@@ -136,7 +236,7 @@ class VaultSaveCoordinator(
         // Step 3: stage.
         val stagedBytes =
             try {
-                session.stageUpdateEntry(entryId, input, nowMs)
+                stage()
             } catch (error: BridgeException) {
                 return SaveOutcome.ValidationFailed(error)
             }

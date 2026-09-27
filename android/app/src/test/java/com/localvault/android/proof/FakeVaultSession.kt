@@ -1,6 +1,7 @@
 package com.localvault.android.proof
 
 import uniffi.localvault_android_bridge.BridgeException
+import uniffi.localvault_android_bridge.CategoryInput
 import uniffi.localvault_android_bridge.CategorySummary
 import uniffi.localvault_android_bridge.EntryDetails
 import uniffi.localvault_android_bridge.EntryInput
@@ -29,6 +30,24 @@ class FakeVaultSession(
     var discardCount = 0
         private set
 
+    /** Which `stage*` method(s) were actually invoked, in call order --
+     * used to prove a [VaultSaveCoordinator] wrapper reaches exactly the
+     * one bridge call it names, not some other mutation. */
+    val stagedMethodCalls = mutableListOf<String>()
+
+    /** Shared by every `stage*` override below: records which method was
+     * called, applies the configured exception/hook, and returns the
+     * configured bytes -- only one of these is ever invoked per save
+     * attempt, so a single shared [stagedBytes]/[stageException]/[onStage]
+     * configuration is sufficient for all six. */
+    private fun stage(methodName: String): ByteArray {
+        stageCount++
+        stagedMethodCalls += methodName
+        stageException?.let { throw it }
+        onStage?.invoke()
+        return stagedBytes
+    }
+
     override fun commitStagedSave() {
         commitCount++
     }
@@ -47,12 +66,23 @@ class FakeVaultSession(
 
     override fun lock() {}
 
-    override fun stageUpdateEntry(entryId: String, input: EntryInput, nowMs: Long): ByteArray {
-        stageCount++
-        stageException?.let { throw it }
-        onStage?.invoke()
-        return stagedBytes
-    }
+    override fun stageUpdateEntry(entryId: String, input: EntryInput, nowMs: Long): ByteArray =
+        stage("stageUpdateEntry")
+
+    override fun stageCreateEntry(input: EntryInput, nowMs: Long): ByteArray =
+        stage("stageCreateEntry")
+
+    override fun stageDeleteEntry(entryId: String, nowMs: Long): ByteArray =
+        stage("stageDeleteEntry")
+
+    override fun stageCreateCategory(input: CategoryInput, nowMs: Long): ByteArray =
+        stage("stageCreateCategory")
+
+    override fun stageUpdateCategory(categoryId: String, input: CategoryInput, nowMs: Long): ByteArray =
+        stage("stageUpdateCategory")
+
+    override fun stageDeleteCategory(categoryId: String, nowMs: Long): ByteArray =
+        stage("stageDeleteCategory")
 
     override fun totpStatus(entryId: String, unixTimeSeconds: Long): TotpStatus =
         throw UnsupportedOperationException()
