@@ -11,9 +11,16 @@
     <string name="recent_vaults">Recent vaults</string>
     <string name="recent_vaults_empty">Vaults you open will appear here.</string>
     <string name="remove_from_history">Remove from history</string>
+    <string name="enable_editing">Enable editing</string>
+    <string name="msg_reselect_for_write">Select \"%1$s\" again to grant write access.</string>
+    <string name="msg_write_access_not_granted">Write access was not granted for this vault.</string>
+    <string name="forget_vault_unresolved_title">Unresolved save</string>
+    <string name="forget_vault_unresolved_message">This vault has an unresolved save. Forgetting it will also delete its only local recovery copy. Continue?</string>
+    <string name="msg_recovery_needed">A previous save on this vault may not have completed. A local recovery copy is available.</string>
 
     <string name="vault_label">Vault</string>
     <string name="default_vault_name">Selected vault</string>
+    <string name="backup_file_warning">This looks like a backup file (name ends in .backup), not your primary vault. Only continue if you specifically intend to open the backup.</string>
     <string name="master_password">Master password</string>
     <string name="unlock">Unlock</string>
     <string name="unlocking">Unlocking...</string>

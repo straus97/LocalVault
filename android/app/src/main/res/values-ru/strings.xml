@@ -10,9 +10,16 @@
     <string name="recent_vaults">Недавние хранилища</string>
     <string name="recent_vaults_empty">Здесь появятся хранилища, которые вы откроете.</string>
     <string name="remove_from_history">Удалить из истории</string>
+    <string name="enable_editing">Разрешить редактирование</string>
+    <string name="msg_reselect_for_write">Выберите «%1$s» ещё раз, чтобы предоставить доступ на запись.</string>
+    <string name="msg_write_access_not_granted">Доступ на запись для этого хранилища не был предоставлен.</string>
+    <string name="forget_vault_unresolved_title">Незавершённое сохранение</string>
+    <string name="forget_vault_unresolved_message">У этого хранилища есть незавершённое сохранение. Удаление из истории также удалит его единственную локальную копию для восстановления. Продолжить?</string>
+    <string name="msg_recovery_needed">Предыдущее сохранение в этом хранилище могло не завершиться. Доступна локальная копия для восстановления.</string>
 
     <string name="vault_label">Хранилище</string>
     <string name="default_vault_name">Выбранное хранилище</string>
+    <string name="backup_file_warning">Похоже, это файл резервной копии (имя оканчивается на .backup), а не основное хранилище. Продолжайте, только если действительно хотите открыть резервную копию.</string>
     <string name="master_password">Мастер-пароль</string>
     <string name="unlock">Разблокировать</string>
     <string name="unlocking">Разблокировка...</string>

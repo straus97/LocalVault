@@ -6,11 +6,17 @@
 //! schema validation -- all of that stays in `localvault-core` (see
 //! `docs/ARCHITECTURE.md`).
 //!
-//! B2 scope is deliberately read-only: open an encrypted vault envelope with
-//! the master password, keep the decrypted `VaultData` Rust-owned inside a
-//! `VaultSession`, list non-secret entry summaries, and lock. The Master Key
-//! and Vault Key never leave `localvault-core`; decrypted `VaultData` and its
-//! JSON never cross the boundary.
+//! Through 1T-B4 this crate was read-only. 1T-B5a adds the write-capability
+//! and transactional-save infrastructure accepted in the 1T-B5 storage /
+//! mutation architecture review (Revision 3): a `stage -> Kotlin
+//! writes/verifies -> commit/discard` mutation protocol, and a
+//! `PendingVaultCreation` handle for transactional vault creation. The
+//! Master Key and Vault Key never leave
+//! `localvault-core`; decrypted `VaultData` and its JSON never cross the
+//! boundary. Every stale-source check and write-verification comparison is
+//! performed on the Kotlin side against byte arrays it already holds -- this
+//! crate never reads a clock or touches `ContentResolver`, and no Rust-side
+//! hash/compare call is added purely to shadow a Kotlin-side one.
 
 use std::{
     collections::HashMap,
@@ -20,10 +26,14 @@ use std::{
 use localvault_core::{
     totp::generate_totp,
     vault::{
-        data::VaultData,
-        format::{open_envelope, CryptoError, VaultEnvelope, VaultError},
+        data::{VaultData, VaultEntry},
+        format::{
+            create_envelope_with_key, open_envelope_with_key, reseal_envelope, CryptoError,
+            SecretKey, VaultEnvelope, VaultError,
+        },
     },
 };
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
@@ -116,6 +126,20 @@ pub enum BridgeError {
     TotpNotConfigured,
     #[error("TOTP configuration is invalid")]
     InvalidTotpConfiguration,
+    /// A second mutation was staged while one was already pending commit or
+    /// discard. Mirrors desktop's `SessionError::PendingUnsavedChanges`
+    /// dirty-guard: only one staged candidate may exist at a time.
+    #[error("a staged mutation is already pending commit or discard")]
+    PendingUnsavedChanges,
+    /// A generic, oracle-safe failure for the small set of internal
+    /// operations that are expected to succeed given already-validated state
+    /// (resealing an envelope with a key this session already holds,
+    /// serializing an already-validated `VaultData`, or a vault-creation
+    /// write-verification byte mismatch) and therefore have no more specific
+    /// variant. Carries no detail, by the same oracle-safety convention as
+    /// every other variant here.
+    #[error("the operation could not be completed")]
+    OperationFailed,
 }
 
 fn map_vault_error(err: VaultError) -> BridgeError {
@@ -128,23 +152,47 @@ fn map_vault_error(err: VaultError) -> BridgeError {
     }
 }
 
-/// An unlocked, Rust-owned, read-only vault session.
+/// Rust-owned state for an unlocked vault session, including what B5a adds
+/// on top of the read-only B1-B4 state: the original envelope and Vault Key
+/// (needed to reseal on save, and never exposed across FFI), and at most one
+/// staged mutation candidate awaiting a Kotlin-confirmed commit or discard.
+struct SessionState {
+    /// The envelope as last opened or successfully committed. Used only to
+    /// reseal (`reseal_envelope` preserves its KDF/salt/wrapped-key fields
+    /// and replaces only the payload) -- never as an external-change
+    /// identity signal. That check is a raw encrypted-byte hash comparison
+    /// performed entirely on the Kotlin side against bytes it already holds.
+    envelope: VaultEnvelope,
+    /// Never crosses FFI. Used only inside `stage_*` to reseal a candidate.
+    vault_key: SecretKey,
+    data: VaultData,
+    /// At most one candidate mutation, produced by a `stage_*` call and
+    /// awaiting `commit_staged_save`/`discard_staged_save`. A second
+    /// `stage_*` call while this is `Some` is rejected with
+    /// `BridgeError::PendingUnsavedChanges`, mirroring desktop's `dirty`
+    /// guard.
+    staged: Option<(VaultData, VaultEnvelope)>,
+}
+
+/// An unlocked, Rust-owned vault session.
 ///
-/// Holds only the decrypted `VaultData` -- not the Master Key, not the Vault
-/// Key (`open_envelope` drops and zeroizes both before returning). Locking
-/// takes the `VaultData` out and drops it, which zeroizes its sensitive
-/// fields through `localvault-core`'s existing `Drop` implementation. Dropping
-/// the last reference to the session does the same.
+/// Holds the decrypted `VaultData`, the Vault Key and the envelope needed to
+/// reseal it -- never the Master Key (`open_envelope_with_key` drops and
+/// zeroizes it before returning). Locking takes the whole `SessionState` out
+/// (including any pending staged candidate) and drops it, which zeroizes its
+/// sensitive fields through `localvault-core`'s existing `Drop`
+/// implementations. Dropping the last reference to the session does the
+/// same.
 #[derive(uniffi::Object)]
 pub struct VaultSession {
-    data: Mutex<Option<VaultData>>,
+    state: Mutex<Option<SessionState>>,
 }
 
 impl VaultSession {
-    fn guard(&self) -> MutexGuard<'_, Option<VaultData>> {
+    fn guard(&self) -> MutexGuard<'_, Option<SessionState>> {
         // A poisoned mutex must never turn a lock/list call into a panic
         // across the FFI boundary; the guarded state is still valid to drop.
-        self.data
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -166,6 +214,12 @@ fn find_entry<'a>(
 /// Uses `localvault-core`'s existing envelope, schema and validation APIs
 /// unchanged. This performs a real Argon2id derivation and must be called off
 /// the Android main thread.
+///
+/// Unlike the read-only B1-B4 implementation, this retains the Vault Key and
+/// the opened envelope inside the session (via `open_envelope_with_key`
+/// rather than `open_envelope`) so a later `stage_*` mutation can reseal
+/// without re-deriving the Master Key. The Master Key itself is still never
+/// retained -- `open_envelope_with_key` drops and zeroizes it internally.
 #[uniffi::export]
 pub fn open_vault(
     envelope_bytes: Vec<u8>,
@@ -179,7 +233,8 @@ pub fn open_vault(
     let envelope: VaultEnvelope =
         serde_json::from_slice(&envelope_bytes).map_err(|_| BridgeError::UnsupportedFormat)?;
 
-    let plaintext = open_envelope(master_password.as_str(), &envelope).map_err(map_vault_error)?;
+    let (vault_key, plaintext) =
+        open_envelope_with_key(master_password.as_str(), &envelope).map_err(map_vault_error)?;
 
     let data: VaultData =
         serde_json::from_slice(plaintext.as_slice()).map_err(|_| BridgeError::UnsupportedFormat)?;
@@ -188,7 +243,12 @@ pub fn open_vault(
         .map_err(|_| BridgeError::UnsupportedFormat)?;
 
     Ok(Arc::new(VaultSession {
-        data: Mutex::new(Some(data)),
+        state: Mutex::new(Some(SessionState {
+            envelope,
+            vault_key,
+            data,
+            staged: None,
+        })),
     }))
 }
 
@@ -197,7 +257,7 @@ impl VaultSession {
     /// Non-secret summaries of every entry, in stored order.
     pub fn list_entries(&self) -> Result<Vec<EntrySummary>, BridgeError> {
         let guard = self.guard();
-        let data = guard.as_ref().ok_or(BridgeError::SessionLocked)?;
+        let data = &guard.as_ref().ok_or(BridgeError::SessionLocked)?.data;
 
         Ok(data
             .entries
@@ -216,7 +276,7 @@ impl VaultSession {
     /// Categories in stored order with per-category entry counts.
     pub fn list_categories(&self) -> Result<Vec<CategorySummary>, BridgeError> {
         let guard = self.guard();
-        let data = guard.as_ref().ok_or(BridgeError::SessionLocked)?;
+        let data = &guard.as_ref().ok_or(BridgeError::SessionLocked)?.data;
 
         let mut counts = HashMap::new();
         for entry in &data.entries {
@@ -239,7 +299,7 @@ impl VaultSession {
     /// Non-secret details of one entry (no password, notes or TOTP).
     pub fn entry_details(&self, entry_id: String) -> Result<EntryDetails, BridgeError> {
         let guard = self.guard();
-        let data = guard.as_ref().ok_or(BridgeError::SessionLocked)?;
+        let data = &guard.as_ref().ok_or(BridgeError::SessionLocked)?.data;
         let entry = find_entry(data, &entry_id)?;
 
         Ok(EntryDetails {
@@ -265,7 +325,7 @@ impl VaultSession {
         }
 
         let guard = self.guard();
-        let data = guard.as_ref().ok_or(BridgeError::SessionLocked)?;
+        let data = &guard.as_ref().ok_or(BridgeError::SessionLocked)?.data;
         let entry = find_entry(data, &entry_id)?;
         let config = entry.totp.as_ref().ok_or(BridgeError::TotpNotConfigured)?;
 
@@ -295,16 +355,291 @@ impl VaultSession {
     /// lifetime narrow.
     pub fn entry_password(&self, entry_id: String) -> Result<String, BridgeError> {
         let guard = self.guard();
-        let data = guard.as_ref().ok_or(BridgeError::SessionLocked)?;
+        let data = &guard.as_ref().ok_or(BridgeError::SessionLocked)?.data;
         let entry = find_entry(data, &entry_id)?;
 
         Ok(entry.password.clone())
     }
 
-    /// Drop (and thereby zeroize) the decrypted vault data. Idempotent.
+    /// Drop (and thereby zeroize) the decrypted session state -- the
+    /// committed `VaultData`, the Vault Key, and any staged-but-uncommitted
+    /// candidate. Idempotent.
+    ///
+    /// This is called unconditionally on Android background/`onStop`
+    /// (existing invariant, unchanged by B5a) even if a save's Kotlin-side
+    /// write is still in flight: nothing past `stage_*` needs the key or
+    /// plaintext to finish that write, so dropping the session here never
+    /// has to wait for it. The write's own outcome is reconciled from disk
+    /// truth on the next unlock, not from this session's state.
     pub fn lock(&self) {
         // Take the value out under the lock, then drop it after the guard is
-        // released so `VaultData`'s zeroizing `Drop` never runs under the lock.
+        // released so the zeroizing `Drop` impls never run under the lock.
+        let taken = self.guard().take();
+        drop(taken);
+    }
+
+    /// Stage an update to an existing entry's non-TOTP fields, producing the
+    /// resealed candidate envelope's bytes for Kotlin to write. Does not
+    /// modify the committed session state -- see `commit_staged_save` and
+    /// `discard_staged_save`.
+    ///
+    /// `now_ms` is caller-supplied (this crate reads no clock, matching
+    /// `totp_status`). The entry's existing TOTP configuration, if any, is
+    /// preserved unchanged (`Keep` semantics) -- TOTP setup/edit/remove is
+    /// 1T-B5c's scope, not B5a's.
+    ///
+    /// Only one staged mutation may be outstanding at a time.
+    pub fn stage_update_entry(
+        &self,
+        entry_id: String,
+        input: EntryInput,
+        now_ms: i64,
+    ) -> Result<Vec<u8>, BridgeError> {
+        if now_ms < 0 {
+            return Err(BridgeError::InvalidInput);
+        }
+
+        let category_id = parse_optional_category_id(&input.category_id)?;
+
+        let mut guard = self.guard();
+        let state = guard.as_mut().ok_or(BridgeError::SessionLocked)?;
+
+        if state.staged.is_some() {
+            return Err(BridgeError::PendingUnsavedChanges);
+        }
+
+        let mut candidate = state.data.clone();
+
+        let index = candidate
+            .entries
+            .iter()
+            .position(|entry| entry.id.to_string() == entry_id)
+            .ok_or(BridgeError::EntryNotFound)?;
+
+        let existing = &candidate.entries[index];
+        let id = existing.id;
+        let created_at_ms = existing.created_at_ms;
+        let previous_updated_at_ms = existing.updated_at_ms;
+        let totp = existing.totp.clone();
+        let effective_updated_at_ms = now_ms.max(previous_updated_at_ms);
+
+        candidate.entries[index] = VaultEntry {
+            id,
+            title: input.title,
+            profile_name: input.profile_name,
+            url: input.url,
+            username: input.username,
+            password: input.password,
+            totp,
+            notes: input.notes,
+            category_id,
+            tags: input.tags,
+            favorite: input.favorite,
+            created_at_ms,
+            updated_at_ms: effective_updated_at_ms,
+        };
+
+        candidate.updated_at_ms = candidate.updated_at_ms.max(effective_updated_at_ms);
+
+        candidate.upgrade_legacy_schema_for_write();
+        candidate
+            .validate()
+            .map_err(|_| BridgeError::InvalidInput)?;
+
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
+        );
+
+        let candidate_envelope = reseal_envelope(&state.envelope, &state.vault_key, &plaintext)
+            .map_err(|_| BridgeError::OperationFailed)?;
+
+        let bytes =
+            serde_json::to_vec(&candidate_envelope).map_err(|_| BridgeError::OperationFailed)?;
+
+        state.staged = Some((candidate, candidate_envelope));
+
+        Ok(bytes)
+    }
+
+    /// Promote the single staged candidate into the session's committed
+    /// state. Call only after Kotlin has written the bytes `stage_*`
+    /// returned, re-read them back, and confirmed exact byte equality --
+    /// this method performs no I/O and no verification of its own.
+    pub fn commit_staged_save(&self) -> Result<(), BridgeError> {
+        let mut guard = self.guard();
+        let state = guard.as_mut().ok_or(BridgeError::SessionLocked)?;
+
+        let (data, envelope) = state.staged.take().ok_or(BridgeError::InvalidInput)?;
+
+        state.data = data;
+        state.envelope = envelope;
+
+        Ok(())
+    }
+
+    /// Drop the single staged candidate without committing it. Safe to call
+    /// whether or not a stage exists (idempotent, never panics) and whether
+    /// or not the session is still unlocked -- a locked/dropped session has
+    /// nothing left to discard.
+    pub fn discard_staged_save(&self) {
+        if let Some(state) = self.guard().as_mut() {
+            state.staged = None;
+        }
+    }
+}
+
+/// Parses a mutation input's `category_id` string into the `Option<Uuid>`
+/// `VaultEntry.category_id` requires. `None` means "no category" (a genuine
+/// persisted state); a non-empty string that fails to parse as a UUID is
+/// invalid input, not an unknown-entry condition.
+fn parse_optional_category_id(value: &Option<String>) -> Result<Option<Uuid>, BridgeError> {
+    match value {
+        None => Ok(None),
+        Some(raw) => Uuid::parse_str(raw)
+            .map(Some)
+            .map_err(|_| BridgeError::InvalidInput),
+    }
+}
+
+/// Input for creating or replacing an entry's non-TOTP fields. Mirrors
+/// desktop's `EntryInput` field-for-field (`src-tauri/src/vault/session/
+/// entries.rs`), adapted to UniFFI-representable types (`category_id` as a
+/// `String` rather than a `Uuid`, since UniFFI has no native UUID type).
+///
+/// Deliberately excludes TOTP: 1T-B5a proves the stage/commit/discard
+/// protocol against non-TOTP entry mutation only. TOTP setup/edit/remove is
+/// 1T-B5c's scope.
+#[derive(uniffi::Record)]
+pub struct EntryInput {
+    pub title: String,
+    pub profile_name: String,
+    pub url: String,
+    pub username: String,
+    pub password: String,
+    pub notes: String,
+    pub category_id: Option<String>,
+    pub tags: Vec<String>,
+    pub favorite: bool,
+}
+
+/// Rust-owned state for a vault creation in progress. Never exposed as a
+/// usable `VaultSession` -- only `verify_and_finalize` can produce one, and
+/// only after Kotlin confirms the initial encrypted bytes were written and
+/// read back correctly.
+///
+/// Per the accepted design, `begin_create_vault` must only ever be called
+/// while the app is foreground, after any `ACTION_CREATE_DOCUMENT` picker
+/// has already returned -- never before or during that picker Activity. This
+/// type exists only from that point forward; there is no window during which
+/// it needs to (or could) survive a picker transition.
+struct PendingCreationState {
+    envelope: VaultEnvelope,
+    vault_key: SecretKey,
+    data: VaultData,
+    /// The exact bytes `initial_envelope_bytes` returned, kept so
+    /// `verify_and_finalize` can compare Kotlin's readback against them
+    /// without re-serializing (which would not, by itself, prove anything
+    /// about what actually reached the document).
+    initial_bytes: Vec<u8>,
+}
+
+#[derive(uniffi::Object)]
+pub struct PendingVaultCreation {
+    state: Mutex<Option<PendingCreationState>>,
+}
+
+impl PendingVaultCreation {
+    fn guard(&self) -> MutexGuard<'_, Option<PendingCreationState>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Begin creating a new vault: build a fresh empty `VaultData` (current
+/// schema) and its initial encrypted envelope, returning an opaque,
+/// not-yet-usable handle. Call `initial_envelope_bytes` to get the bytes to
+/// write to the newly created SAF document, then `verify_and_finalize` only
+/// after reading them back -- never expose or use this as a `VaultSession`
+/// before that verification succeeds.
+///
+/// `now_ms` is caller-supplied; this crate reads no clock.
+#[uniffi::export]
+pub fn begin_create_vault(
+    master_password: String,
+    now_ms: i64,
+) -> Result<Arc<PendingVaultCreation>, BridgeError> {
+    if now_ms < 0 {
+        return Err(BridgeError::InvalidInput);
+    }
+
+    let master_password = Zeroizing::new(master_password);
+
+    let data = VaultData::new(now_ms).map_err(|_| BridgeError::InvalidInput)?;
+
+    let plaintext =
+        Zeroizing::new(serde_json::to_vec(&data).map_err(|_| BridgeError::OperationFailed)?);
+
+    let (envelope, vault_key) =
+        create_envelope_with_key(master_password.as_str(), &plaintext).map_err(map_vault_error)?;
+
+    let initial_bytes = serde_json::to_vec(&envelope).map_err(|_| BridgeError::OperationFailed)?;
+
+    Ok(Arc::new(PendingVaultCreation {
+        state: Mutex::new(Some(PendingCreationState {
+            envelope,
+            vault_key,
+            data,
+            initial_bytes,
+        })),
+    }))
+}
+
+#[uniffi::export]
+impl PendingVaultCreation {
+    /// The initial encrypted envelope bytes to write to the newly created
+    /// SAF document. Callable repeatedly until `verify_and_finalize` or
+    /// `discard` consumes this handle.
+    pub fn initial_envelope_bytes(&self) -> Result<Vec<u8>, BridgeError> {
+        let guard = self.guard();
+        let state = guard.as_ref().ok_or(BridgeError::SessionLocked)?;
+
+        Ok(state.initial_bytes.clone())
+    }
+
+    /// Verify Kotlin's readback of the just-written document against the
+    /// exact bytes this handle produced and, only on an exact match,
+    /// consume this handle and return a genuine, usable `VaultSession`
+    /// already primed with the committed empty vault.
+    ///
+    /// Consumes this handle whether it succeeds or fails: a failed initial
+    /// write leaves the new document in an uncertain state that should not
+    /// be retried against the same in-memory candidate, so the caller is
+    /// expected to abandon or clean up the document and start over rather
+    /// than call this again.
+    pub fn verify_and_finalize(
+        &self,
+        readback_bytes: Vec<u8>,
+    ) -> Result<Arc<VaultSession>, BridgeError> {
+        let state = self.guard().take().ok_or(BridgeError::SessionLocked)?;
+
+        if readback_bytes != state.initial_bytes {
+            return Err(BridgeError::OperationFailed);
+        }
+
+        Ok(Arc::new(VaultSession {
+            state: Mutex::new(Some(SessionState {
+                envelope: state.envelope,
+                vault_key: state.vault_key,
+                data: state.data,
+                staged: None,
+            })),
+        }))
+    }
+
+    /// Drop (and thereby zeroize) the pending Vault Key and `VaultData`
+    /// without producing a session. Idempotent.
+    pub fn discard(&self) {
         let taken = self.guard().take();
         drop(taken);
     }
@@ -374,6 +709,7 @@ mod tests {
             .guard()
             .as_ref()
             .expect("session is unlocked")
+            .data
             .schema_version
     }
 
@@ -428,7 +764,7 @@ mod tests {
 
         // Value check against the real decrypted secrets held by the session.
         let guard = session.guard();
-        let data = guard.as_ref().unwrap();
+        let data = &guard.as_ref().unwrap().data;
         assert!(data.entries.iter().any(|entry| entry.totp.is_some()));
 
         for entry in &data.entries {
@@ -582,7 +918,7 @@ mod tests {
         assert_eq!(all_details.len(), 2);
 
         let guard = session.guard();
-        let data = guard.as_ref().unwrap();
+        let data = &guard.as_ref().unwrap().data;
 
         for details in &all_details {
             for entry in &data.entries {
@@ -682,6 +1018,7 @@ mod tests {
             .guard()
             .as_ref()
             .unwrap()
+            .data
             .entries
             .iter()
             .map(|entry| {
@@ -705,7 +1042,7 @@ mod tests {
         // The id and name are exactly the persisted category's.
         {
             let guard = session.guard();
-            let persisted = &guard.as_ref().unwrap().categories[0];
+            let persisted = &guard.as_ref().unwrap().data.categories[0];
             assert!(categories[0].id == persisted.id.to_string());
             assert!(categories[0].name == persisted.name);
         }
@@ -819,6 +1156,7 @@ mod tests {
         let secret = guard
             .as_ref()
             .unwrap()
+            .data
             .entries
             .iter()
             .find_map(|entry| entry.totp.as_ref().map(|totp| totp.secret_base64.clone()))
@@ -887,6 +1225,311 @@ mod tests {
         assert_eq!(
             session.totp_status(id, TOTP_FIXED_UNIX_SECONDS).err(),
             Some(BridgeError::TotpNotConfigured)
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 1T-B5a: stage / commit / discard, PendingVaultCreation.
+    // -----------------------------------------------------------------
+
+    const UPDATE_NOW_MS: i64 = TOTP_FIXED_UNIX_SECONDS * 1000 + 1;
+
+    fn update_input(title: &str) -> EntryInput {
+        EntryInput {
+            title: title.to_owned(),
+            profile_name: "Updated Profile".to_owned(),
+            url: "https://updated.example.test".to_owned(),
+            username: "updated-user@example.test".to_owned(),
+            password: "UPDATED_STAGE_TEST_SECRET".to_owned(),
+            notes: "UPDATED_STAGE_TEST_NOTE".to_owned(),
+            category_id: None,
+            tags: vec!["updated".to_owned()],
+            favorite: true,
+        }
+    }
+
+    fn reopen_bytes(bytes: &[u8]) -> Arc<VaultSession> {
+        open_ok(bytes.to_vec())
+    }
+
+    #[test]
+    fn stage_update_entry_returns_reopenable_bytes_and_does_not_touch_committed_state() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let staged_bytes = session
+            .stage_update_entry(id.clone(), update_input("Staged Title"), UPDATE_NOW_MS)
+            .unwrap();
+
+        // The committed session is untouched until commit_staged_save runs.
+        assert_eq!(
+            session.entry_details(id.clone()).unwrap().title,
+            "Fixture Login"
+        );
+
+        // The staged bytes are a fully independent, reopenable vault
+        // reflecting the mutation -- proving the reseal/serialize path
+        // produces a valid envelope before any commit happens.
+        let staged_session = reopen_bytes(&staged_bytes);
+        let details = staged_session.entry_details(id).unwrap();
+        assert_eq!(details.title, "Staged Title");
+    }
+
+    #[test]
+    fn commit_staged_save_promotes_the_candidate_into_the_session() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        session
+            .stage_update_entry(id.clone(), update_input("Committed Title"), UPDATE_NOW_MS)
+            .unwrap();
+
+        session.commit_staged_save().unwrap();
+
+        assert_eq!(
+            session.entry_details(id.clone()).unwrap().title,
+            "Committed Title"
+        );
+        assert_eq!(
+            session.entry_password(id).unwrap(),
+            "UPDATED_STAGE_TEST_SECRET"
+        );
+    }
+
+    #[test]
+    fn discard_staged_save_leaves_committed_state_byte_identical() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let before = session.entry_details(id.clone()).unwrap();
+
+        session
+            .stage_update_entry(id.clone(), update_input("Discarded Title"), UPDATE_NOW_MS)
+            .unwrap();
+
+        session.discard_staged_save();
+
+        let after = session.entry_details(id).unwrap();
+        assert_eq!(before.title, after.title);
+        assert_eq!(before.profile_name, after.profile_name);
+        assert_eq!(before.url, after.url);
+        assert_eq!(before.username, after.username);
+        assert_eq!(before.totp_enabled, after.totp_enabled);
+
+        // Idempotent: discarding again (nothing staged) is a safe no-op.
+        session.discard_staged_save();
+    }
+
+    #[test]
+    fn commit_staged_save_without_a_stage_is_a_structured_error() {
+        let session = open_ok(schema2());
+
+        assert_eq!(
+            session.commit_staged_save().err(),
+            Some(BridgeError::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn second_stage_while_one_is_pending_is_rejected() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        session
+            .stage_update_entry(id.clone(), update_input("First Stage"), UPDATE_NOW_MS)
+            .unwrap();
+
+        let result = session.stage_update_entry(id, update_input("Second Stage"), UPDATE_NOW_MS);
+
+        assert_eq!(result.err(), Some(BridgeError::PendingUnsavedChanges));
+    }
+
+    #[test]
+    fn discard_then_stage_again_succeeds() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        session
+            .stage_update_entry(id.clone(), update_input("First Stage"), UPDATE_NOW_MS)
+            .unwrap();
+        session.discard_staged_save();
+
+        let result = session.stage_update_entry(id, update_input("Second Stage"), UPDATE_NOW_MS);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn stage_update_entry_rejects_unknown_entry() {
+        let session = open_ok(schema2());
+
+        let result = session.stage_update_entry(
+            "00000000-0000-0000-0000-000000000000".to_owned(),
+            update_input("Nobody"),
+            UPDATE_NOW_MS,
+        );
+
+        assert_eq!(result.err(), Some(BridgeError::EntryNotFound));
+    }
+
+    #[test]
+    fn stage_update_entry_rejects_malformed_category_id() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let mut input = update_input("Bad Category");
+        input.category_id = Some("not-a-uuid".to_owned());
+
+        let result = session.stage_update_entry(id, input, UPDATE_NOW_MS);
+
+        assert_eq!(result.err(), Some(BridgeError::InvalidInput));
+    }
+
+    #[test]
+    fn stage_update_entry_rejects_unknown_category_reference() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let mut input = update_input("Dangling Category");
+        input.category_id = Some(Uuid::new_v4().to_string());
+
+        let result = session.stage_update_entry(id, input, UPDATE_NOW_MS);
+
+        assert_eq!(result.err(), Some(BridgeError::InvalidInput));
+    }
+
+    #[test]
+    fn stage_update_entry_is_rejected_when_locked() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        session.lock();
+
+        let result = session.stage_update_entry(id, update_input("Locked"), UPDATE_NOW_MS);
+
+        assert_eq!(result.err(), Some(BridgeError::SessionLocked));
+    }
+
+    #[test]
+    fn stage_update_entry_rejects_negative_timestamp() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let result = session.stage_update_entry(id, update_input("Bad Time"), -1);
+
+        assert_eq!(result.err(), Some(BridgeError::InvalidInput));
+    }
+
+    #[test]
+    fn stage_update_entry_preserves_existing_totp_configuration() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture TOTP Account");
+
+        let staged_bytes = session
+            .stage_update_entry(id.clone(), update_input("Still Has TOTP"), UPDATE_NOW_MS)
+            .unwrap();
+
+        let staged_session = reopen_bytes(&staged_bytes);
+        let details = staged_session.entry_details(id.clone()).unwrap();
+        assert!(details.totp_enabled);
+
+        let status = staged_session
+            .totp_status(id, TOTP_FIXED_UNIX_SECONDS)
+            .unwrap();
+        assert_eq!(status.code, "27711647");
+    }
+
+    #[test]
+    fn stage_update_entry_upgrades_legacy_schema_via_the_shared_core_rule() {
+        let session = open_ok(schema1());
+        assert_eq!(schema_version(&session), 1);
+        let id = id_of(&session, "Legacy Fixture Login");
+
+        let staged_bytes = session
+            .stage_update_entry(id.clone(), update_input("Upgraded"), UPDATE_NOW_MS)
+            .unwrap();
+
+        let staged_session = reopen_bytes(&staged_bytes);
+        assert_eq!(schema_version(&staged_session), 2);
+        assert_eq!(staged_session.entry_details(id).unwrap().title, "Upgraded");
+    }
+
+    #[test]
+    fn staged_bytes_never_contain_the_plaintext_password_or_notes() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let mut input = update_input("Ciphertext Check");
+        input.password = "PLAINTEXT_MUST_NOT_LEAK_INTO_CIPHERTEXT".to_owned();
+        input.notes = "PLAINTEXT_NOTE_MUST_NOT_LEAK".to_owned();
+
+        let staged_bytes = session
+            .stage_update_entry(id, input, UPDATE_NOW_MS)
+            .unwrap();
+
+        let raw = String::from_utf8_lossy(&staged_bytes);
+        assert!(!raw.contains("PLAINTEXT_MUST_NOT_LEAK_INTO_CIPHERTEXT"));
+        assert!(!raw.contains("PLAINTEXT_NOTE_MUST_NOT_LEAK"));
+        assert!(!raw.contains(TEST_MASTER_PASSWORD));
+    }
+
+    // -- PendingVaultCreation -------------------------------------------
+
+    const CREATE_MASTER_PASSWORD: &str = "pending-creation-master-password-test-only";
+    const CREATE_NOW_MS: i64 = 1_700_000_200_000;
+
+    #[test]
+    fn begin_create_vault_and_finalize_produces_a_usable_empty_session() {
+        let pending = begin_create_vault(CREATE_MASTER_PASSWORD.to_owned(), CREATE_NOW_MS).unwrap();
+
+        let initial_bytes = pending.initial_envelope_bytes().unwrap();
+
+        // Simulates Kotlin reading back exactly what it wrote.
+        let session = pending.verify_and_finalize(initial_bytes).unwrap();
+
+        assert_eq!(schema_version(&session), 2);
+        assert!(session.list_entries().unwrap().is_empty());
+        assert!(session.list_categories().unwrap().is_empty());
+    }
+
+    #[test]
+    fn verify_and_finalize_rejects_a_readback_mismatch_and_consumes_the_pending_state() {
+        let pending = begin_create_vault(CREATE_MASTER_PASSWORD.to_owned(), CREATE_NOW_MS).unwrap();
+
+        let result = pending.verify_and_finalize(b"not what was written".to_vec());
+
+        assert_eq!(result.err(), Some(BridgeError::OperationFailed));
+
+        // Consumed regardless of outcome: a second call finds nothing left.
+        assert_eq!(
+            pending.verify_and_finalize(Vec::new()).err(),
+            Some(BridgeError::SessionLocked)
+        );
+        assert_eq!(
+            pending.initial_envelope_bytes().err(),
+            Some(BridgeError::SessionLocked)
+        );
+    }
+
+    #[test]
+    fn discard_zeroizes_and_invalidates_a_pending_creation() {
+        let pending = begin_create_vault(CREATE_MASTER_PASSWORD.to_owned(), CREATE_NOW_MS).unwrap();
+
+        pending.discard();
+
+        assert_eq!(
+            pending.initial_envelope_bytes().err(),
+            Some(BridgeError::SessionLocked)
+        );
+
+        // Idempotent, never panics.
+        pending.discard();
+    }
+
+    #[test]
+    fn begin_create_vault_rejects_negative_timestamp() {
+        assert_eq!(
+            begin_create_vault(CREATE_MASTER_PASSWORD.to_owned(), -1).err(),
+            Some(BridgeError::InvalidInput)
         );
     }
 }

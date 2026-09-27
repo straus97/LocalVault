@@ -243,6 +243,20 @@ impl VaultData {
         })
     }
 
+    /// Upgrade an in-memory legacy schema-1 vault to the current schema
+    /// before it is persisted. A no-op if the vault is already current.
+    ///
+    /// This is the single, shared implementation of the "any write upgrades
+    /// a legacy vault" rule (see `@docs/SECURITY_MODEL.md`): every adapter
+    /// that persists a mutated `VaultData` must call this before `validate`
+    /// so desktop and Android apply exactly the same upgrade-on-write policy
+    /// rather than each reimplementing the one-line bump independently.
+    pub fn upgrade_legacy_schema_for_write(&mut self) {
+        if self.schema_version == LEGACY_VAULT_DATA_SCHEMA_VERSION {
+            self.schema_version = VAULT_DATA_SCHEMA_VERSION;
+        }
+    }
+
     pub fn validate(&self) -> Result<(), VaultDataError> {
         if self.schema_version != LEGACY_VAULT_DATA_SCHEMA_VERSION
             && self.schema_version != VAULT_DATA_SCHEMA_VERSION
@@ -714,6 +728,23 @@ mod tests {
         assert!(data.categories.is_empty());
         assert!(data.site_icons.is_empty());
         assert!(data.validate().is_ok());
+    }
+
+    #[test]
+    fn upgrade_legacy_schema_for_write_bumps_legacy_only() {
+        let mut legacy = VaultData::new(NOW_MS).unwrap();
+        legacy.schema_version = LEGACY_VAULT_DATA_SCHEMA_VERSION;
+
+        legacy.upgrade_legacy_schema_for_write();
+
+        assert_eq!(legacy.schema_version, VAULT_DATA_SCHEMA_VERSION);
+
+        let mut current = VaultData::new(NOW_MS).unwrap();
+        current.schema_version = VAULT_DATA_SCHEMA_VERSION;
+
+        current.upgrade_legacy_schema_for_write();
+
+        assert_eq!(current.schema_version, VAULT_DATA_SCHEMA_VERSION);
     }
 
     #[test]

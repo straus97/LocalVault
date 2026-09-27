@@ -1,6 +1,7 @@
 package com.localvault.android.proof
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.res.ColorStateList
@@ -33,6 +34,8 @@ import android.widget.TextView
 import android.widget.Toast
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import uniffi.localvault_android_bridge.EntryInput
 import uniffi.localvault_android_bridge.BridgeException
 import uniffi.localvault_android_bridge.CategorySummary
 import uniffi.localvault_android_bridge.EntryDetails
@@ -41,9 +44,9 @@ import uniffi.localvault_android_bridge.VaultSession
 import uniffi.localvault_android_bridge.openVault
 
 /**
- * LocalVault Android read-only client (1T-B3): pick or re-open a recent vault,
- * unlock it through localvault-core (via the Rust bridge, off the main thread),
- * search the entry list, open an entry, show/copy its credentials, and lock.
+ * LocalVault Android client: pick or re-open a recent vault, unlock it
+ * through localvault-core (via the Rust bridge, off the main thread), search
+ * the entry list, open an entry, show/copy its credentials, and lock.
  *
  * Security shape:
  *  - The decrypted vault lives only inside the Rust-owned [VaultSession]. Kotlin
@@ -57,10 +60,17 @@ import uniffi.localvault_android_bridge.openVault
  *    a fetched entry password once it is a Java String or in a TextView), so
  *    no erasure of those copies is claimed; lifetimes are kept narrow instead.
  *  - The vault is locked whenever the Activity leaves the foreground, on Back
- *    from the list, and on explicit Lock.
- *  - Only non-secret metadata (document Uri + display name) is persisted, for
- *    the recent-vault list, with a persistable READ-only Uri grant.
- *  - This slice is read-only: the vault file is never written.
+ *    from the list, and on explicit Lock -- unconditionally, including while a
+ *    save (once one exists) is mid-write; see [VaultSaveCoordinator].
+ *  - Only non-secret metadata (document Uri, display name, and a UX-only
+ *    write-grant hint) is persisted for the recent-vault list.
+ *  - As of 1T-B5a, no UI in this Activity actually writes the vault file yet
+ *    (that begins with 1T-B5b's entry/category CRUD screens); this
+ *    checkpoint adds the write-capability/save-transaction infrastructure
+ *    ([SafDocumentIo], [RecoverySnapshotStore], [VaultSaveCoordinator],
+ *    [VaultCreationCoordinator], [SaveReconciler]) that those screens will
+ *    use, plus the write-grant re-pick flow and the accepted backup-filename
+ *    warning, which are both usable standalone.
  */
 class MainActivity : Activity() {
 
@@ -80,6 +90,12 @@ class MainActivity : Activity() {
     private companion object {
         const val REQUEST_PICK_VAULT = 1
 
+        // 1T-B5a: re-picking an existing recent vault to obtain a write
+        // grant. A distinct request code from REQUEST_PICK_VAULT so
+        // onActivityResult can apply the accepted grant-intersection logic
+        // (Revision 3, section 3) instead of the plain read-only path.
+        const val REQUEST_ENABLE_WRITE = 2
+
         // Mirrors the desktop adapter's vault file size bound.
         const val MAX_VAULT_FILE_BYTES = 32L * 1024 * 1024
 
@@ -93,6 +109,16 @@ class MainActivity : Activity() {
     private lateinit var scroll: ScrollView
     private lateinit var recents: RecentVaultStore
     private lateinit var clipboard: SecureClipboard
+
+    // 1T-B5a write-capability infrastructure. Neither holds any secret --
+    // documentIo wraps ContentResolver calls, recovery is the durable
+    // ciphertext-only pre-write snapshot store. Not yet driving any save
+    // (there is no entry-edit UI until 1T-B5b), but reconciliation already
+    // runs on every unlock so an interrupted save from a future save path
+    // is never silently mis-reported.
+    private lateinit var documentIo: SafDocumentIo
+    private lateinit var recovery: RecoverySnapshotStore
+    private var isDebuggable: Boolean = false
 
     private var screen = Screen.NO_FILE
     private var vaultUri: Uri? = null
@@ -138,13 +164,17 @@ class MainActivity : Activity() {
         // Screenshots and recents thumbnails are blocked in every build except
         // a debuggable one (so development screenshots stay possible). This is
         // derived from the app's real debuggable state, not a hard-coded flag.
-        val debuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
-        if (!debuggable) {
+        // The same flag also gates the 1T-B5a QA save harness below -- a real
+        // release build is never debuggable, so neither is reachable there.
+        isDebuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        if (!isDebuggable) {
             window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
         }
 
         recents = RecentVaultStore(this)
         clipboard = SecureClipboard.get(this)
+        documentIo = ContentResolverSafDocumentIo(this)
+        recovery = FileRecoverySnapshotStore(this)
 
         content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
@@ -239,6 +269,11 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
 
+        if (requestCode == REQUEST_ENABLE_WRITE) {
+            finishEnableWriteAccess(resultCode, data)
+            return
+        }
+
         if (requestCode != REQUEST_PICK_VAULT || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
 
@@ -251,6 +286,28 @@ class MainActivity : Activity() {
         }
 
         selectVault(uri, name)
+    }
+
+    /**
+     * 1T-B5a: re-pick result for upgrading an existing recent vault to
+     * write access (accepted review, Revision 3, section 3).
+     *
+     * By the time this runs, launching the picker has already put this
+     * Activity through the ordinary `onStop`/lock path if a session
+     * happened to be open -- nothing here special-cases or works around
+     * that. Only the grant is handled; the user must explicitly re-unlock
+     * before editing if a session was dropped.
+     */
+    private fun finishEnableWriteAccess(resultCode: Int, data: Intent?) {
+        if (resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+
+        val granted = grantedPermissionsFrom(data.flags)
+        val grant = takeGrantedPersistablePermissions(contentResolver, uri, granted)
+
+        recents.updateGrant(uri, grant)
+        statusRes = if (grant == VaultGrant.READ_WRITE) 0 else R.string.msg_write_access_not_granted
+        render()
     }
 
     // ---------------------------------------------------------------- back
@@ -280,6 +337,36 @@ class MainActivity : Activity() {
         // Read access only; ask for a grant that survives process restarts.
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         startActivityForResult(intent, REQUEST_PICK_VAULT)
+    }
+
+    /**
+     * 1T-B5a: re-invoke the system picker to upgrade [vault] from read-only
+     * to a write-capable grant. Does not require, and does not assume, a
+     * currently-live unlocked session for this vault (accepted review,
+     * Revision 3, section 3) -- launching this picker may drop one via the
+     * ordinary `onStop` lock path exactly like any other backgrounding.
+     */
+    @Suppress("DEPRECATION")
+    private fun requestWriteAccess(vault: RecentVault) {
+        // SAF has no reliable, cross-provider way to pre-navigate the
+        // picker to a specific document, so the user must reselect it
+        // manually -- tell them which file, since selecting a different one
+        // creates a distinct grant rather than "upgrading" this entry.
+        Toast.makeText(
+            this,
+            getString(R.string.msg_reselect_for_write, vault.name.ifEmpty { getString(R.string.default_vault_name) }),
+            Toast.LENGTH_LONG,
+        ).show()
+
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        intent.addCategory(Intent.CATEGORY_OPENABLE)
+        intent.type = "*/*"
+        intent.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+        )
+        startActivityForResult(intent, REQUEST_ENABLE_WRITE)
     }
 
     private fun selectVault(uri: Uri, name: String) {
@@ -316,18 +403,64 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * 1T-B5a post-QA fix: an automatically-evicted vault (the recent list's
+     * 5-item cap pushing out its oldest entry) is not equivalent to
+     * explicitly forgetting it. Its grant/recovery state is only released
+     * and cleaned up when nothing is unresolved for it; a genuinely
+     * unresolved save is left fully intact -- grant and recovery state both
+     * -- so it stays reachable/reconcilable despite falling out of the
+     * visible recent list (see [evictionOutcomeFor]).
+     */
     private fun rememberVault(vault: RecentVault) {
-        for (evicted in recents.promote(vault)) releaseGrant(evicted.uri)
+        for (evicted in recents.promote(vault)) {
+            val outcome = evictionOutcomeFor(recovery.hasUnresolvedMarker(evicted.uri.toString()))
+            if (outcome == EvictionOutcome.RELEASE_AND_FORGET) {
+                releaseGrant(evicted.uri)
+                recovery.forget(evicted.uri.toString())
+            }
+        }
     }
 
     private fun forgetVault(uri: Uri) {
         recents.remove(uri)
         releaseGrant(uri)
+        recovery.forget(uri.toString())
+    }
+
+    /**
+     * 1T-B5a: "forget vault" cleanup with the accepted unresolved-marker
+     * warning (Revision 3, section 7). Removing a vault that has no
+     * unresolved save in flight behaves exactly as before -- no dialog, no
+     * behavior change for the overwhelming majority of vaults, since B5a
+     * introduces no UI that can actually leave a save unresolved yet.
+     */
+    private fun confirmForgetVault(vault: RecentVault) {
+        if (!recovery.hasUnresolvedMarker(vault.uri.toString())) {
+            forgetVault(vault.uri)
+            statusRes = 0
+            render()
+            return
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.forget_vault_unresolved_title)
+            .setMessage(R.string.forget_vault_unresolved_message)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                forgetVault(vault.uri)
+                statusRes = 0
+                render()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     private fun releaseGrant(uri: Uri) {
         try {
-            contentResolver.releasePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            contentResolver.releasePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
         } catch (ignored: Exception) {
         }
     }
@@ -362,6 +495,7 @@ class MainActivity : Activity() {
         var cats: List<CategorySummary> = emptyList()
         var messageRes = 0
         var unreadable = false
+        var reconciliationOutcome: ReconciliationOutcome? = null
 
         try {
             val envelopeBytes = readVaultBytes(uri)
@@ -390,8 +524,26 @@ class MainActivity : Activity() {
             opened = null
         }
 
+        // 1T-B5a: before treating this unlock as normal, resolve any
+        // unresolved save marker left by an interrupted write against the
+        // vault's actual current disk content (accepted review, Revision 3,
+        // section 5). The only path that can currently create such a marker
+        // is the debug-only QA save harness below; a real product save path
+        // lands in 1T-B5b and is covered by this same reconciliation from
+        // the moment it lands, not retrofitted later.
+        if (opened != null) {
+            reconciliationOutcome =
+                try {
+                    SaveReconciler(documentIo, recovery).reconcileOnUnlock(uri.toString())
+                } catch (ignored: Exception) {
+                    ReconciliationOutcome.UNKNOWN_NEEDS_RECOVERY
+                }
+        }
+
         val result = opened
-        runOnUiThread { finishUnlock(generation, uri, result, rows, cats, messageRes, unreadable) }
+        runOnUiThread {
+            finishUnlock(generation, uri, result, rows, cats, messageRes, unreadable, reconciliationOutcome)
+        }
     }
 
     private fun readVaultBytes(uri: Uri): ByteArray {
@@ -425,6 +577,7 @@ class MainActivity : Activity() {
         cats: List<CategorySummary>,
         messageRes: Int,
         unreadable: Boolean,
+        reconciliationOutcome: ReconciliationOutcome? = null,
     ) {
         if (generation != unlockGeneration || screen != Screen.UNLOCKING || isFinishing || isDestroyed) {
             closeQuietly(opened)
@@ -440,6 +593,24 @@ class MainActivity : Activity() {
             listScrollY = 0
             statusRes = 0
             screen = Screen.LIST
+
+            if (reconciliationOutcome == ReconciliationOutcome.UNKNOWN_NEEDS_RECOVERY) {
+                // 1T-B5a: reconciliation could not determine whether a
+                // previously interrupted save reached the primary. Never
+                // reported as either "saved" or "lost" -- only that a
+                // recovery copy exists. Restoring from it is a deliberate,
+                // explicit action left to a later checkpoint's UI; this
+                // does not block normal (read-only, in this checkpoint) use
+                // of the vault.
+                Toast.makeText(this, R.string.msg_recovery_needed, Toast.LENGTH_LONG).show()
+            }
+
+            if (isDebuggable && reconciliationOutcome != null) {
+                // QA visibility only: shows every reconciliation branch
+                // (not just the user-facing "needs recovery" one) so a
+                // real-device tester can confirm which one actually fired.
+                Toast.makeText(this, "QA reconciliation: $reconciliationOutcome", Toast.LENGTH_LONG).show()
+            }
         } else if (unreadable && recents.load().any { it.uri == uri }) {
             // A remembered vault that can no longer be read is stale: forget it.
             forgetVault(uri)
@@ -799,14 +970,19 @@ class MainActivity : Activity() {
             card.setOnClickListener { selectRecent(vault) }
 
             card.addView(newText(vault.name.ifEmpty { getString(R.string.default_vault_name) }, size = 16f, bold = true))
-            card.addView(
-                newTextButton(getString(R.string.remove_from_history)) {
-                    forgetVault(vault.uri)
-                    statusRes = 0
-                    render()
-                },
-                wrapParams(top = 8, gravity = Gravity.END),
+
+            val actions = LinearLayout(this)
+            actions.orientation = LinearLayout.HORIZONTAL
+            actions.gravity = Gravity.END
+            if (vault.grant == VaultGrant.READ_ONLY) {
+                actions.addView(
+                    newTextButton(getString(R.string.enable_editing)) { requestWriteAccess(vault) },
+                )
+            }
+            actions.addView(
+                newTextButton(getString(R.string.remove_from_history)) { confirmForgetVault(vault) },
             )
+            card.addView(actions, wrapParams(top = 8, gravity = Gravity.END))
 
             addToContent(card, topMargin = 8)
         }
@@ -818,6 +994,7 @@ class MainActivity : Activity() {
         val card = newCard()
         card.addView(newText(getString(R.string.vault_label), size = 13f, color = R.color.lv_text_tertiary))
         card.addView(newText(vaultName, size = 17f, bold = true), matchParams(top = 2))
+        addBackupWarningIfNeeded(vaultName)
         card.addView(
             newText(getString(R.string.master_password), size = 13f, color = R.color.lv_text_tertiary),
             matchParams(top = 16),
@@ -856,6 +1033,12 @@ class MainActivity : Activity() {
 
         val title = newText(getString(R.string.app_name), size = 22f, bold = true)
         header.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (isDebuggable) {
+            // 1T-B5a QA save harness entry point -- see the dedicated
+            // section near the bottom of this file. Absent in any real
+            // (non-debuggable) build; see that section's own doc comment.
+            header.addView(newSecondaryButton("QA save", compact = true) { showQaSaveDialog() })
+        }
         header.addView(newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() })
         addToContent(header, topMargin = 4)
 
@@ -863,6 +1046,7 @@ class MainActivity : Activity() {
         fileName.setSingleLine()
         fileName.ellipsize = TextUtils.TruncateAt.END
         addToContent(fileName, topMargin = 2)
+        addBackupWarningIfNeeded(vaultName)
 
         val search = newSearchField()
         searchField = search
@@ -1230,6 +1414,22 @@ class MainActivity : Activity() {
         addToContent(message, topMargin = 16)
     }
 
+    /**
+     * 1T-B5a: warns before opening or saving to a document whose name
+     * matches the automatic rolling backup convention (`<name>.backup`) --
+     * the exact naming that caused the real, documented QA confusion
+     * between a vault's primary and backup files (accepted review, Revision
+     * 3, section 7).
+     */
+    private fun addBackupWarningIfNeeded(name: String, topMargin: Int = 10) {
+        if (!isLikelyBackupFilename(name)) return
+
+        val message = newText(getString(R.string.backup_file_warning), size = 13f, color = R.color.lv_error)
+        message.setPadding(dp(14), dp(10), dp(14), dp(10))
+        message.background = getDrawable(R.drawable.bg_error)
+        addToContent(message, topMargin = topMargin)
+    }
+
     private fun addPrimaryButton(label: String, topMargin: Int, onClick: () -> Unit) {
         addToContent(newPrimaryButton(label, onClick), topMargin = topMargin)
     }
@@ -1262,5 +1462,201 @@ class MainActivity : Activity() {
         params.leftMargin = dp(left)
         params.gravity = gravity
         return params
+    }
+
+    // =====================================================================
+    // 1T-B5a QA save harness -- DEBUG BUILDS ONLY.
+    //
+    // Every entry point here is gated behind `isDebuggable`, the same real
+    // installed-APK `android:debuggable` flag that already gates screenshot
+    // blocking above -- a real release build is never debuggable, so none
+    // of this is reachable there, and no separate runtime toggle exists to
+    // turn it on in one. This is the smallest way to reach it: it needed
+    // access to the same private `session`/`vaultUri`/`documentIo`/
+    // `recovery` fields the rest of this Activity already uses, and
+    // splitting it into a separate `src/debug` source set would have meant
+    // exposing those fields beyond this file just for this one purpose.
+    //
+    // This proves the Revision 3 real-device acceptance criterion for
+    // 1T-B5a: one real `update_entry` mutation through the REAL
+    // VaultSaveCoordinator + ContentResolverSafDocumentIo +
+    // FileRecoverySnapshotStore path (never a fake), against whatever
+    // vault is currently open -- use only a disposable QA vault, since this
+    // performs a real write. It is NOT product CRUD UI: it always mutates
+    // the first entry with fixed QA values, offers no field editing, and
+    // must not be extended into one. It is expected to be deleted once
+    // 1T-B5b's real save UI lands and can absorb its own on-device
+    // verification instead.
+    // =====================================================================
+
+    private enum class QaFaultMode { NONE, EXTERNAL_CHANGE, INTERRUPT_AFTER_MARKER, INTERRUPT_AFTER_PRIMARY_WRITE }
+
+    private fun showQaSaveDialog() {
+        val uri = vaultUri
+        val activeSession = session
+        val target = entries.firstOrNull()
+        if (uri == null || activeSession == null) return
+        if (target == null) {
+            Toast.makeText(this, "QA: vault has no entries to mutate -- add one from desktop first", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val modes = arrayOf(
+            "Normal round trip",
+            "External change between stale checks",
+            "Interrupt after marker, before write (background/kill now)",
+            "Interrupt after primary write, before verification (force-stop now)",
+        )
+        AlertDialog.Builder(this)
+            .setTitle("QA save test (DEBUG ONLY) -- mutates \"${target.title}\"")
+            .setItems(modes) { _, which ->
+                runQaSave(uri, activeSession, target.id, QaFaultMode.entries[which])
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * Runs one real `stage -> recovery snapshot -> [after-marker hook] ->
+     * second check -> "wt" write -> [after-write hook] -> readback ->
+     * commit` save off the main thread, exactly as a real 1T-B5b save path
+     * would, and reports the resulting [SaveOutcome] verbatim so a tester
+     * can distinguish every branch (success; stale-source abort before any
+     * primary write; actual write/readback failure; provider-capability
+     * refusal).
+     */
+    private fun runQaSave(uri: Uri, activeSession: VaultSession, entryId: String, mode: QaFaultMode) {
+        Thread {
+            val baseline =
+                try {
+                    documentIo.readAll(uri.toString())
+                } catch (error: Exception) {
+                    runOnUiThread { Toast.makeText(this, "QA: could not read baseline: $error", Toast.LENGTH_LONG).show() }
+                    return@Thread
+                }
+
+            val coordinator = VaultSaveCoordinator(activeSession, documentIo, recovery, baseline)
+            val input = EntryInput(
+                title = "QA mutated ${System.currentTimeMillis()}",
+                profileName = "",
+                url = "",
+                username = "qa-user",
+                password = "qa-password-${System.currentTimeMillis()}",
+                notes = "",
+                categoryId = null,
+                tags = emptyList(),
+                favorite = false,
+            )
+
+            // Only one of these ever actually pauses for a given mode --
+            // VaultSaveCoordinator only reaches the hook matching where
+            // this mode wants to interrupt, so passing both unconditionally
+            // is safe and keeps this call site simple.
+            val afterMarkerHook: (() -> Unit)? =
+                when (mode) {
+                    QaFaultMode.EXTERNAL_CHANGE, QaFaultMode.INTERRUPT_AFTER_MARKER -> {
+                        { awaitQaResume(mode, uri) }
+                    }
+                    else -> null
+                }
+            val afterPrimaryWriteHook: (() -> Unit)? =
+                if (mode == QaFaultMode.INTERRUPT_AFTER_PRIMARY_WRITE) {
+                    { awaitQaResume(mode, uri) }
+                } else {
+                    null
+                }
+
+            val outcome =
+                try {
+                    coordinator.saveUpdateEntry(
+                        uri.toString(),
+                        entryId,
+                        input,
+                        System.currentTimeMillis(),
+                        afterMarkerHook,
+                        afterPrimaryWriteHook,
+                    )
+                } catch (error: Exception) {
+                    SaveOutcome.UnexpectedError(error)
+                }
+
+            runOnUiThread { Toast.makeText(this, "QA save outcome: $outcome", Toast.LENGTH_LONG).show() }
+        }.start()
+    }
+
+    /**
+     * Deterministic fault-injection pause point for real-device QA. Called
+     * on the background save thread from one of [VaultSaveCoordinator]'s
+     * two QA hooks:
+     *  - `onAfterMarkerWritten` for [QaFaultMode.EXTERNAL_CHANGE] and
+     *    [QaFaultMode.INTERRUPT_AFTER_MARKER] -- after the durable recovery
+     *    snapshot and marker already exist on disk, before the second
+     *    stale-source check runs (before the primary is ever touched);
+     *  - `onAfterPrimaryWrite` for [QaFaultMode.INTERRUPT_AFTER_PRIMARY_WRITE]
+     *    -- after the primary document has already been physically written
+     *    with "wt", before readback verification, marker clearing, or
+     *    `commit_staged_save`.
+     *
+     * Either way this blocks only that background thread on a
+     * [CountDownLatch] until the tester responds; it holds no plaintext or
+     * key material itself (everything from this point on is ciphertext the
+     * coordinator already computed), and it does not touch, delay, or
+     * special-case `onStop`'s immediate lock, and does not clear the
+     * durable marker itself while paused -- if the Activity backgrounds or
+     * the process dies while this is blocked, the live session is
+     * dropped/zeroized exactly as it always is, this thread simply dies
+     * with the process, and the marker is left exactly as it was written,
+     * for the next unlock's reconciliation to resolve from disk truth.
+     */
+    private fun awaitQaResume(mode: QaFaultMode, uri: Uri) {
+        val latch = CountDownLatch(1)
+
+        runOnUiThread {
+            val builder = AlertDialog.Builder(this).setCancelable(false)
+            when (mode) {
+                QaFaultMode.EXTERNAL_CHANGE -> {
+                    builder.setTitle("QA: recovery snapshot + marker written")
+                    builder.setMessage(
+                        "Stale-check #2 is about to run. Tap below to simulate an external write to " +
+                            "this vault document right now through the real ContentResolver, or modify " +
+                            "it yourself externally first, then tap Resume.",
+                    )
+                    builder.setPositiveButton("Simulate external write && Resume") { _, _ ->
+                        try {
+                            documentIo.writeTruncated(
+                                uri.toString(),
+                                "qa-simulated-external-write-${System.currentTimeMillis()}".toByteArray(),
+                            )
+                        } catch (ignored: Exception) {
+                        }
+                        latch.countDown()
+                    }
+                    builder.setNegativeButton("Resume (I changed it myself)") { _, _ -> latch.countDown() }
+                }
+                QaFaultMode.INTERRUPT_AFTER_MARKER -> {
+                    builder.setTitle("QA: recovery snapshot + marker written")
+                    builder.setMessage(
+                        "Background or force-stop the app now to test interrupted-write reconciliation " +
+                            "(expect NOT_SAVED on next unlock, since the primary has not been touched yet). " +
+                            "Tap Resume instead to continue this save normally.",
+                    )
+                    builder.setPositiveButton("Resume normally") { _, _ -> latch.countDown() }
+                }
+                QaFaultMode.INTERRUPT_AFTER_PRIMARY_WRITE -> {
+                    builder.setTitle("QA: primary write completed, not yet verified")
+                    builder.setMessage(
+                        "The real primary document was just written with \"wt\", but LocalVault has not " +
+                            "yet verified the readback or claimed success. FORCE-STOP the app now (Settings " +
+                            "> Apps > LocalVault > Force stop) to test that next-unlock reconciliation " +
+                            "resolves this as SAVED from disk truth. Tap Resume instead to continue normally.",
+                    )
+                    builder.setPositiveButton("Resume normally") { _, _ -> latch.countDown() }
+                }
+                QaFaultMode.NONE -> latch.countDown()
+            }
+            builder.show()
+        }
+
+        latch.await()
     }
 }

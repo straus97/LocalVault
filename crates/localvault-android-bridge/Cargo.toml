@@ -2,7 +2,7 @@
 name = "localvault-android-bridge"
 version = "0.1.0"
 edition = "2021"
-description = "1T-B1b architecture-proof-only Android FFI adapter: exposes exactly one synchronous, non-secret compatibility-check operation from localvault-core to Kotlin via stable UniFFI/JNA bindings. Not a general-purpose Android vault API yet."
+description = "Android FFI adapter: exposes localvault-core's vault open/mutate/save operations to Kotlin via stable UniFFI/JNA bindings. Thin marshalling layer only -- crypto, format and schema logic stay in localvault-core."
 authors = ["Штраус Никита Алексеевич"]
 publish = false
 
@@ -16,6 +16,12 @@ uniffi = "=0.32.0"
 serde_json = "1"
 thiserror = "2"
 zeroize = "1.9.0"
+# Same pinned version already used by localvault-core and src-tauri (not a new
+# or unaudited dependency). Needed here to parse the category_id string a
+# mutation input carries across FFI into the Option<Uuid> localvault-core's
+# VaultEntry requires -- otherwise the bridge would have to do that parsing
+# by hand instead of reusing the crate core's own data model already depends on.
+uuid = "1.26.0"
 
 [dev-dependencies]
 sha2 = "0.10"

@@ -15,9 +15,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use localvault_core::vault::{
-    data::{
-        VaultData, VaultDataError, LEGACY_VAULT_DATA_SCHEMA_VERSION, VAULT_DATA_SCHEMA_VERSION,
-    },
+    data::{VaultData, VaultDataError},
     format::{
         create_envelope_with_key, open_envelope_with_key, reseal_envelope, SecretKey,
         VaultEnvelope, VaultError,
@@ -205,9 +203,7 @@ impl UnlockedVaultSession {
             return Ok(false);
         }
 
-        if self.data.schema_version == LEGACY_VAULT_DATA_SCHEMA_VERSION {
-            self.data.schema_version = VAULT_DATA_SCHEMA_VERSION;
-        }
+        self.data.upgrade_legacy_schema_for_write();
 
         self.data.validate()?;
 
@@ -241,9 +237,7 @@ impl UnlockedVaultSession {
             return Err(SessionError::PendingUnsavedChanges);
         }
 
-        if candidate.schema_version == LEGACY_VAULT_DATA_SCHEMA_VERSION {
-            candidate.schema_version = VAULT_DATA_SCHEMA_VERSION;
-        }
+        candidate.upgrade_legacy_schema_for_write();
 
         candidate.validate()?;
 

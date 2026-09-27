@@ -66,4 +66,15 @@ dependencies {
     // bridge crate's own Cargo.toml -- JNA is how the stable UniFFI Kotlin
     // binding path talks to the native library, not a Rust dependency.
     implementation("net.java.dev.jna:jna:5.19.1@aar")
+
+    // 1T-B5a: local (plain-JVM) unit tests for the new save/creation
+    // orchestration logic (stale-source checks, recovery-snapshot bookkeeping,
+    // reconciliation, grant-flag intersection). These depend only on small
+    // interfaces (SafDocumentIo, RecoverySnapshotStore) and the UniFFI-
+    // generated VaultSessionInterface, so a plain JUnit4 dependency is
+    // sufficient -- no Robolectric/instrumentation is needed, and none is
+    // added, since nothing under test touches a real ContentResolver/
+    // AtomicFile directly (those concrete implementations are exercised by
+    // on-device QA instead, per the accepted 1T-B5 review's test plan).
+    testImplementation("junit:junit:4.13.2")
 }

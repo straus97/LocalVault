@@ -5,8 +5,18 @@ import android.net.Uri
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** One remembered vault: NON-SECRET metadata only (document Uri + display name). */
-data class RecentVault(val uri: Uri, val name: String)
+/**
+ * One remembered vault: NON-SECRET metadata only (document Uri, display
+ * name, and a UX-only write-grant hint).
+ *
+ * [grant] is never an authorization source -- it exists only so the UI can
+ * decide whether to offer "Enable editing" without a synchronous permission
+ * check on every screen paint. Every actual write independently
+ * re-validates the live persisted grant and provider capability regardless
+ * of this value (accepted 1T-B5 storage/mutation architecture review,
+ * Revision 3, sections 3, 6 and 15).
+ */
+data class RecentVault(val uri: Uri, val name: String, val grant: VaultGrant = VaultGrant.READ_ONLY)
 
 /**
  * Tiny SharedPreferences-backed history of recently opened vault documents,
@@ -33,7 +43,16 @@ class RecentVaultStore(context: Context) {
                 val item = array.optJSONObject(index) ?: continue
                 val uri = item.optString(FIELD_URI, "")
                 if (uri.isEmpty()) continue
-                result.add(RecentVault(Uri.parse(uri), item.optString(FIELD_NAME, "")))
+                val grant =
+                    if (item.optString(FIELD_GRANT, "") == VaultGrant.READ_WRITE.name) {
+                        VaultGrant.READ_WRITE
+                    } else {
+                        // Older stored entries (pre-1T-B5a) and anything
+                        // unrecognized default to the safer, more
+                        // conservative hint.
+                        VaultGrant.READ_ONLY
+                    }
+                result.add(RecentVault(Uri.parse(uri), item.optString(FIELD_NAME, ""), grant))
             }
 
             result
@@ -60,13 +79,23 @@ class RecentVaultStore(context: Context) {
         save(load().filter { it.uri != uri })
     }
 
+    /**
+     * Updates the UX-only write-grant hint for [uri], if it is present in
+     * history. A no-op for a vault not in history. Never itself grants or
+     * revokes anything -- see [RecentVault.grant]'s documentation.
+     */
+    fun updateGrant(uri: Uri, grant: VaultGrant) {
+        save(load().map { if (it.uri == uri) it.copy(grant = grant) else it })
+    }
+
     private fun save(items: List<RecentVault>) {
         val array = JSONArray()
         for (item in items) {
             array.put(
                 JSONObject()
                     .put(FIELD_URI, item.uri.toString())
-                    .put(FIELD_NAME, item.name),
+                    .put(FIELD_NAME, item.name)
+                    .put(FIELD_GRANT, item.grant.name),
             )
         }
 
@@ -80,5 +109,6 @@ class RecentVaultStore(context: Context) {
         private const val KEY_ITEMS = "items"
         private const val FIELD_URI = "uri"
         private const val FIELD_NAME = "name"
+        private const val FIELD_GRANT = "grant"
     }
 }
