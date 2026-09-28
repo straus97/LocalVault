@@ -63,12 +63,24 @@ pub struct EntrySummary {
     pub category_id: Option<String>,
 }
 
-/// Non-secret detail for one entry, fetched only when the user opens it.
+/// Detail for one entry, fetched only when the user opens it (for browsing)
+/// or edits it (1T-B5b-4).
 ///
-/// Deliberately excludes the password (fetched separately, and only on an
-/// explicit show/copy via [`VaultSession::entry_password`]), notes, TOTP
-/// configuration/secrets, tags and key material. Opening an entry card
-/// therefore never moves that entry's password across the FFI boundary.
+/// `notes` and `tags` are user-authored free text, not categorically
+/// "non-secret" -- notes in particular can contain anything the user chose
+/// to write there, including sensitive content. It is acceptable for them
+/// (and `category_id`/`favorite`) to cross the FFI boundary here because this
+/// struct exists specifically to drive the explicit detail/edit workflow
+/// the user themselves initiated, and because they are already
+/// produced/consumed the same way via `EntryInput` in
+/// `stage_create_entry`/`stage_update_entry` -- this is not a new exposure,
+/// only a new read path for content the bridge already writes.
+///
+/// This struct must never carry the password, the TOTP secret/configuration,
+/// or any key material (Vault Key/Master Key) -- those remain exclusively
+/// on [`VaultSession::entry_password`] (fetched separately, only on an
+/// explicit show/copy/edit action) and the TOTP-specific bridge calls, which never
+/// return the underlying secret either.
 #[derive(uniffi::Record)]
 pub struct EntryDetails {
     pub id: String,
@@ -76,6 +88,10 @@ pub struct EntryDetails {
     pub profile_name: String,
     pub url: String,
     pub username: String,
+    pub notes: String,
+    pub category_id: Option<String>,
+    pub tags: Vec<String>,
+    pub favorite: bool,
     /// Whether the entry has a TOTP configuration. The configuration and its
     /// secret never cross the FFI boundary.
     pub totp_enabled: bool,
@@ -320,6 +336,10 @@ impl VaultSession {
             profile_name: entry.profile_name.clone(),
             url: entry.url.clone(),
             username: entry.username.clone(),
+            notes: entry.notes.clone(),
+            category_id: entry.category_id.map(|id| id.to_string()),
+            tags: entry.tags.clone(),
+            favorite: entry.favorite,
             totp_enabled: entry.totp.is_some(),
         })
     }
@@ -1211,7 +1231,7 @@ mod tests {
     }
 
     #[test]
-    fn entry_details_return_non_secret_fields_for_a_known_entry() {
+    fn entry_details_return_expected_fields_for_a_known_entry() {
         let session = open_ok(schema2());
         let id = id_of(&session, "Fixture Login");
 
@@ -1221,6 +1241,25 @@ mod tests {
         assert_eq!(details.title, "Fixture Login");
         assert_eq!(details.profile_name, "Fixture Profile");
         assert_eq!(details.username, "fixture.user@example.com");
+
+        // Behaviorally check notes/category_id/tags/favorite (added
+        // alongside 1T-B5b-4's Android entry-edit UI) round-trip through the
+        // same stage -> reopen -> read path stage_update_entry's other tests
+        // already use, against known values -- not just the field-set pin
+        // entry_details_carry_no_secret_fields below already covers.
+        let category_id = category_id_of(&session, "Fixture Category");
+        let mut input = update_input("Fixture Login");
+        input.category_id = Some(category_id.clone());
+
+        let staged_bytes = session
+            .stage_update_entry(id.clone(), input, UPDATE_NOW_MS)
+            .unwrap();
+        let updated = reopen_bytes(&staged_bytes).entry_details(id).unwrap();
+
+        assert_eq!(updated.notes, "UPDATED_STAGE_TEST_NOTE");
+        assert_eq!(updated.category_id, Some(category_id));
+        assert_eq!(updated.tags, vec!["updated".to_owned()]);
+        assert!(updated.favorite);
     }
 
     #[test]
@@ -1236,6 +1275,10 @@ mod tests {
             profile_name: _,
             url: _,
             username: _,
+            notes: _,
+            category_id: _,
+            tags: _,
+            favorite: _,
             totp_enabled: _,
         } = session.entry_details(id).unwrap();
 

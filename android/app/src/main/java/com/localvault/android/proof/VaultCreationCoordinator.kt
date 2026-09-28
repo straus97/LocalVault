@@ -18,7 +18,19 @@ import uniffi.localvault_android_bridge.beginCreateVault
  * shared abort-cleanup procedure.
  */
 sealed class CreateVaultOutcome {
-    data class Success(val session: VaultSession) : CreateVaultOutcome()
+    /**
+     * [committedEnvelopeBytes] are the exact readback ciphertext bytes that
+     * were passed to (and accepted by) `verifyAndFinalize` -- i.e. the exact
+     * bytes now on disk for this newly created vault. 1T-B5b-4's Blocker 1
+     * fix requires the caller's session-scoped `VaultSaveCoordinator` to be
+     * constructed from precisely these bytes (never a fresh disk read),
+     * exactly like the ordinary unlock path already does with its own
+     * envelope bytes -- otherwise the coordinator's external-change
+     * detection would be silently defeated from the very first save. No
+     * decryption or re-serialization is involved; this is the same
+     * ciphertext [readback] already computed a few lines below.
+     */
+    data class Success(val session: VaultSession, val committedEnvelopeBytes: ByteArray) : CreateVaultOutcome()
     object ProviderNotWritable : CreateVaultOutcome()
     data class ValidationFailedBeforeWrite(val error: BridgeException) : CreateVaultOutcome()
     data class ValidationFailedAfterWrite(val error: BridgeException) : CreateVaultOutcome()
@@ -138,7 +150,7 @@ class VaultCreationCoordinator(
         // failure (see the bridge's own doc comment), so no extra discard()
         // is needed in either branch below.
         return try {
-            CreateVaultOutcome.Success(pending.verifyAndFinalize(readback))
+            CreateVaultOutcome.Success(pending.verifyAndFinalize(readback), readback)
         } catch (error: BridgeException.OperationFailed) {
             CreateVaultOutcome.WriteFailed
         } catch (error: BridgeException) {

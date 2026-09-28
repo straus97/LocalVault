@@ -73,4 +73,23 @@
     <string name="msg_empty_password">Enter the master password.</string>
     <string name="msg_recent_unavailable">This vault is no longer available and was removed from recent vaults.</string>
     <string name="msg_action_failed">Something went wrong.</string>
+
+    <string name="add_entry">Add entry</string>
+    <string name="edit">Edit</string>
+    <string name="delete">Delete</string>
+    <string name="save">Save</string>
+    <string name="new_entry_title">New entry</string>
+    <string name="edit_entry_title">Edit entry</string>
+    <string name="field_title">Title</string>
+    <string name="field_notes">Notes</string>
+    <string name="field_tags">Tags</string>
+    <string name="field_tags_hint">Comma-separated</string>
+    <string name="field_favorite">Favorite</string>
+    <string name="confirm_delete_entry_title">Delete entry?</string>
+    <string name="confirm_delete_entry_message">This will permanently delete \"%1$s\". This cannot be undone.</string>
+    <string name="msg_entry_saved">Entry saved.</string>
+    <string name="msg_entry_deleted">Entry deleted.</string>
+    <string name="msg_invalid_entry">This entry is invalid. Check the fields and try again.</string>
+    <string name="msg_vault_changed_externally">The vault changed externally. Reopen it to continue.</string>
+    <string name="msg_write_access_unavailable">Write access is unavailable for this vault. Editing is disabled.</string>
 </resources>

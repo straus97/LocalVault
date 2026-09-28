@@ -77,7 +77,7 @@ import uniffi.localvault_android_bridge.openVault
  */
 class MainActivity : Activity() {
 
-    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS }
+    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS, ENTRY_EDIT }
 
     private class VaultReadException : Exception()
 
@@ -190,6 +190,96 @@ class MainActivity : Activity() {
     // behavior even in a debuggable build -- see renderCreatePassword).
     private var qaPauseAfterInitialWrite: Boolean = false
 
+    // 1T-B5b-4 entry-edit/delete state. entryId == null means create mode.
+    // categoryId is preserved verbatim from the entry being edited (or null
+    // for a new entry) -- this checkpoint does not add a category picker;
+    // that is B5b-5's job (accepted task, section A). editInitialPassword
+    // holds the one explicit entryPassword fetch, only long enough to be
+    // consumed into the password EditText the moment ENTRY_EDIT is rendered
+    // -- it is nulled immediately after (see startEditEntry and
+    // renderEntryEdit), and is NEVER included in [EntryEditSnapshot] (see
+    // that class's own doc comment).
+    private var editEntryId: String? = null
+    private var editCategoryId: String? = null
+    private var editInitialPassword: String? = null
+
+    // A snapshot of the form's non-password content, captured only when a save
+    // attempt fails and the user is kept on ENTRY_EDIT to retry -- render()
+    // otherwise always rebuilds the form from [detail] (edit mode) or blank
+    // (create mode), which would silently discard whatever the user had just
+    // typed. Consumed (and cleared) the next time the form is rendered.
+    //
+    // Deliberately carries no password field: submitEntryEdit always wipes
+    // the password EditText the instant it reads it into the outgoing
+    // EntryInput, success or failure, and this snapshot must never become a
+    // second place that value survives. A failed save therefore always
+    // requires the password to be retyped -- the same accepted-task
+    // hygiene rule CREATE_PASSWORD already follows on any failure.
+    private data class EntryEditSnapshot(
+        val title: String,
+        val profileName: String,
+        val url: String,
+        val username: String,
+        val notes: String,
+        val tags: String,
+        val favorite: Boolean,
+    )
+
+    private var editPendingSnapshot: EntryEditSnapshot? = null
+
+    // Bumped whenever DETAIL/ENTRY_EDIT is left without an in-flight
+    // create/update/delete resolving first (Back/Cancel, Lock, onStop,
+    // onDestroy) so a save/delete that finishes after the fact is silently
+    // dropped instead of resurrecting a screen the user already left --
+    // mirrors unlockGeneration/createGeneration above. This governs the UI
+    // only; it has no bearing on whether the mutation itself is still
+    // physically running -- see [activeMutationToken] for that.
+    private var entryMutationGeneration = 0
+
+    // Physical in-flight ownership for entry create/update/delete, shared
+    // across all three so at most one may ever be running at a time against
+    // the live session-scoped [saveCoordinator] -- unlike
+    // [entryMutationGeneration] above, this is deliberately NOT reset by
+    // navigation (Back/Cancel/Lock): a bare Thread already started cannot be
+    // cancelled, and letting a second mutation start against the same
+    // coordinator while the first is still running would race
+    // VaultSaveCoordinator's own internal baseline-hash state. Only the
+    // matching completion callback (finishEntrySave/finishEntryDelete) may
+    // clear ownership, and only if it still holds the exact token it was
+    // given -- a late completion from an abandoned attempt can therefore
+    // never clear a newer attempt's ownership, because with a single slot a
+    // newer attempt could not have started in the first place while the
+    // older one still held it.
+    private var mutationTokenCounter = 0L
+    private var activeMutationToken: Long? = null
+
+    /** Returns a fresh ownership token, or null if a mutation is already in flight. */
+    private fun beginMutation(): Long? {
+        if (activeMutationToken != null) return null
+        val token = ++mutationTokenCounter
+        activeMutationToken = token
+        return token
+    }
+
+    /** No-op unless [token] is still the current owner -- see the field doc comment above. */
+    private fun endMutationIfOwned(token: Long) {
+        if (activeMutationToken == token) {
+            activeMutationToken = null
+        }
+    }
+
+    // Session-scoped save coordinator (Blocker 1 fix): constructed exactly
+    // once per live [session], from the exact ciphertext bytes that produced
+    // it (the unlock envelope bytes, or vault-creation's committed readback
+    // bytes) -- never rebuilt from a fresh disk read per mutation, which
+    // would silently discard the external-change protection
+    // VaultSaveCoordinator's own baselineSha256 tracking exists to provide.
+    // Always cleared in the same places [session] itself is cleared or
+    // replaced (lockVault, onDestroy, a forced reopen after
+    // SaveOutcome.ChangedExternally) so it can never outlive the
+    // VaultSession it wraps.
+    private var saveCoordinator: VaultSaveCoordinator? = null
+
     // Views that hold user-entered or revealed text; nulled on every render.
     private var passwordField: EditText? = null
     private var confirmPasswordField: EditText? = null
@@ -200,6 +290,14 @@ class MainActivity : Activity() {
     private var passwordToggleButton: Button? = null
     private var passwordShown = false
     private var chipsContainer: LinearLayout? = null
+    private var editTitleField: EditText? = null
+    private var editProfileField: EditText? = null
+    private var editUrlField: EditText? = null
+    private var editUsernameField: EditText? = null
+    private var editPasswordField: EditText? = null
+    private var editNotesField: EditText? = null
+    private var editTagsField: EditText? = null
+    private var editFavoriteCheckbox: CheckBox? = null
 
     // Live TOTP display. Only non-secret timing is kept in fields; the code
     // itself lives solely in the visible view and is cleared with it.
@@ -305,6 +403,10 @@ class MainActivity : Activity() {
 
         when (screen) {
             Screen.LIST, Screen.DETAIL, Screen.UNLOCKING -> lockVault()
+            Screen.ENTRY_EDIT -> {
+                editPasswordField?.let { wipe(it) }
+                lockVault()
+            }
             Screen.CREATE_IN_PROGRESS -> abandonCreateInProgress()
             else -> {
                 // CREATE_PASSWORD included: no Rust secret state exists yet
@@ -322,8 +424,11 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         stopTotp()
         unlockGeneration++
+        entryMutationGeneration++
+        clearEntryEditState()
         val current = session
         session = null
+        saveCoordinator = null
         entries = emptyList()
         categories = emptyList()
         detail = null
@@ -396,6 +501,7 @@ class MainActivity : Activity() {
             Screen.LIST, Screen.UNLOCKING -> lockVault()
             Screen.CREATE_IN_PROGRESS -> abandonCreateInProgress()
             Screen.CREATE_PASSWORD -> cancelCreatePassword()
+            Screen.ENTRY_EDIT -> cancelEntryEdit()
             Screen.FILE_SELECTED -> {
                 vaultUri = null
                 vaultName = ""
@@ -778,6 +884,10 @@ class MainActivity : Activity() {
                 clearCreateState()
                 closeQuietly(session)
                 session = outcome.session
+                // Blocker 1 fix: constructed from the exact committed
+                // ciphertext bytes verify_and_finalize accepted -- see
+                // CreateVaultOutcome.Success's own doc comment.
+                saveCoordinator = VaultSaveCoordinator(outcome.session, documentIo, recovery, outcome.committedEnvelopeBytes)
                 entries = emptyList()
                 categories = emptyList()
                 categoryFilter = CategoryFilter.All
@@ -979,6 +1089,7 @@ class MainActivity : Activity() {
     /** Runs on a dedicated background thread: file read + Argon2id + list. */
     private fun runUnlock(uri: Uri, password: String, generation: Int) {
         var opened: VaultSession? = null
+        var openedEnvelopeBytes: ByteArray? = null
         var rows: List<EntrySummary> = emptyList()
         var cats: List<CategorySummary> = emptyList()
         var messageRes = 0
@@ -988,6 +1099,7 @@ class MainActivity : Activity() {
         try {
             val envelopeBytes = readVaultBytes(uri)
             opened = openVault(envelopeBytes, password)
+            openedEnvelopeBytes = envelopeBytes
             rows = opened.listEntries()
             cats = opened.listCategories()
         } catch (error: BridgeException.AuthenticationFailed) {
@@ -1029,8 +1141,9 @@ class MainActivity : Activity() {
         }
 
         val result = opened
+        val resultEnvelopeBytes = openedEnvelopeBytes
         runOnUiThread {
-            finishUnlock(generation, uri, result, rows, cats, messageRes, unreadable, reconciliationOutcome)
+            finishUnlock(generation, uri, result, resultEnvelopeBytes, rows, cats, messageRes, unreadable, reconciliationOutcome)
         }
     }
 
@@ -1061,6 +1174,7 @@ class MainActivity : Activity() {
         generation: Int,
         uri: Uri,
         opened: VaultSession?,
+        openedEnvelopeBytes: ByteArray?,
         rows: List<EntrySummary>,
         cats: List<CategorySummary>,
         messageRes: Int,
@@ -1072,8 +1186,14 @@ class MainActivity : Activity() {
             return
         }
 
-        if (opened != null) {
+        if (opened != null && openedEnvelopeBytes != null) {
             session = opened
+            // Blocker 1 fix: constructed from the exact ciphertext bytes that
+            // produced this session -- never re-read from disk per mutation,
+            // so VaultSaveCoordinator's own baseline tracking is the sole
+            // source of truth for external-change detection, exactly as
+            // 1T-B5a/B5b-2 already proved it.
+            saveCoordinator = VaultSaveCoordinator(opened, documentIo, recovery, openedEnvelopeBytes)
             entries = rows
             categories = cats
             categoryFilter = CategoryFilter.All
@@ -1114,11 +1234,21 @@ class MainActivity : Activity() {
         render()
     }
 
-    private fun lockVault() {
+    /**
+     * [messageRes], when non-zero, is shown after locking -- used by the
+     * forced-reopen path after [SaveOutcome.ChangedExternally] (Blocker 2) to
+     * surface [R.string.msg_vault_changed_externally] without a second,
+     * separate status-clearing step. Every ordinary Lock/Back/onStop call
+     * site is unaffected (defaults to the existing silent-lock behavior).
+     */
+    private fun lockVault(messageRes: Int = 0) {
         unlockGeneration++
+        entryMutationGeneration++
+        clearEntryEditState()
 
         val current = session
         session = null
+        saveCoordinator = null
         entries = emptyList()
         categories = emptyList()
         categoryFilter = CategoryFilter.All
@@ -1128,7 +1258,7 @@ class MainActivity : Activity() {
         clearRevealedPassword()
         closeQuietly(current)
 
-        statusRes = 0
+        statusRes = messageRes
         screen = if (vaultUri != null) Screen.FILE_SELECTED else Screen.NO_FILE
         render()
     }
@@ -1168,6 +1298,7 @@ class MainActivity : Activity() {
     }
 
     private fun closeDetail() {
+        entryMutationGeneration++
         clearRevealedPassword()
         detail = null
         screen = Screen.LIST
@@ -1220,6 +1351,303 @@ class MainActivity : Activity() {
             toast(R.string.msg_action_failed)
             null
         }
+    }
+
+    // ---------------------------------------------------------------- entry create/edit/delete
+    //
+    // 1T-B5b-4. One shared ENTRY_EDIT screen drives both create ([editEntryId]
+    // null) and edit (non-null) via VaultSaveCoordinator.saveCreateEntry /
+    // saveUpdateEntry, and DETAIL's Delete action drives saveDeleteEntry --
+    // never stageCreateEntry/stageUpdateEntry/stageDeleteEntry directly, and
+    // never a duplicate write-capability pre-check: SaveOutcome.
+    // ProviderNotWritable already reflects the coordinator's own live
+    // grant/provider re-check.
+
+    private fun clearEntryEditState() {
+        editPasswordField?.let { wipe(it) }
+        editEntryId = null
+        editCategoryId = null
+        editInitialPassword = null
+        editPendingSnapshot = null
+        // Deliberately does NOT touch activeMutationToken -- see that
+        // field's own doc comment: navigation must not let a second
+        // mutation start while an earlier one is still physically running
+        // against the same session-scoped coordinator.
+    }
+
+    private fun startCreateEntry() {
+        clearEntryEditState()
+        statusRes = 0
+        screen = Screen.ENTRY_EDIT
+        render()
+    }
+
+    /**
+     * Prefills the shared editor from the already-fetched [detail] -- no
+     * redundant `entryDetails` read -- except for the password, which
+     * [EntryDetails] never carries; that one field is fetched here, once,
+     * through the same [fetchPassword] path Show/Copy already use.
+     */
+    private fun startEditEntry() {
+        val current = detail ?: return
+        val password = fetchPassword(current.id) ?: return
+
+        editEntryId = current.id
+        editCategoryId = current.categoryId
+        editInitialPassword = password
+        editPendingSnapshot = null
+        statusRes = 0
+        screen = Screen.ENTRY_EDIT
+        render()
+    }
+
+    private fun cancelEntryEdit() {
+        entryMutationGeneration++
+        val wasCreate = editEntryId == null
+        clearEntryEditState()
+        statusRes = 0
+        screen = if (wasCreate) Screen.LIST else Screen.DETAIL
+        render()
+    }
+
+    /** Never includes the password field -- see [EntryEditSnapshot]'s own doc comment. */
+    private fun captureEntryEditSnapshot(): EntryEditSnapshot? {
+        val title = editTitleField ?: return null
+        val profileName = editProfileField ?: return null
+        val url = editUrlField ?: return null
+        val username = editUsernameField ?: return null
+        val notes = editNotesField ?: return null
+        val tags = editTagsField ?: return null
+        val favorite = editFavoriteCheckbox ?: return null
+
+        return EntryEditSnapshot(
+            title = title.text.toString(),
+            profileName = profileName.text.toString(),
+            url = url.text.toString(),
+            username = username.text.toString(),
+            notes = notes.text.toString(),
+            tags = tags.text.toString(),
+            favorite = favorite.isChecked,
+        )
+    }
+
+    private fun parseTags(raw: String): List<String> =
+        raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+
+    private fun submitEntryEdit() {
+        val titleField = editTitleField ?: return
+        val profileField = editProfileField ?: return
+        val urlField = editUrlField ?: return
+        val usernameField = editUsernameField ?: return
+        val pwField = editPasswordField ?: return
+        val notesField = editNotesField ?: return
+        val tagsField = editTagsField ?: return
+        val favoriteCheckbox = editFavoriteCheckbox ?: return
+
+        val uri = vaultUri ?: return
+        val coordinator = saveCoordinator ?: return
+        val token = beginMutation() ?: return
+
+        val input = EntryInput(
+            title = titleField.text.toString(),
+            profileName = profileField.text.toString(),
+            url = urlField.text.toString(),
+            username = usernameField.text.toString(),
+            password = pwField.text.toString(),
+            notes = notesField.text.toString(),
+            categoryId = editCategoryId,
+            tags = parseTags(tagsField.text.toString()),
+            favorite = favoriteCheckbox.isChecked,
+        )
+
+        // Security hygiene, matching the CREATE_PASSWORD precedent: never
+        // silently retain a just-submitted password in the visible field,
+        // success or failure -- a failed attempt requires retyping it. This
+        // is also why EntryEditSnapshot never carries a password (Blocker 3).
+        wipe(pwField)
+
+        val entryId = editEntryId
+        val generation = entryMutationGeneration
+        statusRes = 0
+
+        Thread {
+            val outcome =
+                try {
+                    if (entryId == null) {
+                        coordinator.saveCreateEntry(uri.toString(), input, System.currentTimeMillis())
+                    } else {
+                        coordinator.saveUpdateEntry(uri.toString(), entryId, input, System.currentTimeMillis())
+                    }
+                } catch (error: Exception) {
+                    SaveOutcome.UnexpectedError(error)
+                }
+
+            runOnUiThread { finishEntrySave(generation, token, entryId, outcome) }
+        }.start()
+    }
+
+    private fun refreshEntriesAndCategories() {
+        val current = session ?: return
+
+        try {
+            entries = current.listEntries()
+            categories = current.listCategories()
+        } catch (error: Throwable) {
+            // Best-effort refresh only -- on failure the list simply keeps
+            // showing its last-known state until the next successful read.
+        }
+    }
+
+    /** Back on the main thread. Handles create/update outcomes identically per section E. */
+    private fun finishEntrySave(generation: Int, token: Long, entryId: String?, outcome: SaveOutcome) {
+        endMutationIfOwned(token)
+
+        // Blocker 2: ChangedExternally means the live session no longer
+        // represents disk truth -- a security-relevant fact independent of
+        // whether the user already navigated away from this specific
+        // attempt, so it is handled before, and regardless of, the
+        // generation-staleness gate below (which governs UI-only outcomes).
+        // Never adopt the externally changed bytes into the old session,
+        // never auto-retry -- force the user back through FILE_SELECTED to
+        // re-unlock.
+        if (outcome == SaveOutcome.ChangedExternally) {
+            if (!isFinishing && !isDestroyed) {
+                lockVault(R.string.msg_vault_changed_externally)
+            }
+            return
+        }
+
+        if (generation != entryMutationGeneration || isFinishing || isDestroyed) {
+            // ENTRY_EDIT was already left (Back/Lock/onStop/onDestroy) before
+            // this resolved. The mutation itself cannot be undone from here,
+            // but this Activity's view of the vault has already moved on (or
+            // the vault was locked) -- never resurrect ENTRY_EDIT/DETAIL/LIST
+            // for a stale result.
+            return
+        }
+
+        when (outcome) {
+            SaveOutcome.Success -> {
+                refreshEntriesAndCategories()
+                clearEntryEditState()
+                toast(R.string.msg_entry_saved)
+
+                if (entryId == null) {
+                    statusRes = 0
+                    screen = Screen.LIST
+                } else {
+                    val refreshed =
+                        try {
+                            session?.entryDetails(entryId)
+                        } catch (error: Throwable) {
+                            null
+                        }
+                    if (refreshed != null) {
+                        detail = refreshed
+                        statusRes = 0
+                        screen = Screen.DETAIL
+                    } else {
+                        detail = null
+                        statusRes = 0
+                        screen = Screen.LIST
+                    }
+                }
+            }
+
+            // Handled unconditionally above, before the staleness gate --
+            // never reached here.
+            SaveOutcome.ChangedExternally -> Unit
+
+            SaveOutcome.ProviderNotWritable -> {
+                editPendingSnapshot = captureEntryEditSnapshot()
+                statusRes = R.string.msg_write_access_unavailable
+            }
+
+            is SaveOutcome.ValidationFailed -> {
+                editPendingSnapshot = captureEntryEditSnapshot()
+                statusRes = R.string.msg_invalid_entry
+            }
+
+            SaveOutcome.RecoverySnapshotFailed, SaveOutcome.WriteFailed -> {
+                editPendingSnapshot = captureEntryEditSnapshot()
+                statusRes = R.string.msg_action_failed
+            }
+
+            is SaveOutcome.UnexpectedError -> {
+                editPendingSnapshot = captureEntryEditSnapshot()
+                statusRes = R.string.msg_action_failed
+            }
+        }
+
+        render()
+    }
+
+    private fun confirmDeleteEntry() {
+        val entryId = detail?.id ?: return
+        val title = detail?.title ?: ""
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.confirm_delete_entry_title)
+            .setMessage(getString(R.string.confirm_delete_entry_message, title))
+            .setPositiveButton(R.string.delete) { _, _ -> startDeleteEntry(entryId) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun startDeleteEntry(entryId: String) {
+        val uri = vaultUri ?: return
+        val coordinator = saveCoordinator ?: return
+        val token = beginMutation() ?: return
+
+        val generation = entryMutationGeneration
+        statusRes = 0
+
+        Thread {
+            val outcome =
+                try {
+                    coordinator.saveDeleteEntry(uri.toString(), entryId, System.currentTimeMillis())
+                } catch (error: Exception) {
+                    SaveOutcome.UnexpectedError(error)
+                }
+
+            runOnUiThread { finishEntryDelete(generation, token, outcome) }
+        }.start()
+    }
+
+    private fun finishEntryDelete(generation: Int, token: Long, outcome: SaveOutcome) {
+        endMutationIfOwned(token)
+
+        // See finishEntrySave's identical handling for why this precedes,
+        // and is independent of, the generation-staleness gate below.
+        if (outcome == SaveOutcome.ChangedExternally) {
+            if (!isFinishing && !isDestroyed) {
+                lockVault(R.string.msg_vault_changed_externally)
+            }
+            return
+        }
+
+        if (generation != entryMutationGeneration || isFinishing || isDestroyed) return
+
+        when (outcome) {
+            SaveOutcome.Success -> {
+                refreshEntriesAndCategories()
+                clearEntryEditState()
+                detail = null
+                toast(R.string.msg_entry_deleted)
+                statusRes = 0
+                screen = Screen.LIST
+            }
+
+            // Handled unconditionally above; never reached here.
+            SaveOutcome.ChangedExternally -> Unit
+
+            SaveOutcome.ProviderNotWritable -> statusRes = R.string.msg_write_access_unavailable
+            is SaveOutcome.ValidationFailed -> statusRes = R.string.msg_invalid_entry
+            SaveOutcome.RecoverySnapshotFailed, SaveOutcome.WriteFailed -> statusRes = R.string.msg_action_failed
+            is SaveOutcome.UnexpectedError -> statusRes = R.string.msg_action_failed
+        }
+
+        render()
     }
 
     // ---------------------------------------------------------------- TOTP
@@ -1431,6 +1859,14 @@ class MainActivity : Activity() {
         totpCodeView = null
         totpRemainingView = null
         totpProgress = null
+        editTitleField = null
+        editProfileField = null
+        editUrlField = null
+        editUsernameField = null
+        editPasswordField = null
+        editNotesField = null
+        editTagsField = null
+        editFavoriteCheckbox = null
 
         when (screen) {
             Screen.NO_FILE -> renderNoFile()
@@ -1440,6 +1876,7 @@ class MainActivity : Activity() {
             Screen.DETAIL -> renderDetail()
             Screen.CREATE_PASSWORD -> renderCreatePassword()
             Screen.CREATE_IN_PROGRESS -> renderCreateInProgress()
+            Screen.ENTRY_EDIT -> renderEntryEdit()
         }
     }
 
@@ -1583,6 +2020,98 @@ class MainActivity : Activity() {
         addToContent(card, topMargin = 24)
     }
 
+    /**
+     * Shared create/edit form (1T-B5b-4, accepted task section A). Populated
+     * from, in priority order: an [editPendingSnapshot] left by a just-failed
+     * save attempt (preserves what the user typed), then the already-fetched
+     * [detail] for edit mode, then blank for create mode. No category
+     * spinner yet -- [editCategoryId] is preserved silently; B5b-5 adds the
+     * picker UI for it. No TOTP field (B5c).
+     */
+    private fun renderEntryEdit() {
+        val isCreate = editEntryId == null
+        val existing = if (isCreate) null else detail
+        val snapshot = editPendingSnapshot
+        editPendingSnapshot = null
+
+        addToContent(
+            newText(
+                getString(if (isCreate) R.string.new_entry_title else R.string.edit_entry_title),
+                size = 22f,
+                bold = true,
+            ),
+            topMargin = 8,
+        )
+
+        val card = newCard()
+
+        card.addView(newText(getString(R.string.field_title), size = 13f, color = R.color.lv_text_tertiary))
+        val titleField = newField()
+        titleField.setText(snapshot?.title ?: existing?.title ?: "")
+        editTitleField = titleField
+        card.addView(titleField, matchParams(top = 6))
+
+        card.addView(newText(getString(R.string.profile), size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 16))
+        val profileField = newField()
+        profileField.setText(snapshot?.profileName ?: existing?.profileName ?: "")
+        editProfileField = profileField
+        card.addView(profileField, matchParams(top = 6))
+
+        card.addView(newText(getString(R.string.website), size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 16))
+        val urlField = newField()
+        urlField.setText(snapshot?.url ?: existing?.url ?: "")
+        editUrlField = urlField
+        card.addView(urlField, matchParams(top = 6))
+
+        card.addView(newText(getString(R.string.username), size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 16))
+        val usernameField = newField()
+        usernameField.setText(snapshot?.username ?: existing?.username ?: "")
+        editUsernameField = usernameField
+        card.addView(usernameField, matchParams(top = 6))
+
+        card.addView(newText(getString(R.string.password), size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 16))
+        val pwField = newField()
+        pwField.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        // Never sourced from [snapshot] (Blocker 3 -- EntryEditSnapshot never
+        // carries a password): only the initial edit-mode fetch prefills
+        // this field. After any failed save, submitEntryEdit has already
+        // wiped it, so a retry always requires the password to be retyped.
+        pwField.setText(editInitialPassword ?: "")
+        editPasswordField = pwField
+        card.addView(pwField, matchParams(top = 6))
+        // Consumed into the visible field; never retained a second place
+        // beyond it (accepted task section F).
+        editInitialPassword = null
+
+        card.addView(newText(getString(R.string.field_notes), size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 16))
+        val notesField = newField()
+        notesField.setSingleLine(false)
+        notesField.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+        notesField.setMinLines(3)
+        notesField.setText(snapshot?.notes ?: existing?.notes ?: "")
+        editNotesField = notesField
+        card.addView(notesField, matchParams(top = 6))
+
+        card.addView(newText(getString(R.string.field_tags), size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 16))
+        val tagsField = newField()
+        tagsField.hint = getString(R.string.field_tags_hint)
+        tagsField.setText(snapshot?.tags ?: existing?.tags?.joinToString(", ") ?: "")
+        editTagsField = tagsField
+        card.addView(tagsField, matchParams(top = 6))
+
+        val favoriteCheckbox = CheckBox(this)
+        favoriteCheckbox.text = getString(R.string.field_favorite)
+        favoriteCheckbox.isChecked = snapshot?.favorite ?: existing?.favorite ?: false
+        editFavoriteCheckbox = favoriteCheckbox
+        card.addView(favoriteCheckbox, matchParams(top = 16))
+
+        addToContent(card, topMargin = 16)
+
+        addStatus()
+        addPrimaryButton(getString(R.string.save), topMargin = 16) { submitEntryEdit() }
+        addSecondaryButton(getString(android.R.string.cancel), topMargin = 10) { cancelEntryEdit() }
+    }
+
     private fun renderList() {
         // Stable heading + Lock on one row; the (possibly long) vault file name
         // sits below on its own single, end-ellipsized line so it can never
@@ -1599,7 +2128,14 @@ class MainActivity : Activity() {
             // (non-debuggable) build; see that section's own doc comment.
             header.addView(newSecondaryButton("QA save", compact = true) { showQaSaveDialog() })
         }
-        header.addView(newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() })
+        header.addView(
+            newSecondaryButton(getString(R.string.add_entry), compact = true) { startCreateEntry() },
+            wrapParams(left = 8),
+        )
+        header.addView(
+            newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() },
+            wrapParams(left = 8),
+        )
         addToContent(header, topMargin = 4)
 
         val fileName = newText(vaultName, size = 14f, color = R.color.lv_text_secondary)
@@ -1710,7 +2246,15 @@ class MainActivity : Activity() {
         bar.gravity = Gravity.CENTER_VERTICAL
         bar.addView(newTextButton(getString(R.string.back)) { closeDetail() })
         bar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-        bar.addView(newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() })
+        bar.addView(newSecondaryButton(getString(R.string.edit), compact = true) { startEditEntry() })
+        bar.addView(
+            newSecondaryButton(getString(R.string.delete), compact = true) { confirmDeleteEntry() },
+            wrapParams(left = 8),
+        )
+        bar.addView(
+            newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() },
+            wrapParams(left = 8),
+        )
         addToContent(bar, topMargin = 0)
 
         addToContent(newText(current.title, size = 24f, bold = true), topMargin = 12)

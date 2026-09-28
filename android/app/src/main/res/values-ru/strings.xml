@@ -74,4 +74,23 @@
     <string name="msg_empty_password">Введите мастер-пароль.</string>
     <string name="msg_recent_unavailable">Это хранилище больше недоступно и удалено из недавних.</string>
     <string name="msg_action_failed">Что-то пошло не так.</string>
+
+    <string name="add_entry">Добавить запись</string>
+    <string name="edit">Изменить</string>
+    <string name="delete">Удалить</string>
+    <string name="save">Сохранить</string>
+    <string name="new_entry_title">Новая запись</string>
+    <string name="edit_entry_title">Изменить запись</string>
+    <string name="field_title">Название</string>
+    <string name="field_notes">Заметки</string>
+    <string name="field_tags">Теги</string>
+    <string name="field_tags_hint">Через запятую</string>
+    <string name="field_favorite">Избранное</string>
+    <string name="confirm_delete_entry_title">Удалить запись?</string>
+    <string name="confirm_delete_entry_message">Запись «%1$s» будет удалена без возможности восстановления.</string>
+    <string name="msg_entry_saved">Запись сохранена.</string>
+    <string name="msg_entry_deleted">Запись удалена.</string>
+    <string name="msg_invalid_entry">Запись некорректна. Проверьте поля и попробуйте снова.</string>
+    <string name="msg_vault_changed_externally">Хранилище было изменено извне. Откройте его заново, чтобы продолжить.</string>
+    <string name="msg_write_access_unavailable">Доступ на запись для этого хранилища недоступен. Редактирование отключено.</string>
 </resources>
