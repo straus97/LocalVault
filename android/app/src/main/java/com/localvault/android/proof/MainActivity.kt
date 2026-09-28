@@ -25,13 +25,17 @@ import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.window.OnBackInvokedDispatcher
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import java.io.ByteArrayOutputStream
@@ -39,6 +43,7 @@ import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import uniffi.localvault_android_bridge.EntryInput
 import uniffi.localvault_android_bridge.BridgeException
+import uniffi.localvault_android_bridge.CategoryInput
 import uniffi.localvault_android_bridge.CategorySummary
 import uniffi.localvault_android_bridge.EntryDetails
 import uniffi.localvault_android_bridge.EntrySummary
@@ -77,7 +82,7 @@ import uniffi.localvault_android_bridge.openVault
  */
 class MainActivity : Activity() {
 
-    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS, ENTRY_EDIT }
+    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS, ENTRY_EDIT, CATEGORY_MANAGE }
 
     private class VaultReadException : Exception()
 
@@ -236,20 +241,30 @@ class MainActivity : Activity() {
     // physically running -- see [activeMutationToken] for that.
     private var entryMutationGeneration = 0
 
-    // Physical in-flight ownership for entry create/update/delete, shared
-    // across all three so at most one may ever be running at a time against
-    // the live session-scoped [saveCoordinator] -- unlike
-    // [entryMutationGeneration] above, this is deliberately NOT reset by
+    // 1T-B5b-5: same-purpose generation counter for CATEGORY_MANAGE, bumped
+    // wherever that screen is left without an in-flight category
+    // create/rename/delete resolving first (Back, Lock, onStop, onDestroy)
+    // -- mirrors [entryMutationGeneration] exactly, kept as its own counter
+    // only because it governs a different screen. Like its entry
+    // counterpart, this governs UI resurrection only; physical mutation
+    // ownership is [activeMutationToken] below, shared across both.
+    private var categoryMutationGeneration = 0
+
+    // Physical in-flight ownership for entry create/update/delete AND
+    // category create/rename/delete, shared across all six so at most one
+    // may ever be running at a time against the live session-scoped
+    // [saveCoordinator] -- unlike [entryMutationGeneration]/
+    // [categoryMutationGeneration] above, this is deliberately NOT reset by
     // navigation (Back/Cancel/Lock): a bare Thread already started cannot be
     // cancelled, and letting a second mutation start against the same
     // coordinator while the first is still running would race
     // VaultSaveCoordinator's own internal baseline-hash state. Only the
-    // matching completion callback (finishEntrySave/finishEntryDelete) may
-    // clear ownership, and only if it still holds the exact token it was
-    // given -- a late completion from an abandoned attempt can therefore
-    // never clear a newer attempt's ownership, because with a single slot a
-    // newer attempt could not have started in the first place while the
-    // older one still held it.
+    // matching completion callback (finishEntrySave/finishEntryDelete/
+    // finishCategoryMutation) may clear ownership, and only if it still
+    // holds the exact token it was given -- a late completion from an
+    // abandoned attempt can therefore never clear a newer attempt's
+    // ownership, because with a single slot a newer attempt could not have
+    // started in the first place while the older one still held it.
     private var mutationTokenCounter = 0L
     private var activeMutationToken: Long? = null
 
@@ -298,6 +313,7 @@ class MainActivity : Activity() {
     private var editNotesField: EditText? = null
     private var editTagsField: EditText? = null
     private var editFavoriteCheckbox: CheckBox? = null
+    private var editCategorySpinner: Spinner? = null
 
     // Live TOTP display. Only non-secret timing is kept in fields; the code
     // itself lives solely in the visible view and is cleared with it.
@@ -402,7 +418,7 @@ class MainActivity : Activity() {
         clipboard.setAppFocused(false)
 
         when (screen) {
-            Screen.LIST, Screen.DETAIL, Screen.UNLOCKING -> lockVault()
+            Screen.LIST, Screen.DETAIL, Screen.UNLOCKING, Screen.CATEGORY_MANAGE -> lockVault()
             Screen.ENTRY_EDIT -> {
                 editPasswordField?.let { wipe(it) }
                 lockVault()
@@ -425,6 +441,7 @@ class MainActivity : Activity() {
         stopTotp()
         unlockGeneration++
         entryMutationGeneration++
+        categoryMutationGeneration++
         clearEntryEditState()
         val current = session
         session = null
@@ -502,6 +519,7 @@ class MainActivity : Activity() {
             Screen.CREATE_IN_PROGRESS -> abandonCreateInProgress()
             Screen.CREATE_PASSWORD -> cancelCreatePassword()
             Screen.ENTRY_EDIT -> cancelEntryEdit()
+            Screen.CATEGORY_MANAGE -> closeCategoryManage()
             Screen.FILE_SELECTED -> {
                 vaultUri = null
                 vaultName = ""
@@ -1244,6 +1262,7 @@ class MainActivity : Activity() {
     private fun lockVault(messageRes: Int = 0) {
         unlockGeneration++
         entryMutationGeneration++
+        categoryMutationGeneration++
         clearEntryEditState()
 
         val current = session
@@ -1446,6 +1465,17 @@ class MainActivity : Activity() {
 
         val uri = vaultUri ?: return
         val coordinator = saveCoordinator ?: return
+
+        // Conservative fail-closed guard (accepted task section G): never
+        // submit a save that would silently drop the entry's real category
+        // because it disappeared from the current [categories] list (e.g.
+        // deleted by another session) between render and submit.
+        if (editCategoryId != null && categories.none { it.id == editCategoryId }) {
+            statusRes = R.string.msg_entry_category_missing
+            render()
+            return
+        }
+
         val token = beginMutation() ?: return
 
         val input = EntryInput(
@@ -1492,9 +1522,27 @@ class MainActivity : Activity() {
         try {
             entries = current.listEntries()
             categories = current.listCategories()
+            normalizeCategoryFilter()
         } catch (error: Throwable) {
             // Best-effort refresh only -- on failure the list simply keeps
             // showing its last-known state until the next successful read.
+        }
+    }
+
+    /**
+     * A successful category delete (or any other refresh) can leave
+     * [categoryFilter] pointing at a category id that no longer exists --
+     * e.g. LIST was filtered by category X, X had zero entries so its
+     * deletion was allowed, and the delete happened from CATEGORY_MANAGE.
+     * All/Uncategorized are always valid; only a [CategoryFilter.Category]
+     * whose id has disappeared from the just-refreshed [categories] is reset
+     * to All so LIST never stays silently filtered by a deleted category
+     * with no chip to represent it.
+     */
+    private fun normalizeCategoryFilter() {
+        val filter = categoryFilter
+        if (filter is CategoryFilter.Category && categories.none { it.id == filter.id }) {
+            categoryFilter = CategoryFilter.All
         }
     }
 
@@ -1643,6 +1691,233 @@ class MainActivity : Activity() {
 
             SaveOutcome.ProviderNotWritable -> statusRes = R.string.msg_write_access_unavailable
             is SaveOutcome.ValidationFailed -> statusRes = R.string.msg_invalid_entry
+            SaveOutcome.RecoverySnapshotFailed, SaveOutcome.WriteFailed -> statusRes = R.string.msg_action_failed
+            is SaveOutcome.UnexpectedError -> statusRes = R.string.msg_action_failed
+        }
+
+        render()
+    }
+
+    // ---------------------------------------------------------------- category management
+    //
+    // 1T-B5b-5. CATEGORY_MANAGE drives saveCreateCategory/saveUpdateCategory/
+    // saveDeleteCategory through the same session-scoped [saveCoordinator]
+    // and the same shared [beginMutation]/[endMutationIfOwned] ownership
+    // token entry mutations already use (accepted task section F) -- never
+    // a separate category-only busy flag, so an entry mutation and a
+    // category mutation can never overlap. [categoryMutationGeneration]
+    // mirrors [entryMutationGeneration]: it governs only whether a late
+    // completion may resurrect CATEGORY_MANAGE, never whether the mutation
+    // itself is still physically running.
+
+    private fun startCategoryManage() {
+        statusRes = 0
+        screen = Screen.CATEGORY_MANAGE
+        render()
+    }
+
+    private fun closeCategoryManage() {
+        categoryMutationGeneration++
+        statusRes = 0
+        screen = Screen.LIST
+        render()
+    }
+
+    /** One-EditText AlertDialog, matching the existing grant-request dialog convention. */
+    private fun newDialogField(initialText: String = ""): EditText {
+        val field = newField()
+        field.hint = getString(R.string.category_name_hint)
+        field.setText(initialText)
+        field.setSelection(field.text.length)
+        return field
+    }
+
+    private fun dialogFieldWrapper(field: EditText): View {
+        val wrapper = FrameLayout(this)
+        val params = FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT)
+        params.setMargins(dp(24), dp(8), dp(24), dp(8))
+        wrapper.addView(field, params)
+        return wrapper
+    }
+
+    private fun showAddCategoryDialog() {
+        val field = newDialogField()
+        AlertDialog.Builder(this)
+            .setTitle(R.string.add_category)
+            .setView(dialogFieldWrapper(field))
+            .setPositiveButton(R.string.save) { _, _ -> submitCreateCategory(field.text.toString()) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun showRenameCategoryDialog(category: CategorySummary) {
+        val field = newDialogField(category.name)
+        AlertDialog.Builder(this)
+            .setTitle(R.string.rename_category)
+            .setView(dialogFieldWrapper(field))
+            .setPositiveButton(R.string.save) { _, _ -> submitRenameCategory(category.id, field.text.toString()) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun confirmDeleteCategory(category: CategorySummary) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.confirm_delete_category_title)
+            .setMessage(getString(R.string.confirm_delete_category_message, category.name))
+            .setPositiveButton(R.string.delete) { _, _ -> submitDeleteCategory(category.id) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun submitCreateCategory(name: String) {
+        val uri = vaultUri ?: return
+        val coordinator = saveCoordinator ?: return
+        val token = beginMutation() ?: return
+
+        val generation = categoryMutationGeneration
+        statusRes = 0
+        val input = CategoryInput(name = name)
+
+        Thread {
+            val outcome =
+                try {
+                    coordinator.saveCreateCategory(uri.toString(), input, System.currentTimeMillis())
+                } catch (error: Exception) {
+                    SaveOutcome.UnexpectedError(error)
+                }
+
+            runOnUiThread { finishCategoryMutation(generation, token, coordinator, outcome, R.string.msg_category_created) }
+        }.start()
+    }
+
+    private fun submitRenameCategory(categoryId: String, name: String) {
+        val uri = vaultUri ?: return
+        val coordinator = saveCoordinator ?: return
+        val token = beginMutation() ?: return
+
+        val generation = categoryMutationGeneration
+        statusRes = 0
+        val input = CategoryInput(name = name)
+
+        Thread {
+            val outcome =
+                try {
+                    coordinator.saveUpdateCategory(uri.toString(), categoryId, input, System.currentTimeMillis())
+                } catch (error: Exception) {
+                    SaveOutcome.UnexpectedError(error)
+                }
+
+            runOnUiThread { finishCategoryMutation(generation, token, coordinator, outcome, R.string.msg_category_renamed) }
+        }.start()
+    }
+
+    private fun submitDeleteCategory(categoryId: String) {
+        val uri = vaultUri ?: return
+        val coordinator = saveCoordinator ?: return
+        val token = beginMutation() ?: return
+
+        val generation = categoryMutationGeneration
+        statusRes = 0
+
+        Thread {
+            val outcome =
+                try {
+                    coordinator.saveDeleteCategory(uri.toString(), categoryId, System.currentTimeMillis())
+                } catch (error: Exception) {
+                    SaveOutcome.UnexpectedError(error)
+                }
+
+            runOnUiThread { finishCategoryMutation(generation, token, coordinator, outcome, R.string.msg_category_deleted) }
+        }.start()
+    }
+
+    /**
+     * Back on the main thread. Shared outcome handling for create/rename/
+     * delete (accepted task section E): a distinct [R.string.msg_category_in_use]
+     * message is surfaced only when the structured [BridgeException.CategoryInUse]
+     * variant is present; every other rejection (including
+     * [BridgeException.CategoryNotFound]) falls back to the generic invalid-
+     * category message. No raw exception text is ever shown.
+     *
+     * [coordinator] is the exact [VaultSaveCoordinator] this specific attempt
+     * was issued against (captured in submitCreateCategory/
+     * submitRenameCategory/submitDeleteCategory), never re-read from the
+     * current [saveCoordinator] field -- comparing the two by identity is
+     * what lets a mutation that outlives a Back-to-LIST navigation still
+     * refresh the right (still-current) session's cached data, while a
+     * mutation whose session was since locked/replaced can be recognized as
+     * belonging to a coordinator that is no longer live and must not refresh
+     * anything.
+     */
+    private fun finishCategoryMutation(
+        generation: Int,
+        token: Long,
+        coordinator: VaultSaveCoordinator,
+        outcome: SaveOutcome,
+        successMessageRes: Int,
+    ) {
+        endMutationIfOwned(token)
+
+        // See finishEntrySave's identical handling for why ChangedExternally
+        // precedes, and is independent of, everything below.
+        if (outcome == SaveOutcome.ChangedExternally) {
+            if (!isFinishing && !isDestroyed) {
+                lockVault(R.string.msg_vault_changed_externally)
+            }
+            return
+        }
+
+        val activityAlive = !isFinishing && !isDestroyed
+        val generationStale = generation != categoryMutationGeneration
+
+        if (outcome == SaveOutcome.Success && coordinator === saveCoordinator) {
+            // The mutation succeeded against the session that is still the
+            // live one -- refresh the cached data unconditionally, even if
+            // CATEGORY_MANAGE's own UI generation is already stale, so a
+            // successful category create/rename/delete that outlives a Back
+            // to LIST is never left invisible on disk-vs-cache alone
+            // (Blocker 2). A completion whose [coordinator] no longer
+            // matches [saveCoordinator] belongs to a session that was since
+            // locked/replaced/re-created -- refreshing from it would read
+            // through a coordinator no longer backed by the live
+            // VaultSession, so it is skipped entirely.
+            refreshEntriesAndCategories()
+        }
+
+        if (generationStale || !activityAlive) {
+            // CATEGORY_MANAGE (or the Activity itself) was already left
+            // before this resolved. Never resurrect CATEGORY_MANAGE and
+            // never show its success/failure toast or status for a stale
+            // attempt -- but if the refresh above just updated the cached
+            // data and the user is sitting on LIST right now, redraw it so
+            // the successful mutation is immediately visible instead of only
+            // becoming visible the next time LIST happens to re-render.
+            if (outcome == SaveOutcome.Success && activityAlive && screen == Screen.LIST) {
+                render()
+            }
+            return
+        }
+
+        when (outcome) {
+            SaveOutcome.Success -> {
+                toast(successMessageRes)
+                statusRes = 0
+            }
+
+            // Handled unconditionally above; never reached here.
+            SaveOutcome.ChangedExternally -> Unit
+
+            SaveOutcome.ProviderNotWritable -> statusRes = R.string.msg_write_access_unavailable
+
+            is SaveOutcome.ValidationFailed -> {
+                statusRes =
+                    if (outcome.error is BridgeException.CategoryInUse) {
+                        R.string.msg_category_in_use
+                    } else {
+                        R.string.msg_invalid_category
+                    }
+            }
+
             SaveOutcome.RecoverySnapshotFailed, SaveOutcome.WriteFailed -> statusRes = R.string.msg_action_failed
             is SaveOutcome.UnexpectedError -> statusRes = R.string.msg_action_failed
         }
@@ -1867,6 +2142,7 @@ class MainActivity : Activity() {
         editNotesField = null
         editTagsField = null
         editFavoriteCheckbox = null
+        editCategorySpinner = null
 
         when (screen) {
             Screen.NO_FILE -> renderNoFile()
@@ -1877,6 +2153,7 @@ class MainActivity : Activity() {
             Screen.CREATE_PASSWORD -> renderCreatePassword()
             Screen.CREATE_IN_PROGRESS -> renderCreateInProgress()
             Screen.ENTRY_EDIT -> renderEntryEdit()
+            Screen.CATEGORY_MANAGE -> renderCategoryManage()
         }
     }
 
@@ -2099,6 +2376,60 @@ class MainActivity : Activity() {
         editTagsField = tagsField
         card.addView(tagsField, matchParams(top = 6))
 
+        // 1T-B5b-5: category picker. [editCategoryId] is the persistent
+        // source of truth -- set on startCreateEntry (null)/startEditEntry
+        // (the entry's current category), updated live by the listener
+        // below, and never reset by a failed save (see finishEntrySave's
+        // failure branches, which only set editPendingSnapshot) -- so a
+        // failed save keeps the user's selection without any dedicated
+        // EntryEditSnapshot field for it.
+        //
+        // If editCategoryId names a category that is no longer in
+        // [categories] (e.g. deleted concurrently by another client/
+        // session), a transient UI-only "Current category unavailable" row
+        // is prepended whose value is the missing id itself -- never a fake
+        // id, and never null. That row, not "Uncategorized", is the initial
+        // selection. This matters because Spinner can fire its selection
+        // callback once during initial layout even without user action: with
+        // this row selected, that callback can only rewrite editCategoryId
+        // to the SAME missing id (a no-op), never silently to null. The
+        // save-time membership guard in submitEntryEdit keeps blocking Save
+        // for as long as this row (or the still-missing id) remains
+        // selected; only an explicit user choice of "Uncategorized" or a
+        // real category changes editCategoryId to a value that guard
+        // accepts.
+        card.addView(newText(getString(R.string.field_category), size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 16))
+        val currentCategoryId = editCategoryId
+        val categoryMissing = currentCategoryId != null && categories.none { it.id == currentCategoryId }
+
+        val categoryOptions: List<Pair<String?, String>> =
+            (if (categoryMissing) listOf(currentCategoryId to getString(R.string.category_unavailable)) else emptyList()) +
+                listOf(null to getString(R.string.category_uncategorized)) +
+                categories.map { it.id to it.name }
+
+        val spinner = Spinner(this)
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, categoryOptions.map { it.second })
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinner.adapter = adapter
+        val selectedIndex = categoryOptions.indexOfFirst { it.first == currentCategoryId }
+        spinner.setSelection(if (selectedIndex >= 0) selectedIndex else 0)
+        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                editCategoryId = categoryOptions.getOrNull(position)?.first
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
+        editCategorySpinner = spinner
+        card.addView(spinner, matchParams(top = 6))
+
+        if (categoryMissing) {
+            card.addView(
+                newText(getString(R.string.msg_entry_category_missing), size = 12f, color = R.color.lv_error),
+                matchParams(top = 4),
+            )
+        }
+
         val favoriteCheckbox = CheckBox(this)
         favoriteCheckbox.text = getString(R.string.field_favorite)
         favoriteCheckbox.isChecked = snapshot?.favorite ?: existing?.favorite ?: false
@@ -2110,6 +2441,56 @@ class MainActivity : Activity() {
         addStatus()
         addPrimaryButton(getString(R.string.save), topMargin = 16) { submitEntryEdit() }
         addSecondaryButton(getString(android.R.string.cancel), topMargin = 10) { cancelEntryEdit() }
+    }
+
+    /**
+     * 1T-B5b-5. Lists categories in stored order with per-category entry
+     * counts (already carried by [CategorySummary], no new bridge read),
+     * plus Rename/Delete per row and an Add-category action. No search
+     * (accepted task section A). Stays on this screen after every normal
+     * create/rename/delete success or failure -- only explicit Back leaves it.
+     */
+    private fun renderCategoryManage() {
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER_VERTICAL
+        bar.addView(newTextButton(getString(R.string.back)) { closeCategoryManage() })
+        addToContent(bar, topMargin = 0)
+
+        addToContent(newText(getString(R.string.categories_title), size = 22f, bold = true), topMargin = 12)
+
+        addStatus()
+
+        addSecondaryButton(getString(R.string.add_category), topMargin = 16) { showAddCategoryDialog() }
+
+        if (categories.isEmpty()) {
+            addBody(getString(R.string.no_categories), color = R.color.lv_text_tertiary, topMargin = 16)
+            return
+        }
+
+        for (category in categories) {
+            val card = newCard()
+            card.addView(newText(category.name, size = 16f, bold = true))
+            card.addView(
+                newText(
+                    resources.getQuantityString(R.plurals.entries_count, category.entryCount.toInt(), category.entryCount.toInt()),
+                    size = 13f,
+                    color = R.color.lv_text_tertiary,
+                ),
+                matchParams(top = 2),
+            )
+
+            val actions = LinearLayout(this)
+            actions.orientation = LinearLayout.HORIZONTAL
+            actions.addView(newSecondaryButton(getString(R.string.rename), compact = true) { showRenameCategoryDialog(category) })
+            actions.addView(
+                newSecondaryButton(getString(R.string.delete), compact = true) { confirmDeleteCategory(category) },
+                wrapParams(left = 8),
+            )
+            card.addView(actions, wrapParams(top = 12, gravity = Gravity.START))
+
+            addToContent(card, topMargin = 8)
+        }
     }
 
     private fun renderList() {
@@ -2156,6 +2537,11 @@ class MainActivity : Activity() {
         chipScroll.addView(chipRow)
         addToContent(chipScroll, topMargin = 12)
         renderChips()
+
+        addToContent(
+            newTextButton(getString(R.string.manage_categories)) { startCategoryManage() },
+            topMargin = 4,
+        )
 
         val count = newText("", size = 13f, color = R.color.lv_text_tertiary)
         countView = count

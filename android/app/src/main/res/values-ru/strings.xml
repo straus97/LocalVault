@@ -93,4 +93,22 @@
     <string name="msg_invalid_entry">Запись некорректна. Проверьте поля и попробуйте снова.</string>
     <string name="msg_vault_changed_externally">Хранилище было изменено извне. Откройте его заново, чтобы продолжить.</string>
     <string name="msg_write_access_unavailable">Доступ на запись для этого хранилища недоступен. Редактирование отключено.</string>
+
+    <string name="manage_categories">Управление категориями</string>
+    <string name="categories_title">Категории</string>
+    <string name="add_category">Добавить категорию</string>
+    <string name="rename">Переименовать</string>
+    <string name="rename_category">Переименовать категорию</string>
+    <string name="category_name_hint">Название категории</string>
+    <string name="field_category">Категория</string>
+    <string name="category_unavailable">Текущая категория недоступна</string>
+    <string name="no_categories">Категорий пока нет.</string>
+    <string name="confirm_delete_category_title">Удалить категорию?</string>
+    <string name="confirm_delete_category_message">Категория «%1$s» будет удалена без возможности восстановления.</string>
+    <string name="msg_category_created">Категория создана.</string>
+    <string name="msg_category_renamed">Категория переименована.</string>
+    <string name="msg_category_deleted">Категория удалена.</string>
+    <string name="msg_category_in_use">Эту категорию нельзя удалить, так как она используется в записях.</string>
+    <string name="msg_invalid_category">Некорректная категория. Проверьте название и попробуйте снова.</string>
+    <string name="msg_entry_category_missing">Категория этой записи больше недоступна. Выберите категорию и попробуйте снова.</string>
 </resources>
