@@ -35,11 +35,18 @@ class FakeVaultSession(
      * one bridge call it names, not some other mutation. */
     val stagedMethodCalls = mutableListOf<String>()
 
+    /** The exact `setupInput` last passed to [stageSetEntryTotp], recorded
+     * unmodified so a test can prove [VaultSaveCoordinator] did not trim,
+     * normalize or otherwise touch it. Test-only; never logged or included
+     * in any thrown exception. */
+    var lastSetupInput: String? = null
+        private set
+
     /** Shared by every `stage*` override below: records which method was
      * called, applies the configured exception/hook, and returns the
      * configured bytes -- only one of these is ever invoked per save
      * attempt, so a single shared [stagedBytes]/[stageException]/[onStage]
-     * configuration is sufficient for all six. */
+     * configuration is sufficient for all eight. */
     private fun stage(methodName: String): ByteArray {
         stageCount++
         stagedMethodCalls += methodName
@@ -83,6 +90,14 @@ class FakeVaultSession(
 
     override fun stageDeleteCategory(categoryId: String, nowMs: Long): ByteArray =
         stage("stageDeleteCategory")
+
+    override fun stageSetEntryTotp(entryId: String, setupInput: String, nowMs: Long): ByteArray {
+        lastSetupInput = setupInput
+        return stage("stageSetEntryTotp")
+    }
+
+    override fun stageRemoveEntryTotp(entryId: String, nowMs: Long): ByteArray =
+        stage("stageRemoveEntryTotp")
 
     override fun totpStatus(entryId: String, unixTimeSeconds: Long): TotpStatus =
         throw UnsupportedOperationException()

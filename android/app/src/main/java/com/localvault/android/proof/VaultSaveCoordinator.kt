@@ -76,6 +76,8 @@ sealed class SaveOutcome {
  * [runStagedSave] core below -- a purely mechanical extraction (the
  * sequence, its branches, and every [SaveOutcome] meaning are unchanged)
  * that parameterizes only which `stage_*` bridge call step 3 makes.
+ * 1T-B5c-1 adds two more thin wrappers of the same shape (`saveSetEntryTotp`,
+ * `saveRemoveEntryTotp`); neither adds any transaction logic.
  */
 class VaultSaveCoordinator(
     private val session: VaultSessionInterface,
@@ -176,6 +178,46 @@ class VaultSaveCoordinator(
         onAfterPrimaryWrite: (() -> Unit)? = null,
     ): SaveOutcome = runStagedSave(vaultUri, nowMs, onAfterMarkerWritten, onAfterPrimaryWrite) {
         session.stageDeleteCategory(categoryId, nowMs)
+    }
+
+    /**
+     * Stages, saves and commits adding or replacing [entryId]'s TOTP
+     * configuration (1T-B5c-1). See [runStagedSave] for the shared sequence.
+     *
+     * [setupInput] is the user-entered Base32 secret or `otpauth://` URI and
+     * is passed to the bridge **verbatim**: this class does no trimming,
+     * normalization, validation or parsing of it -- all of that belongs to
+     * `localvault-core` via the Rust bridge, which rejects an invalid input
+     * with `BridgeException.InvalidTotpConfiguration` (surfaced here as
+     * [SaveOutcome.ValidationFailed] like any other staging rejection). It is
+     * never stored, logged, put in [SaveOutcome], or written to the recovery
+     * snapshot/marker; its only path is the `stage` lambda below.
+     */
+    fun saveSetEntryTotp(
+        vaultUri: String,
+        entryId: String,
+        setupInput: String,
+        nowMs: Long,
+        onAfterMarkerWritten: (() -> Unit)? = null,
+        onAfterPrimaryWrite: (() -> Unit)? = null,
+    ): SaveOutcome = runStagedSave(vaultUri, nowMs, onAfterMarkerWritten, onAfterPrimaryWrite) {
+        session.stageSetEntryTotp(entryId, setupInput, nowMs)
+    }
+
+    /**
+     * Stages, saves and commits removing [entryId]'s TOTP configuration
+     * (1T-B5c-1). See [runStagedSave] for the shared sequence. An entry with no
+     * TOTP is rejected bridge-side (`BridgeException.TotpNotConfigured`,
+     * surfaced as [SaveOutcome.ValidationFailed]) before anything is written.
+     */
+    fun saveRemoveEntryTotp(
+        vaultUri: String,
+        entryId: String,
+        nowMs: Long,
+        onAfterMarkerWritten: (() -> Unit)? = null,
+        onAfterPrimaryWrite: (() -> Unit)? = null,
+    ): SaveOutcome = runStagedSave(vaultUri, nowMs, onAfterMarkerWritten, onAfterPrimaryWrite) {
+        session.stageRemoveEntryTotp(entryId, nowMs)
     }
 
     /**

@@ -540,4 +540,334 @@ class VaultSaveCoordinatorTest {
         assertEquals(1, session.discardCount)
         assertNull(recovery.readMarker(vaultUri))
     }
+
+    // -- 1T-B5c-1: saveSetEntryTotp / saveRemoveEntryTotp, both thin
+    // wrappers over the same private runStagedSave core. These tests prove
+    // routing, verbatim pass-through and inheritance of the shared
+    // behavior -- not a second copy of the transactional sequence. -------
+
+    // Deliberately awkward: leading/trailing whitespace (incl. a tab and a
+    // newline), lower case, inner spaces and '=' padding. A throw-away test
+    // value, not a real key.
+    private val awkwardSetupInput = "  gezd gnbv\tgy3t qojq gezd gnbv gy3t qojq====\n"
+
+    private val setEntryTotp: (VaultSaveCoordinator) -> SaveOutcome = { c ->
+        c.saveSetEntryTotp(vaultUri, "entry-1", awkwardSetupInput, 1_000L)
+    }
+
+    private val removeEntryTotp: (VaultSaveCoordinator) -> SaveOutcome = { c ->
+        c.saveRemoveEntryTotp(vaultUri, "entry-1", 1_000L)
+    }
+
+    private val totpWrappers: List<Pair<String, (VaultSaveCoordinator) -> SaveOutcome>> = listOf(
+        "stageSetEntryTotp" to setEntryTotp,
+        "stageRemoveEntryTotp" to removeEntryTotp,
+    )
+
+    // A. / B. successful paths through the shared pipeline.
+
+    @Test
+    fun saveSetEntryTotp_success_uses_the_shared_pipeline_and_advances_the_baseline() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+        val save = coordinator(io, recovery, session)
+
+        val outcome = save.saveSetEntryTotp(vaultUri, "entry-1", awkwardSetupInput, 1_000L)
+
+        assertEquals(SaveOutcome.Success, outcome)
+        assertEquals(listOf("stageSetEntryTotp"), session.stagedMethodCalls)
+        assertEquals(1, session.stageCount)
+        assertEquals(1, session.commitCount)
+        assertEquals(0, session.discardCount)
+        // Existing shared behavior: exactly one write of the staged bytes,
+        // marker cleared, primary now equals the staged bytes.
+        assertEquals(1, io.writes.size)
+        assertTrue(io.writes[0].contentEquals(stagedBytes))
+        assertTrue(io.contentOf(vaultUri)!!.contentEquals(stagedBytes))
+        assertNull(recovery.readMarker(vaultUri))
+        // The durable snapshot holds the pre-write ciphertext, nothing else.
+        assertTrue(recovery.readSnapshotBytes(vaultUri)!!.contentEquals(originalBytes))
+
+        // Baseline advanced: a second attempt is not mistaken for an
+        // external change.
+        val secondOutcome = save.saveSetEntryTotp(vaultUri, "entry-1", awkwardSetupInput, 2_000L)
+
+        assertEquals(SaveOutcome.Success, secondOutcome)
+        assertEquals(2, session.commitCount)
+    }
+
+    @Test
+    fun saveRemoveEntryTotp_success_uses_the_shared_pipeline_and_advances_the_baseline() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+        val save = coordinator(io, recovery, session)
+
+        val outcome = save.saveRemoveEntryTotp(vaultUri, "entry-1", 1_000L)
+
+        assertEquals(SaveOutcome.Success, outcome)
+        assertEquals(listOf("stageRemoveEntryTotp"), session.stagedMethodCalls)
+        assertEquals(1, session.commitCount)
+        assertEquals(0, session.discardCount)
+        assertEquals(1, io.writes.size)
+        assertTrue(io.contentOf(vaultUri)!!.contentEquals(stagedBytes))
+        assertNull(recovery.readMarker(vaultUri))
+
+        val secondOutcome = save.saveRemoveEntryTotp(vaultUri, "entry-1", 2_000L)
+
+        assertEquals(SaveOutcome.Success, secondOutcome)
+        assertEquals(2, session.commitCount)
+    }
+
+    // C. dispatch isolation.
+
+    @Test
+    fun totp_wrappers_each_reach_only_their_own_stage_call() {
+        for ((expectedMethod, invoke) in totpWrappers) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            val recovery = FakeRecoverySnapshotStore()
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+            val outcome = invoke(coordinator(io, recovery, session))
+
+            assertEquals("$expectedMethod outcome", SaveOutcome.Success, outcome)
+            // Set never reaches remove, and remove never reaches set (nor
+            // any of the six pre-existing stage calls).
+            assertEquals(
+                "$expectedMethod should be the only stage call made",
+                listOf(expectedMethod),
+                session.stagedMethodCalls,
+            )
+        }
+    }
+
+    @Test
+    fun saveRemoveEntryTotp_never_passes_any_setup_input_to_the_session() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+        coordinator(io, FakeRecoverySnapshotStore(), session).saveRemoveEntryTotp(vaultUri, "entry-1", 1_000L)
+
+        assertNull(session.lastSetupInput)
+    }
+
+    // D. verbatim pass-through.
+
+    @Test
+    fun saveSetEntryTotp_passes_setupInput_to_the_session_exactly_as_given() {
+        val inputs = listOf(
+            awkwardSetupInput,
+            "otpauth://totp/Example:alice?secret=gezdgnbvgy3tqojq&issuer=Example Inc&digits=6",
+            "OTPAUTH://TOTP/Example?SECRET=GEZDGNBVGY3TQOJQ====",
+            "   ",
+            "",
+        )
+
+        for (input in inputs) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+            coordinator(io, FakeRecoverySnapshotStore(), session)
+                .saveSetEntryTotp(vaultUri, "entry-1", input, 1_000L)
+
+            // Not trimmed, not case-folded, padding and inner whitespace
+            // intact, not parsed: the very same characters reach the bridge
+            // (empty/blank input too -- rejecting it is core's job).
+            assertEquals(input, session.lastSetupInput)
+            assertEquals(input.length, session.lastSetupInput!!.length)
+        }
+    }
+
+    // E. bridge rejection of the setup input.
+
+    @Test
+    fun saveSetEntryTotp_invalidTotpConfiguration_surfaces_as_validationFailed_and_never_writes() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stageException = BridgeException.InvalidTotpConfiguration())
+
+        val outcome = coordinator(io, recovery, session)
+            .saveSetEntryTotp(vaultUri, "entry-1", awkwardSetupInput, 1_000L)
+
+        assertTrue(outcome is SaveOutcome.ValidationFailed)
+        assertTrue((outcome as SaveOutcome.ValidationFailed).error is BridgeException.InvalidTotpConfiguration)
+        // A rejected stage never opens/writes the primary, never creates a
+        // marker/snapshot transaction, and never commits.
+        assertEquals(0, io.writes.size)
+        assertEquals(0, recovery.writeAndVerifyCallCount)
+        assertNull(recovery.readMarker(vaultUri))
+        assertEquals(0, session.commitCount)
+        assertTrue(io.contentOf(vaultUri)!!.contentEquals(originalBytes))
+        // The raw input is not carried into the outcome's text.
+        assertTrue(!outcome.toString().contains("gezd"))
+    }
+
+    @Test
+    fun saveRemoveEntryTotp_totpNotConfigured_surfaces_as_validationFailed_and_never_writes() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stageException = BridgeException.TotpNotConfigured())
+
+        val outcome = coordinator(io, recovery, session).saveRemoveEntryTotp(vaultUri, "entry-1", 1_000L)
+
+        assertTrue(outcome is SaveOutcome.ValidationFailed)
+        assertTrue((outcome as SaveOutcome.ValidationFailed).error is BridgeException.TotpNotConfigured)
+        assertEquals(0, io.writes.size)
+        assertEquals(0, recovery.writeAndVerifyCallCount)
+        assertEquals(0, session.commitCount)
+    }
+
+    // F. ProviderNotWritable inherited from the shared pre-stage check.
+
+    @Test
+    fun totp_wrappers_do_not_stage_or_write_without_a_live_write_grant() {
+        for ((name, invoke) in totpWrappers) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            io.writeGrant = false
+            val recovery = FakeRecoverySnapshotStore()
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+            val outcome = invoke(coordinator(io, recovery, session))
+
+            assertEquals("$name outcome", SaveOutcome.ProviderNotWritable, outcome)
+            assertEquals("$name stage count", 0, session.stageCount)
+            assertTrue("$name stage calls", session.stagedMethodCalls.isEmpty())
+            assertEquals("$name write count", 0, io.writes.size)
+            assertEquals("$name read count", 0, io.readCount)
+            assertEquals("$name snapshot count", 0, recovery.writeAndVerifyCallCount)
+        }
+    }
+
+    @Test
+    fun totp_wrappers_do_not_stage_or_write_when_the_provider_reports_no_write_support() {
+        for ((name, invoke) in totpWrappers) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            io.writeSupported = false
+            val recovery = FakeRecoverySnapshotStore()
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+            val outcome = invoke(coordinator(io, recovery, session))
+
+            assertEquals("$name outcome", SaveOutcome.ProviderNotWritable, outcome)
+            assertEquals("$name stage count", 0, session.stageCount)
+            assertEquals("$name write count", 0, io.writes.size)
+        }
+    }
+
+    // G. ChangedExternally via both shared stale checks.
+
+    @Test
+    fun totp_wrappers_first_stale_check_mismatch_aborts_before_staging_anything() {
+        for ((name, invoke) in totpWrappers) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to "externally-changed-bytes".toByteArray()))
+            val recovery = FakeRecoverySnapshotStore()
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+            val outcome = invoke(coordinator(io, recovery, session))
+
+            assertEquals("$name outcome", SaveOutcome.ChangedExternally, outcome)
+            assertEquals("$name stage count", 0, session.stageCount)
+            assertNull("$name raw input never reached the session", session.lastSetupInput)
+            assertEquals("$name write count", 0, io.writes.size)
+            assertNull("$name marker", recovery.readMarker(vaultUri))
+        }
+    }
+
+    @Test
+    fun saveSetEntryTotp_second_stale_check_via_the_existing_after_marker_hook_catches_a_race() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+        var markerExistedWhenRaceInjected = false
+
+        val outcome = coordinator(io, recovery, session).saveSetEntryTotp(
+            vaultUri,
+            "entry-1",
+            awkwardSetupInput,
+            1_000L,
+            onAfterMarkerWritten = {
+                markerExistedWhenRaceInjected = recovery.hasUnresolvedMarker(vaultUri)
+                io.setContent(vaultUri, "raced-external-write".toByteArray())
+            },
+        )
+
+        assertEquals(SaveOutcome.ChangedExternally, outcome)
+        assertTrue(markerExistedWhenRaceInjected)
+        // Staged, then aborted by stale check #2: primary never written, the
+        // stage discarded, the marker explicitly cleared, nothing committed.
+        assertEquals(1, session.stageCount)
+        assertEquals(0, io.writes.size)
+        assertEquals(1, session.discardCount)
+        assertEquals(0, session.commitCount)
+        assertNull(recovery.readMarker(vaultUri))
+        assertTrue(io.contentOf(vaultUri)!!.contentEquals("raced-external-write".toByteArray()))
+    }
+
+    @Test
+    fun saveRemoveEntryTotp_second_stale_check_catches_a_change_injected_while_staging() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(
+            stagedBytes = stagedBytes,
+            onStage = { io.setContent(vaultUri, "raced-external-write".toByteArray()) },
+        )
+
+        val outcome = coordinator(io, recovery, session).saveRemoveEntryTotp(vaultUri, "entry-1", 1_000L)
+
+        assertEquals(SaveOutcome.ChangedExternally, outcome)
+        assertEquals(0, io.writes.size)
+        assertEquals(1, session.discardCount)
+        assertEquals(0, session.commitCount)
+        assertNull(recovery.readMarker(vaultUri))
+    }
+
+    // H. write / readback failure paths inherited unchanged.
+
+    @Test
+    fun saveSetEntryTotp_write_failure_leaves_the_marker_unresolved_and_never_commits() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        io.writeException = IOException("provider write failed")
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+        val outcome = coordinator(io, recovery, session)
+            .saveSetEntryTotp(vaultUri, "entry-1", awkwardSetupInput, 1_000L)
+
+        assertEquals(SaveOutcome.WriteFailed, outcome)
+        assertEquals(0, session.commitCount)
+        // Same as every other mutation: left for next-unlock reconciliation.
+        assertTrue(recovery.hasUnresolvedMarker(vaultUri))
+    }
+
+    @Test
+    fun saveRemoveEntryTotp_readback_mismatch_is_a_write_failure_with_the_marker_left_unresolved() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        io.writeTransform = { written -> written + "-corrupted-by-provider".toByteArray() }
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+        val outcome = coordinator(io, recovery, session).saveRemoveEntryTotp(vaultUri, "entry-1", 1_000L)
+
+        assertEquals(SaveOutcome.WriteFailed, outcome)
+        assertEquals(0, session.commitCount)
+        assertTrue(recovery.hasUnresolvedMarker(vaultUri))
+    }
+
+    @Test
+    fun totp_wrappers_recovery_snapshot_failure_fails_closed_before_touching_the_primary() {
+        for ((name, invoke) in totpWrappers) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            val recovery = FakeRecoverySnapshotStore()
+            recovery.failWrites = true
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+            val outcome = invoke(coordinator(io, recovery, session))
+
+            assertEquals("$name outcome", SaveOutcome.RecoverySnapshotFailed, outcome)
+            assertEquals("$name discard count", 1, session.discardCount)
+            assertEquals("$name commit count", 0, session.commitCount)
+            assertEquals("$name write count", 0, io.writes.size)
+        }
+    }
 }

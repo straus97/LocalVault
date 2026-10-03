@@ -24,7 +24,7 @@ use std::{
 };
 
 use localvault_core::{
-    totp::generate_totp,
+    totp::{generate_totp, parse_totp_input},
     vault::{
         data::{VaultCategory, VaultData, VaultEntry},
         format::{
@@ -152,6 +152,16 @@ pub enum BridgeError {
     CategoryInUse,
     #[error("entry has no TOTP configured")]
     TotpNotConfigured,
+    /// Two situations share this one variant, distinguished only by which
+    /// call returned it: `totp_status` returns it when `localvault-core`
+    /// cannot generate a code from an already-*stored* configuration, and
+    /// `stage_set_entry_totp` returns it when core's `parse_totp_input`
+    /// rejects the user-entered setup input. Every parser failure kind
+    /// (empty input, bad URI, unsupported type, missing/invalid secret,
+    /// invalid algorithm/digits/period, ...) deliberately collapses into
+    /// this single variant, so the bridge exposes no parser-internals
+    /// oracle -- mirroring desktop's single `invalidTotpSetup` code. The
+    /// message is static and never contains any part of the input.
     #[error("TOTP configuration is invalid")]
     InvalidTotpConfiguration,
     /// A second mutation was staged while one was already pending commit or
@@ -806,6 +816,135 @@ impl VaultSession {
         Ok(bytes)
     }
 
+    /// Stage adding or replacing an existing entry's TOTP configuration from
+    /// user-entered setup input, producing the resealed candidate envelope's
+    /// bytes for Kotlin to write. Does not modify the committed session state
+    /// -- see `commit_staged_save` and `discard_staged_save`.
+    ///
+    /// `setup_input` is either a bare Base32 secret or an `otpauth://totp/...`
+    /// URI. Parsing and validation are entirely `localvault-core`'s
+    /// (`parse_totp_input`); this method performs no parsing or normalization
+    /// of its own, and every parser failure collapses into
+    /// `BridgeError::InvalidTotpConfiguration` (no parser-internals oracle).
+    /// The input crosses FFI only because the user is directly entering it as
+    /// mutation input; it is wrapped in `Zeroizing` as the first statement and
+    /// dropped as soon as core has parsed it. It is never logged, echoed,
+    /// returned or included in any error. The resulting `TotpConfig` is moved
+    /// (not cloned) into the candidate entry; the replaced configuration, if
+    /// any, is dropped and thereby zeroized by core's `Drop`.
+    ///
+    /// Replaces any existing TOTP on the entry, so this one method covers both
+    /// "set up" and "replace". `now_ms` is caller-supplied (this crate reads
+    /// no clock). The ordinary `stage_update_entry` never touches TOTP, so
+    /// this is the only way TOTP changes.
+    ///
+    /// A legacy schema-1 vault is upgraded to the current schema by the shared
+    /// core rule before validation (schema 1 cannot carry TOTP).
+    ///
+    /// Only one staged mutation may be outstanding at a time.
+    pub fn stage_set_entry_totp(
+        &self,
+        entry_id: String,
+        setup_input: String,
+        now_ms: i64,
+    ) -> Result<Vec<u8>, BridgeError> {
+        // Zeroizing storage as early as practical, before any early return,
+        // so every path below drops (and zeroizes) the Rust-side copy.
+        let setup_input = Zeroizing::new(setup_input);
+
+        if now_ms < 0 {
+            return Err(BridgeError::InvalidInput);
+        }
+
+        let mut guard = self.guard();
+        let state = guard.as_mut().ok_or(BridgeError::SessionLocked)?;
+
+        if state.staged.is_some() {
+            return Err(BridgeError::PendingUnsavedChanges);
+        }
+
+        let index = state
+            .data
+            .entries
+            .iter()
+            .position(|entry| entry.id.to_string() == entry_id)
+            .ok_or(BridgeError::EntryNotFound)?;
+
+        // Parsed before anything is cloned or staged, so a rejected input
+        // leaves no staged state behind. The error is intentionally dropped
+        // (`|_|`): its kind is not exposed.
+        let config = parse_totp_input(setup_input.as_str())
+            .map_err(|_| BridgeError::InvalidTotpConfiguration)?;
+        drop(setup_input);
+
+        let mut candidate = state.data.clone();
+
+        let previous_updated_at_ms = candidate.entries[index].updated_at_ms;
+        let effective_updated_at_ms = now_ms.max(previous_updated_at_ms);
+
+        let entry = &mut candidate.entries[index];
+        entry.totp = Some(config);
+        entry.updated_at_ms = effective_updated_at_ms;
+
+        candidate.updated_at_ms = candidate.updated_at_ms.max(effective_updated_at_ms);
+
+        seal_and_stage(state, candidate)
+    }
+
+    /// Stage removing an existing entry's TOTP configuration, producing the
+    /// resealed candidate envelope's bytes for Kotlin to write. Does not
+    /// modify the committed session state -- see `commit_staged_save` and
+    /// `discard_staged_save`.
+    ///
+    /// Returns `BridgeError::TotpNotConfigured` -- without upgrading the
+    /// schema and without staging anything -- if the entry has no TOTP, so a
+    /// no-op remove can never rewrite (or upgrade) the vault file. The removed
+    /// configuration is dropped and thereby zeroized by core's `Drop`.
+    ///
+    /// `now_ms` is caller-supplied (this crate reads no clock).
+    ///
+    /// Only one staged mutation may be outstanding at a time.
+    pub fn stage_remove_entry_totp(
+        &self,
+        entry_id: String,
+        now_ms: i64,
+    ) -> Result<Vec<u8>, BridgeError> {
+        if now_ms < 0 {
+            return Err(BridgeError::InvalidInput);
+        }
+
+        let mut guard = self.guard();
+        let state = guard.as_mut().ok_or(BridgeError::SessionLocked)?;
+
+        if state.staged.is_some() {
+            return Err(BridgeError::PendingUnsavedChanges);
+        }
+
+        let index = state
+            .data
+            .entries
+            .iter()
+            .position(|entry| entry.id.to_string() == entry_id)
+            .ok_or(BridgeError::EntryNotFound)?;
+
+        if state.data.entries[index].totp.is_none() {
+            return Err(BridgeError::TotpNotConfigured);
+        }
+
+        let mut candidate = state.data.clone();
+
+        let previous_updated_at_ms = candidate.entries[index].updated_at_ms;
+        let effective_updated_at_ms = now_ms.max(previous_updated_at_ms);
+
+        let entry = &mut candidate.entries[index];
+        entry.totp = None;
+        entry.updated_at_ms = effective_updated_at_ms;
+
+        candidate.updated_at_ms = candidate.updated_at_ms.max(effective_updated_at_ms);
+
+        seal_and_stage(state, candidate)
+    }
+
     /// Promote the single staged candidate into the session's committed
     /// state. Call only after Kotlin has written the bytes `stage_*`
     /// returned, re-read them back, and confirmed exact byte equality --
@@ -844,6 +983,41 @@ fn parse_optional_category_id(value: &Option<String>) -> Result<Option<Uuid>, Br
             .map(Some)
             .map_err(|_| BridgeError::InvalidInput),
     }
+}
+
+/// Finishes a staged mutation for `stage_set_entry_totp` and
+/// `stage_remove_entry_totp`: applies the shared legacy-schema upgrade rule,
+/// validates, serializes, reseals under the session's existing envelope/Vault
+/// Key, records the candidate as the single staged mutation, and returns the
+/// resealed envelope's bytes.
+///
+/// The order is the same as every other `stage_*` method -- upgrade
+/// (`VaultData::upgrade_legacy_schema_for_write`, the one shared core rule)
+/// strictly *before* `validate`, because `validate` rejects TOTP in a schema-1
+/// vault. The caller must already have checked the session is unlocked and no
+/// stage is pending. Used only by the two TOTP stage methods; the older
+/// `stage_*` methods keep their own inline copies untouched.
+fn seal_and_stage(
+    state: &mut SessionState,
+    mut candidate: VaultData,
+) -> Result<Vec<u8>, BridgeError> {
+    candidate.upgrade_legacy_schema_for_write();
+    candidate
+        .validate()
+        .map_err(|_| BridgeError::InvalidInput)?;
+
+    let plaintext =
+        Zeroizing::new(serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?);
+
+    let candidate_envelope = reseal_envelope(&state.envelope, &state.vault_key, &plaintext)
+        .map_err(|_| BridgeError::OperationFailed)?;
+
+    let bytes =
+        serde_json::to_vec(&candidate_envelope).map_err(|_| BridgeError::OperationFailed)?;
+
+    state.staged = Some((candidate, candidate_envelope));
+
+    Ok(bytes)
 }
 
 /// Input for creating or replacing an entry's non-TOTP fields. Mirrors
@@ -2368,5 +2542,621 @@ mod tests {
             session.stage_delete_category(category_id, -1).err(),
             Some(BridgeError::InvalidInput)
         );
+    }
+
+    // -----------------------------------------------------------------
+    // 1T-B5c-1: stage_set_entry_totp / stage_remove_entry_totp.
+    // -----------------------------------------------------------------
+
+    /// Base32 of the RFC 6238 SHA1 test secret "12345678901234567890".
+    const RFC_BASE32: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+    /// Base64 of the same secret, exactly as core persists it.
+    const RFC_SECRET_BASE64: &str = "MTIzNDU2Nzg5MDEyMzQ1Njc4OTA=";
+    /// RFC 6238 SHA1 vector time (T = 59 s) and its code truncated to the
+    /// default 6 digits (the same value core's own
+    /// `six_digit_code_is_zero_padded` pins).
+    const RFC_UNIX_SECONDS: i64 = 59;
+    const RFC_CODE_6: &str = "287082";
+    /// The schema-2 fixture's own TOTP entry code at `TOTP_FIXED_UNIX_SECONDS`.
+    const FIXTURE_TOTP_CODE: &str = "27711647";
+
+    /// An otpauth URI over the RFC secret with extra query parameters.
+    fn rfc_uri(params: &str) -> String {
+        format!("otpauth://totp/Example:alice?secret={RFC_BASE32}&{params}")
+    }
+
+    /// The code `localvault-core` itself computes for `input` -- the
+    /// independent expectation the bridge result is compared against.
+    fn core_code(input: &str, unix_seconds: i64) -> String {
+        let config = parse_totp_input(input).expect("test input parses in core");
+        generate_totp(&config, unix_seconds * 1000)
+            .expect("core generates a code")
+            .code()
+            .to_owned()
+    }
+
+    /// Everything the bridge exposes about an entry except TOTP presence.
+    #[derive(Debug, PartialEq)]
+    struct EntryRow {
+        id: String,
+        title: String,
+        profile_name: String,
+        url: String,
+        username: String,
+        notes: String,
+        category_id: Option<String>,
+        tags: Vec<String>,
+        favorite: bool,
+        password: String,
+    }
+
+    fn entry_rows(session: &VaultSession) -> Vec<EntryRow> {
+        session
+            .list_entries()
+            .unwrap()
+            .into_iter()
+            .map(|summary| {
+                let details = session.entry_details(summary.id.clone()).unwrap();
+                let password = session.entry_password(summary.id).unwrap();
+                EntryRow {
+                    id: details.id,
+                    title: details.title,
+                    profile_name: details.profile_name,
+                    url: details.url,
+                    username: details.username,
+                    notes: details.notes,
+                    category_id: details.category_id,
+                    tags: details.tags,
+                    favorite: details.favorite,
+                    password,
+                }
+            })
+            .collect()
+    }
+
+    fn totp_flags(session: &VaultSession) -> Vec<(String, bool)> {
+        session
+            .list_entries()
+            .unwrap()
+            .into_iter()
+            .map(|summary| {
+                let enabled = session
+                    .entry_details(summary.id.clone())
+                    .unwrap()
+                    .totp_enabled;
+                (summary.id, enabled)
+            })
+            .collect()
+    }
+
+    fn category_rows(session: &VaultSession) -> Vec<(String, String, u32)> {
+        session
+            .list_categories()
+            .unwrap()
+            .into_iter()
+            .map(|category| (category.id, category.name, category.entry_count))
+            .collect()
+    }
+
+    fn vault_meta(session: &VaultSession) -> (Uuid, i64, i64) {
+        let guard = session.guard();
+        let data = &guard.as_ref().expect("session is unlocked").data;
+        (data.vault_id, data.created_at_ms, data.updated_at_ms)
+    }
+
+    fn entry_updated_at_ms(session: &VaultSession, entry_id: &str) -> i64 {
+        let guard = session.guard();
+        let data = &guard.as_ref().expect("session is unlocked").data;
+        data.entries
+            .iter()
+            .find(|entry| entry.id.to_string() == entry_id)
+            .expect("entry exists")
+            .updated_at_ms
+    }
+
+    fn assert_no_totp_plaintext(bytes: &[u8]) {
+        let raw = String::from_utf8_lossy(bytes);
+        assert!(!raw.contains(RFC_BASE32), "Base32 secret leaked");
+        assert!(!raw.contains(RFC_SECRET_BASE64), "base64 secret leaked");
+        assert!(!raw.contains("otpauth://"), "setup URI leaked");
+        assert!(
+            !raw.contains(TEST_MASTER_PASSWORD),
+            "master password leaked"
+        );
+    }
+
+    #[test]
+    fn stage_set_entry_totp_bare_base32_stages_a_reopenable_working_totp() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+        assert!(!session.entry_details(id.clone()).unwrap().totp_enabled);
+        let updated_before = entry_updated_at_ms(&session, &id);
+
+        let staged = session
+            .stage_set_entry_totp(id.clone(), RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .unwrap();
+
+        // The committed session is untouched until commit_staged_save runs.
+        assert!(!session.entry_details(id.clone()).unwrap().totp_enabled);
+        assert_eq!(
+            session.totp_status(id.clone(), RFC_UNIX_SECONDS).err(),
+            Some(BridgeError::TotpNotConfigured)
+        );
+
+        // The staged bytes are an independent, reopenable vault with a
+        // working TOTP, computed by core (SHA1 / 6 digits / 30 s defaults).
+        let reopened = reopen_bytes(&staged);
+        assert_eq!(schema_version(&reopened), 2);
+        assert!(reopened.entry_details(id.clone()).unwrap().totp_enabled);
+
+        let status = reopened.totp_status(id.clone(), RFC_UNIX_SECONDS).unwrap();
+        assert_eq!(status.code, RFC_CODE_6);
+        assert_eq!(status.period_seconds, 30);
+        assert_eq!(status.remaining_seconds, 1);
+
+        // Ordinary fields are untouched; only the timestamp advances.
+        assert_eq!(entry_rows(&reopened), entry_rows(&session));
+        assert_eq!(
+            entry_updated_at_ms(&reopened, &id),
+            UPDATE_NOW_MS.max(updated_before)
+        );
+    }
+
+    #[test]
+    fn stage_set_entry_totp_passes_input_through_to_core_unmodified() {
+        // Whitespace, lower case and padding are core's normalization, not
+        // the bridge's: the bridge must hand the string over untouched.
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let staged = session
+            .stage_set_entry_totp(
+                id.clone(),
+                "  gezdgnbv gy3tqojq\tgezdgnbv gy3tqojq====  ".to_owned(),
+                UPDATE_NOW_MS,
+            )
+            .unwrap();
+
+        let reopened = reopen_bytes(&staged);
+        let status = reopened.totp_status(id, RFC_UNIX_SECONDS).unwrap();
+        assert_eq!(status.code, RFC_CODE_6);
+    }
+
+    #[test]
+    fn stage_set_entry_totp_otpauth_uri_applies_algorithm_digits_and_period() {
+        let cases = [
+            (
+                "algorithm=SHA256&digits=8&period=45&issuer=Example",
+                45u32,
+                8usize,
+            ),
+            ("algorithm=SHA512&digits=6&period=30", 30, 6),
+            ("algorithm=SHA1", 30, 6),
+        ];
+
+        for (params, period, digits) in cases {
+            let uri = rfc_uri(params);
+            let session = open_ok(schema2());
+            let id = id_of(&session, "Fixture Login");
+
+            let staged = session
+                .stage_set_entry_totp(id.clone(), uri.clone(), UPDATE_NOW_MS)
+                .unwrap();
+
+            let reopened = reopen_bytes(&staged);
+            let status = reopened.totp_status(id, TOTP_FIXED_UNIX_SECONDS).unwrap();
+
+            assert_eq!(status.period_seconds, period, "period for {params}");
+            assert_eq!(status.code.len(), digits, "digits for {params}");
+            // Same code as core computes directly from the same input.
+            assert_eq!(
+                status.code,
+                core_code(&uri, TOTP_FIXED_UNIX_SECONDS),
+                "code for {params}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_set_entry_totp_rejects_invalid_input_with_one_variant_and_stages_nothing() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        let invalid = [
+            String::new(),
+            "   ".to_owned(),
+            "not base32 !!!".to_owned(),
+            // 5 decoded bytes: below the 10-byte minimum.
+            "ABCDEFGH".to_owned(),
+            // 130 decoded bytes: above the 128-byte maximum.
+            "A".repeat(208),
+            format!("otpauth://hotp/Test?secret={RFC_BASE32}&counter=1"),
+            rfc_uri("digits=7"),
+            rfc_uri("period=0"),
+            rfc_uri("period=301"),
+            rfc_uri("algorithm=MD5"),
+            format!("{}#fragment", rfc_uri("digits=6")),
+            // Duplicate secret parameter.
+            rfc_uri(&format!("secret={RFC_BASE32}")),
+            // Missing secret, empty label, no query.
+            "otpauth://totp/Example:alice?issuer=Example".to_owned(),
+            format!("otpauth://totp/?secret={RFC_BASE32}"),
+            "otpauth://totp/Example:alice".to_owned(),
+        ];
+
+        for input in invalid {
+            assert_eq!(
+                session
+                    .stage_set_entry_totp(id.clone(), input, UPDATE_NOW_MS)
+                    .err(),
+                Some(BridgeError::InvalidTotpConfiguration)
+            );
+        }
+
+        // Nothing was staged by any rejected input: a valid stage is not
+        // blocked by PendingUnsavedChanges, and the committed state is
+        // unchanged.
+        assert!(!session.entry_details(id.clone()).unwrap().totp_enabled);
+        assert!(session
+            .stage_set_entry_totp(id, RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .is_ok());
+    }
+
+    #[test]
+    fn stage_set_entry_totp_replaces_an_existing_configuration() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture TOTP Account");
+        assert_eq!(
+            session
+                .totp_status(id.clone(), TOTP_FIXED_UNIX_SECONDS)
+                .unwrap()
+                .code,
+            FIXTURE_TOTP_CODE
+        );
+
+        let staged = session
+            .stage_set_entry_totp(id.clone(), RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .unwrap();
+
+        // Committed state still has the old configuration.
+        assert_eq!(
+            session
+                .totp_status(id.clone(), TOTP_FIXED_UNIX_SECONDS)
+                .unwrap()
+                .code,
+            FIXTURE_TOTP_CODE
+        );
+
+        let reopened = reopen_bytes(&staged);
+        let status = reopened.totp_status(id, TOTP_FIXED_UNIX_SECONDS).unwrap();
+        assert_eq!(status.period_seconds, 30);
+        assert_eq!(status.code, core_code(RFC_BASE32, TOTP_FIXED_UNIX_SECONDS));
+        assert_ne!(status.code, FIXTURE_TOTP_CODE);
+        assert_eq!(entry_rows(&reopened), entry_rows(&session));
+    }
+
+    #[test]
+    fn stage_remove_entry_totp_removes_only_that_entrys_totp() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture TOTP Account");
+
+        let staged = session
+            .stage_remove_entry_totp(id.clone(), UPDATE_NOW_MS)
+            .unwrap();
+
+        // Committed state still has it.
+        assert!(session.entry_details(id.clone()).unwrap().totp_enabled);
+
+        let reopened = reopen_bytes(&staged);
+        assert!(!reopened.entry_details(id.clone()).unwrap().totp_enabled);
+        assert_eq!(
+            reopened
+                .totp_status(id.clone(), TOTP_FIXED_UNIX_SECONDS)
+                .err(),
+            Some(BridgeError::TotpNotConfigured)
+        );
+
+        let mut expected_flags = totp_flags(&session);
+        for (entry_id, enabled) in expected_flags.iter_mut() {
+            if *entry_id == id {
+                *enabled = false;
+            }
+        }
+        assert_eq!(totp_flags(&reopened), expected_flags);
+        assert_eq!(entry_rows(&reopened), entry_rows(&session));
+        assert_no_totp_plaintext(&staged);
+    }
+
+    #[test]
+    fn stage_remove_entry_totp_without_totp_is_not_configured_and_stages_nothing() {
+        let session = open_ok(schema2());
+        let without = id_of(&session, "Fixture Login");
+        let with = id_of(&session, "Fixture TOTP Account");
+
+        assert_eq!(
+            session
+                .stage_remove_entry_totp(without, UPDATE_NOW_MS)
+                .err(),
+            Some(BridgeError::TotpNotConfigured)
+        );
+
+        // Nothing was staged: a following valid stage is not blocked.
+        assert!(session.stage_remove_entry_totp(with, UPDATE_NOW_MS).is_ok());
+    }
+
+    #[test]
+    fn ordinary_entry_update_preserves_a_totp_added_by_stage_set_entry_totp() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        session
+            .stage_set_entry_totp(id.clone(), RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .unwrap();
+        session.commit_staged_save().unwrap();
+
+        let staged = session
+            .stage_update_entry(
+                id.clone(),
+                update_input("Renamed After TOTP"),
+                UPDATE_NOW_MS + 1,
+            )
+            .unwrap();
+
+        let reopened = reopen_bytes(&staged);
+        let details = reopened.entry_details(id.clone()).unwrap();
+        assert_eq!(details.title, "Renamed After TOTP");
+        assert!(details.totp_enabled);
+        assert_eq!(
+            reopened.totp_status(id, RFC_UNIX_SECONDS).unwrap().code,
+            RFC_CODE_6
+        );
+    }
+
+    #[test]
+    fn totp_stage_methods_reject_unknown_entries_negative_time_and_a_locked_session() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture TOTP Account");
+
+        for bad_id in ["not-a-uuid", "00000000-0000-0000-0000-000000000001"] {
+            assert_eq!(
+                session
+                    .stage_set_entry_totp(bad_id.to_owned(), RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+                    .err(),
+                Some(BridgeError::EntryNotFound)
+            );
+            assert_eq!(
+                session
+                    .stage_remove_entry_totp(bad_id.to_owned(), UPDATE_NOW_MS)
+                    .err(),
+                Some(BridgeError::EntryNotFound)
+            );
+        }
+
+        assert_eq!(
+            session
+                .stage_set_entry_totp(id.clone(), RFC_BASE32.to_owned(), -1)
+                .err(),
+            Some(BridgeError::InvalidInput)
+        );
+        assert_eq!(
+            session.stage_remove_entry_totp(id.clone(), -1).err(),
+            Some(BridgeError::InvalidInput)
+        );
+
+        session.lock();
+
+        assert_eq!(
+            session
+                .stage_set_entry_totp(id.clone(), RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+                .err(),
+            Some(BridgeError::SessionLocked)
+        );
+        assert_eq!(
+            session.stage_remove_entry_totp(id, UPDATE_NOW_MS).err(),
+            Some(BridgeError::SessionLocked)
+        );
+    }
+
+    #[test]
+    fn totp_stage_methods_reject_a_second_pending_stage() {
+        let session = open_ok(schema2());
+        let without = id_of(&session, "Fixture Login");
+        let with = id_of(&session, "Fixture TOTP Account");
+
+        session
+            .stage_set_entry_totp(without.clone(), RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .unwrap();
+
+        assert_eq!(
+            session
+                .stage_set_entry_totp(without, RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+                .err(),
+            Some(BridgeError::PendingUnsavedChanges)
+        );
+        assert_eq!(
+            session
+                .stage_remove_entry_totp(with.clone(), UPDATE_NOW_MS)
+                .err(),
+            Some(BridgeError::PendingUnsavedChanges)
+        );
+
+        // Discarding releases the slot.
+        session.discard_staged_save();
+        assert!(session.stage_remove_entry_totp(with, UPDATE_NOW_MS).is_ok());
+    }
+
+    #[test]
+    fn staged_totp_bytes_never_contain_the_plaintext_secret_or_setup_input() {
+        let inputs = [
+            RFC_BASE32.to_owned(),
+            rfc_uri("algorithm=SHA256&digits=8&period=45&issuer=Example"),
+        ];
+
+        for input in inputs {
+            let session = open_ok(schema2());
+            let id = id_of(&session, "Fixture Login");
+
+            let staged = session
+                .stage_set_entry_totp(id, input, UPDATE_NOW_MS)
+                .unwrap();
+
+            assert_no_totp_plaintext(&staged);
+        }
+    }
+
+    #[test]
+    fn commit_promotes_a_staged_totp_and_discard_leaves_committed_state_untouched() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+        let rows_before = entry_rows(&session);
+
+        // Discard: nothing changes.
+        session
+            .stage_set_entry_totp(id.clone(), RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .unwrap();
+        session.discard_staged_save();
+        assert!(!session.entry_details(id.clone()).unwrap().totp_enabled);
+        assert_eq!(
+            session.totp_status(id.clone(), RFC_UNIX_SECONDS).err(),
+            Some(BridgeError::TotpNotConfigured)
+        );
+        assert_eq!(entry_rows(&session), rows_before);
+
+        // Commit: the live session now generates the code.
+        session
+            .stage_set_entry_totp(id.clone(), RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .unwrap();
+        session.commit_staged_save().unwrap();
+        assert!(session.entry_details(id.clone()).unwrap().totp_enabled);
+        assert_eq!(
+            session
+                .totp_status(id.clone(), RFC_UNIX_SECONDS)
+                .unwrap()
+                .code,
+            RFC_CODE_6
+        );
+        assert_eq!(entry_rows(&session), rows_before);
+
+        // Remove + commit: the live session no longer has it.
+        session
+            .stage_remove_entry_totp(id.clone(), UPDATE_NOW_MS + 1)
+            .unwrap();
+        session.commit_staged_save().unwrap();
+        assert!(!session.entry_details(id).unwrap().totp_enabled);
+    }
+
+    #[test]
+    fn stage_set_entry_totp_on_schema1_upgrades_to_schema2_and_generates_a_working_code() {
+        let session = open_ok(schema1());
+        assert_eq!(schema_version(&session), 1);
+        let id = id_of(&session, "Legacy Fixture Login");
+
+        let rows_before = entry_rows(&session);
+        let categories_before = category_rows(&session);
+        let flags_before = totp_flags(&session);
+        assert!(flags_before.iter().all(|(_, enabled)| !enabled));
+        let (vault_id, created_at_ms, vault_updated_before) = vault_meta(&session);
+        let entry_updated_before = entry_updated_at_ms(&session, &id);
+
+        let staged = session
+            .stage_set_entry_totp(id.clone(), RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .unwrap();
+
+        // Before commit the live session is still the untouched schema-1 vault.
+        assert_eq!(schema_version(&session), 1);
+        assert!(!session.entry_details(id.clone()).unwrap().totp_enabled);
+        assert_eq!(entry_rows(&session), rows_before);
+
+        // The staged bytes reopen through the real open path
+        // (open_envelope_with_key + VaultData::validate) as schema 2 with a
+        // working TOTP, and everything else is preserved.
+        let reopened = reopen_bytes(&staged);
+        assert_eq!(schema_version(&reopened), 2);
+        assert!(reopened.entry_details(id.clone()).unwrap().totp_enabled);
+        assert_eq!(
+            reopened
+                .totp_status(id.clone(), RFC_UNIX_SECONDS)
+                .unwrap()
+                .code,
+            RFC_CODE_6
+        );
+
+        assert_eq!(entry_rows(&reopened), rows_before);
+        assert_eq!(category_rows(&reopened), categories_before);
+
+        let mut expected_flags = flags_before;
+        for (entry_id, enabled) in expected_flags.iter_mut() {
+            if *entry_id == id {
+                *enabled = true;
+            }
+        }
+        assert_eq!(totp_flags(&reopened), expected_flags);
+
+        let (reopened_vault_id, reopened_created_at_ms, reopened_updated) = vault_meta(&reopened);
+        assert_eq!(reopened_vault_id, vault_id);
+        assert_eq!(reopened_created_at_ms, created_at_ms);
+        let expected_entry_updated = entry_updated_before.max(UPDATE_NOW_MS);
+        assert_eq!(entry_updated_at_ms(&reopened, &id), expected_entry_updated);
+        assert_eq!(
+            reopened_updated,
+            vault_updated_before.max(expected_entry_updated)
+        );
+
+        assert_no_totp_plaintext(&staged);
+
+        // Commit promotes both the schema upgrade and the TOTP.
+        session.commit_staged_save().unwrap();
+        assert_eq!(schema_version(&session), 2);
+        assert_eq!(
+            session
+                .totp_status(id.clone(), RFC_UNIX_SECONDS)
+                .unwrap()
+                .code,
+            RFC_CODE_6
+        );
+        assert_eq!(entry_rows(&session), rows_before);
+    }
+
+    #[test]
+    fn discarded_schema1_totp_stage_leaves_the_vault_schema1() {
+        let session = open_ok(schema1());
+        let id = id_of(&session, "Legacy Fixture Login");
+
+        session
+            .stage_set_entry_totp(id.clone(), RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .unwrap();
+        session.discard_staged_save();
+
+        assert_eq!(schema_version(&session), 1);
+        assert!(!session.entry_details(id.clone()).unwrap().totp_enabled);
+
+        // The slot is free again.
+        assert!(session
+            .stage_set_entry_totp(id, RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .is_ok());
+    }
+
+    #[test]
+    fn stage_remove_entry_totp_on_schema1_never_stages_or_upgrades() {
+        let session = open_ok(schema1());
+        let id = id_of(&session, "Legacy Fixture Login");
+
+        assert_eq!(
+            session
+                .stage_remove_entry_totp(id.clone(), UPDATE_NOW_MS)
+                .err(),
+            Some(BridgeError::TotpNotConfigured)
+        );
+        assert_eq!(schema_version(&session), 1);
+
+        // Nothing staged: committing has nothing to promote, and a stage
+        // is not blocked.
+        assert_eq!(
+            session.commit_staged_save().err(),
+            Some(BridgeError::InvalidInput)
+        );
+        assert!(session
+            .stage_set_entry_totp(id, RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+            .is_ok());
     }
 }
