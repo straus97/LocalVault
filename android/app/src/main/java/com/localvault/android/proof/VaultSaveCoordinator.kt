@@ -279,8 +279,8 @@ class VaultSaveCoordinator(
         }
 
         // Step 8: the point of no return. From here, an interruption must
-        // not claim an outcome -- see SaveReconciler for how the *next*
-        // unlock resolves whatever happens from this point on.
+        // not claim an outcome -- see runUnlockPreOpenGate for how the
+        // *next* unlock resolves whatever happens from this point on.
         try {
             io.writeTruncated(vaultUri, stagedBytes)
         } catch (error: Exception) {

@@ -4,7 +4,7 @@ import java.io.FileNotFoundException
 
 /**
  * In-memory [SafDocumentIo] fake for plain JVM unit tests. Deliberately
- * small -- it exists only to exercise [VaultSaveCoordinator]/[SaveReconciler]
+ * small -- it exists only to exercise [VaultSaveCoordinator]/[RecoverySnapshotRestorer]
  * logic without a real `ContentResolver`, per the accepted 1T-B5 review's
  * guidance against overengineering this seam.
  */
@@ -18,6 +18,12 @@ class FakeSafDocumentIo(
     var writeSupported: Boolean = true
     var readException: Exception? = null
     var writeException: Exception? = null
+
+    /** When set, [hasPersistedWriteGrant] throws this instead of returning normally. */
+    var writeGrantException: Exception? = null
+
+    /** When set, [supportsWrite] throws this instead of returning normally. */
+    var writeSupportedException: Exception? = null
 
     /** When set, transforms the bytes actually persisted by [writeTruncated]
      * -- used to simulate a provider that silently does not honor "wt"
@@ -51,7 +57,13 @@ class FakeSafDocumentIo(
         documents[documentUri] = writeTransform?.invoke(bytes) ?: bytes
     }
 
-    override fun supportsWrite(documentUri: String): Boolean = writeSupported
+    override fun supportsWrite(documentUri: String): Boolean {
+        writeSupportedException?.let { throw it }
+        return writeSupported
+    }
 
-    override fun hasPersistedWriteGrant(documentUri: String): Boolean = writeGrant
+    override fun hasPersistedWriteGrant(documentUri: String): Boolean {
+        writeGrantException?.let { throw it }
+        return writeGrant
+    }
 }

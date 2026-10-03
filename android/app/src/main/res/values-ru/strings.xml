@@ -25,6 +25,13 @@
     <string name="forget_vault_unresolved_title">Незавершённое сохранение</string>
     <string name="forget_vault_unresolved_message">У этого хранилища есть незавершённое сохранение. Удаление из истории также удалит его единственную локальную копию для восстановления. Продолжить?</string>
     <string name="msg_recovery_needed">Предыдущее сохранение в этом хранилище могло не завершиться. Доступна локальная копия для восстановления.</string>
+    <string name="restore_previous_version">Восстановить предыдущую версию</string>
+    <string name="confirm_restore_title">Восстановить предыдущую версию?</string>
+    <string name="confirm_restore_message">Текущее содержимое хранилища будет заменено последней проверенной копией, сделанной до незавершённого сохранения. Это действие нельзя отменить.</string>
+    <string name="msg_restore_succeeded">Восстановлено. Разблокируйте хранилище ещё раз, чтобы продолжить.</string>
+    <string name="msg_restore_needs_retry">Требуется проверка восстановления. Разблокируйте хранилище ещё раз.</string>
+    <string name="msg_restore_recheck">Хранилище изменилось, пока был открыт этот экран. Проверьте и подтвердите восстановление ещё раз.</string>
+    <string name="msg_restore_failed">Не удалось восстановить хранилище. Попробуйте ещё раз.</string>
 
     <string name="vault_label">Хранилище</string>
     <string name="default_vault_name">Выбранное хранилище</string>

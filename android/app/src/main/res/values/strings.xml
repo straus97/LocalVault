@@ -26,6 +26,13 @@
     <string name="forget_vault_unresolved_title">Unresolved save</string>
     <string name="forget_vault_unresolved_message">This vault has an unresolved save. Forgetting it will also delete its only local recovery copy. Continue?</string>
     <string name="msg_recovery_needed">A previous save on this vault may not have completed. A local recovery copy is available.</string>
+    <string name="restore_previous_version">Restore previous version</string>
+    <string name="confirm_restore_title">Restore previous version?</string>
+    <string name="confirm_restore_message">This replaces the vault\'s current content with the last verified copy from before the unresolved save. This cannot be undone.</string>
+    <string name="msg_restore_succeeded">Restored. Unlock again to continue.</string>
+    <string name="msg_restore_needs_retry">Recovery needs verification. Unlock the vault again.</string>
+    <string name="msg_restore_recheck">The vault changed since this screen was shown. Review and confirm restore again.</string>
+    <string name="msg_restore_failed">Unable to restore the vault right now. Please try again.</string>
 
     <string name="vault_label">Vault</string>
     <string name="default_vault_name">Selected vault</string>

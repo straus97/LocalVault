@@ -40,7 +40,6 @@ import android.widget.TextView
 import android.widget.Toast
 import java.io.ByteArrayOutputStream
 import java.io.IOException
-import java.util.concurrent.CountDownLatch
 import uniffi.localvault_android_bridge.EntryInput
 import uniffi.localvault_android_bridge.BridgeException
 import uniffi.localvault_android_bridge.CategoryInput
@@ -76,13 +75,34 @@ import uniffi.localvault_android_bridge.openVault
  *    (that begins with 1T-B5b's entry/category CRUD screens); this
  *    checkpoint adds the write-capability/save-transaction infrastructure
  *    ([SafDocumentIo], [RecoverySnapshotStore], [VaultSaveCoordinator],
- *    [VaultCreationCoordinator], [SaveReconciler]) that those screens will
+ *    [VaultCreationCoordinator], [runUnlockPreOpenGate]) that those screens will
  *    use, plus the write-grant re-pick flow and the accepted backup-filename
  *    warning, which are both usable standalone.
  */
+/**
+ * Which screen a stale-generation category mutation completion (see
+ * `finishCategoryMutation`) landed on, reduced to only the distinction that
+ * decision actually needs. Deliberately not `MainActivity.Screen` itself
+ * (private to that class, and this seam has no reason to know about every
+ * other screen) -- this is the smallest value that lets the redraw policy
+ * below be a plain JVM-testable pure function.
+ */
+internal enum class CategoryMutationRedrawTarget { LIST, CATEGORY_MANAGE, OTHER }
+
+/**
+ * Whether a *stale-generation* category mutation that nonetheless succeeded
+ * (and already refreshed the category/entry cache) should force a redraw
+ * of [target]. `LIST` and `CATEGORY_MANAGE` are the only two screens whose
+ * content depends on that cache; every other screen is left untouched. The
+ * `Success`/activity-alive checks stay in `finishCategoryMutation` itself --
+ * this helper only ever needs to know the destination.
+ */
+internal fun shouldRedrawAfterStaleCategoryMutation(target: CategoryMutationRedrawTarget): Boolean =
+    target == CategoryMutationRedrawTarget.LIST || target == CategoryMutationRedrawTarget.CATEGORY_MANAGE
+
 class MainActivity : Activity() {
 
-    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS, ENTRY_EDIT, CATEGORY_MANAGE }
+    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS, ENTRY_EDIT, CATEGORY_MANAGE, RECOVERY_NEEDED }
 
     private class VaultReadException : Exception()
 
@@ -140,6 +160,15 @@ class MainActivity : Activity() {
     private var vaultName: String = ""
     private var statusRes: Int = 0
 
+    // RECOVERY_NEEDED state -- see runUnlockPreOpenGate/RecoverySnapshotRestorer.
+    // recoveryUnresolvedSha256 is the SHA pinned when this screen was last
+    // (re-)entered; it changes only when the screen is left entirely, or
+    // when an explicit recheck re-pins it and requires a fresh confirmation
+    // -- never merely because a restore attempt failed. See finishUnlock/
+    // finishRestore for the exact lifecycle.
+    private var recoveryUnresolvedSha256: String? = null
+    private var restoring: Boolean = false
+
     private var session: VaultSession? = null
     private var entries: List<EntrySummary> = emptyList()
     private var categories: List<CategorySummary> = emptyList()
@@ -190,10 +219,6 @@ class MainActivity : Activity() {
 
     private val createLock = Any()
     private var activePendingSlot: PendingCreationSlot? = null
-
-    // Debug-only, opt-in via a checkbox on CREATE_PASSWORD (never default
-    // behavior even in a debuggable build -- see renderCreatePassword).
-    private var qaPauseAfterInitialWrite: Boolean = false
 
     // 1T-B5b-4 entry-edit/delete state. entryId == null means create mode.
     // categoryId is preserved verbatim from the entry being edited (or null
@@ -336,8 +361,6 @@ class MainActivity : Activity() {
         // Screenshots and recents thumbnails are blocked in every build except
         // a debuggable one (so development screenshots stay possible). This is
         // derived from the app's real debuggable state, not a hard-coded flag.
-        // The same flag also gates the 1T-B5a QA save harness below -- a real
-        // release build is never debuggable, so neither is reachable there.
         isDebuggable = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
         if (!isDebuggable) {
             window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
@@ -418,7 +441,7 @@ class MainActivity : Activity() {
         clipboard.setAppFocused(false)
 
         when (screen) {
-            Screen.LIST, Screen.DETAIL, Screen.UNLOCKING, Screen.CATEGORY_MANAGE -> lockVault()
+            Screen.LIST, Screen.DETAIL, Screen.UNLOCKING, Screen.CATEGORY_MANAGE, Screen.RECOVERY_NEEDED -> lockVault()
             Screen.ENTRY_EDIT -> {
                 editPasswordField?.let { wipe(it) }
                 lockVault()
@@ -515,7 +538,7 @@ class MainActivity : Activity() {
     private fun handleBack() {
         when (screen) {
             Screen.DETAIL -> closeDetail()
-            Screen.LIST, Screen.UNLOCKING -> lockVault()
+            Screen.LIST, Screen.UNLOCKING, Screen.RECOVERY_NEEDED -> lockVault()
             Screen.CREATE_IN_PROGRESS -> abandonCreateInProgress()
             Screen.CREATE_PASSWORD -> cancelCreatePassword()
             Screen.ENTRY_EDIT -> cancelEntryEdit()
@@ -726,7 +749,6 @@ class MainActivity : Activity() {
         createDocumentName = queryDisplayName(uri) ?: getString(R.string.default_vault_name)
         createTookPersistableRead = tookRead
         createTookPersistableWrite = tookWrite
-        qaPauseAfterInitialWrite = false
         statusRes = 0
         screen = Screen.CREATE_PASSWORD
         render()
@@ -784,7 +806,6 @@ class MainActivity : Activity() {
         val name = createDocumentName
         val tookRead = createTookPersistableRead
         val tookWrite = createTookPersistableWrite
-        val pauseAfterWrite = isDebuggable && qaPauseAfterInitialWrite
 
         val generation = synchronized(createLock) { ++createGeneration }
         statusRes = 0
@@ -799,7 +820,6 @@ class MainActivity : Activity() {
                         password,
                         System.currentTimeMillis(),
                         onPendingCreated = { pending -> registerPendingCreation(generation, pending) },
-                        onAfterInitialWrite = if (pauseAfterWrite) { { awaitQaCreatePause() } } else null,
                     )
                 } catch (error: Exception) {
                     CreateVaultOutcome.UnexpectedError(error)
@@ -1041,44 +1061,11 @@ class MainActivity : Activity() {
         createDocumentName = ""
         createTookPersistableRead = false
         createTookPersistableWrite = false
-        qaPauseAfterInitialWrite = false
     }
 
     private fun wipeCreatePasswordFields() {
         passwordField?.let { wipe(it) }
         confirmPasswordField?.let { wipe(it) }
-    }
-
-    /**
-     * Debug-only QA pause point (opt-in via the CREATE_PASSWORD checkbox
-     * above; never reachable in a non-debuggable build), mirroring the
-     * existing QA save harness's [awaitQaResume] pattern: blocks only the
-     * background creation thread until the tester responds, right after the
-     * initial ciphertext has been physically written but before readback
-     * verification or finalize -- so a tester can force-stop the app here to
-     * confirm the newly created vault still opens normally via the ordinary
-     * `open_vault` path after a cold restart. Holds no plaintext or key
-     * material of its own (everything from this point on is ciphertext the
-     * coordinator already computed) and does not touch, delay, or
-     * special-case onStop's own immediate PendingVaultCreation discard.
-     */
-    private fun awaitQaCreatePause() {
-        val latch = CountDownLatch(1)
-
-        runOnUiThread {
-            AlertDialog.Builder(this)
-                .setCancelable(false)
-                .setTitle("QA: initial vault write completed, not yet verified")
-                .setMessage(
-                    "The new vault document was just written but not yet verified/finalized. " +
-                        "Force-stop the app now (Settings > Apps > LocalVault > Force stop) to test that " +
-                        "the vault still opens normally after a cold restart. Tap Resume to continue normally.",
-                )
-                .setPositiveButton("Resume normally") { _, _ -> latch.countDown() }
-                .show()
-        }
-
-        latch.await()
     }
 
     // ---------------------------------------------------------------- unlock / lock
@@ -1104,7 +1091,17 @@ class MainActivity : Activity() {
         Thread { runUnlock(uri, password, generation) }.start()
     }
 
-    /** Runs on a dedicated background thread: file read + Argon2id + list. */
+    /**
+     * Runs on a dedicated background thread: file read + Argon2id + list.
+     *
+     * 1T-B5a/B5b-6 recovery fix: before treating this unlock as normal,
+     * [runUnlockPreOpenGate] resolves any unresolved save marker left by an
+     * interrupted write against the vault's actual current disk content
+     * (accepted review, Revision 3, section 5) -- strictly *before* any
+     * attempt to parse/decrypt that content, using the one primary read
+     * this function performs. `openVault` is reached only when the gate
+     * permits it, with exactly the bytes the gate itself read.
+     */
     private fun runUnlock(uri: Uri, password: String, generation: Int) {
         var opened: VaultSession? = null
         var openedEnvelopeBytes: ByteArray? = null
@@ -1113,13 +1110,29 @@ class MainActivity : Activity() {
         var messageRes = 0
         var unreadable = false
         var reconciliationOutcome: ReconciliationOutcome? = null
+        var recoveryPrimarySha: String? = null
 
         try {
-            val envelopeBytes = readVaultBytes(uri)
-            opened = openVault(envelopeBytes, password)
-            openedEnvelopeBytes = envelopeBytes
-            rows = opened.listEntries()
-            cats = opened.listCategories()
+            when (
+                val gateResult = runUnlockPreOpenGate(
+                    readMarker = { recovery.readMarker(uri.toString()) },
+                    readCurrentBytes = { readVaultBytes(uri) },
+                    clearMarker = { recovery.clearMarker(uri.toString()) },
+                    openPrimary = { bytes -> openVault(bytes, password) },
+                )
+            ) {
+                is UnlockGateResult.RecoveryNeeded -> {
+                    reconciliationOutcome = ReconciliationOutcome.UNKNOWN_NEEDS_RECOVERY
+                    recoveryPrimarySha = gateResult.unresolvedPrimarySha256
+                }
+                is UnlockGateResult.Opened -> {
+                    opened = gateResult.value
+                    openedEnvelopeBytes = gateResult.envelopeBytes
+                    reconciliationOutcome = gateResult.reconciliationOutcome
+                    rows = opened.listEntries()
+                    cats = opened.listCategories()
+                }
+            }
         } catch (error: BridgeException.AuthenticationFailed) {
             messageRes = R.string.msg_auth
         } catch (error: BridgeException.UnsupportedFormat) {
@@ -1142,26 +1155,21 @@ class MainActivity : Activity() {
             opened = null
         }
 
-        // 1T-B5a: before treating this unlock as normal, resolve any
-        // unresolved save marker left by an interrupted write against the
-        // vault's actual current disk content (accepted review, Revision 3,
-        // section 5). The only path that can currently create such a marker
-        // is the debug-only QA save harness below; a real product save path
-        // lands in 1T-B5b and is covered by this same reconciliation from
-        // the moment it lands, not retrofitted later.
-        if (opened != null) {
-            reconciliationOutcome =
-                try {
-                    SaveReconciler(documentIo, recovery).reconcileOnUnlock(uri.toString())
-                } catch (ignored: Exception) {
-                    ReconciliationOutcome.UNKNOWN_NEEDS_RECOVERY
-                }
-        }
-
         val result = opened
         val resultEnvelopeBytes = openedEnvelopeBytes
         runOnUiThread {
-            finishUnlock(generation, uri, result, resultEnvelopeBytes, rows, cats, messageRes, unreadable, reconciliationOutcome)
+            finishUnlock(
+                generation,
+                uri,
+                result,
+                resultEnvelopeBytes,
+                rows,
+                cats,
+                messageRes,
+                unreadable,
+                reconciliationOutcome,
+                recoveryPrimarySha,
+            )
         }
     }
 
@@ -1198,9 +1206,24 @@ class MainActivity : Activity() {
         messageRes: Int,
         unreadable: Boolean,
         reconciliationOutcome: ReconciliationOutcome? = null,
+        recoveryPrimarySha: String? = null,
     ) {
         if (generation != unlockGeneration || screen != Screen.UNLOCKING || isFinishing || isDestroyed) {
             closeQuietly(opened)
+            return
+        }
+
+        if (reconciliationOutcome == ReconciliationOutcome.UNKNOWN_NEEDS_RECOVERY) {
+            // runUnlockPreOpenGate never calls openVault in this case, so
+            // `opened` is guaranteed null here -- never claims
+            // UnsupportedFormat/auth failure, never shows the vault.
+            closeQuietly(opened)
+            session = null
+            saveCoordinator = null
+            recoveryUnresolvedSha256 = recoveryPrimarySha
+            statusRes = 0
+            screen = Screen.RECOVERY_NEEDED
+            render()
             return
         }
 
@@ -1219,24 +1242,6 @@ class MainActivity : Activity() {
             listScrollY = 0
             statusRes = 0
             screen = Screen.LIST
-
-            if (reconciliationOutcome == ReconciliationOutcome.UNKNOWN_NEEDS_RECOVERY) {
-                // 1T-B5a: reconciliation could not determine whether a
-                // previously interrupted save reached the primary. Never
-                // reported as either "saved" or "lost" -- only that a
-                // recovery copy exists. Restoring from it is a deliberate,
-                // explicit action left to a later checkpoint's UI; this
-                // does not block normal (read-only, in this checkpoint) use
-                // of the vault.
-                Toast.makeText(this, R.string.msg_recovery_needed, Toast.LENGTH_LONG).show()
-            }
-
-            if (isDebuggable && reconciliationOutcome != null) {
-                // QA visibility only: shows every reconciliation branch
-                // (not just the user-facing "needs recovery" one) so a
-                // real-device tester can confirm which one actually fired.
-                Toast.makeText(this, "QA reconciliation: $reconciliationOutcome", Toast.LENGTH_LONG).show()
-            }
         } else if (unreadable && recents.load().any { it.uri == uri }) {
             // A remembered vault that can no longer be read is stale: forget it.
             forgetVault(uri)
@@ -1275,6 +1280,8 @@ class MainActivity : Activity() {
         searchQuery = ""
         listScrollY = 0
         clearRevealedPassword()
+        recoveryUnresolvedSha256 = null
+        restoring = false
         closeQuietly(current)
 
         statusRes = messageRes
@@ -1889,10 +1896,18 @@ class MainActivity : Activity() {
             // before this resolved. Never resurrect CATEGORY_MANAGE and
             // never show its success/failure toast or status for a stale
             // attempt -- but if the refresh above just updated the cached
-            // data and the user is sitting on LIST right now, redraw it so
-            // the successful mutation is immediately visible instead of only
-            // becoming visible the next time LIST happens to re-render.
-            if (outcome == SaveOutcome.Success && activityAlive && screen == Screen.LIST) {
+            // data and the user is sitting on LIST or back on
+            // CATEGORY_MANAGE right now (B5b-5/B5b-6 edge case), redraw it
+            // so the successful mutation is immediately visible instead of
+            // only becoming visible the next time that screen happens to
+            // re-render on its own.
+            val redrawTarget =
+                when (screen) {
+                    Screen.LIST -> CategoryMutationRedrawTarget.LIST
+                    Screen.CATEGORY_MANAGE -> CategoryMutationRedrawTarget.CATEGORY_MANAGE
+                    else -> CategoryMutationRedrawTarget.OTHER
+                }
+            if (outcome == SaveOutcome.Success && activityAlive && shouldRedrawAfterStaleCategoryMutation(redrawTarget)) {
                 render()
             }
             return
@@ -2154,6 +2169,7 @@ class MainActivity : Activity() {
             Screen.CREATE_IN_PROGRESS -> renderCreateInProgress()
             Screen.ENTRY_EDIT -> renderEntryEdit()
             Screen.CATEGORY_MANAGE -> renderCategoryManage()
+            Screen.RECOVERY_NEEDED -> renderRecoveryNeeded()
         }
     }
 
@@ -2230,6 +2246,119 @@ class MainActivity : Activity() {
         addToContent(card, topMargin = 24)
     }
 
+    /**
+     * 1T-B5b-6 recovery fix: shown instead of the ordinary unlock flow when
+     * [runUnlockPreOpenGate] reconciled an unresolved save marker to
+     * UNKNOWN_NEEDS_RECOVERY -- the vault is never opened from here (no
+     * session exists), only an explicit, user-confirmed restore of the
+     * verified pre-write snapshot (see [showRecoveryRestoreConfirm]) or
+     * choosing a different vault.
+     */
+    private fun renderRecoveryNeeded() {
+        addHeader()
+
+        val card = newCard()
+        card.addView(newText(getString(R.string.vault_label), size = 13f, color = R.color.lv_text_tertiary))
+        card.addView(newText(vaultName, size = 17f, bold = true), matchParams(top = 2))
+        card.addView(
+            newText(getString(R.string.forget_vault_unresolved_title), size = 15f, bold = true),
+            matchParams(top = 16),
+        )
+        card.addView(
+            newText(getString(R.string.msg_recovery_needed), size = 14f, color = R.color.lv_text_secondary),
+            matchParams(top = 6),
+        )
+        addToContent(card, topMargin = 20)
+
+        addStatus()
+
+        if (restoring) {
+            val progressCard = newCard()
+            progressCard.gravity = Gravity.CENTER_HORIZONTAL
+            progressCard.addView(ProgressBar(this), wrapParams(top = 8, gravity = Gravity.CENTER_HORIZONTAL))
+            addToContent(progressCard, topMargin = 16)
+        } else {
+            addPrimaryButton(getString(R.string.restore_previous_version), topMargin = 16) { showRecoveryRestoreConfirm() }
+            addSecondaryButton(getString(R.string.choose_another_vault), topMargin = 10) { openPicker() }
+        }
+    }
+
+    private fun showRecoveryRestoreConfirm() {
+        val uri = vaultUri ?: return
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.confirm_restore_title)
+            .setMessage(R.string.confirm_restore_message)
+            .setPositiveButton(R.string.restore_previous_version) { _, _ -> runRestore(uri) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * Drives [RecoverySnapshotRestorer] off the main thread, exactly
+     * mirroring [runUnlock]'s own generation-guard pattern so a stale
+     * result from a screen the user already left cannot touch state it no
+     * longer owns.
+     */
+    private fun runRestore(uri: Uri) {
+        restoring = true
+        render()
+
+        val pin = recoveryUnresolvedSha256
+        val generation = ++unlockGeneration
+        Thread {
+            val outcome = RecoverySnapshotRestorer(documentIo, recovery).restore(uri.toString(), pin)
+            runOnUiThread { finishRestore(generation, outcome) }
+        }.start()
+    }
+
+    private fun finishRestore(generation: Int, outcome: RestoreOutcome) {
+        if (generation != unlockGeneration || screen != Screen.RECOVERY_NEEDED || isFinishing || isDestroyed) return
+        restoring = false
+
+        when (outcome) {
+            is RestoreOutcome.Success -> {
+                recoveryUnresolvedSha256 = null
+                screen = Screen.FILE_SELECTED
+                statusRes = R.string.msg_restore_succeeded
+            }
+            is RestoreOutcome.RestoredButMarkerClearFailed -> {
+                recoveryUnresolvedSha256 = null
+                screen = Screen.FILE_SELECTED
+                // Non-success wording: the primary genuinely holds the
+                // restored bytes, but the marker's durable clear could not
+                // be confirmed -- a fresh unlock's own reconciliation
+                // resolves it normally.
+                statusRes = R.string.msg_restore_needs_retry
+            }
+            is RestoreOutcome.RecheckRequired -> {
+                if (outcome.freshOutcome == ReconciliationOutcome.UNKNOWN_NEEDS_RECOVERY && outcome.freshPrimarySha256 != null) {
+                    // Still unresolved -- stay blocked, re-pin, require a
+                    // brand-new explicit confirmation before any future
+                    // destructive write.
+                    recoveryUnresolvedSha256 = outcome.freshPrimarySha256
+                    screen = Screen.RECOVERY_NEEDED
+                    statusRes = R.string.msg_restore_recheck
+                } else {
+                    // Resolved elsewhere, or genuinely undeterminable right
+                    // now -- never claim success; a fresh unlock decides
+                    // current truth.
+                    recoveryUnresolvedSha256 = null
+                    screen = Screen.FILE_SELECTED
+                    statusRes = R.string.msg_vault_changed_externally
+                }
+            }
+            RestoreOutcome.SnapshotMissing, RestoreOutcome.SnapshotInvalid, RestoreOutcome.ProviderNotWritable, RestoreOutcome.WriteFailed -> {
+                // Retryable: stay on RECOVERY_NEEDED, pin left untouched so
+                // a retry still compares against the original unresolved
+                // state, not a silently-reset null.
+                screen = Screen.RECOVERY_NEEDED
+                statusRes = R.string.msg_restore_failed
+            }
+        }
+        render()
+    }
+
     private fun renderCreatePassword() {
         addHeader()
 
@@ -2264,18 +2393,6 @@ class MainActivity : Activity() {
         }
         confirmPasswordField = confirmField
         card.addView(confirmField, matchParams(top = 6))
-
-        // Debug-only, opt-in fault-injection affordance (accepted task
-        // section I) -- off by default even in a debuggable build, gated on
-        // the app's real ApplicationInfo.FLAG_DEBUGGABLE, never a
-        // hard-coded flag, and absent entirely from a non-debuggable build.
-        if (isDebuggable) {
-            val checkbox = CheckBox(this)
-            checkbox.text = "QA: pause after initial write"
-            checkbox.isChecked = qaPauseAfterInitialWrite
-            checkbox.setOnCheckedChangeListener { _, checked -> qaPauseAfterInitialWrite = checked }
-            card.addView(checkbox, matchParams(top = 12))
-        }
 
         addToContent(card, topMargin = 20)
 
@@ -2503,12 +2620,6 @@ class MainActivity : Activity() {
 
         val title = newText(getString(R.string.app_name), size = 22f, bold = true)
         header.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        if (isDebuggable) {
-            // 1T-B5a QA save harness entry point -- see the dedicated
-            // section near the bottom of this file. Absent in any real
-            // (non-debuggable) build; see that section's own doc comment.
-            header.addView(newSecondaryButton("QA save", compact = true) { showQaSaveDialog() })
-        }
         header.addView(
             newSecondaryButton(getString(R.string.add_entry), compact = true) { startCreateEntry() },
             wrapParams(left = 8),
@@ -2952,201 +3063,5 @@ class MainActivity : Activity() {
         params.leftMargin = dp(left)
         params.gravity = gravity
         return params
-    }
-
-    // =====================================================================
-    // 1T-B5a QA save harness -- DEBUG BUILDS ONLY.
-    //
-    // Every entry point here is gated behind `isDebuggable`, the same real
-    // installed-APK `android:debuggable` flag that already gates screenshot
-    // blocking above -- a real release build is never debuggable, so none
-    // of this is reachable there, and no separate runtime toggle exists to
-    // turn it on in one. This is the smallest way to reach it: it needed
-    // access to the same private `session`/`vaultUri`/`documentIo`/
-    // `recovery` fields the rest of this Activity already uses, and
-    // splitting it into a separate `src/debug` source set would have meant
-    // exposing those fields beyond this file just for this one purpose.
-    //
-    // This proves the Revision 3 real-device acceptance criterion for
-    // 1T-B5a: one real `update_entry` mutation through the REAL
-    // VaultSaveCoordinator + ContentResolverSafDocumentIo +
-    // FileRecoverySnapshotStore path (never a fake), against whatever
-    // vault is currently open -- use only a disposable QA vault, since this
-    // performs a real write. It is NOT product CRUD UI: it always mutates
-    // the first entry with fixed QA values, offers no field editing, and
-    // must not be extended into one. It is expected to be deleted once
-    // 1T-B5b's real save UI lands and can absorb its own on-device
-    // verification instead.
-    // =====================================================================
-
-    private enum class QaFaultMode { NONE, EXTERNAL_CHANGE, INTERRUPT_AFTER_MARKER, INTERRUPT_AFTER_PRIMARY_WRITE }
-
-    private fun showQaSaveDialog() {
-        val uri = vaultUri
-        val activeSession = session
-        val target = entries.firstOrNull()
-        if (uri == null || activeSession == null) return
-        if (target == null) {
-            Toast.makeText(this, "QA: vault has no entries to mutate -- add one from desktop first", Toast.LENGTH_LONG).show()
-            return
-        }
-
-        val modes = arrayOf(
-            "Normal round trip",
-            "External change between stale checks",
-            "Interrupt after marker, before write (background/kill now)",
-            "Interrupt after primary write, before verification (force-stop now)",
-        )
-        AlertDialog.Builder(this)
-            .setTitle("QA save test (DEBUG ONLY) -- mutates \"${target.title}\"")
-            .setItems(modes) { _, which ->
-                runQaSave(uri, activeSession, target.id, QaFaultMode.entries[which])
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
-
-    /**
-     * Runs one real `stage -> recovery snapshot -> [after-marker hook] ->
-     * second check -> "wt" write -> [after-write hook] -> readback ->
-     * commit` save off the main thread, exactly as a real 1T-B5b save path
-     * would, and reports the resulting [SaveOutcome] verbatim so a tester
-     * can distinguish every branch (success; stale-source abort before any
-     * primary write; actual write/readback failure; provider-capability
-     * refusal).
-     */
-    private fun runQaSave(uri: Uri, activeSession: VaultSession, entryId: String, mode: QaFaultMode) {
-        Thread {
-            val baseline =
-                try {
-                    documentIo.readAll(uri.toString())
-                } catch (error: Exception) {
-                    runOnUiThread { Toast.makeText(this, "QA: could not read baseline: $error", Toast.LENGTH_LONG).show() }
-                    return@Thread
-                }
-
-            val coordinator = VaultSaveCoordinator(activeSession, documentIo, recovery, baseline)
-            val input = EntryInput(
-                title = "QA mutated ${System.currentTimeMillis()}",
-                profileName = "",
-                url = "",
-                username = "qa-user",
-                password = "qa-password-${System.currentTimeMillis()}",
-                notes = "",
-                categoryId = null,
-                tags = emptyList(),
-                favorite = false,
-            )
-
-            // Only one of these ever actually pauses for a given mode --
-            // VaultSaveCoordinator only reaches the hook matching where
-            // this mode wants to interrupt, so passing both unconditionally
-            // is safe and keeps this call site simple.
-            val afterMarkerHook: (() -> Unit)? =
-                when (mode) {
-                    QaFaultMode.EXTERNAL_CHANGE, QaFaultMode.INTERRUPT_AFTER_MARKER -> {
-                        { awaitQaResume(mode, uri) }
-                    }
-                    else -> null
-                }
-            val afterPrimaryWriteHook: (() -> Unit)? =
-                if (mode == QaFaultMode.INTERRUPT_AFTER_PRIMARY_WRITE) {
-                    { awaitQaResume(mode, uri) }
-                } else {
-                    null
-                }
-
-            val outcome =
-                try {
-                    coordinator.saveUpdateEntry(
-                        uri.toString(),
-                        entryId,
-                        input,
-                        System.currentTimeMillis(),
-                        afterMarkerHook,
-                        afterPrimaryWriteHook,
-                    )
-                } catch (error: Exception) {
-                    SaveOutcome.UnexpectedError(error)
-                }
-
-            runOnUiThread { Toast.makeText(this, "QA save outcome: $outcome", Toast.LENGTH_LONG).show() }
-        }.start()
-    }
-
-    /**
-     * Deterministic fault-injection pause point for real-device QA. Called
-     * on the background save thread from one of [VaultSaveCoordinator]'s
-     * two QA hooks:
-     *  - `onAfterMarkerWritten` for [QaFaultMode.EXTERNAL_CHANGE] and
-     *    [QaFaultMode.INTERRUPT_AFTER_MARKER] -- after the durable recovery
-     *    snapshot and marker already exist on disk, before the second
-     *    stale-source check runs (before the primary is ever touched);
-     *  - `onAfterPrimaryWrite` for [QaFaultMode.INTERRUPT_AFTER_PRIMARY_WRITE]
-     *    -- after the primary document has already been physically written
-     *    with "wt", before readback verification, marker clearing, or
-     *    `commit_staged_save`.
-     *
-     * Either way this blocks only that background thread on a
-     * [CountDownLatch] until the tester responds; it holds no plaintext or
-     * key material itself (everything from this point on is ciphertext the
-     * coordinator already computed), and it does not touch, delay, or
-     * special-case `onStop`'s immediate lock, and does not clear the
-     * durable marker itself while paused -- if the Activity backgrounds or
-     * the process dies while this is blocked, the live session is
-     * dropped/zeroized exactly as it always is, this thread simply dies
-     * with the process, and the marker is left exactly as it was written,
-     * for the next unlock's reconciliation to resolve from disk truth.
-     */
-    private fun awaitQaResume(mode: QaFaultMode, uri: Uri) {
-        val latch = CountDownLatch(1)
-
-        runOnUiThread {
-            val builder = AlertDialog.Builder(this).setCancelable(false)
-            when (mode) {
-                QaFaultMode.EXTERNAL_CHANGE -> {
-                    builder.setTitle("QA: recovery snapshot + marker written")
-                    builder.setMessage(
-                        "Stale-check #2 is about to run. Tap below to simulate an external write to " +
-                            "this vault document right now through the real ContentResolver, or modify " +
-                            "it yourself externally first, then tap Resume.",
-                    )
-                    builder.setPositiveButton("Simulate external write && Resume") { _, _ ->
-                        try {
-                            documentIo.writeTruncated(
-                                uri.toString(),
-                                "qa-simulated-external-write-${System.currentTimeMillis()}".toByteArray(),
-                            )
-                        } catch (ignored: Exception) {
-                        }
-                        latch.countDown()
-                    }
-                    builder.setNegativeButton("Resume (I changed it myself)") { _, _ -> latch.countDown() }
-                }
-                QaFaultMode.INTERRUPT_AFTER_MARKER -> {
-                    builder.setTitle("QA: recovery snapshot + marker written")
-                    builder.setMessage(
-                        "Background or force-stop the app now to test interrupted-write reconciliation " +
-                            "(expect NOT_SAVED on next unlock, since the primary has not been touched yet). " +
-                            "Tap Resume instead to continue this save normally.",
-                    )
-                    builder.setPositiveButton("Resume normally") { _, _ -> latch.countDown() }
-                }
-                QaFaultMode.INTERRUPT_AFTER_PRIMARY_WRITE -> {
-                    builder.setTitle("QA: primary write completed, not yet verified")
-                    builder.setMessage(
-                        "The real primary document was just written with \"wt\", but LocalVault has not " +
-                            "yet verified the readback or claimed success. FORCE-STOP the app now (Settings " +
-                            "> Apps > LocalVault > Force stop) to test that next-unlock reconciliation " +
-                            "resolves this as SAVED from disk truth. Tap Resume instead to continue normally.",
-                    )
-                    builder.setPositiveButton("Resume normally") { _, _ -> latch.countDown() }
-                }
-                QaFaultMode.NONE -> latch.countDown()
-            }
-            builder.show()
-        }
-
-        latch.await()
     }
 }

@@ -8,8 +8,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Exercises the [RecoverySnapshotStore] contract that [VaultSaveCoordinator]
- * and [SaveReconciler] rely on, via [FakeRecoverySnapshotStore]. The real
+ * Exercises the [RecoverySnapshotStore] contract that [VaultSaveCoordinator],
+ * [runUnlockPreOpenGate] and [RecoverySnapshotRestorer] rely on, via
+ * [FakeRecoverySnapshotStore]. The real
  * `android.util.AtomicFile`-backed [FileRecoverySnapshotStore] cannot be
  * exercised in a plain JVM unit test (AGP stubs `AtomicFile`'s methods to
  * throw without Robolectric, which is deliberately not added here per the

@@ -16,6 +16,21 @@ class FakeRecoverySnapshotStore : RecoverySnapshotStore {
      * readback verification failed, leaving no snapshot/marker behind. */
     var failWrites: Boolean = false
 
+    /** When set, [readMarker] throws this instead of returning normally. */
+    var readMarkerException: Exception? = null
+
+    /** When set, [readSnapshotBytes] throws this instead of returning normally. */
+    var readSnapshotBytesException: Exception? = null
+
+    /** When set, [clearMarker] throws this instead of returning normally. */
+    var clearMarkerException: Exception? = null
+
+    /** When true, [clearMarker] returns without throwing but does not
+     * actually remove the marker -- simulates a silent
+     * AtomicFile/File.delete() failure (the more realistic failure mode
+     * than an exception), distinct from [clearMarkerException]. */
+    var failClearMarkerSilently: Boolean = false
+
     var writeAndVerifyCallCount = 0
         private set
 
@@ -34,11 +49,19 @@ class FakeRecoverySnapshotStore : RecoverySnapshotStore {
         return true
     }
 
-    override fun readMarker(vaultUri: String): RecoveryMarker? = markers[vaultUri]
+    override fun readMarker(vaultUri: String): RecoveryMarker? {
+        readMarkerException?.let { throw it }
+        return markers[vaultUri]
+    }
 
-    override fun readSnapshotBytes(vaultUri: String): ByteArray? = snapshots[vaultUri]
+    override fun readSnapshotBytes(vaultUri: String): ByteArray? {
+        readSnapshotBytesException?.let { throw it }
+        return snapshots[vaultUri]
+    }
 
     override fun clearMarker(vaultUri: String) {
+        clearMarkerException?.let { throw it }
+        if (failClearMarkerSilently) return
         markers.remove(vaultUri)
     }
 
