@@ -79,7 +79,7 @@ The following are still implemented only in `src-tauri`. Some are genuine platfo
 - frontend (`src/`)
 - password-health orchestration and current implementation (`app_state/password_health.rs`, `commands/password_health.rs`) — placement undecided
 - password generator (`password_generator.rs`) — placement undecided
-- Android adapter (`crates/localvault-android-bridge/`, `android/`) — exists and is read-only as of 1T-B4 (`4a42ffc`); write/create/CRUD is not yet implemented (1T-B5, not started) — see `@docs/HANDOFF_1T_PROGRESS.md`
+- Android adapter (`crates/localvault-android-bridge/`, `android/`) — exists and, as of 1T-B5c-2 (`4d75bb81042dfcf339073240472b2129265f23e1`), supports vault creation, transactional SAF saves, entry/category CRUD and TOTP set/replace/remove — see `@docs/HANDOFF_1T_PROGRESS.md`
 - synchronization — does not exist yet (1U/1V not started)
 
 The subset of this list that is a permanent platform-adapter responsibility (not just "not yet extracted") is listed separately below in "What must stay outside the shared core."
@@ -105,7 +105,7 @@ localvault-core (Rust, no Tauri/platform dependency)
     +-- future sync metadata and merge/conflict semantics  [NOT STARTED]
     |
     +-- Desktop/Tauri adapter   (src-tauri, current app)
-    +-- Android adapter         (future, 1T — not started)
+    +-- Android adapter         (1T — implemented through B5c; 1T not complete)
 ```
 
 ## What must stay outside the shared core (platform adapter responsibility)
@@ -126,7 +126,7 @@ localvault-core (Rust, no Tauri/platform dependency)
 - Adapters must not implement or re-implement cryptography, KDF, AEAD, vault format parsing, migrations, or TOTP generation — all of that stays in the core.
 - The favicon network path (`site_icon_fetcher.rs`) is a desktop-only, explicit, narrow exception and should not be assumed available on constrained mobile contexts without re-review; it must not be treated as precedent for adding network dependencies elsewhere.
 
-## Android architecture (1T, implemented as of 1T-B4)
+## Android architecture (1T, implemented through 1T-B5c)
 
 Android gets a thin adapter analogous to the current `src-tauri` adapter, chosen by the 1T-A/1T-A2 architecture audits and implemented starting at 1T-B1b:
 
@@ -152,10 +152,10 @@ Explicitly **not** used: the experimental `uniffi-bindgen-kotlin-jni` backend, h
 - The Master Key and Vault Key never cross FFI at all — `open_vault` uses `localvault_core::vault::format::open_envelope` (not `_with_key`), so neither key is even retained bridge-side.
 - The master password enters through one narrow `open_vault(envelope_bytes, master_password)` call; the bridge wraps it in `Zeroizing` as early as practical. This does not erase the JVM/JNA-side copy — see `@docs/SECURITY_MODEL.md`.
 - Individual entry passwords cross FFI only on an explicit user show/copy action (`VaultSession::entry_password`), never as part of any list/summary call.
-- The TOTP secret/configuration never crosses FFI; only a generated code + timing (`VaultSession::totp_status`, backed by `localvault_core::totp::generate_totp`) crosses, and only while the detail screen is visible.
+- The stored TOTP secret/configuration never crosses FFI outward; only a generated code + timing (`VaultSession::totp_status`, backed by `localvault_core::totp::generate_totp`) crosses, and only while the detail screen is visible. Read/display state exposes only whether TOTP is enabled (`totp_enabled`) plus generated `TotpStatus`. Since 1T-B5c-1, the user's raw setup input (bare Base32 or `otpauth://`) crosses FFI inward only as direct mutation input to `stage_set_entry_totp(entry_id, setup_input, now_ms)`; `stage_remove_entry_totp(entry_id, now_ms)` carries no secret. `localvault-core` remains the sole owner of TOTP parsing, validation and generation — Kotlin does not parse, normalize or construct TOTP configuration. Set/replace/remove run through the same transactional SAF save pipeline (`VaultSaveCoordinator.runStagedSave`) as every other Android mutation.
 - Category data (`VaultSession::list_categories`) is non-secret metadata only (id/name/entry-count).
 
-**Read-only as of 1T-B4.** Vault writes, creation, and mutation (entries, categories, TOTP setup) are **not implemented** — that is the entire scope of the next task, 1T-B5. Mobile-only concerns not yet built (autofill, biometrics, camera-based QR scanning, platform secure storage for convenience unlock) remain out of scope until 1W and would live entirely in the Android adapter, never in core, per the existing "What must stay outside the shared core" rule below. Password-health and password-generator placement remain undecided as of this checkpoint (see "What still remains outside core" above); neither is required before 1T, though either could still move into core later if a concrete Android need arises.
+**Read/write as of 1T-B5c.** Writes, vault creation and mutation (entries, categories, TOTP set/replace/remove) are implemented through the transactional SAF save coordinator; see `@docs/HANDOFF_1T_PROGRESS.md` for the B5 history. Android uses a dedicated TOTP setup screen (entered from entry detail) rather than putting raw setup input in the entry editor; create-with-TOTP was deliberately not added (create the entry first, then configure TOTP). Mobile-only concerns not yet built (autofill, biometrics, camera-based QR scanning, platform secure storage for convenience unlock) remain out of scope until 1W and would live entirely in the Android adapter, never in core, per the existing "What must stay outside the shared core" rule below. Password-health and password-generator placement remain undecided as of this checkpoint (see "What still remains outside core" above); neither is required before 1T, though either could still move into core later if a concrete Android need arises.
 
 Full toolchain pins (Rust/NDK/AGP/Gradle/Kotlin/UniFFI/JNA versions), the storage/SAF model, the clipboard model, and the complete B1a–B4 history live in `@docs/HANDOFF_1T_PROGRESS.md` — this section only records the architecture shape and security boundary.
 

@@ -14,6 +14,7 @@ Do not rely on old conversational memory from any prior Claude chat. Repository 
 - Branch: `redesign/light-ui-v1.1`
 - HEAD at the time this handoff was written: `4a42ffc5081a2958f2046132f063e6f9261c3f1b` — `feat: add Android categories and TOTP` (1T-B4)
 - Working tree at that HEAD: clean
+- **Update (after B5c):** the sections below are the original B4-era snapshot and are intentionally left as written. The B5 write/CRUD series has since landed and is summarized in **§31**; the B5c-2 implementation/code checkpoint summarized by this update is `4d75bb81042dfcf339073240472b2129265f23e1`. Where §12/§14/§22/§23 below say Android is read-only or B5 is next, §31 supersedes them.
 - **Do not trust this hash blindly** — re-verify with `git rev-parse HEAD` at the start of any new session (see §29).
 
 ## 3. Immutable v1.0.0 (do not touch)
@@ -225,7 +226,7 @@ None of these are blocking or scheduled into a specific stage yet; keep them on 
 - The Android release `panic = "abort"` blocker (§20).
 - A final Android security/UX/regression pass once write support lands.
 
-## 23. Next: 1T-B5 — safe Android write/create/CRUD foundation
+## 23. Next: 1T-B5 — safe Android write/create/CRUD foundation (historical — B5 is now implemented, see §31)
 
 This is the next major implementation task. **It must not be implemented in the chat that produced this handoff — start it in a new Claude chat.** Before any B5 source edits, that new chat must perform a focused security/storage architecture review (audit-first, per `@CLAUDE.md`'s "for high-risk or architectural work: audit first, design second, implementation third" rule) covering at minimum:
 
@@ -312,3 +313,25 @@ A fresh Claude chat picking up LocalVault work after this handoff should, in ord
 3. Only then plan 1T-B5 (or whatever the next task actually is by that point — re-check `@docs/PROJECT_STATUS.md` rather than assuming B5 is still next if time has passed and other work may have landed).
 
 Repository docs and Git history are authoritative over any prior chat's conversational memory, including this document once it, too, goes stale.
+
+## 31. Update: 1T-B5 write/CRUD series (complete through B5c)
+
+Added after the B4-era snapshot above; supersedes the "read-only"/"B5 next" statements in §12, §14, §22 and §23. Git and the four concise docs still win.
+
+**Checkpoints (in order):** `1abf5e4` B5a (transactional SAF save infrastructure) · `5c20513` B5b-1 · `3ebbed5` B5b-2 · `60e26c4` B5b-3 (vault creation) · `18a0034` B5b-4 (entry CRUD UI) · `32a0754` B5b-5 (category CRUD UI) · `0224fee` B5b-6 (save-recovery hardening) · `9f8f6411f2dd0303458bb541c8a0a401c5f813ce` B5c-1 · `4d75bb81042dfcf339073240472b2129265f23e1` B5c-2. B5a–B5b per-step detail lives in the commit history and was not recorded in this file before.
+
+**1T-B5c — TOTP set / replace / remove (COMPLETE)**
+- **B5c-1:** bridge `stage_set_entry_totp(entry_id, setup_input, now_ms)` and `stage_remove_entry_totp(entry_id, now_ms)` (UniFFI equivalents exposed to Kotlin) and thin `VaultSaveCoordinator.saveSetEntryTotp` / `saveRemoveEntryTotp` wrappers using the same `runStagedSave` pipeline as every other mutation.
+- **B5c-2:** Android TOTP management UI in `MainActivity.kt` (+ EN/RU strings, new `TotpMutationUiTest.kt`; exactly four source files). Dedicated `TOTP_SETUP` screen entered from entry detail (set and replace); detail shows a "not set up" card with a set-up action when TOTP is absent, and Replace / Remove next to the existing code card when present; Remove requires an explicit confirmation dialog. TOTP mutations reuse the existing mutation token and `entryMutationGeneration`; the new finisher refreshes the session-derived cache after a success even if the UI moved on, and `ChangedExternally` locks with the existing message.
+- **Invariants:** `localvault-core` is the sole owner of TOTP parsing/validation/generation; Kotlin does not parse, normalize or construct TOTP configuration. Raw setup input crosses FFI only as direct mutation input (verbatim). Read/display state exposes only `totp_enabled` plus generated `TotpStatus`, never the secret. The input is not put in snapshots, Bundles, status objects, toasts or logs, and is wiped on cancel / Back / background / lock / destroy. Android `onStop` still locks immediately. Create-with-TOTP was deliberately not added (create the entry, then configure TOTP from detail). QR setup/scanning is not part of B5c and remains deferred to 1W.
+- **B5c-1 validation:** bridge 77 tests PASS; desktop `localvault` lib: 178 tests PASS; clippy / `cargo check` / `cargo check --release` PASS; schema 1 → 2 TOTP mutation path covered; coordinator tests cover success, validation errors, `ProviderNotWritable`, stale #1/#2, snapshot failure, write failure and readback failure; immutable Windows `v1.0.0` executables unchanged.
+- **B5c-2 validation:** Android debug build PASS; targeted `TotpMutationUiTest` PASS; full Android JVM suite PASS; immutable `v1.0.0` executables unchanged.
+- **Real-device QA (Android 16 / SDK 36):** bare Base32 setup succeeded and the generated code matched an independent calculation; invalid replacement input caused no write and the raw input did not appear in logcat; Cancel, system Back, and HOME/`onStop` with unsaved input caused no vault write, and HOME/`onStop` locked immediately and discarded the input; an `otpauth://` replacement (SHA256, 8 digits, 45 s period) succeeded and matched an independent calculation; remove-confirmation Cancel caused no write; a confirmed remove persisted across lock/reopen; `ChangedExternally` was detected before overwrite, forced a safe lock/reopen, and did not overwrite the externally changed primary; no tested TOTP secret/URI/canary appeared in logcat; no crash/ANR in the tested scenarios.
+- **Desktop ⇄ Android compatibility (both directions):** an Android-created TOTP vault opened in current desktop source and produced the same independently calculated code; a desktop-created SHA256 / 8-digit / 45 s TOTP vault opened on Android and produced the same code. Vault files were transferred byte-identically; the immutable release executables were not rebuilt or modified.
+- **`ProviderNotWritable`:** B5c did **not** repeat a dedicated real-device read-only-grant test. That SAF path was proven during B5b device QA, and the B5c coordinator tests show the new TOTP wrappers inherit it. No QA-only revoke/fault harness was reintroduced into production code to repeat it.
+
+**Still open (not fixed by B5c, do not describe as fixed):**
+- `finishEntrySave` / `finishEntryDelete` can skip the cache refresh after a successful save that completes after the user navigated away (the new TOTP finisher uses the safer `finishCategoryMutation` pattern instead).
+- After `WriteFailed`, Rust can leave the staged candidate pending until lock/reconciliation.
+
+**What remains in 1T (do not mark 1T complete):** `applicationId`/package cleanup (§20), site/profile grouping decision (§18), large-vault list optimization, the Android release `panic = "abort"` blocker (§12/§20), and the final Android security/UX/regression pass. No further named 1T-B stage exists in the roadmap; the next task is chosen from this list and confirmed with the user. Sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
