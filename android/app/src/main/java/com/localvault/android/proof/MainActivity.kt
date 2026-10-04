@@ -161,6 +161,52 @@ internal fun shouldRedrawAfterStaleTotpMutation(
     mutatedEntryId: String,
 ): Boolean = currentScreen == TotpRedrawScreen.DETAIL && currentDetailEntryId == mutatedEntryId
 
+/**
+ * Issue 1 (B5 correctness follow-up): whether a finished entry/delete
+ * mutation must refresh the session-derived caches (entries, categories,
+ * and -- if it is showing the mutated entry -- detail). True only for a
+ * persisted `Success` whose [coordinatorLive] flag says the mutating
+ * coordinator is still the current `saveCoordinator`. Deliberately independent
+ * of the UI generation: a mutation that outlived a navigation has still
+ * changed Rust/disk state, so the live session's cache must follow it. A
+ * completion from a coordinator that was since locked/replaced must not
+ * refresh anything.
+ */
+internal fun entryMutationRefreshesCache(outcome: SaveOutcome, coordinatorLive: Boolean): Boolean =
+    outcome == SaveOutcome.Success && coordinatorLive
+
+/**
+ * Whether a `ChangedExternally` completion must lock the session. The
+ * mutation's coordinator being still the current `saveCoordinator` means it
+ * owns the live session, so that session no longer represents disk truth and
+ * must be closed (fail closed). A replaced/dead coordinator belongs to a
+ * session that was already locked, so locking again would wrongly close an
+ * unrelated newer session. UI generation is intentionally NOT an input:
+ * navigating away makes it stale but must never keep a live session open.
+ */
+internal fun changedExternallyLocksSession(activityAlive: Boolean, coordinatorLive: Boolean): Boolean =
+    activityAlive && coordinatorLive
+
+/**
+ * Whether a *stale-generation* entry create/update/delete that already
+ * refreshed the cache may redraw the user's current screen. Reuses
+ * [TotpRedrawScreen]'s screen set. LIST and CATEGORY_MANAGE depend only on
+ * the refreshed cache; DETAIL is redrawn only for the very entry that was
+ * mutated (a create has no known entry id, so [mutatedEntryId] is null and
+ * DETAIL is never redrawn for it). ENTRY_EDIT and TOTP_SETUP are never
+ * redrawn: `render()` there would destroy the user's in-progress input.
+ */
+internal fun shouldRedrawAfterStaleEntryMutation(
+    currentScreen: TotpRedrawScreen,
+    currentDetailEntryId: String?,
+    mutatedEntryId: String?,
+): Boolean =
+    when (currentScreen) {
+        TotpRedrawScreen.LIST, TotpRedrawScreen.CATEGORY_MANAGE -> true
+        TotpRedrawScreen.DETAIL -> mutatedEntryId != null && currentDetailEntryId == mutatedEntryId
+        TotpRedrawScreen.ENTRY_EDIT, TotpRedrawScreen.TOTP_SETUP, TotpRedrawScreen.OTHER -> false
+    }
+
 class MainActivity : Activity() {
 
     private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS, ENTRY_EDIT, CATEGORY_MANAGE, TOTP_SETUP, RECOVERY_NEEDED }
@@ -1602,7 +1648,7 @@ class MainActivity : Activity() {
                     SaveOutcome.UnexpectedError(error)
                 }
 
-            runOnUiThread { finishEntrySave(generation, token, entryId, outcome) }
+            runOnUiThread { finishEntrySave(generation, token, coordinator, entryId, outcome) }
         }.start()
     }
 
@@ -1636,9 +1682,53 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Back on the main thread. Handles create/update outcomes identically per section E. */
-    private fun finishEntrySave(generation: Int, token: Long, entryId: String?, outcome: SaveOutcome) {
+    /**
+     * Shared stale-completion handling for entry create/update/delete (Issue
+     * 1). Called when the UI generation went stale or the Activity is no
+     * longer alive. Separates three concerns: (1) the session-derived cache
+     * refresh, which follows the persisted mutation whenever [coordinatorLive]
+     * says it belongs to the current session; (2) the redraw, decided BEFORE
+     * the refresh because refreshing may replace/drop [detail]; and (3)
+     * suppression of everything else -- no toast, no status, no screen
+     * change, no edit/TOTP state touched. [mutatedEntryId] is null for a
+     * create.
+     */
+    private fun finishStaleEntryMutation(
+        outcome: SaveOutcome,
+        coordinatorLive: Boolean,
+        activityAlive: Boolean,
+        mutatedEntryId: String?,
+    ) {
+        if (!entryMutationRefreshesCache(outcome, coordinatorLive)) return
+
+        val redrawAllowed =
+            activityAlive &&
+                shouldRedrawAfterStaleEntryMutation(currentTotpRedrawScreen(), detail?.id, mutatedEntryId)
+
+        refreshEntriesAndCategories()
+        if (mutatedEntryId != null && !refreshDetailIfCurrent(mutatedEntryId)) return
+
+        if (redrawAllowed) render()
+    }
+
+    /**
+     * Back on the main thread. Handles create/update outcomes identically per section E.
+     * [coordinator] is the exact [VaultSaveCoordinator] that performed this
+     * attempt (captured in submitEntryEdit), never re-read from the current
+     * [saveCoordinator] field, so a completion can tell whether it still
+     * belongs to the live session.
+     */
+    private fun finishEntrySave(
+        generation: Int,
+        token: Long,
+        coordinator: VaultSaveCoordinator,
+        entryId: String?,
+        outcome: SaveOutcome,
+    ) {
         endMutationIfOwned(token)
+
+        val activityAlive = !isFinishing && !isDestroyed
+        val coordinatorLive = coordinator === saveCoordinator
 
         // Blocker 2: ChangedExternally means the live session no longer
         // represents disk truth -- a security-relevant fact independent of
@@ -1647,20 +1737,25 @@ class MainActivity : Activity() {
         // generation-staleness gate below (which governs UI-only outcomes).
         // Never adopt the externally changed bytes into the old session,
         // never auto-retry -- force the user back through FILE_SELECTED to
-        // re-unlock.
+        // re-unlock. Only the coordinator that still owns the live session
+        // may lock it: an old attempt whose session was already locked must
+        // not close a newer, unrelated session.
         if (outcome == SaveOutcome.ChangedExternally) {
-            if (!isFinishing && !isDestroyed) {
+            if (changedExternallyLocksSession(activityAlive, coordinatorLive)) {
                 lockVault(R.string.msg_vault_changed_externally)
             }
             return
         }
 
-        if (generation != entryMutationGeneration || isFinishing || isDestroyed) {
+        if (generation != entryMutationGeneration || !activityAlive) {
             // ENTRY_EDIT was already left (Back/Lock/onStop/onDestroy) before
             // this resolved. The mutation itself cannot be undone from here,
-            // but this Activity's view of the vault has already moved on (or
-            // the vault was locked) -- never resurrect ENTRY_EDIT/DETAIL/LIST
-            // for a stale result.
+            // and this Activity's UI has already moved on -- never resurrect
+            // ENTRY_EDIT/DETAIL/LIST for a stale result. A persisted success
+            // against the still-live session must nevertheless refresh the
+            // session-derived cache so LIST/DETAIL/a later Edit never show
+            // pre-save values.
+            finishStaleEntryMutation(outcome, coordinatorLive, activityAlive, entryId)
             return
         }
 
@@ -1748,23 +1843,39 @@ class MainActivity : Activity() {
                     SaveOutcome.UnexpectedError(error)
                 }
 
-            runOnUiThread { finishEntryDelete(generation, token, outcome) }
+            runOnUiThread { finishEntryDelete(generation, token, coordinator, entryId, outcome) }
         }.start()
     }
 
-    private fun finishEntryDelete(generation: Int, token: Long, outcome: SaveOutcome) {
+    private fun finishEntryDelete(
+        generation: Int,
+        token: Long,
+        coordinator: VaultSaveCoordinator,
+        entryId: String,
+        outcome: SaveOutcome,
+    ) {
         endMutationIfOwned(token)
 
+        val activityAlive = !isFinishing && !isDestroyed
+        val coordinatorLive = coordinator === saveCoordinator
+
         // See finishEntrySave's identical handling for why this precedes,
-        // and is independent of, the generation-staleness gate below.
+        // is independent of the generation-staleness gate below, and is
+        // gated on coordinator ownership.
         if (outcome == SaveOutcome.ChangedExternally) {
-            if (!isFinishing && !isDestroyed) {
+            if (changedExternallyLocksSession(activityAlive, coordinatorLive)) {
                 lockVault(R.string.msg_vault_changed_externally)
             }
             return
         }
 
-        if (generation != entryMutationGeneration || isFinishing || isDestroyed) return
+        if (generation != entryMutationGeneration || !activityAlive) {
+            // See finishEntrySave: a persisted delete against the live
+            // session still refreshes the cache (detail becomes null if it
+            // was the deleted entry) without touching unrelated UI state.
+            finishStaleEntryMutation(outcome, coordinatorLive, activityAlive, entryId)
+            return
+        }
 
         when (outcome) {
             SaveOutcome.Success -> {
@@ -1948,19 +2059,22 @@ class MainActivity : Activity() {
     ) {
         endMutationIfOwned(token)
 
+        val activityAlive = !isFinishing && !isDestroyed
+        val coordinatorLive = coordinator === saveCoordinator
+
         // See finishEntrySave's identical handling for why ChangedExternally
-        // precedes, and is independent of, everything below.
+        // precedes, and is independent of, everything below -- including
+        // its coordinator-ownership gate.
         if (outcome == SaveOutcome.ChangedExternally) {
-            if (!isFinishing && !isDestroyed) {
+            if (changedExternallyLocksSession(activityAlive, coordinatorLive)) {
                 lockVault(R.string.msg_vault_changed_externally)
             }
             return
         }
 
-        val activityAlive = !isFinishing && !isDestroyed
         val generationStale = generation != categoryMutationGeneration
 
-        if (outcome == SaveOutcome.Success && coordinator === saveCoordinator) {
+        if (outcome == SaveOutcome.Success && coordinatorLive) {
             // The mutation succeeded against the session that is still the
             // live one -- refresh the cached data unconditionally, even if
             // CATEGORY_MANAGE's own UI generation is already stale, so a
@@ -2196,9 +2310,9 @@ class MainActivity : Activity() {
         }
 
     /**
-     * Back on the main thread. Uses the finishCategoryMutation pattern (not
-     * finishEntrySave's): a Success against the still-live [coordinator]
-     * always refreshes the session-derived caches/detail, even if this
+     * Back on the main thread. Uses the finishCategoryMutation pattern (which
+     * finishEntrySave/finishEntryDelete now share): a Success against the
+     * still-live [coordinator] always refreshes the session-derived caches/detail, even if this
      * attempt's UI generation went stale, so the committed change is never
      * invisible. A stale or dead-Activity completion never toasts, never
      * returns to TOTP_SETUP and never resurrects any secret UI or session;
