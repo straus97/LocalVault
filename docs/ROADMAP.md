@@ -63,13 +63,19 @@ Completed so far, in order:
 - **1T-B5b-1 … B5b-6** (`5c20513`, `3ebbed5`, `60e26c4`, `18a0034`, `32a0754`, `0224fee`): bridge category CRUD and entry create/delete, generalized save coordinator, Android vault creation, entry CRUD UI, category CRUD UI, save-recovery hardening.
 - **1T-B5c** (COMPLETE — `9f8f6411f2dd0303458bb541c8a0a401c5f813ce` B5c-1, `4d75bb81042dfcf339073240472b2129265f23e1` B5c-2): Android TOTP set/replace/remove. B5c-1 added the Rust/UniFFI TOTP mutation API and thin Kotlin coordinator wrappers on the existing SAF save pipeline; B5c-2 added a dedicated TOTP setup screen, remove confirmation, and passed real-device acceptance (including desktop ⇄ Android TOTP vault compatibility in both directions). `localvault-core` stays the sole owner of TOTP parsing/validation/generation; Kotlin does not parse or normalize TOTP input. QR setup/scanning is **not** part of B5c and remains in 1W; create-with-TOTP was deliberately not added.
 
-The 1T-B5 write/CRUD series is complete. Still outstanding before 1T can close — **do not treat 1T as complete**:
-- `applicationId`/package identity cleanup;
+The 1T-B5 write/CRUD series is complete, and its two correctness follow-ups (not a new named stage) are also complete:
+- `cfe9e6f24be55e3ebc6889f209f7141db22938b4`: the save coordinator discards the Rust staged candidate after a failed/unverified primary write, so a retry is no longer rejected as `PendingUnsavedChanges`.
+- `d1a85e44a0e45fddc7973ed88cb36ae034dea050`: a successful entry save/delete that completes after navigation still refreshes the session-derived caches when its coordinator owns the live session; `ChangedExternally` locks only for the owning live coordinator.
+
+Still outstanding before 1T can close — **do not treat 1T as complete**:
+- `applicationId`/package identity cleanup (`com.localvault.android.proof`);
 - desktop-vs-Android site/profile grouping decision;
-- large-vault list performance;
+- large-vault list performance measurement/optimization;
 - the Android-release `panic = "abort"` blocker (see `@docs/SECURITY_MODEL.md`);
-- a final Android security/UX/regression pass;
-- known B5 follow-ups, not fixed by B5c: `finishEntrySave`/`finishEntryDelete` stale-cache behavior after navigation, and Rust leaving a staged candidate pending after `WriteFailed` until lock/reconciliation.
+- known visual polish, including the DETAIL top-action overflow/cutoff;
+- a final Android security/UX/regression pass.
+
+A later dedicated desktop + Android design/UX pass is still planned; the current UI is not considered final.
 
 No further named 1T-B stage is defined; the next task is chosen from this list. Do not mix sync work into 1T.
 
