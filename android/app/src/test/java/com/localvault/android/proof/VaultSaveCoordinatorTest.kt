@@ -2,11 +2,13 @@ package com.localvault.android.proof
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.localvault_android_bridge.BridgeException
 import uniffi.localvault_android_bridge.CategoryInput
 import uniffi.localvault_android_bridge.EntryInput
+import uniffi.localvault_android_bridge.InternalException
 import java.io.IOException
 
 /**
@@ -868,6 +870,194 @@ class VaultSaveCoordinatorTest {
             assertEquals("$name discard count", 1, session.discardCount)
             assertEquals("$name commit count", 0, session.commitCount)
             assertEquals("$name write count", 0, io.writes.size)
+        }
+    }
+
+    // -- Issue 2 (B5 correctness follow-up): the Rust staged candidate must
+    // not stay pending after SaveOutcome.WriteFailed. Recovery state (marker,
+    // snapshot, baseline) is deliberately left untouched. ------------------
+
+    /** Each of the three existing WriteFailed paths, as a way to configure
+     * the fakes so the save ends in [SaveOutcome.WriteFailed]. */
+    private val writeFailureModes: List<Pair<String, (FakeSafDocumentIo) -> Unit>> = listOf(
+        "primary write throws" to { io: FakeSafDocumentIo ->
+            io.writeException = IOException("provider write failed")
+        },
+        "readback read throws" to { io: FakeSafDocumentIo ->
+            // Reads: #1 stale check 1, #2 stale check 2, #3 readback.
+            io.onBeforeRead = { if (io.readCount >= 3) throw IOException("readback failed") }
+        },
+        "readback bytes mismatch" to { io: FakeSafDocumentIo ->
+            io.writeTransform = { written -> written + "-corrupted-by-provider".toByteArray() }
+        },
+    )
+
+    @Test
+    fun write_failed_paths_discard_the_stage_once_and_leave_recovery_state_untouched() {
+        for ((name, configure) in writeFailureModes) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            configure(io)
+            val recovery = FakeRecoverySnapshotStore()
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+            val outcome = coordinator(io, recovery, session)
+                .saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+
+            assertEquals("$name outcome", SaveOutcome.WriteFailed, outcome)
+            assertEquals("$name discard count", 1, session.discardCount)
+            assertEquals("$name commit count", 0, session.commitCount)
+            assertTrue("$name marker kept", recovery.hasUnresolvedMarker(vaultUri))
+            assertEquals("$name marker baseline", Sha256.hex(originalBytes), recovery.readMarker(vaultUri)!!.baselineSha256)
+            assertEquals("$name marker expected", Sha256.hex(stagedBytes), recovery.readMarker(vaultUri)!!.expectedNewSha256)
+            assertTrue("$name snapshot is the pre-write primary", recovery.readSnapshotBytes(vaultUri)!!.contentEquals(originalBytes))
+            assertEquals("$name snapshot written once", 1, recovery.writeAndVerifyCallCount)
+        }
+    }
+
+    @Test
+    fun retry_after_write_failed_with_untouched_primary_succeeds_when_only_one_pending_stage_is_allowed() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        io.writeException = IOException("provider write failed")
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+        session.enforceSinglePendingStage = true
+        val save = coordinator(io, recovery, session)
+
+        assertEquals(SaveOutcome.WriteFailed, save.saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L))
+        assertTrue(!session.hasPendingStage)
+
+        // The failed write never touched the primary; the provider recovers.
+        io.writeException = null
+        val retry = save.saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 2_000L)
+
+        assertEquals(SaveOutcome.Success, retry)
+        assertEquals(1, session.commitCount)
+        assertNull(recovery.readMarker(vaultUri))
+        assertTrue(io.contentOf(vaultUri)!!.contentEquals(stagedBytes))
+    }
+
+    @Test
+    fun retry_after_a_failed_write_that_changed_the_primary_is_changed_externally_and_keeps_recovery_state() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        io.writeTransform = { written -> written + "-corrupted-by-provider".toByteArray() }
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+        session.enforceSinglePendingStage = true
+        val save = coordinator(io, recovery, session)
+
+        assertEquals(SaveOutcome.WriteFailed, save.saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L))
+        val markerAfterFailure = recovery.readMarker(vaultUri)!!
+
+        val retry = save.saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 2_000L)
+
+        assertEquals(SaveOutcome.ChangedExternally, retry)
+        // Stopped at stale check #1: nothing staged, written or committed,
+        // and the recovery marker/snapshot from the failed attempt remain.
+        assertEquals(1, session.stageCount)
+        assertEquals(0, session.commitCount)
+        assertEquals(1, io.writes.size)
+        assertEquals(1, recovery.writeAndVerifyCallCount)
+        assertEquals(markerAfterFailure, recovery.readMarker(vaultUri))
+        assertTrue(recovery.readSnapshotBytes(vaultUri)!!.contentEquals(originalBytes))
+    }
+
+    @Test
+    fun write_succeeded_but_readback_threw_still_reconciles_as_saved_on_next_unlock() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        io.onBeforeRead = { if (io.readCount >= 3) throw IOException("readback failed") }
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+        val outcome = coordinator(io, recovery, session)
+            .saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+        assertEquals(SaveOutcome.WriteFailed, outcome)
+        assertEquals(1, session.discardCount)
+
+        io.onBeforeRead = null
+        val gate = runUnlockPreOpenGate(
+            readMarker = { recovery.readMarker(vaultUri) },
+            readCurrentBytes = { io.readAll(vaultUri) },
+            clearMarker = { recovery.clearMarker(vaultUri) },
+            openPrimary = { bytes -> bytes },
+        )
+
+        val opened = gate as UnlockGateResult.Opened<ByteArray>
+        assertEquals(ReconciliationOutcome.SAVED, opened.reconciliationOutcome)
+        assertTrue(opened.envelopeBytes.contentEquals(stagedBytes))
+        assertNull(recovery.readMarker(vaultUri))
+    }
+
+    @Test
+    fun partial_or_corrupt_write_still_reconciles_as_recovery_needed_on_next_unlock() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val corrupted = { written: ByteArray -> written.copyOf(written.size / 2) }
+        io.writeTransform = corrupted
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+
+        val outcome = coordinator(io, recovery, session)
+            .saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+        assertEquals(SaveOutcome.WriteFailed, outcome)
+        assertEquals(1, session.discardCount)
+
+        val gate = runUnlockPreOpenGate(
+            readMarker = { recovery.readMarker(vaultUri) },
+            readCurrentBytes = { io.readAll(vaultUri) },
+            clearMarker = { recovery.clearMarker(vaultUri) },
+            openPrimary = { bytes -> bytes },
+        )
+
+        assertTrue(gate is UnlockGateResult.RecoveryNeeded<*>)
+        assertEquals(
+            Sha256.hex(corrupted(stagedBytes)),
+            (gate as UnlockGateResult.RecoveryNeeded<*>).unresolvedPrimarySha256,
+        )
+        assertTrue(recovery.hasUnresolvedMarker(vaultUri))
+        assertTrue(recovery.readSnapshotBytes(vaultUri)!!.contentEquals(originalBytes))
+    }
+
+    @Test
+    fun already_closed_session_during_discard_still_returns_write_failed_and_keeps_recovery_state() {
+        for ((name, configure) in writeFailureModes) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            configure(io)
+            val recovery = FakeRecoverySnapshotStore()
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+            session.discardException = IllegalStateException("VaultSession object has already been destroyed")
+
+            val outcome = coordinator(io, recovery, session)
+                .saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+
+            assertEquals("$name outcome", SaveOutcome.WriteFailed, outcome)
+            assertEquals("$name discard attempted once", 1, session.discardCount)
+            assertEquals("$name commit count", 0, session.commitCount)
+            assertTrue("$name marker kept", recovery.hasUnresolvedMarker(vaultUri))
+        }
+    }
+
+    @Test
+    fun unrelated_internal_exception_from_discard_is_not_swallowed() {
+        for ((name, configure) in writeFailureModes) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            configure(io)
+            val recovery = FakeRecoverySnapshotStore()
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+            val failure = InternalException("unexpected bridge failure")
+            session.discardException = failure
+
+            val thrown =
+                try {
+                    coordinator(io, recovery, session)
+                        .saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+                    null
+                } catch (error: InternalException) {
+                    error
+                }
+
+            assertSame("$name must propagate the discard failure", failure, thrown)
+            assertEquals("$name commit count", 0, session.commitCount)
+            // Recovery state is still intact for next-unlock reconciliation.
+            assertTrue("$name marker kept", recovery.hasUnresolvedMarker(vaultUri))
         }
     }
 }

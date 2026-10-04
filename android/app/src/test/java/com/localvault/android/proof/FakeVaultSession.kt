@@ -30,6 +30,20 @@ class FakeVaultSession(
     var discardCount = 0
         private set
 
+    /** When true, mirrors the real bridge's single-pending-stage rule: a
+     * `stage*` call while one is outstanding throws
+     * [BridgeException.PendingUnsavedChanges]. Off by default so existing
+     * tests are unaffected. */
+    var enforceSinglePendingStage: Boolean = false
+
+    /** Whether a staged candidate is currently outstanding. Only tracked
+     * when [enforceSinglePendingStage] is true. */
+    var hasPendingStage = false
+        private set
+
+    /** When set, [discardStagedSave] throws this (after counting the call). */
+    var discardException: Exception? = null
+
     /** Which `stage*` method(s) were actually invoked, in call order --
      * used to prove a [VaultSaveCoordinator] wrapper reaches exactly the
      * one bridge call it names, not some other mutation. */
@@ -50,17 +64,24 @@ class FakeVaultSession(
     private fun stage(methodName: String): ByteArray {
         stageCount++
         stagedMethodCalls += methodName
+        if (enforceSinglePendingStage && hasPendingStage) {
+            throw BridgeException.PendingUnsavedChanges()
+        }
         stageException?.let { throw it }
         onStage?.invoke()
+        if (enforceSinglePendingStage) hasPendingStage = true
         return stagedBytes
     }
 
     override fun commitStagedSave() {
         commitCount++
+        hasPendingStage = false
     }
 
     override fun discardStagedSave() {
         discardCount++
+        discardException?.let { throw it }
+        hasPendingStage = false
     }
 
     override fun entryDetails(entryId: String): EntryDetails = throw UnsupportedOperationException()

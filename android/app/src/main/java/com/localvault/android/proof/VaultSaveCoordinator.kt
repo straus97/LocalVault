@@ -326,6 +326,7 @@ class VaultSaveCoordinator(
         try {
             io.writeTruncated(vaultUri, stagedBytes)
         } catch (error: Exception) {
+            discardStagedAfterFailedWrite()
             return SaveOutcome.WriteFailed
         }
 
@@ -336,9 +337,11 @@ class VaultSaveCoordinator(
             try {
                 io.readAll(vaultUri)
             } catch (error: Exception) {
+                discardStagedAfterFailedWrite()
                 return SaveOutcome.WriteFailed
             }
         if (!readback.contentEquals(stagedBytes)) {
+            discardStagedAfterFailedWrite()
             return SaveOutcome.WriteFailed
         }
 
@@ -348,5 +351,26 @@ class VaultSaveCoordinator(
         baselineSha256 = expectedNewSha256
 
         return SaveOutcome.Success
+    }
+
+    /**
+     * Drops the Rust staged candidate after an unverified primary write so a
+     * later retry is not rejected as `PendingUnsavedChanges`. Touches no
+     * recovery state: the marker and snapshot stay for next-unlock
+     * reconciliation, and the baseline is not advanced. The live session
+     * keeps its verified in-memory state; a retry is guarded by stale check
+     * #1 (a primary changed by the failed write yields `ChangedExternally`).
+     *
+     * Only [IllegalStateException] is swallowed: the generated UniFFI handle
+     * throws it when a concurrent `lockVault()`/`onDestroy` already closed
+     * the session, which also dropped the staged state. Anything else
+     * (e.g. a bridge `InternalException`) must propagate.
+     */
+    private fun discardStagedAfterFailedWrite() {
+        try {
+            session.discardStagedSave()
+        } catch (closed: IllegalStateException) {
+            // Concurrent close already dropped the session and staged state.
+        }
     }
 }

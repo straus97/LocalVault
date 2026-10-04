@@ -1909,6 +1909,31 @@ mod tests {
     }
 
     #[test]
+    fn discard_is_a_safe_noop_and_commit_is_session_locked_after_lock_with_a_pending_stage() {
+        let session = open_ok(schema2());
+        let id = id_of(&session, "Fixture Login");
+
+        session
+            .stage_update_entry(id, update_input("Pending At Lock"), UPDATE_NOW_MS)
+            .unwrap();
+
+        // A concurrent lock (onStop/lockVault) drops the session, including
+        // the pending stage, while Kotlin's write is still in flight.
+        session.lock();
+
+        // Never panics and does nothing: there is no session left to clear.
+        session.discard_staged_save();
+        session.discard_staged_save();
+
+        // The staged candidate was dropped with the session; it can never be
+        // committed afterwards.
+        assert_eq!(
+            session.commit_staged_save().err(),
+            Some(BridgeError::SessionLocked)
+        );
+    }
+
+    #[test]
     fn stage_update_entry_rejects_unknown_entry() {
         let session = open_ok(schema2());
 
