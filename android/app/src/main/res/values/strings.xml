@@ -72,6 +72,23 @@
     <string name="totp_copy">Copy code</string>
     <string name="totp_refresh_in">Refreshes in %1$d s</string>
     <string name="msg_totp_failed">Unable to generate the 2FA code.</string>
+    <string name="totp_section_title">Two-factor authentication (2FA)</string>
+    <string name="totp_not_configured">2FA is not set up for this entry. Add an authenticator key to show one-time codes here.</string>
+    <string name="totp_setup_action">Set up 2FA</string>
+    <string name="totp_replace">Replace</string>
+    <string name="totp_remove">Remove</string>
+    <string name="totp_setup_title">Set up 2FA</string>
+    <string name="totp_replace_title">Replace 2FA key</string>
+    <string name="totp_setup_help">Enter the authenticator key (Base32) or the otpauth:// link provided by the website. QR scanning is not available yet.</string>
+    <string name="totp_replace_warning">The current key will be replaced. LocalVault cannot show the current key.</string>
+    <string name="totp_key_label">Authenticator key or otpauth:// link</string>
+    <string name="totp_key_hint">Key or otpauth:// link</string>
+    <string name="totp_show_key">Show key</string>
+    <string name="confirm_remove_totp_title">Remove 2FA?</string>
+    <string name="confirm_remove_totp_message">LocalVault will stop generating codes for this entry. The current key cannot be shown again, so make sure you still have another way to access this account (for example a backup code or another authenticator) before continuing.</string>
+    <string name="msg_totp_invalid_key">This 2FA key isn\'t valid. Enter a Base32 key or an otpauth:// link.</string>
+    <string name="msg_totp_saved">2FA saved.</string>
+    <string name="msg_totp_removed">2FA removed.</string>
 
     <string name="msg_auth">Unable to unlock vault. Check the master password and file.</string>
     <string name="msg_format">This file is not a supported LocalVault vault.</string>

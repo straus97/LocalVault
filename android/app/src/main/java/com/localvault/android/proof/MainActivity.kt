@@ -100,9 +100,70 @@ internal enum class CategoryMutationRedrawTarget { LIST, CATEGORY_MANAGE, OTHER 
 internal fun shouldRedrawAfterStaleCategoryMutation(target: CategoryMutationRedrawTarget): Boolean =
     target == CategoryMutationRedrawTarget.LIST || target == CategoryMutationRedrawTarget.CATEGORY_MANAGE
 
+/** 1T-B5c-2: which kind of TOTP mutation a completion belongs to. */
+internal enum class TotpMutationKind { SET, REMOVE }
+
+/**
+ * What `finishTotpMutation` must do for one [SaveOutcome], reduced to a
+ * plain value so the mapping is JVM-testable without an Activity or any
+ * `R.string` id. Never carries (or derives anything from) the user's setup
+ * input -- [SaveOutcome] itself never contains it.
+ */
+internal enum class TotpOutcomeAction {
+    SUCCESS,
+    LOCK_CHANGED_EXTERNALLY,
+    LOCK_SESSION_LOCKED,
+    SHOW_INVALID_KEY,
+    SHOW_WRITE_ACCESS_UNAVAILABLE,
+    SHOW_GENERIC_FAILURE,
+}
+
+/**
+ * Only a rejected *setup* input maps to [TotpOutcomeAction.SHOW_INVALID_KEY];
+ * every other bridge rejection (including `PendingUnsavedChanges` and, for a
+ * remove, `TotpNotConfigured`/`InvalidTotpConfiguration`) is deliberately the
+ * generic failure, so the invalid-key wording is never shown for a failure
+ * that is not actually about the key the user typed.
+ */
+internal fun totpOutcomeAction(kind: TotpMutationKind, outcome: SaveOutcome): TotpOutcomeAction =
+    when (outcome) {
+        SaveOutcome.Success -> TotpOutcomeAction.SUCCESS
+        SaveOutcome.ChangedExternally -> TotpOutcomeAction.LOCK_CHANGED_EXTERNALLY
+        SaveOutcome.ProviderNotWritable -> TotpOutcomeAction.SHOW_WRITE_ACCESS_UNAVAILABLE
+        is SaveOutcome.ValidationFailed ->
+            when (outcome.error) {
+                is BridgeException.SessionLocked -> TotpOutcomeAction.LOCK_SESSION_LOCKED
+                is BridgeException.InvalidTotpConfiguration ->
+                    if (kind == TotpMutationKind.SET) {
+                        TotpOutcomeAction.SHOW_INVALID_KEY
+                    } else {
+                        TotpOutcomeAction.SHOW_GENERIC_FAILURE
+                    }
+                else -> TotpOutcomeAction.SHOW_GENERIC_FAILURE
+            }
+        SaveOutcome.RecoverySnapshotFailed, SaveOutcome.WriteFailed, is SaveOutcome.UnexpectedError ->
+            TotpOutcomeAction.SHOW_GENERIC_FAILURE
+    }
+
+/** The screens `finishTotpMutation`'s stale-completion redraw policy distinguishes. */
+internal enum class TotpRedrawScreen { LIST, DETAIL, ENTRY_EDIT, TOTP_SETUP, CATEGORY_MANAGE, OTHER }
+
+/**
+ * Whether a *stale-generation* TOTP mutation that nonetheless succeeded (and
+ * already refreshed the session-derived entry/detail cache) may redraw. Only
+ * a DETAIL screen currently showing the very entry that was mutated is ever
+ * redrawn -- never TOTP_SETUP (it must not be resurrected or touched), never
+ * ENTRY_EDIT, and never a DETAIL for a different entry.
+ */
+internal fun shouldRedrawAfterStaleTotpMutation(
+    currentScreen: TotpRedrawScreen,
+    currentDetailEntryId: String?,
+    mutatedEntryId: String,
+): Boolean = currentScreen == TotpRedrawScreen.DETAIL && currentDetailEntryId == mutatedEntryId
+
 class MainActivity : Activity() {
 
-    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS, ENTRY_EDIT, CATEGORY_MANAGE, RECOVERY_NEEDED }
+    private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS, ENTRY_EDIT, CATEGORY_MANAGE, TOTP_SETUP, RECOVERY_NEEDED }
 
     private class VaultReadException : Exception()
 
@@ -351,6 +412,19 @@ class MainActivity : Activity() {
     private var totpExpiresAtMs = 0L
     private var totpPeriodSeconds = 30
 
+    // 1T-B5c-2 TOTP_SETUP state. Deliberately only: which entry is being
+    // edited, whether it is a replace, and the live EditText while rendered.
+    // The raw setup input (a secret) lives ONLY inside that EditText until
+    // submit -- it is never held in a String field, snapshot, Bundle, status
+    // or log (see submitTotpSetup). Wiped/nulled by clearTotpSetupState().
+    private var totpSetupEntryId: String? = null
+    private var totpSetupReplacing: Boolean = false
+    private var totpSetupField: EditText? = null
+
+    // The Remove-2FA confirmation dialog, kept only so it can be dismissed
+    // on lock/onStop/onDestroy. Carries no secret.
+    private var removeTotpDialog: AlertDialog? = null
+
     // Bumped on every lock/stop/destroy so a late background result for an
     // abandoned unlock is discarded (and its session closed) instead of shown.
     private var unlockGeneration = 0
@@ -446,6 +520,10 @@ class MainActivity : Activity() {
                 editPasswordField?.let { wipe(it) }
                 lockVault()
             }
+            Screen.TOTP_SETUP -> {
+                totpSetupField?.let { wipe(it) }
+                lockVault()
+            }
             Screen.CREATE_IN_PROGRESS -> abandonCreateInProgress()
             else -> {
                 // CREATE_PASSWORD included: no Rust secret state exists yet
@@ -466,6 +544,8 @@ class MainActivity : Activity() {
         entryMutationGeneration++
         categoryMutationGeneration++
         clearEntryEditState()
+        clearTotpSetupState()
+        dismissRemoveTotpDialog()
         val current = session
         session = null
         saveCoordinator = null
@@ -543,6 +623,7 @@ class MainActivity : Activity() {
             Screen.CREATE_PASSWORD -> cancelCreatePassword()
             Screen.ENTRY_EDIT -> cancelEntryEdit()
             Screen.CATEGORY_MANAGE -> closeCategoryManage()
+            Screen.TOTP_SETUP -> cancelTotpSetup()
             Screen.FILE_SELECTED -> {
                 vaultUri = null
                 vaultName = ""
@@ -1269,6 +1350,8 @@ class MainActivity : Activity() {
         entryMutationGeneration++
         categoryMutationGeneration++
         clearEntryEditState()
+        clearTotpSetupState()
+        dismissRemoveTotpDialog()
 
         val current = session
         session = null
@@ -1940,6 +2023,261 @@ class MainActivity : Activity() {
         render()
     }
 
+    // ---------------------------------------------------------------- TOTP setup / replace / remove
+    //
+    // 1T-B5c-2. TOTP mutations are entry mutations: they share
+    // [beginMutation]/[endMutationIfOwned] and [entryMutationGeneration] with
+    // entry create/update/delete -- no third mutation system. All parsing,
+    // normalization and validation of the setup input happens in
+    // localvault-core via the bridge; nothing in this Activity inspects it.
+
+    /** Wipes the live setup field (if any) and drops all TOTP_SETUP state. Safe to call repeatedly. */
+    private fun clearTotpSetupState() {
+        totpSetupField?.let { wipe(it) }
+        totpSetupField = null
+        totpSetupEntryId = null
+        totpSetupReplacing = false
+        // Deliberately does NOT touch activeMutationToken -- see that
+        // field's own doc comment.
+    }
+
+    private fun dismissRemoveTotpDialog() {
+        val dialog = removeTotpDialog
+        removeTotpDialog = null
+        try {
+            dialog?.dismiss()
+        } catch (ignored: Exception) {
+        }
+    }
+
+    private fun startTotpSetup() {
+        val current = detail ?: return
+        if (screen != Screen.DETAIL) return
+
+        // Invalidates any UI completion still in flight from this DETAIL
+        // (e.g. a Remove): it can no longer claim this screen transition.
+        entryMutationGeneration++
+        totpSetupEntryId = current.id
+        totpSetupReplacing = current.totpEnabled
+        statusRes = 0
+        screen = Screen.TOTP_SETUP
+        render()
+    }
+
+    private fun cancelTotpSetup() {
+        entryMutationGeneration++
+        clearTotpSetupState()
+        statusRes = 0
+        screen = if (detail != null) Screen.DETAIL else Screen.LIST
+        render()
+    }
+
+    private fun submitTotpSetup() {
+        val field = totpSetupField ?: return
+        val entryId = totpSetupEntryId ?: return
+        val uri = vaultUri ?: return
+        val coordinator = saveCoordinator ?: return
+        if (screen != Screen.TOTP_SETUP || session == null) return
+
+        val token = beginMutation() ?: return
+
+        // Captured exactly once and passed VERBATIM -- no trim, case change,
+        // regex, Base32/otpauth parsing or any other inspection. The
+        // immutable JVM String cannot be zeroized (no such claim is made); it
+        // is held only by the worker lambda below for the duration of the
+        // UniFFI call, and the visible field is wiped immediately.
+        val setupInput = field.text.toString()
+        wipe(field)
+
+        val generation = entryMutationGeneration
+        statusRes = 0
+
+        Thread {
+            val outcome =
+                try {
+                    coordinator.saveSetEntryTotp(uri.toString(), entryId, setupInput, System.currentTimeMillis())
+                } catch (error: Exception) {
+                    SaveOutcome.UnexpectedError(error)
+                }
+
+            runOnUiThread { finishTotpMutation(generation, token, coordinator, entryId, TotpMutationKind.SET, outcome) }
+        }.start()
+    }
+
+    private fun confirmRemoveTotp() {
+        val current = detail ?: return
+        if (screen != Screen.DETAIL || !current.totpEnabled) return
+        val coordinator = saveCoordinator ?: return
+        val entryId = current.id
+
+        dismissRemoveTotpDialog()
+
+        val dialog =
+            AlertDialog.Builder(this)
+                .setTitle(R.string.confirm_remove_totp_title)
+                .setMessage(R.string.confirm_remove_totp_message)
+                .setPositiveButton(R.string.totp_remove) { _, _ -> startRemoveTotp(entryId, coordinator) }
+                .setNegativeButton(android.R.string.cancel, null)
+                .create()
+        dialog.setOnDismissListener {
+            if (removeTotpDialog === dialog) removeTotpDialog = null
+        }
+        removeTotpDialog = dialog
+        dialog.show()
+    }
+
+    /**
+     * Re-checks the live state at confirmation time (the dialog may have been
+     * open while state moved on): same live session/coordinator, same DETAIL
+     * entry, and TOTP still enabled. No secret exists in this flow.
+     */
+    private fun startRemoveTotp(entryId: String, expectedCoordinator: VaultSaveCoordinator) {
+        val coordinator = saveCoordinator ?: return
+        if (coordinator !== expectedCoordinator || session == null) return
+
+        val current = detail
+        if (screen != Screen.DETAIL || current == null || current.id != entryId || !current.totpEnabled) return
+
+        val uri = vaultUri ?: return
+        val token = beginMutation() ?: return
+
+        val generation = entryMutationGeneration
+        statusRes = 0
+
+        Thread {
+            val outcome =
+                try {
+                    coordinator.saveRemoveEntryTotp(uri.toString(), entryId, System.currentTimeMillis())
+                } catch (error: Exception) {
+                    SaveOutcome.UnexpectedError(error)
+                }
+
+            runOnUiThread { finishTotpMutation(generation, token, coordinator, entryId, TotpMutationKind.REMOVE, outcome) }
+        }.start()
+    }
+
+    /**
+     * Re-reads [entryId]'s details from the live session iff [detail] is
+     * currently that entry, so a later DETAIL render reflects the committed
+     * TOTP state. On a failed read [detail] is dropped (renderDetail falls
+     * back to LIST). Returns false only if the session turned out to be
+     * locked, in which case the vault has already been locked here.
+     */
+    private fun refreshDetailIfCurrent(entryId: String): Boolean {
+        if (detail?.id != entryId) return true
+        val current = session ?: return true
+
+        try {
+            detail = current.entryDetails(entryId)
+        } catch (error: BridgeException.SessionLocked) {
+            lockVault()
+            return false
+        } catch (error: Throwable) {
+            detail = null
+        }
+        return true
+    }
+
+    private fun currentTotpRedrawScreen(): TotpRedrawScreen =
+        when (screen) {
+            Screen.LIST -> TotpRedrawScreen.LIST
+            Screen.DETAIL -> TotpRedrawScreen.DETAIL
+            Screen.ENTRY_EDIT -> TotpRedrawScreen.ENTRY_EDIT
+            Screen.TOTP_SETUP -> TotpRedrawScreen.TOTP_SETUP
+            Screen.CATEGORY_MANAGE -> TotpRedrawScreen.CATEGORY_MANAGE
+            else -> TotpRedrawScreen.OTHER
+        }
+
+    private fun totpFailureMessageRes(action: TotpOutcomeAction): Int =
+        when (action) {
+            TotpOutcomeAction.SHOW_INVALID_KEY -> R.string.msg_totp_invalid_key
+            TotpOutcomeAction.SHOW_WRITE_ACCESS_UNAVAILABLE -> R.string.msg_write_access_unavailable
+            else -> R.string.msg_action_failed
+        }
+
+    /**
+     * Back on the main thread. Uses the finishCategoryMutation pattern (not
+     * finishEntrySave's): a Success against the still-live [coordinator]
+     * always refreshes the session-derived caches/detail, even if this
+     * attempt's UI generation went stale, so the committed change is never
+     * invisible. A stale or dead-Activity completion never toasts, never
+     * returns to TOTP_SETUP and never resurrects any secret UI or session;
+     * it may only redraw a DETAIL for the same entry.
+     */
+    private fun finishTotpMutation(
+        generation: Int,
+        token: Long,
+        coordinator: VaultSaveCoordinator,
+        entryId: String,
+        kind: TotpMutationKind,
+        outcome: SaveOutcome,
+    ) {
+        endMutationIfOwned(token)
+
+        val activityAlive = !isFinishing && !isDestroyed
+        val coordinatorLive = coordinator === saveCoordinator
+        val action = totpOutcomeAction(kind, outcome)
+
+        // ChangedExternally (and a locked session) take precedence over
+        // everything else: the live session no longer represents disk truth
+        // / is not usable. Never adopt stale state; only lock if this
+        // coordinator is still the live one (otherwise it was already
+        // locked/replaced and there is nothing of this attempt left to close).
+        if (action == TotpOutcomeAction.LOCK_CHANGED_EXTERNALLY) {
+            if (activityAlive && coordinatorLive) lockVault(R.string.msg_vault_changed_externally)
+            return
+        }
+        if (action == TotpOutcomeAction.LOCK_SESSION_LOCKED) {
+            if (activityAlive && coordinatorLive) lockVault()
+            return
+        }
+
+        // Everything about "where is the user right now" is decided BEFORE
+        // the refresh below, which may replace/drop [detail].
+        val expectedScreen = if (kind == TotpMutationKind.SET) Screen.TOTP_SETUP else Screen.DETAIL
+        val expectedEntryId = if (kind == TotpMutationKind.SET) totpSetupEntryId else detail?.id
+        val uiCurrent =
+            activityAlive &&
+                generation == entryMutationGeneration &&
+                screen == expectedScreen &&
+                expectedEntryId == entryId
+        val redrawAllowed = shouldRedrawAfterStaleTotpMutation(currentTotpRedrawScreen(), detail?.id, entryId)
+
+        val succeeded = action == TotpOutcomeAction.SUCCESS
+        if (succeeded && coordinatorLive) {
+            refreshEntriesAndCategories()
+            if (!refreshDetailIfCurrent(entryId)) return
+        }
+
+        if (!uiCurrent) {
+            if (succeeded && coordinatorLive && activityAlive && redrawAllowed) render()
+            return
+        }
+
+        if (succeeded) {
+            clearTotpSetupState()
+            toast(if (kind == TotpMutationKind.SET) R.string.msg_totp_saved else R.string.msg_totp_removed)
+            statusRes = 0
+            // The existing totp_status/startTotp path in renderDetail shows
+            // (or no longer shows) the code from the committed live session.
+            screen = if (detail != null) Screen.DETAIL else Screen.LIST
+            render()
+            return
+        }
+
+        val messageRes = totpFailureMessageRes(action)
+        if (kind == TotpMutationKind.SET) {
+            // Stay on TOTP_SETUP; the field was already wiped at submit, so
+            // the key must be re-entered. Never echoes the input.
+            statusRes = messageRes
+            render()
+        } else {
+            // DETAIL has no status area; a toast keeps this non-secret
+            // message visible without touching the existing detail layout.
+            toast(messageRes)
+        }
+    }
+
     // ---------------------------------------------------------------- TOTP
 
     /**
@@ -2158,6 +2496,10 @@ class MainActivity : Activity() {
         editTagsField = null
         editFavoriteCheckbox = null
         editCategorySpinner = null
+        // The previous setup EditText (if any) is about to leave the window:
+        // best-effort wipe before dropping the reference, like clearTotpSetupState.
+        totpSetupField?.let { wipe(it) }
+        totpSetupField = null
 
         when (screen) {
             Screen.NO_FILE -> renderNoFile()
@@ -2169,6 +2511,7 @@ class MainActivity : Activity() {
             Screen.CREATE_IN_PROGRESS -> renderCreateInProgress()
             Screen.ENTRY_EDIT -> renderEntryEdit()
             Screen.CATEGORY_MANAGE -> renderCategoryManage()
+            Screen.TOTP_SETUP -> renderTotpSetup()
             Screen.RECOVERY_NEEDED -> renderRecoveryNeeded()
         }
     }
@@ -2561,6 +2904,89 @@ class MainActivity : Activity() {
     }
 
     /**
+     * 1T-B5c-2. Dedicated setup/replace screen for an entry's 2FA key. Kept
+     * off ENTRY_EDIT on purpose: the raw setup input is secret material and
+     * must live only in this one EditText ([totpSetupField]) under the
+     * render/onStop/lock/wipe lifecycle. The field is concealed by default,
+     * excluded from autofill/suggestions/IME learning, and has NO IME action
+     * -- submitting is only via the Save button. The accepted formats are
+     * described to the user but never inspected here.
+     */
+    private fun renderTotpSetup() {
+        val entryId = totpSetupEntryId
+        val current = detail
+        if (entryId == null || current == null || current.id != entryId) {
+            clearTotpSetupState()
+            screen = Screen.LIST
+            renderList()
+            return
+        }
+
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER_VERTICAL
+        bar.addView(newTextButton(getString(R.string.back)) { cancelTotpSetup() })
+        addToContent(bar, topMargin = 0)
+
+        addToContent(
+            newText(
+                getString(if (totpSetupReplacing) R.string.totp_replace_title else R.string.totp_setup_title),
+                size = 22f,
+                bold = true,
+            ),
+            topMargin = 12,
+        )
+        addToContent(newText(current.title, size = 14f, color = R.color.lv_text_secondary), topMargin = 2)
+
+        val card = newCard()
+        card.addView(newText(getString(R.string.totp_setup_help), size = 14f, color = R.color.lv_text_secondary))
+        if (totpSetupReplacing) {
+            card.addView(
+                newText(getString(R.string.totp_replace_warning), size = 14f, color = R.color.lv_text_secondary),
+                matchParams(top = 8),
+            )
+        }
+
+        card.addView(
+            newText(getString(R.string.totp_key_label), size = 13f, color = R.color.lv_text_tertiary),
+            matchParams(top = 16),
+        )
+        val field = newField()
+        field.hint = getString(R.string.totp_key_hint)
+        field.inputType =
+            InputType.TYPE_CLASS_TEXT or
+            InputType.TYPE_TEXT_VARIATION_PASSWORD or
+            InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        field.imeOptions = EditorInfo.IME_ACTION_NONE or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        totpSetupField = field
+        card.addView(field, matchParams(top = 6))
+
+        val showKey = CheckBox(this)
+        showKey.text = getString(R.string.totp_show_key)
+        showKey.setOnCheckedChangeListener { _, checked ->
+            val selection = field.selectionEnd
+            field.inputType =
+                if (checked) {
+                    InputType.TYPE_CLASS_TEXT or
+                        InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
+                        InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                } else {
+                    InputType.TYPE_CLASS_TEXT or
+                        InputType.TYPE_TEXT_VARIATION_PASSWORD or
+                        InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                }
+            if (selection >= 0) field.setSelection(selection.coerceAtMost(field.text.length))
+        }
+        card.addView(showKey, matchParams(top = 8))
+
+        addToContent(card, topMargin = 16)
+
+        addStatus()
+        addPrimaryButton(getString(R.string.save), topMargin = 16) { submitTotpSetup() }
+        addSecondaryButton(getString(android.R.string.cancel), topMargin = 10) { cancelTotpSetup() }
+    }
+
+    /**
      * 1T-B5b-5. Lists categories in stored order with per-category entry
      * counts (already carried by [CategorySummary], no new bridge read),
      * plus Rename/Delete per row and an Add-category action. No search
@@ -2821,9 +3247,31 @@ class MainActivity : Activity() {
                 newSecondaryButton(getString(R.string.totp_copy), compact = true) { copyTotp() },
                 wrapParams(top = 12, gravity = Gravity.START),
             )
+
+            // 1T-B5c-2: the key itself is never shown; only replace/remove.
+            val keyActions = LinearLayout(this)
+            keyActions.orientation = LinearLayout.HORIZONTAL
+            keyActions.addView(newSecondaryButton(getString(R.string.totp_replace), compact = true) { startTotpSetup() })
+            keyActions.addView(
+                newSecondaryButton(getString(R.string.totp_remove), compact = true) { confirmRemoveTotp() },
+                wrapParams(left = 8),
+            )
+            totp.addView(keyActions, wrapParams(top = 8, gravity = Gravity.START))
             addToContent(totp, topMargin = 12)
 
             startTotp(current.id)
+        } else {
+            val totp = newCard()
+            totp.addView(newText(getString(R.string.totp_section_title), size = 13f, color = R.color.lv_text_tertiary))
+            totp.addView(
+                newText(getString(R.string.totp_not_configured), size = 14f, color = R.color.lv_text_secondary),
+                matchParams(top = 4),
+            )
+            totp.addView(
+                newSecondaryButton(getString(R.string.totp_setup_action), compact = true) { startTotpSetup() },
+                wrapParams(top = 12, gravity = Gravity.START),
+            )
+            addToContent(totp, topMargin = 12)
         }
 
         addToContent(

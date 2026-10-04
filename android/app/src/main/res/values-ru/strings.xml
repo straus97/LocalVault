@@ -73,6 +73,23 @@
     <string name="totp_copy">Копировать код</string>
     <string name="totp_refresh_in">Обновление через %1$d с</string>
     <string name="msg_totp_failed">Не удалось создать код 2FA.</string>
+    <string name="totp_section_title">Двухфакторная аутентификация (2FA)</string>
+    <string name="totp_not_configured">2FA для этой записи не настроена. Добавьте ключ аутентификатора, чтобы здесь отображались одноразовые коды.</string>
+    <string name="totp_setup_action">Настроить 2FA</string>
+    <string name="totp_replace">Заменить</string>
+    <string name="totp_remove">Убрать</string>
+    <string name="totp_setup_title">Настройка 2FA</string>
+    <string name="totp_replace_title">Замена ключа 2FA</string>
+    <string name="totp_setup_help">Введите ключ аутентификатора (Base32) или ссылку otpauth://, которую предоставил сайт. Сканирование QR-кода пока недоступно.</string>
+    <string name="totp_replace_warning">Текущий ключ будет заменён. LocalVault не может показать текущий ключ.</string>
+    <string name="totp_key_label">Ключ аутентификатора или ссылка otpauth://</string>
+    <string name="totp_key_hint">Ключ или ссылка otpauth://</string>
+    <string name="totp_show_key">Показать ключ</string>
+    <string name="confirm_remove_totp_title">Убрать 2FA?</string>
+    <string name="confirm_remove_totp_message">LocalVault перестанет создавать коды для этой записи. Текущий ключ показать повторно нельзя, поэтому прежде чем продолжить, убедитесь, что у вас есть другой способ войти в аккаунт (например, резервный код или другой аутентификатор).</string>
+    <string name="msg_totp_invalid_key">Этот ключ 2FA недействителен. Введите ключ Base32 или ссылку otpauth://.</string>
+    <string name="msg_totp_saved">2FA сохранена.</string>
+    <string name="msg_totp_removed">2FA убрана.</string>
 
     <string name="msg_auth">Не удалось разблокировать хранилище. Проверьте мастер-пароль и файл.</string>
     <string name="msg_format">Этот файл не является поддерживаемым хранилищем LocalVault.</string>
