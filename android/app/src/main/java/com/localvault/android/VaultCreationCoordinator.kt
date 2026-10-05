@@ -1,4 +1,4 @@
-package com.localvault.android.proof
+package com.localvault.android
 
 import uniffi.localvault_android_bridge.BridgeException
 import uniffi.localvault_android_bridge.PendingVaultCreationInterface

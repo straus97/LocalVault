@@ -1,4 +1,4 @@
-package com.localvault.android.proof
+package com.localvault.android
 
 /**
  * True when [displayName] matches the automatic rolling backup naming

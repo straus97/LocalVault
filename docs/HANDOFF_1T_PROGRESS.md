@@ -129,7 +129,7 @@ Categories and TOTP, plus a visual polish follow-up:
 - Vault session locks immediately on backgrounding (`onStop`) or explicit Lock/Back from an unlocked screen — Android currently has **no** inactivity-timeout grace period (unlike desktop's 60s); this is intentionally more conservative, not a gap.
 - Screenshots: blocked via `FLAG_SECURE` except in debuggable builds. Non-debug/release screenshot-blocking has not been exercised in an actual release build.
 - **Open blocker:** workspace `[profile.release]` has `panic = "abort"`, which can prevent UniFFI's panic containment (which expects unwinding) from working in an Android **release** build. Not yet a problem because all Android work so far has used debug builds (default unwind). Must be deliberately resolved — without naively changing the shared release profile, which could affect the Windows release — before any production Android release. **Not solved.**
-- `applicationId`/package is still `com.localvault.android.proof` — an intentional temporary bootstrap identity.
+- `applicationId`/package was `com.localvault.android.proof` — an intentional temporary bootstrap identity at the B4 snapshot; since replaced by `com.localvault.android` (see §32).
 
 ## 13. Clipboard model (current, from B3, unchanged by B4's TOTP-copy reuse)
 
@@ -195,7 +195,7 @@ None of these are blocking or scheduled into a specific stage yet; keep them on 
 ## 20. Known blockers
 
 - **Android release `panic = "abort"`** (see §12) — must be resolved before any production Android release build. Not solved.
-- **`applicationId`/package** still `com.localvault.android.proof` — deliberate cleanup deferred, not yet scheduled to a specific stage.
+- **`applicationId`/package** was `com.localvault.android.proof` (B4-era blocker) — resolved; now `com.localvault.android` (see §32).
 
 ## 21. Test baseline at 1T-B4
 
@@ -220,7 +220,7 @@ None of these are blocking or scheduled into a specific stage yet; keep them on 
 - Add/edit/delete profiles, to whatever extent is needed for parity with desktop.
 - Category mutation (create/rename/delete/assign).
 - TOTP setup/edit/remove (currently Android can only *display* an existing TOTP configuration created on desktop).
-- `applicationId`/package cleanup.
+- `applicationId`/package cleanup (done since — see §32).
 - Site/profile grouping decision (§18).
 - Large-vault list performance/optimization decision (currently a plain `LinearLayout`; fine for typical vaults, not validated at scale — e.g. near the core's 50,000-entry cap).
 - The Android release `panic = "abort"` blocker (§20).
@@ -355,4 +355,13 @@ Added after the B4-era snapshot above; supersedes the "read-only"/"B5 next" stat
 - Purpose: so `stage_*` mutations can reseal the encrypted envelope without storing the master password or re-running Argon2id on every save. This matches the desktop session model conceptually.
 - Lock/drop of the session or pending creation drops (zeroizes) the Vault Key along with the rest of the state. While unlocked, the process necessarily holds decrypted secret state and the Vault Key in memory; hostile process-memory inspection while unlocked remains outside the protection boundary in `@docs/SECURITY_MODEL.md`.
 
-**What remains in 1T (do not mark 1T complete):** `applicationId`/package cleanup (`com.localvault.android.proof`, §20), site/profile grouping decision / Android vs. desktop UX model (§18), large-vault list performance measurement/optimization, the Android release `panic = "abort"` blocker (§12/§20), known visual polish (including the DETAIL top-action overflow/cutoff), and the final Android security/UX/regression pass. A later dedicated desktop + Android design/UX pass is still planned; the current UI is not considered final. No further named 1T-B stage exists in the roadmap; the next task is chosen from this list and confirmed with the user. Sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
+**What remains in 1T (do not mark 1T complete; `applicationId`/package cleanup was listed here at the time of writing and is now done — see §32):** site/profile grouping decision / Android vs. desktop UX model (§18), large-vault list performance measurement/optimization, the Android release `panic = "abort"` blocker (§12/§20), known visual polish (including the DETAIL top-action overflow/cutoff), and the final Android security/UX/regression pass. A later dedicated desktop + Android design/UX pass is still planned; the current UI is not considered final. No further named 1T-B stage exists in the roadmap; the next task is chosen from this list and confirmed with the user. Sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
+
+## 32. Update: `applicationId`/package cleanup (done; not a new named stage)
+
+- **Old → new identity:** `com.localvault.android.proof` → `com.localvault.android`. No different production identity was documented anywhere in the repo, so the default from the task was used. (Desktop's Tauri identifier `com.localvault.app` is unrelated.)
+- **Changed:** `android/app/build.gradle.kts` (`namespace`, `applicationId`); the `package` declaration of all 12 production and 15 JVM-test Kotlin files; the source directories, moved with `git mv` from `.../java/com/localvault/android/proof/` to `.../java/com/localvault/android/` (main and test). `AndroidManifest.xml` needed no change (`.MainActivity` is relative to `namespace`); the build script and no resource referenced the old name.
+- **Deliberately untouched:** Rust UniFFI namespace/crate names (`uniffi.localvault_android_bridge`, `localvault-android-bridge`), UniFFI `=0.32.0`, JNA wiring, vault format, permissions (none), lifecycle, UI, and the `SecureClipboard` extras key `com.localvault.android.clip_owner` (a non-secret clip-extras key that never contained `.proof`).
+- **Consequence for installed builds:** a build with the new `applicationId` is a different app to Android from a build with the old one. It does not share the old app's private data (recent-vault history, recovery snapshots) or its persisted SAF URI grants; the old proof install may coexist with the new app; if it is no longer wanted, it must be uninstalled separately. The new app must re-select vaults through the picker. Vault files themselves are unaffected.
+- **Validation:** full Android JVM suite and the full `android/scripts/build-android-debug.ps1` (see the task report); no device QA required or performed.
+- **Still remaining in 1T (do not mark 1T complete):** site/profile grouping decision (§18); large-vault list performance measurement/optimization; the Android release `panic = "abort"` blocker (§12/§20); known visual polish, including the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass; and a later dedicated desktop + Android design/UX pass (the current UI is not final). No further named 1T-B stage exists; sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.

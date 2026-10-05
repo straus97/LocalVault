@@ -1,4 +1,4 @@
-package com.localvault.android.proof
+package com.localvault.android
 
 import android.content.Context
 import android.util.AtomicFile

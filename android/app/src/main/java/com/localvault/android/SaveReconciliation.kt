@@ -1,4 +1,4 @@
-package com.localvault.android.proof
+package com.localvault.android
 
 /**
  * The result of comparing a vault's current on-disk content against an

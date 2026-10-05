@@ -20,11 +20,11 @@ val generatedJniLibs = File(project.buildDir, "generated/jniLibs")
 val generatedUniffiKotlin = File(project.buildDir, "generated/uniffiKotlin")
 
 android {
-    namespace = "com.localvault.android.proof"
+    namespace = "com.localvault.android"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.localvault.android.proof"
+        applicationId = "com.localvault.android"
         minSdk = 26
         targetSdk = 36
         versionCode = 1

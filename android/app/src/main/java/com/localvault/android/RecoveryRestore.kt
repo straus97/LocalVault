@@ -1,4 +1,4 @@
-package com.localvault.android.proof
+package com.localvault.android
 
 /**
  * Outcome of one [RecoverySnapshotRestorer.restore] attempt. Deliberately

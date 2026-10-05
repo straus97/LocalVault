@@ -67,8 +67,9 @@ The 1T-B5 write/CRUD series is complete, and its two correctness follow-ups (not
 - `cfe9e6f24be55e3ebc6889f209f7141db22938b4`: the save coordinator discards the Rust staged candidate after a failed/unverified primary write, so a retry is no longer rejected as `PendingUnsavedChanges`.
 - `d1a85e44a0e45fddc7973ed88cb36ae034dea050`: a successful entry save/delete that completes after navigation still refreshes the session-derived caches when its coordinator owns the live session; `ChangedExternally` locks only for the owning live coordinator.
 
+`applicationId`/package cleanup (not a new named stage) is also complete: the temporary identity `com.localvault.android.proof` was replaced by the production identity `com.localvault.android` (Gradle `namespace`/`applicationId`, Kotlin package declarations, and source directories aligned). No behavior, UI, vault/storage/crypto/session/save, permission or lifecycle change; the UniFFI bridge namespace is unchanged.
+
 Still outstanding before 1T can close — **do not treat 1T as complete**:
-- `applicationId`/package identity cleanup (`com.localvault.android.proof`);
 - desktop-vs-Android site/profile grouping decision;
 - large-vault list performance measurement/optimization;
 - the Android-release `panic = "abort"` blocker (see `@docs/SECURITY_MODEL.md`);

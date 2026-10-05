@@ -1,4 +1,4 @@
-package com.localvault.android.proof
+package com.localvault.android
 
 /**
  * In-memory [RecoverySnapshotStore] fake for plain JVM unit tests. Upholds

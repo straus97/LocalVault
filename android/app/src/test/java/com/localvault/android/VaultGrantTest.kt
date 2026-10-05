@@ -1,4 +1,4 @@
-package com.localvault.android.proof
+package com.localvault.android
 
 import android.content.Intent
 import org.junit.Assert.assertEquals

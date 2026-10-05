@@ -1,4 +1,4 @@
-package com.localvault.android.proof
+package com.localvault.android
 
 import android.app.Activity
 import android.app.AlertDialog
