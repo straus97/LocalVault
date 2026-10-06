@@ -30,6 +30,11 @@ android {
         versionCode = 1
         versionName = "1t-b3"
 
+        // Only used when the on-device list benchmark is built/run
+        // (src/androidTest, plain android.app.Instrumentation -- no AndroidX
+        // test libraries). Has no effect on the app itself.
+        testInstrumentationRunner = "com.localvault.android.bench.ListRebuildBenchmark"
+
         // arm64-v8a only for now (no additional ABIs added for completeness).
         ndk {
             abiFilters += "arm64-v8a"
@@ -53,6 +58,16 @@ android {
         getByName("main") {
             jniLibs.srcDir(generatedJniLibs)
             kotlin.srcDir(generatedUniffiKotlin)
+        }
+        // List-performance benchmark (not a 1T-B stage): the synthetic
+        // dataset generator is shared by the plain-JVM benchmark (src/test)
+        // and the on-device view-rebuild harness (src/androidTest) so both
+        // measure identical data. Test-only; never part of the app.
+        getByName("test") {
+            kotlin.srcDir("src/benchShared/java")
+        }
+        getByName("androidTest") {
+            kotlin.srcDir("src/benchShared/java")
         }
     }
 

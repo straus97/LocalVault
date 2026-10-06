@@ -213,15 +213,6 @@ class MainActivity : Activity() {
 
     private class VaultReadException : Exception()
 
-    /** Transient UI filter; "uncategorized" is a real state of the model (no category id). */
-    private sealed class CategoryFilter {
-        object All : CategoryFilter()
-
-        object Uncategorized : CategoryFilter()
-
-        class Category(val id: String) : CategoryFilter()
-    }
-
     private companion object {
         const val REQUEST_PICK_VAULT = 1
 
@@ -2571,19 +2562,6 @@ class MainActivity : Activity() {
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
-    private fun matchesCategory(entry: EntrySummary): Boolean =
-        when (val filter = categoryFilter) {
-            CategoryFilter.All -> true
-            CategoryFilter.Uncategorized -> entry.categoryId == null
-            is CategoryFilter.Category -> entry.categoryId == filter.id
-        }
-
-    private fun matchesQuery(entry: EntrySummary, query: String): Boolean =
-        entry.title.contains(query, ignoreCase = true) ||
-            entry.username.contains(query, ignoreCase = true) ||
-            entry.url.contains(query, ignoreCase = true) ||
-            entry.profileName.contains(query, ignoreCase = true)
-
     // ---------------------------------------------------------------- render
 
     private fun render() {
@@ -3211,7 +3189,7 @@ class MainActivity : Activity() {
         container.removeAllViews()
 
         val query = searchQuery.trim()
-        val visible = entries.filter { matchesCategory(it) && (query.isEmpty() || matchesQuery(it, query)) }
+        val visible = EntryListFilter.visible(entries, categoryFilter, query)
 
         countView?.text = resources.getQuantityString(R.plurals.entries_count, visible.size, visible.size)
 
