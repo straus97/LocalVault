@@ -69,14 +69,15 @@ The 1T-B5 write/CRUD series is complete, and its two correctness follow-ups (not
 
 `applicationId`/package cleanup (not a new named stage) is also complete: the temporary identity `com.localvault.android.proof` was replaced by the production identity `com.localvault.android` (Gradle `namespace`/`applicationId`, Kotlin package declarations, and source directories aligned). No behavior, UI, vault/storage/crypto/session/save, permission or lifecycle change; the UniFFI bridge namespace is unchanged.
 
+Android LIST virtualization (not a new named stage) is also accepted: large-vault performance was measured on a real device first, the old full-materialization `ScrollView`/`LinearLayout` list was shown to be unacceptable (1,000 entries: 3,909 resident Views, ~950 ms frames), and the list is now a framework `ListView` + `BaseAdapter` with `convertView` recycling (no AndroidX/RecyclerView). Resident Views stay at 59 through 50,000 entries with no OOM; a residual O(n) text-search cost at 50,000 entries (`mail` ≈ 223 ms frame median) is known and not a blocker, with no further search optimization planned before grouping. Manual QA on a 300-entry synthetic vault passed. Numbers: `@docs/HANDOFF_1T_PROGRESS.md` §33. The source change is accepted but not yet committed.
+
 Still outstanding before 1T can close — **do not treat 1T as complete**:
-- desktop-vs-Android site/profile grouping decision;
-- large-vault list performance measurement/optimization;
+- Android site/profile grouping **implementation** (next; direction decided: grouped site rows with inline expansion, no Site screen, core-owned normalized `site_key(url) -> Option<String>` exposed by the bridge, Kotlin owns visual grouping/expanded state, no persisted site entity, desktop unchanged; "New profile for this site" deferred to the design/UX pass);
 - the Android-release `panic = "abort"` blocker (see `@docs/SECURITY_MODEL.md`);
 - known visual polish, including the DETAIL top-action overflow/cutoff;
 - a final Android security/UX/regression pass.
 
-A later dedicated desktop + Android design/UX pass is still planned; the current UI is not considered final.
+A later dedicated, coordinated desktop + Android design/UX pass is still planned and not implemented; the current UI (including the Android LIST layout/spacing) is not considered final.
 
 No further named 1T-B stage is defined; the next task is chosen from this list. Do not mix sync work into 1T.
 

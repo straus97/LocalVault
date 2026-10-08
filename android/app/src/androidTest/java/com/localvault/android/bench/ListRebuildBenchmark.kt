@@ -14,6 +14,7 @@ import android.view.FrameMetrics
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
+import android.widget.BaseAdapter
 import android.widget.EditText
 import android.widget.TextView
 import java.lang.reflect.Field
@@ -23,24 +24,33 @@ import java.util.concurrent.TimeUnit
 import uniffi.localvault_android_bridge.CategorySummary
 
 /**
- * ON-DEVICE view-rebuild benchmark for the current Android list architecture
- * (ScrollView -> LinearLayout, removeAllViews() + recreate every visible row).
+ * ON-DEVICE list benchmark for the Android LIST screen. The committed
+ * baseline measured the former architecture (ScrollView -> LinearLayout,
+ * removeAllViews() + recreate every visible row); this harness now measures
+ * the virtualized one (framework ListView + recycling BaseAdapter, header =
+ * search/chips/count, footer = empty state). Scenario names, synthetic data
+ * and seed are unchanged so before/after results compare directly.
  *
  * It drives the REAL, unmodified `MainActivity` -- no production telemetry,
  * no production hook. The only things it does to the Activity are:
  *   1. inject synthetic, non-secret list state (entries / categories / screen)
  *      into the private fields by reflection and call the private `render()`;
  *   2. then exercise the real UI the way a user would: type into the real
- *      search EditText (which fires the real TextWatcher -> `renderRows()`)
+ *      search EditText (which fires the real TextWatcher -> `refreshListRows()`)
  *      and tap the real category chip TextViews.
  * No vault is opened, no real data is read, nothing is written.
  *
  * Per scenario it records, over measured iterations (median / p95):
  *   - action ms: synchronous main-thread time of the user action (filter +
- *     removeAllViews + construct every row + addView);
- *   - layout/measure ms and draw ms of the very next frame (FrameMetrics);
- *   - total frame ms, row count and total View count.
- * It also records the Java-heap cost of N resident rows.
+ *     row-model build + adapter update + count/empty-state update);
+ *   - layout/measure ms and draw ms of the very next frame (FrameMetrics),
+ *     which is where ListView lays out and binds the visible rows;
+ *   - total frame ms;
+ *   - `rows` = LOGICAL adapter row count (virtualized: not a View count),
+ *     `views` = every View currently in the Activity window hierarchy,
+ *     `listChildren` = ListView's resident children (visible rows + header
+ *     + footer). Nothing scrolls the list to inflate these.
+ * It also records the Java-heap cost of the N-entry list state.
  *
  * It is a plain `android.app.Instrumentation` (no AndroidX test libraries).
  * See `android/scripts/run-list-benchmark-device.ps1` for the exact commands.
@@ -140,11 +150,11 @@ class ListRebuildBenchmark : Instrumentation() {
         return null
     }
 
-    /** The rows container is the vertical LinearLayout holding the entry cards; count its children. */
-    private fun rowsContainerChildCount(): Int {
-        val container = getField("rowsContainer") as? ViewGroup ?: return -1
-        return container.childCount
-    }
+    /** Logical rows held by the LIST adapter (header/footer excluded). -1 if the list is not built. */
+    private fun adapterRowCount(): Int = (getField("entryAdapter") as? BaseAdapter)?.count ?: -1
+
+    /** Views ListView currently keeps as children (visible rows + header + footer). -1 if not built. */
+    private fun listChildCount(): Int = (getField("entryListView") as? ViewGroup)?.childCount ?: -1
 
     // ---------------------------------------------------------------- frame metrics
 
@@ -168,6 +178,7 @@ class ListRebuildBenchmark : Instrumentation() {
         val gotFrame: Boolean,
         val rows: Int,
         val views: Int,
+        val listChildren: Int,
     )
 
     /**
@@ -202,11 +213,13 @@ class ListRebuildBenchmark : Instrumentation() {
         waitForIdleSync()
         var rows = -1
         var views = -1
+        var listChildren = -1
         onMain {
-            rows = rowsContainerChildCount()
+            rows = adapterRowCount()
             views = countViews(decor())
+            listChildren = listChildCount()
         }
-        return Sample(actionNs / 1e6, layout, draw, total, got, rows, views)
+        return Sample(actionNs / 1e6, layout, draw, total, got, rows, views, listChildren)
     }
 
     // ---------------------------------------------------------------- scenario driving
@@ -253,12 +266,12 @@ class ListRebuildBenchmark : Instrumentation() {
 
     private fun typeQuery(query: String) {
         val field = findSearchField(decor()) ?: error("search field not found")
-        field.setText(query) // fires the real TextWatcher -> renderRows()
+        field.setText(query) // fires the real TextWatcher -> refreshListRows()
     }
 
     private fun tapChip(categoryIndex: Int) {
         val chip = findTextView(decor(), SyntheticEntries.categoryName(categoryIndex)) ?: error("chip not found")
-        chip.performClick() // real selectCategory -> renderChips() + renderRows()
+        chip.performClick() // real selectCategory -> renderChips() + refreshListRows()
     }
 
     private fun median(values: List<Double>): Double = values.sorted()[values.size / 2]
@@ -278,7 +291,7 @@ class ListRebuildBenchmark : Instrumentation() {
                 "layout_med=${f(median(samples.map { it.layoutMeasureMs }))},layout_p95=${f(p95(samples.map { it.layoutMeasureMs }))}," +
                 "draw_med=${f(median(samples.map { it.drawMs }))},draw_p95=${f(p95(samples.map { it.drawMs }))}," +
                 "frame_med=${f(median(samples.map { it.frameTotalMs }))},frame_p95=${f(p95(samples.map { it.frameTotalMs }))}," +
-                "n=${samples.size},missing_frames=$missing",
+                "n=${samples.size},missing_frames=$missing,listChildren=${samples.last().listChildren}",
         )
     }
 
@@ -331,13 +344,16 @@ class ListRebuildBenchmark : Instrumentation() {
         val heapFull = usedHeapBytes()
         var rows = -1
         var views = -1
+        var listChildren = -1
         onMain {
-            rows = rowsContainerChildCount()
+            rows = adapterRowCount()
             views = countViews(decor())
+            listChildren = listChildCount()
         }
         emit(
             "MEMORY,$size,rows=$rows,views=$views,heapEmptyMiB=${f(heapEmpty / 1048576.0)}," +
-                "heapFullMiB=${f(heapFull / 1048576.0)},deltaMiB=${f((heapFull - heapEmpty) / 1048576.0)}",
+                "heapFullMiB=${f(heapFull / 1048576.0)},deltaMiB=${f((heapFull - heapEmpty) / 1048576.0)}," +
+                "listChildren=$listChildren",
         )
 
         // --- initial screen build (unlock / back-from-detail) -----------------
@@ -390,7 +406,9 @@ class ListRebuildBenchmark : Instrumentation() {
                     last = s
                 }
                 if (i >= warmup) {
-                    samples.add(Sample(totalActionMs, totalLayoutMs, last!!.drawMs, last.frameTotalMs, last.gotFrame, last.rows, last.views))
+                    samples.add(
+                        Sample(totalActionMs, totalLayoutMs, last!!.drawMs, last.frameTotalMs, last.gotFrame, last.rows, last.views, last.listChildren),
+                    )
                 }
             }
             report(size, "type 'mail' (4 keystrokes, summed action+layout)", samples)

@@ -14,7 +14,7 @@ import uniffi.localvault_android_bridge.EntrySummary
  * pure-data part of building row content, at 1k / 5k / 10k / 50k entries.
  *
  * It calls the exact production helper [EntryListFilter.visible] that
- * `MainActivity.renderRows` calls. It is opt-in so the normal JVM suite stays
+ * `MainActivity.refreshListRows` calls (through `ListRows.build`). It is opt-in so the normal JVM suite stays
  * fast and quiet: it does nothing unless `LOCALVAULT_BENCH=1` is set. Run it
  * with `android/scripts/run-list-benchmark.ps1`.
  *

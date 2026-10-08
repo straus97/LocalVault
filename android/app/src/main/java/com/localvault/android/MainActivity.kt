@@ -5,7 +5,9 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.res.ColorStateList
+import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -21,6 +23,7 @@ import android.text.TextUtils
 import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
@@ -33,6 +36,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.Spinner
@@ -238,6 +242,10 @@ class MainActivity : Activity() {
         const val TOTP_PROGRESS_MAX = 10_000
     }
 
+    // Window root. Holds the system-bar inset padding and exactly one body:
+    // the ScrollView (every screen except LIST) or the virtualized entry
+    // ListView (LIST only; see renderList).
+    private lateinit var root: FrameLayout
     private lateinit var content: LinearLayout
     private lateinit var scroll: ScrollView
     private lateinit var recents: RecentVaultStore
@@ -272,7 +280,13 @@ class MainActivity : Activity() {
     private var categories: List<CategorySummary> = emptyList()
     private var categoryFilter: CategoryFilter = CategoryFilter.All
     private var searchQuery: String = ""
-    private var listScrollY: Int = 0
+
+    // LIST scroll restoration (ListView coordinates). savedListScroll is taken
+    // when a row opens DETAIL and reset on every unlock/create/lock so it can
+    // never leak between vault sessions; pendingListScroll is applied (clamped)
+    // by the next renderList and then dropped.
+    private var savedListScroll: ListScrollPosition = ListScrollPosition.TOP
+    private var pendingListScroll: ListScrollPosition? = null
     private var detail: EntryDetails? = null
 
     // 1T-B5b-3 vault-creation state. Holds only non-secret bookkeeping for
@@ -422,7 +436,9 @@ class MainActivity : Activity() {
     private var passwordField: EditText? = null
     private var confirmPasswordField: EditText? = null
     private var searchField: EditText? = null
-    private var rowsContainer: LinearLayout? = null
+    private var entryListView: ListView? = null
+    private var entryAdapter: EntryListAdapter? = null
+    private var listEmptyView: TextView? = null
     private var countView: TextView? = null
     private var passwordValueView: TextView? = null
     private var passwordToggleButton: Button? = null
@@ -490,9 +506,16 @@ class MainActivity : Activity() {
         scroll.isFillViewport = true
         scroll.addView(content)
 
+        root = FrameLayout(this)
+        root.addView(
+            scroll,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT),
+        )
+
         // Edge-to-edge (targetSdk 36): inset the body by the system bars,
-        // display cutout and keyboard so nothing is drawn under them.
-        scroll.setOnApplyWindowInsetsListener { view, insets ->
+        // display cutout and keyboard so nothing is drawn under them. Applied
+        // to the root so the ScrollView and the LIST ListView are inset alike.
+        root.setOnApplyWindowInsetsListener { view, insets ->
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val bars =
                     insets.getInsets(
@@ -513,7 +536,7 @@ class MainActivity : Activity() {
             WindowInsets.CONSUMED
         }
 
-        setContentView(scroll)
+        setContentView(root)
 
         // Predictive back (targetSdk 36) no longer calls onBackPressed().
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1048,7 +1071,8 @@ class MainActivity : Activity() {
                 categories = emptyList()
                 categoryFilter = CategoryFilter.All
                 searchQuery = ""
-                listScrollY = 0
+                savedListScroll = ListScrollPosition.TOP
+                pendingListScroll = null
                 vaultUri = uri
                 vaultName = name
                 statusRes = 0
@@ -1357,7 +1381,8 @@ class MainActivity : Activity() {
             categories = cats
             categoryFilter = CategoryFilter.All
             searchQuery = ""
-            listScrollY = 0
+            savedListScroll = ListScrollPosition.TOP
+            pendingListScroll = null
             statusRes = 0
             screen = Screen.LIST
         } else if (unreadable && recents.load().any { it.uri == uri }) {
@@ -1398,7 +1423,8 @@ class MainActivity : Activity() {
         categoryFilter = CategoryFilter.All
         detail = null
         searchQuery = ""
-        listScrollY = 0
+        savedListScroll = ListScrollPosition.TOP
+        pendingListScroll = null
         clearRevealedPassword()
         recoveryUnresolvedSha256 = null
         restoring = false
@@ -1438,7 +1464,7 @@ class MainActivity : Activity() {
             return
         }
 
-        listScrollY = scroll.scrollY
+        entryListView?.let { savedListScroll = captureListScroll(it) ?: ListScrollPosition.TOP }
         screen = Screen.DETAIL
         render()
     }
@@ -1448,8 +1474,8 @@ class MainActivity : Activity() {
         clearRevealedPassword()
         detail = null
         screen = Screen.LIST
+        pendingListScroll = savedListScroll
         render()
-        scroll.post { scroll.scrollTo(0, listScrollY) }
     }
 
     private fun togglePassword() {
@@ -2566,11 +2592,22 @@ class MainActivity : Activity() {
 
     private fun render() {
         stopTotp()
+
+        // A LIST -> LIST redraw (e.g. a stale-completion refresh) keeps its
+        // place; any other transition into LIST uses only pendingListScroll.
+        entryListView?.let { previous ->
+            if (screen == Screen.LIST) captureListScroll(previous)?.let { pendingListScroll = it }
+            root.removeView(previous)
+        }
+        entryListView = null
+        entryAdapter = null
+        listEmptyView = null
+        scroll.visibility = View.VISIBLE
+
         content.removeAllViews()
         passwordField = null
         confirmPasswordField = null
         searchField = null
-        rowsContainer = null
         countView = null
         passwordValueView = null
         passwordToggleButton = null
@@ -3128,35 +3165,50 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * LIST: a virtualized framework `ListView` over [EntryListAdapter]. All the
+     * non-row content that used to sit above the rows (heading, Add/Lock,
+     * file name, search, chips, manage-categories, count) is the ListView's
+     * single header, so it still scrolls away together with the rows exactly
+     * as the old one-ScrollView screen did (nothing is sticky). The empty-state
+     * message is the always-attached footer. Only the visible rows are ever
+     * materialized as Views (recycled through the adapter).
+     */
     private fun renderList() {
+        val header = LinearLayout(this)
+        header.orientation = LinearLayout.VERTICAL
+        // Matches the old shared `content` padding (20/16/20) plus the 4dp
+        // that separated the count from the first row.
+        header.setPadding(dp(20), dp(16), dp(20), dp(4))
+
         // Stable heading + Lock on one row; the (possibly long) vault file name
         // sits below on its own single, end-ellipsized line so it can never
         // wrap awkwardly next to the button.
-        val header = LinearLayout(this)
-        header.orientation = LinearLayout.HORIZONTAL
-        header.gravity = Gravity.CENTER_VERTICAL
+        val titleRow = LinearLayout(this)
+        titleRow.orientation = LinearLayout.HORIZONTAL
+        titleRow.gravity = Gravity.CENTER_VERTICAL
 
         val title = newText(getString(R.string.app_name), size = 22f, bold = true)
-        header.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        header.addView(
+        titleRow.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        titleRow.addView(
             newSecondaryButton(getString(R.string.add_entry), compact = true) { startCreateEntry() },
             wrapParams(left = 8),
         )
-        header.addView(
+        titleRow.addView(
             newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() },
             wrapParams(left = 8),
         )
-        addToContent(header, topMargin = 4)
+        addToContent(titleRow, topMargin = 4, parent = header)
 
         val fileName = newText(vaultName, size = 14f, color = R.color.lv_text_secondary)
         fileName.setSingleLine()
         fileName.ellipsize = TextUtils.TruncateAt.END
-        addToContent(fileName, topMargin = 2)
-        addBackupWarningIfNeeded(vaultName)
+        addToContent(fileName, topMargin = 2, parent = header)
+        addBackupWarningIfNeeded(vaultName, parent = header)
 
         val search = newSearchField()
         searchField = search
-        addToContent(search, topMargin = 16)
+        addToContent(search, topMargin = 16, parent = header)
 
         val chipScroll = HorizontalScrollView(this)
         chipScroll.isHorizontalScrollBarEnabled = false
@@ -3164,52 +3216,97 @@ class MainActivity : Activity() {
         chipRow.orientation = LinearLayout.HORIZONTAL
         chipsContainer = chipRow
         chipScroll.addView(chipRow)
-        addToContent(chipScroll, topMargin = 12)
+        addToContent(chipScroll, topMargin = 12, parent = header)
         renderChips()
 
         addToContent(
             newTextButton(getString(R.string.manage_categories)) { startCategoryManage() },
             topMargin = 4,
+            parent = header,
         )
 
         val count = newText("", size = 13f, color = R.color.lv_text_tertiary)
         countView = count
-        addToContent(count, topMargin = 12)
+        addToContent(count, topMargin = 12, parent = header)
 
-        val container = LinearLayout(this)
-        container.orientation = LinearLayout.VERTICAL
-        rowsContainer = container
-        addToContent(container, topMargin = 4)
+        // Empty-state message. Not a ListView emptyView: that would hide the
+        // whole ListView, header (search!) included, when there are no rows.
+        val empty = newText("", color = R.color.lv_text_tertiary)
+        empty.setPadding(0, dp(12), 0, 0)
+        empty.visibility = View.GONE
+        listEmptyView = empty
+        val footer = LinearLayout(this)
+        footer.orientation = LinearLayout.VERTICAL
+        footer.setPadding(dp(20), 0, dp(20), dp(32))
+        footer.addView(empty, matchParams())
 
-        renderRows()
+        val list = ListView(this)
+        list.divider = null
+        list.dividerHeight = 0
+        list.setHeaderDividersEnabled(false)
+        list.setFooterDividersEnabled(false)
+        // The row cards carry their own ripple; no second list highlight.
+        list.selector = ColorDrawable(Color.TRANSPARENT)
+        list.cacheColorHint = Color.TRANSPARENT
+        // The header holds focusable views (search EditText, buttons); the
+        // ListView must not block them.
+        list.itemsCanFocus = true
+        list.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+        list.addHeaderView(header, null, true)
+        list.addFooterView(footer, null, true)
+
+        val adapter = EntryListAdapter(this) { entryId -> openDetail(entryId) }
+        list.adapter = adapter
+        entryListView = list
+        entryAdapter = adapter
+
+        scroll.visibility = View.GONE
+        root.addView(list, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+
+        refreshListRows()
+
+        pendingListScroll?.let { pending ->
+            val target = pending.coercedTo(list.count)
+            list.setSelectionFromTop(target.firstPosition, target.topOffsetPx)
+        }
+        pendingListScroll = null
     }
 
-    private fun renderRows() {
-        val container = rowsContainer ?: return
-        container.removeAllViews()
+    /** Where the user currently is in [list], or null before its first layout. */
+    private fun captureListScroll(list: ListView): ListScrollPosition? {
+        val first = list.getChildAt(0) ?: return null
+        return ListScrollPosition(list.firstVisiblePosition, first.top - list.paddingTop)
+    }
+
+    /**
+     * Search/category/refresh path: the unchanged [EntryListFilter] runs first,
+     * the adapter gets the new logical rows, and the count and empty state are
+     * updated. `ListView` rebinds only the rows it shows; no row Views are
+     * created for the rest.
+     */
+    private fun refreshListRows() {
+        val adapter = entryAdapter ?: return
 
         val query = searchQuery.trim()
-        val visible = EntryListFilter.visible(entries, categoryFilter, query)
+        val rows = ListRows.build(entries, categoryFilter, query)
+        adapter.submit(rows)
 
-        countView?.text = resources.getQuantityString(R.plurals.entries_count, visible.size, visible.size)
+        countView?.text = resources.getQuantityString(R.plurals.entries_count, rows.size, rows.size)
 
-        if (entries.isEmpty()) {
-            container.addView(newText(getString(R.string.no_entries), color = R.color.lv_text_tertiary), matchParams(top = 12))
-            return
-        }
-        if (visible.isEmpty()) {
-            val emptyRes =
-                if (query.isEmpty() && categoryFilter != CategoryFilter.All) {
-                    R.string.category_empty
-                } else {
-                    R.string.no_search_results
-                }
-            container.addView(newText(getString(emptyRes), color = R.color.lv_text_tertiary), matchParams(top = 12))
-            return
-        }
-
-        for (entry in visible) {
-            container.addView(newEntryRow(entry), matchParams(top = 8))
+        val emptyRes =
+            when (ListEmptyState.resolve(entries.size, rows.size, query, categoryFilter)) {
+                ListEmptyState.NONE -> 0
+                ListEmptyState.NO_ENTRIES -> R.string.no_entries
+                ListEmptyState.CATEGORY_EMPTY -> R.string.category_empty
+                ListEmptyState.NO_RESULTS -> R.string.no_search_results
+            }
+        val emptyView = listEmptyView ?: return
+        if (emptyRes == 0) {
+            emptyView.text = ""
+            emptyView.visibility = View.GONE
+        } else {
+            emptyView.text = getString(emptyRes)
+            emptyView.visibility = View.VISIBLE
         }
     }
 
@@ -3245,7 +3342,7 @@ class MainActivity : Activity() {
     private fun selectCategory(filter: CategoryFilter) {
         categoryFilter = filter
         renderChips()
-        renderRows()
+        refreshListRows()
     }
 
     private fun renderDetail() {
@@ -3379,24 +3476,6 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- view factories
 
-    private fun newEntryRow(entry: EntrySummary): View {
-        val row = newCard(clickable = true)
-        row.setOnClickListener { openDetail(entry.id) }
-
-        row.addView(newText(entry.title, size = 16f, bold = true))
-
-        if (entry.username.isNotBlank()) {
-            row.addView(newText(entry.username, size = 14f, color = R.color.lv_text_secondary), matchParams(top = 2))
-        }
-
-        val site = listOf(entry.url, entry.profileName).filter { it.isNotBlank() }.joinToString(" · ")
-        if (site.isNotEmpty()) {
-            row.addView(newText(site, size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 2))
-        }
-
-        return row
-    }
-
     private fun newChip(label: String, selected: Boolean, onClick: () -> Unit): TextView {
         val chip = TextView(this)
         chip.text = label
@@ -3511,7 +3590,7 @@ class MainActivity : Activity() {
 
                 override fun afterTextChanged(s: Editable?) {
                     searchQuery = s?.toString() ?: ""
-                    renderRows()
+                    refreshListRows()
                 }
             },
         )
@@ -3562,13 +3641,13 @@ class MainActivity : Activity() {
      * between a vault's primary and backup files (accepted review, Revision
      * 3, section 7).
      */
-    private fun addBackupWarningIfNeeded(name: String, topMargin: Int = 10) {
+    private fun addBackupWarningIfNeeded(name: String, topMargin: Int = 10, parent: LinearLayout = content) {
         if (!isLikelyBackupFilename(name)) return
 
         val message = newText(getString(R.string.backup_file_warning), size = 13f, color = R.color.lv_error)
         message.setPadding(dp(14), dp(10), dp(14), dp(10))
         message.background = getDrawable(R.drawable.bg_error)
-        addToContent(message, topMargin = topMargin)
+        addToContent(message, topMargin = topMargin, parent = parent)
     }
 
     private fun addPrimaryButton(label: String, topMargin: Int, onClick: () -> Unit) {
@@ -3579,8 +3658,8 @@ class MainActivity : Activity() {
         addToContent(newSecondaryButton(label, onClick = onClick), topMargin = topMargin)
     }
 
-    private fun addToContent(view: View, topMargin: Int) {
-        content.addView(view, matchParams(top = topMargin))
+    private fun addToContent(view: View, topMargin: Int, parent: LinearLayout = content) {
+        parent.addView(view, matchParams(top = topMargin))
     }
 
     private fun matchParams(top: Int = 0): LinearLayout.LayoutParams {

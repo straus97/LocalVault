@@ -222,7 +222,7 @@ None of these are blocking or scheduled into a specific stage yet; keep them on 
 - TOTP setup/edit/remove (currently Android can only *display* an existing TOTP configuration created on desktop).
 - `applicationId`/package cleanup (done since — see §32).
 - Site/profile grouping decision (§18).
-- Large-vault list performance/optimization decision (currently a plain `LinearLayout`; fine for typical vaults, not validated at scale — e.g. near the core's 50,000-entry cap).
+- Large-vault list performance/optimization decision (B4-era note: was a plain `LinearLayout`, not validated at scale; since measured and resolved by `ListView` virtualization — see §33).
 - The Android release `panic = "abort"` blocker (§20).
 - A final Android security/UX/regression pass once write support lands.
 
@@ -364,4 +364,46 @@ Added after the B4-era snapshot above; supersedes the "read-only"/"B5 next" stat
 - **Deliberately untouched:** Rust UniFFI namespace/crate names (`uniffi.localvault_android_bridge`, `localvault-android-bridge`), UniFFI `=0.32.0`, JNA wiring, vault format, permissions (none), lifecycle, UI, and the `SecureClipboard` extras key `com.localvault.android.clip_owner` (a non-secret clip-extras key that never contained `.proof`).
 - **Consequence for installed builds:** a build with the new `applicationId` is a different app to Android from a build with the old one. It does not share the old app's private data (recent-vault history, recovery snapshots) or its persisted SAF URI grants; the old proof install may coexist with the new app; if it is no longer wanted, it must be uninstalled separately. The new app must re-select vaults through the picker. Vault files themselves are unaffected.
 - **Validation:** full Android JVM suite and the full `android/scripts/build-android-debug.ps1` (see the task report); no device QA required or performed.
-- **Still remaining in 1T (do not mark 1T complete):** site/profile grouping decision (§18); large-vault list performance measurement/optimization; the Android release `panic = "abort"` blocker (§12/§20); known visual polish, including the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass; and a later dedicated desktop + Android design/UX pass (the current UI is not final). No further named 1T-B stage exists; sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
+- **Still remaining in 1T (do not mark 1T complete):** site/profile grouping decision (§18); large-vault list performance measurement/optimization; the Android release `panic = "abort"` blocker (§12/§20); known visual polish, including the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass; and a later dedicated desktop + Android design/UX pass (the current UI is not final). No further named 1T-B stage exists; sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T. **Superseded in part by §33:** large-vault performance is now done and the grouping direction is decided (implementation is next).
+
+## 33. Update: Android LIST virtualization (accepted; not a new named stage)
+
+**Status:** accepted after code review, full Android JVM tests, Android debug build, androidTest compilation, real-device benchmark and manual device QA. The benchmark harness is committed (`a3cd2fe`); the virtualization source change itself is **accepted but still uncommitted** in the worktree at the time of writing. Verify with `git status`/`git log` rather than trusting this line.
+
+**Process:** measured first, optimized second. A committed on-device benchmark (`ListRebuildBenchmark`, deterministic synthetic `EntrySummary` data, real `MainActivity`) measured the old design before any change. The earlier RecyclerView-vs-ListView question was closed in favor of framework `ListView` + `BaseAdapter`; virtualization was done before site/profile grouping.
+
+**Old architecture (shown to be unacceptable):** `ScrollView` → `LinearLayout` rows container; each search/category refresh called `removeAllViews()` and materialized a full View hierarchy for every matching entry.
+
+**New architecture:** framework `ListView` + `BaseAdapter` with `convertView` recycling (`hasStableIds() == false`); no AndroidX, no RecyclerView, no Compose, no new dependency or permission. Header = heading/Add/Lock/file name/search/chips/count (still scrolls with the rows; nothing is sticky); footer = empty-state text. One logical row per visible `EntrySummary` for now, via a small pure row model between the unchanged `EntryListFilter` and the adapter. Scroll restoration = first visible position + top offset, reset on unlock/create/lock. No vault format, Rust, crypto, session, SAF/save, TOTP, clipboard, lifecycle or desktop change. Site/profile grouping is **not** implemented.
+
+**Device:** Xiaomi 24115RA8EG, Android SDK 36, max Java heap 256 MiB.
+
+| 1,000 entries | Before | After |
+|---|---|---|
+| Resident Views | 3,909 | 59 (ListView children: 7) |
+| Additional heap | ~13.20 MiB | ~0.22 MiB |
+| Initial-list frame median | ~961.58 ms | 30.29 ms |
+| Empty-search/full-list frame median | ~965.95 ms | 16.95 ms |
+| Search `a` (996 rows) frame median | ~946.64 ms | 14.71 ms |
+| Typing `mail` (4 keystrokes), summed action median | ~1170.73 ms | 44.99 ms |
+| Typing `mail`, summed layout median | ~256.16 ms | 20.53 ms |
+
+After-virtualization at larger sizes (all sizes: no OOM, instrumentation completed, resident Views 59):
+
+| Entries | Initial-list frame | Empty/full-list frame | Search-many (`a`) frame | `mail` ×4 summed action |
+|---|---|---|---|---|
+| 5,000 | 23.74 ms | 11.20 ms | 10.31 ms | 144.52 ms |
+| 10,000 | 26.60 ms | 17.17 ms | 19.52 ms (search-mid `mail`: 51.82 ms) | 222.19 ms |
+| 50,000 | 21.09 ms | 9.93 ms | 56.27 ms (49,639 rows) | 816.88 ms |
+
+At 50,000 entries also: heap delta for the measured list state ~1.15 MiB; search-mid `mail` (3,323 rows) 223.22 ms; search-few 202.81 ms; search-none 170.81 ms; category-only 29.10 ms; category + search 39.78 ms; final `mail` keystroke frame 253.20 ms; ListView children normally 7.
+
+**Interpretation:** the View-materialization bottleneck is resolved; resident Views are bounded by the viewport, not the entry count; initial/full-list rendering scales well through 50,000 entries. **Residual cost:** text filtering is still O(n) over `EntrySummary` values, so extreme 50,000-entry searches are visibly slower (hundreds of ms per keystroke) — 50k text search must **not** be described as smooth. This is not a blocker for the current 1T slice. No debounce, index or cache was added and none is planned before grouping; re-evaluate only if still useful after grouping changes the logical-row layer.
+
+**Manual device QA (passed):** on a separate synthetic 300-entry vault (300 entries, 8 categories, 28 uncategorized; varied optional fields, repeated sites/titles, Cyrillic/Latin, long/short names; created with the real `localvault-core` APIs, kept outside Git under `qa/`): long scrolling, row recycling with no observed stale username/URL/profile between recycled cards, search, categories, category + search, DETAIL opening, DETAIL → back scroll restoration, lock/reopen, general list behavior. A very small perceptible delay returning from DETAIL to the full list was noticed and is non-blocking (not "instant", not "zero latency").
+
+**Design status:** the Android visual design is explicitly **not final**; LIST layout/spacing still feels uneven. Nothing was redesigned here, and no LIST polish is planned before the remaining functional work. A substantial coordinated desktop + Android UI/UX pass is still planned, not implemented. Grouping will itself change the LIST structure.
+
+**Next implementation work — Android site/profile grouping (decided, not started):** grouped site rows with inline expansion; no separate Site screen; invalid/unparseable URLs may stay ungrouped on Android for 1T; "New profile for this site" stays deferred to the design/UX pass; `localvault-core` owns a normalized `site_key(url) -> Option<String>`; the bridge exposes the derived key; Kotlin owns visual grouping and expanded state; no new persisted site entity; desktop unchanged for this slice.
+
+**Still remaining in 1T (1T is NOT complete):** site/profile grouping implementation; the Android release `panic = "abort"` blocker (§12/§20); known visual polish including the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass; and the later coordinated design/UX pass. No new named B stage is created; sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
