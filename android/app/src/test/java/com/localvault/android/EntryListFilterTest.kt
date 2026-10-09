@@ -29,6 +29,7 @@ class EntryListFilterTest {
         url = url,
         username = username,
         categoryId = categoryId,
+        siteKey = null,
     )
 
     // ---- reference: the exact former MainActivity code, copied verbatim ----

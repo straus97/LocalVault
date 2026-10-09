@@ -21,6 +21,8 @@ import java.lang.reflect.Field
 import java.util.Locale
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import com.localvault.android.ExpandedSites
+import com.localvault.android.ListRow
 import uniffi.localvault_android_bridge.CategorySummary
 
 /**
@@ -46,7 +48,11 @@ import uniffi.localvault_android_bridge.CategorySummary
  *   - layout/measure ms and draw ms of the very next frame (FrameMetrics),
  *     which is where ListView lays out and binds the visible rows;
  *   - total frame ms;
- *   - `rows` = LOGICAL adapter row count (virtualized: not a View count),
+ *   - `rows` = LOGICAL adapter row count (virtualized: not a View count). With
+ *     site grouping this is site-group rows + (expanded) child rows + standalone
+ *     entry rows, NOT the entry count; so it also records `visibleEntries`
+ *     (entries after filtering), `siteGroups` and `expandedSiteGroups`. Every
+ *     scenario starts from the normal freshly-opened state: all groups collapsed.
  *     `views` = every View currently in the Activity window hierarchy,
  *     `listChildren` = ListView's resident children (visible rows + header
  *     + footer). Nothing scrolls the list to inflate these.
@@ -153,6 +159,36 @@ class ListRebuildBenchmark : Instrumentation() {
     /** Logical rows held by the LIST adapter (header/footer excluded). -1 if the list is not built. */
     private fun adapterRowCount(): Int = (getField("entryAdapter") as? BaseAdapter)?.count ?: -1
 
+    /**
+     * Grouping diagnostics read back from the rows the adapter actually holds
+     * (one O(rows) pass; no re-filtering, no production hook). visibleEntries
+     * is the ENTRY count (what the on-screen count means), not the row count.
+     */
+    private class GroupStats(val visibleEntries: Int, val siteGroups: Int, val expandedSiteGroups: Int)
+
+    private fun groupStats(): GroupStats {
+        val adapter = getField("entryAdapter") as? BaseAdapter ?: return GroupStats(-1, -1, -1)
+        var entries = 0
+        var groups = 0
+        var expanded = 0
+        for (i in 0 until adapter.count) {
+            when (val row = adapter.getItem(i) as ListRow) {
+                is ListRow.EntryRow -> entries++
+                is ListRow.SiteGroupRow -> {
+                    groups++
+                    entries += row.profileCount
+                    if (row.expanded) expanded++
+                }
+                is ListRow.ProfileChildRow -> Unit // already counted by its group's profileCount
+            }
+        }
+        return GroupStats(entries, groups, expanded)
+    }
+
+    private fun clearExpansion() {
+        (getField("expandedSites") as ExpandedSites).clear()
+    }
+
     /** Views ListView currently keeps as children (visible rows + header + footer). -1 if not built. */
     private fun listChildCount(): Int = (getField("entryListView") as? ViewGroup)?.childCount ?: -1
 
@@ -179,6 +215,9 @@ class ListRebuildBenchmark : Instrumentation() {
         val rows: Int,
         val views: Int,
         val listChildren: Int,
+        val visibleEntries: Int = -1,
+        val siteGroups: Int = -1,
+        val expandedSiteGroups: Int = -1,
     )
 
     /**
@@ -214,12 +253,17 @@ class ListRebuildBenchmark : Instrumentation() {
         var rows = -1
         var views = -1
         var listChildren = -1
+        var stats = GroupStats(-1, -1, -1)
         onMain {
             rows = adapterRowCount()
             views = countViews(decor())
             listChildren = listChildCount()
+            stats = groupStats()
         }
-        return Sample(actionNs / 1e6, layout, draw, total, got, rows, views, listChildren)
+        return Sample(
+            actionNs / 1e6, layout, draw, total, got, rows, views, listChildren,
+            stats.visibleEntries, stats.siteGroups, stats.expandedSiteGroups,
+        )
     }
 
     // ---------------------------------------------------------------- scenario driving
@@ -253,8 +297,13 @@ class ListRebuildBenchmark : Instrumentation() {
         }
     }
 
-    /** Sets the Activity's own filter state, then rebuilds. Not a measured step. */
+    /**
+     * Sets the Activity's own filter state, then rebuilds. Not a measured step.
+     * Also returns every site group to the normal freshly-opened state
+     * (collapsed), so each scenario starts from the real default.
+     */
     private fun resetFilter(categoryIndex: Int?, query: String) {
+        clearExpansion()
         setField(
             "categoryFilter",
             categoryIndex?.let { com.localvault.android.CategoryFilter.Category(SyntheticEntries.categoryId(it)) }
@@ -286,7 +335,9 @@ class ListRebuildBenchmark : Instrumentation() {
     private fun report(size: Int, name: String, samples: List<Sample>) {
         val missing = samples.count { !it.gotFrame }
         emit(
-            "CSV,$size,\"$name\",rows=${samples.last().rows},views=${samples.last().views}," +
+            "CSV,$size,\"$name\",rows=${samples.last().rows},visibleEntries=${samples.last().visibleEntries}," +
+                "siteGroups=${samples.last().siteGroups},expandedSiteGroups=${samples.last().expandedSiteGroups}," +
+                "views=${samples.last().views}," +
                 "action_med=${f(median(samples.map { it.actionMs }))},action_p95=${f(p95(samples.map { it.actionMs }))}," +
                 "layout_med=${f(median(samples.map { it.layoutMeasureMs }))},layout_p95=${f(p95(samples.map { it.layoutMeasureMs }))}," +
                 "draw_med=${f(median(samples.map { it.drawMs }))},draw_p95=${f(p95(samples.map { it.drawMs }))}," +
@@ -334,6 +385,64 @@ class ListRebuildBenchmark : Instrumentation() {
         emit("DONE")
     }
 
+    /**
+     * Taps the real site-group card (real click -> toggleSite -> regroup) of the
+     * largest group among the first rows, then taps it again to collapse. Reported
+     * as two extra scenarios; the existing scenarios are unchanged.
+     */
+    private fun runExpandScenario(size: Int, warmup: Int, iterations: Int) {
+        val expand = ArrayList<Sample>()
+        val collapse = ArrayList<Sample>()
+        var skipped = false
+
+        repeat(warmup + iterations) { i ->
+            onMain {
+                resetFilter(null, "")
+                // Bring the first rows to the top so a group is laid out and tappable.
+                (getField("entryListView") as android.widget.ListView).setSelectionFromTop(1, 0)
+            }
+            waitForIdleSync()
+
+            var siteKey: String? = null
+            onMain {
+                val adapter = getField("entryAdapter") as BaseAdapter
+                siteKey =
+                    (0 until minOf(4, adapter.count))
+                        .mapNotNull { adapter.getItem(it) as? ListRow.SiteGroupRow }
+                        .maxByOrNull { it.profileCount }
+                        ?.siteKey
+            }
+            val key = siteKey
+            if (key == null) {
+                skipped = true
+                return@repeat
+            }
+
+            val opened = measure { tapSiteGroup(key) }
+            val closed = measure { tapSiteGroup(key) }
+            if (i >= warmup) {
+                expand.add(opened)
+                collapse.add(closed)
+            }
+        }
+
+        if (skipped && expand.isEmpty()) {
+            emit("CSV,$size,\"expand one site group (skipped: no group among first rows)\"")
+            return
+        }
+        report(size, "expand one site group (tap)", expand)
+        report(size, "collapse same site group (tap)", collapse)
+        onMain { resetFilter(null, "") }
+    }
+
+    /** Clicks the clickable card that contains the group's site-key label. */
+    private fun tapSiteGroup(siteKey: String) {
+        val label = findTextView(decor(), siteKey) ?: error("site group row not found: $siteKey")
+        var card: View? = label
+        while (card != null && !card.isClickable) card = card.parent as? View
+        (card ?: error("site group card not clickable")).performClick()
+    }
+
     private fun runSize(size: Int, warmup: Int, iterations: Int) {
         // --- memory: heap with 0 resident rows vs N resident rows -------------
         inject(size)
@@ -345,13 +454,16 @@ class ListRebuildBenchmark : Instrumentation() {
         var rows = -1
         var views = -1
         var listChildren = -1
+        var stats = GroupStats(-1, -1, -1)
         onMain {
             rows = adapterRowCount()
             views = countViews(decor())
             listChildren = listChildCount()
+            stats = groupStats()
         }
         emit(
-            "MEMORY,$size,rows=$rows,views=$views,heapEmptyMiB=${f(heapEmpty / 1048576.0)}," +
+            "MEMORY,$size,rows=$rows,visibleEntries=${stats.visibleEntries},siteGroups=${stats.siteGroups}," +
+                "expandedSiteGroups=${stats.expandedSiteGroups},views=$views,heapEmptyMiB=${f(heapEmpty / 1048576.0)}," +
                 "heapFullMiB=${f(heapFull / 1048576.0)},deltaMiB=${f((heapFull - heapEmpty) / 1048576.0)}," +
                 "listChildren=$listChildren",
         )
@@ -407,12 +519,19 @@ class ListRebuildBenchmark : Instrumentation() {
                 }
                 if (i >= warmup) {
                     samples.add(
-                        Sample(totalActionMs, totalLayoutMs, last!!.drawMs, last.frameTotalMs, last.gotFrame, last.rows, last.views, last.listChildren),
+                        Sample(
+                            totalActionMs, totalLayoutMs, last!!.drawMs, last.frameTotalMs, last.gotFrame,
+                            last.rows, last.views, last.listChildren,
+                            last.visibleEntries, last.siteGroups, last.expandedSiteGroups,
+                        ),
                     )
                 }
             }
             report(size, "type 'mail' (4 keystrokes, summed action+layout)", samples)
         }
+
+        // --- grouping interaction: tap one site group to expand it, then collapse ---
+        runExpandScenario(size, warmup, iterations)
 
         onMain { resetFilter(null, "zzqqxx-no-match") }
     }

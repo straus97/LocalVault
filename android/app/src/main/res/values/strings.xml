@@ -51,6 +51,12 @@
         <item quantity="one">%d entry</item>
         <item quantity="other">%d entries</item>
     </plurals>
+    <plurals name="site_group_profiles">
+        <item quantity="one">%d profile</item>
+        <item quantity="other">%d profiles</item>
+    </plurals>
+    <string name="site_group_collapsed_a11y">%1$s, %2$s. Collapsed. Tap to expand.</string>
+    <string name="site_group_expanded_a11y">%1$s, %2$s. Expanded. Tap to collapse.</string>
 
     <string name="username">Username</string>
     <string name="password">Password</string>

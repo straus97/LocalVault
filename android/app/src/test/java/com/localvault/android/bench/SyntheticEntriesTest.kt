@@ -38,6 +38,23 @@ class SyntheticEntriesTest {
     }
 
     @Test
+    fun site_keys_follow_the_url_and_group_entries() {
+        val entries = SyntheticEntries.generate(5_000)
+        for (e in entries) {
+            if (e.url.isEmpty()) {
+                assertEquals(null, e.siteKey)
+            } else {
+                // host of "https://<host>/..." with one leading "www." removed
+                val host = e.url.removePrefix("https://").substringBefore('/').removePrefix("www.")
+                assertEquals(host, e.siteKey)
+            }
+        }
+        val keys = entries.mapNotNull { it.siteKey }
+        assertTrue(keys.isNotEmpty())
+        assertTrue("some sites carry several profiles", keys.size > keys.toSet().size)
+    }
+
+    @Test
     fun sizes_are_exact() {
         assertEquals(0, SyntheticEntries.generate(0).size)
         assertEquals(1_000, SyntheticEntries.generate(1_000).size)

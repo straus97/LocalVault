@@ -24,6 +24,7 @@ use std::{
 };
 
 use localvault_core::{
+    site::site_key,
     totp::{generate_totp, parse_totp_input},
     vault::{
         data::{VaultCategory, VaultData, VaultEntry},
@@ -61,6 +62,12 @@ pub struct EntrySummary {
     /// The entry's existing category id, or `None` when it has no category
     /// (a genuine state in the persisted model). Used only for local filtering.
     pub category_id: Option<String>,
+    /// Derived, non-persisted site grouping key from
+    /// `localvault_core::site::site_key(url)`: the normalized hostname, or
+    /// `None` when the URL is blank/unparseable. Computed here on every list
+    /// call; never stored in `VaultData`. Kotlin groups by it and never
+    /// re-derives it.
+    pub site_key: Option<String>,
 }
 
 /// Detail for one entry, fetched only when the user opens it (for browsing)
@@ -307,6 +314,7 @@ impl VaultSession {
                 url: entry.url.clone(),
                 username: entry.username.clone(),
                 category_id: entry.category_id.map(|id| id.to_string()),
+                site_key: site_key(&entry.url),
             })
             .collect())
     }
@@ -1286,6 +1294,7 @@ mod tests {
                 url: _,
                 username: _,
                 category_id: _,
+                site_key: _,
             } = summary;
         }
 
@@ -2168,6 +2177,81 @@ mod tests {
 
         let details = staged_session.entry_details(created.id.clone()).unwrap();
         assert!(!details.totp_enabled);
+    }
+
+    fn staged_site_key_for(url: &str) -> Option<String> {
+        let session = open_ok(schema2());
+        let mut input = create_input("Site Key Probe");
+        input.url = url.to_owned();
+
+        let staged_bytes = session.stage_create_entry(input, UPDATE_NOW_MS).unwrap();
+        reopen_bytes(&staged_bytes)
+            .list_entries()
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.title == "Site Key Probe")
+            .expect("probe entry present")
+            .site_key
+    }
+
+    #[test]
+    fn entry_summary_site_key_is_the_core_normalized_host() {
+        assert_eq!(
+            staged_site_key_for("https://WWW.GitHub.com:8443/login?x=1#f"),
+            Some("github.com".to_owned())
+        );
+        assert_eq!(
+            staged_site_key_for("accounts.example.com/signin"),
+            Some("accounts.example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn entry_summary_site_key_is_none_for_blank_or_unparseable_urls() {
+        assert_eq!(staged_site_key_for(""), None);
+        assert_eq!(staged_site_key_for("   "), None);
+        assert_eq!(staged_site_key_for("https://exa mple.com"), None);
+        assert_eq!(staged_site_key_for("file:///etc/hosts"), None);
+        assert_eq!(staged_site_key_for("http:///path"), None);
+    }
+
+    #[test]
+    fn entry_summary_site_key_matches_core_for_every_fixture_entry() {
+        let session = open_ok(schema2());
+        let summaries = session.list_entries().unwrap();
+
+        let guard = session.guard();
+        let data = &guard.as_ref().unwrap().data;
+        assert_eq!(summaries.len(), data.entries.len());
+
+        for (summary, entry) in summaries.iter().zip(&data.entries) {
+            assert_eq!(summary.site_key, site_key(&entry.url), "{}", entry.title);
+        }
+    }
+
+    #[test]
+    fn entries_sharing_a_site_share_a_key_and_profiles_stay_distinct() {
+        let session = open_ok(schema2());
+        let mut first = create_input("Profile A");
+        first.url = "https://www.shared.example.test/a".to_owned();
+        first.profile_name = "A".to_owned();
+        session.stage_create_entry(first, UPDATE_NOW_MS).unwrap();
+        session.commit_staged_save().unwrap();
+
+        let mut second = create_input("Profile B");
+        second.url = "http://shared.example.test:8080/b".to_owned();
+        second.profile_name = "B".to_owned();
+        session.stage_create_entry(second, UPDATE_NOW_MS).unwrap();
+        session.commit_staged_save().unwrap();
+
+        let shared: Vec<_> = session
+            .list_entries()
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.site_key.as_deref() == Some("shared.example.test"))
+            .collect();
+        assert_eq!(shared.len(), 2);
+        assert_ne!(shared[0].id, shared[1].id);
     }
 
     #[test]

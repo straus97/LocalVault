@@ -52,6 +52,14 @@
         <item quantity="many">%d записей</item>
         <item quantity="other">%d записи</item>
     </plurals>
+    <plurals name="site_group_profiles">
+        <item quantity="one">%d профиль</item>
+        <item quantity="few">%d профиля</item>
+        <item quantity="many">%d профилей</item>
+        <item quantity="other">%d профиля</item>
+    </plurals>
+    <string name="site_group_collapsed_a11y">%1$s, %2$s. Свёрнуто. Нажмите, чтобы развернуть.</string>
+    <string name="site_group_expanded_a11y">%1$s, %2$s. Развёрнуто. Нажмите, чтобы свернуть.</string>
 
     <string name="username">Логин</string>
     <string name="password">Пароль</string>

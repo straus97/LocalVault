@@ -5,40 +5,139 @@ import uniffi.localvault_android_bridge.EntrySummary
 /**
  * One logical row of the Android LIST screen's virtualized `ListView`.
  *
- * Today the list is flat: exactly one [EntryRow] per visible [EntrySummary],
- * in stored order. The sealed type and the per-row [viewType] exist so a
- * later site/profile grouping slice can add further row kinds without
- * replacing the list container or the adapter's recycling contract again.
- * No grouping is implemented here.
+ * The rows are derived UI state only -- nothing here is persisted, and the
+ * site identity is the bridge-provided `EntrySummary.siteKey` (derived by
+ * `localvault-core`; Kotlin never normalizes URLs itself):
  *
- * Holds only the non-secret [EntrySummary] values the list already had.
+ * - [SiteGroupRow]: one per distinct site key among the VISIBLE entries;
+ * - [ProfileChildRow]: one per visible entry of an EXPANDED site group,
+ *   directly below its group row;
+ * - [EntryRow]: an entry with no site key (blank/unparseable URL). The only
+ *   standalone entry rows.
+ *
+ * Holds only non-secret [EntrySummary] values.
  */
 internal sealed class ListRow {
 
     /** Adapter view type; must be in `0 until VIEW_TYPE_COUNT`. */
     abstract val viewType: Int
 
-    /** One entry row. [entryId] is what a tap opens DETAIL for. */
+    /** A standalone (ungroupable) entry. [entryId] is what a tap opens DETAIL for. */
     class EntryRow(val entry: EntrySummary) : ListRow() {
         val entryId: String get() = entry.id
 
         override val viewType: Int get() = VIEW_TYPE_ENTRY
     }
 
+    /** A site with [profileCount] currently visible entries; a tap toggles [siteKey]. */
+    class SiteGroupRow(val siteKey: String, val profileCount: Int, val expanded: Boolean) : ListRow() {
+        override val viewType: Int get() = VIEW_TYPE_SITE_GROUP
+    }
+
+    /** One visible profile/account of the expanded site [siteKey]. */
+    class ProfileChildRow(val siteKey: String, val entry: EntrySummary) : ListRow() {
+        val entryId: String get() = entry.id
+
+        override val viewType: Int get() = VIEW_TYPE_PROFILE_CHILD
+    }
+
     companion object {
         const val VIEW_TYPE_ENTRY = 0
-        const val VIEW_TYPE_COUNT = 1
+        const val VIEW_TYPE_SITE_GROUP = 1
+        const val VIEW_TYPE_PROFILE_CHILD = 2
+        const val VIEW_TYPE_COUNT = 3
     }
+}
+
+/**
+ * The result of grouping the visible entries. [rows] is what the adapter
+ * shows; [visibleEntryCount] is the number of visible [EntrySummary] objects
+ * (what the on-screen count means) and is NOT [rows]`.size`.
+ */
+internal class GroupedList(
+    val rows: List<ListRow>,
+    val visibleEntryCount: Int,
+    val siteGroupCount: Int,
+    val expandedSiteGroupCount: Int,
+)
+
+/**
+ * Which site groups are expanded, keyed by normalized site key. Pure
+ * in-memory UI state: default collapsed, never persisted, and cleared whenever
+ * the vault session ends or a new one starts. A key that no longer appears in
+ * the visible grouping is simply ignored by [ListRows.group].
+ */
+internal class ExpandedSites {
+    private val keys = HashSet<String>()
+
+    fun isExpanded(siteKey: String): Boolean = siteKey in keys
+
+    /** Flips [siteKey]; returns whether it is now expanded. */
+    fun toggle(siteKey: String): Boolean = if (keys.remove(siteKey)) false else keys.add(siteKey)
+
+    fun clear() = keys.clear()
+
+    /** Read-only view for [ListRows.group]; do not retain across toggles. */
+    fun keysView(): Set<String> = keys
 }
 
 internal object ListRows {
 
-    /** Filters first (the unchanged [EntryListFilter]), then builds rows. */
-    fun build(entries: List<EntrySummary>, filter: CategoryFilter, query: String): List<ListRow> =
-        forVisibleEntries(EntryListFilter.visible(entries, filter, query))
+    /**
+     * The whole pipeline: the unchanged [EntryListFilter] filters ENTRIES
+     * first, and only then are the survivors grouped.
+     */
+    fun build(entries: List<EntrySummary>, filter: CategoryFilter, query: String, expanded: Set<String>): GroupedList =
+        group(EntryListFilter.visible(entries, filter, query), expanded)
 
-    /** Exactly one [ListRow.EntryRow] per entry, same order, no grouping. */
-    fun forVisibleEntries(visible: List<EntrySummary>): List<ListRow> = visible.map { ListRow.EntryRow(it) }
+    /**
+     * Groups already-filtered [visible] entries in one order-preserving O(n)
+     * pass: a site's top-level position is its first visible appearance,
+     * children keep the visible order, and entries without a site key stay
+     * standalone at their natural position. Never sorts.
+     */
+    fun group(visible: List<EntrySummary>, expanded: Set<String>): GroupedList {
+        // Top-level slots in first-appearance order: either a site key (group)
+        // or a standalone entry.
+        val slots = ArrayList<Slot>()
+        val bySite = HashMap<String, ArrayList<EntrySummary>>()
+
+        for (entry in visible) {
+            val key = entry.siteKey?.takeIf { it.isNotBlank() }
+            if (key == null) {
+                slots.add(Slot(null, entry))
+                continue
+            }
+            val members = bySite[key]
+            if (members == null) {
+                bySite[key] = arrayListOf(entry)
+                slots.add(Slot(key, null))
+            } else {
+                members.add(entry)
+            }
+        }
+
+        val rows = ArrayList<ListRow>(slots.size)
+        var expandedCount = 0
+        for (slot in slots) {
+            val key = slot.siteKey
+            if (key == null) {
+                rows.add(ListRow.EntryRow(slot.entry!!))
+                continue
+            }
+            val members = bySite.getValue(key)
+            val isExpanded = key in expanded
+            rows.add(ListRow.SiteGroupRow(key, members.size, isExpanded))
+            if (isExpanded) {
+                expandedCount++
+                for (member in members) rows.add(ListRow.ProfileChildRow(key, member))
+            }
+        }
+
+        return GroupedList(rows, visible.size, bySite.size, expandedCount)
+    }
+
+    private class Slot(val siteKey: String?, val entry: EntrySummary?)
 }
 
 /**
@@ -55,10 +154,11 @@ internal enum class ListEmptyState {
     ;
 
     companion object {
-        fun resolve(totalEntries: Int, visibleRows: Int, query: String, filter: CategoryFilter): ListEmptyState =
+        /** [visibleEntries] is the visible ENTRY count, not the adapter row count. */
+        fun resolve(totalEntries: Int, visibleEntries: Int, query: String, filter: CategoryFilter): ListEmptyState =
             when {
                 totalEntries == 0 -> NO_ENTRIES
-                visibleRows > 0 -> NONE
+                visibleEntries > 0 -> NONE
                 query.isEmpty() && filter != CategoryFilter.All -> CATEGORY_EMPTY
                 else -> NO_RESULTS
             }
@@ -80,6 +180,22 @@ internal class EntryRowContent(val title: String, val username: String?, val sub
                 subtitle = site.takeIf { it.isNotEmpty() },
             )
         }
+    }
+}
+
+/**
+ * What one profile child row displays. The site (hostname) is already shown by
+ * the group row above it, so the child omits the URL and shows only what tells
+ * profiles of the same site apart: title, username, profile name.
+ */
+internal class ProfileChildContent(val title: String, val username: String?, val profileName: String?) {
+    companion object {
+        fun from(entry: EntrySummary): ProfileChildContent =
+            ProfileChildContent(
+                title = entry.title,
+                username = entry.username.takeIf { it.isNotBlank() },
+                profileName = entry.profileName.takeIf { it.isNotBlank() },
+            )
     }
 }
 

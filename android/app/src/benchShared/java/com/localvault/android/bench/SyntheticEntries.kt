@@ -74,12 +74,16 @@ internal object SyntheticEntries {
 
             val title = if (rnd.nextInt(100) < 85) name else "$name Account"
 
-            val url =
+            // The site key is what `localvault-core`'s `site_key` yields for the
+            // URL (the bridge supplies it in production). It is written out by
+            // hand here -- no extra random draw -- so the dataset's other fields
+            // and the pinned checksum are unchanged.
+            val (url, siteKey) =
                 when (rnd.nextInt(100)) {
-                    in 0 until 10 -> ""
-                    in 10 until 60 -> "https://www.$domain/login"
-                    in 60 until 90 -> "https://$domain"
-                    else -> "https://accounts.$domain/signin?next=%2Fhome"
+                    in 0 until 10 -> "" to null
+                    in 10 until 60 -> "https://www.$domain/login" to domain
+                    in 60 until 90 -> "https://$domain" to domain
+                    else -> "https://accounts.$domain/signin?next=%2Fhome" to "accounts.$domain"
                 }
 
             val username =
@@ -109,6 +113,7 @@ internal object SyntheticEntries {
                     url = url,
                     username = username,
                     categoryId = categoryId,
+                    siteKey = siteKey,
                 ),
             )
         }

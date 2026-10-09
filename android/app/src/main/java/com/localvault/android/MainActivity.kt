@@ -287,6 +287,13 @@ class MainActivity : Activity() {
     // by the next renderList and then dropped.
     private var savedListScroll: ListScrollPosition = ListScrollPosition.TOP
     private var pendingListScroll: ListScrollPosition? = null
+
+    // Which site groups are expanded (keyed by normalized site key). Pure UI
+    // state: default collapsed, never persisted, cleared with the scroll state
+    // on every unlock/create/lock so it cannot cross vault sessions. It
+    // survives DETAIL round trips and search/category changes (stale keys are
+    // harmless -- they simply match no visible group).
+    private val expandedSites = ExpandedSites()
     private var detail: EntryDetails? = null
 
     // 1T-B5b-3 vault-creation state. Holds only non-secret bookkeeping for
@@ -1073,6 +1080,7 @@ class MainActivity : Activity() {
                 searchQuery = ""
                 savedListScroll = ListScrollPosition.TOP
                 pendingListScroll = null
+                expandedSites.clear()
                 vaultUri = uri
                 vaultName = name
                 statusRes = 0
@@ -1383,6 +1391,7 @@ class MainActivity : Activity() {
             searchQuery = ""
             savedListScroll = ListScrollPosition.TOP
             pendingListScroll = null
+            expandedSites.clear()
             statusRes = 0
             screen = Screen.LIST
         } else if (unreadable && recents.load().any { it.uri == uri }) {
@@ -1425,6 +1434,7 @@ class MainActivity : Activity() {
         searchQuery = ""
         savedListScroll = ListScrollPosition.TOP
         pendingListScroll = null
+        expandedSites.clear()
         clearRevealedPassword()
         recoveryUnresolvedSha256 = null
         restoring = false
@@ -3255,7 +3265,7 @@ class MainActivity : Activity() {
         list.addHeaderView(header, null, true)
         list.addFooterView(footer, null, true)
 
-        val adapter = EntryListAdapter(this) { entryId -> openDetail(entryId) }
+        val adapter = EntryListAdapter(this, { entryId -> openDetail(entryId) }, { siteKey -> toggleSite(siteKey) })
         list.adapter = adapter
         entryListView = list
         entryAdapter = adapter
@@ -3279,22 +3289,25 @@ class MainActivity : Activity() {
     }
 
     /**
-     * Search/category/refresh path: the unchanged [EntryListFilter] runs first,
-     * the adapter gets the new logical rows, and the count and empty state are
-     * updated. `ListView` rebinds only the rows it shows; no row Views are
-     * created for the rest.
+     * Search/category/refresh path: the unchanged [EntryListFilter] filters
+     * ENTRIES first, the survivors are then grouped by site (collapsed unless
+     * in [expandedSites]), the adapter gets the new logical rows, and the
+     * count and empty state are updated. The count is the number of visible
+     * ENTRIES, not the number of adapter rows. `ListView` rebinds only the
+     * rows it shows; no row Views are created for the rest.
      */
     private fun refreshListRows() {
         val adapter = entryAdapter ?: return
 
         val query = searchQuery.trim()
-        val rows = ListRows.build(entries, categoryFilter, query)
-        adapter.submit(rows)
+        val grouped = ListRows.build(entries, categoryFilter, query, expandedSites.keysView())
+        adapter.submit(grouped.rows)
 
-        countView?.text = resources.getQuantityString(R.plurals.entries_count, rows.size, rows.size)
+        val visibleEntries = grouped.visibleEntryCount
+        countView?.text = resources.getQuantityString(R.plurals.entries_count, visibleEntries, visibleEntries)
 
         val emptyRes =
-            when (ListEmptyState.resolve(entries.size, rows.size, query, categoryFilter)) {
+            when (ListEmptyState.resolve(entries.size, visibleEntries, query, categoryFilter)) {
                 ListEmptyState.NONE -> 0
                 ListEmptyState.NO_ENTRIES -> R.string.no_entries
                 ListEmptyState.CATEGORY_EMPTY -> R.string.category_empty
@@ -3308,6 +3321,16 @@ class MainActivity : Activity() {
             emptyView.text = getString(emptyRes)
             emptyView.visibility = View.VISIBLE
         }
+    }
+
+    /**
+     * A site group row was tapped: flip its expansion and regroup. Only rows
+     * below the tapped group change position, so `ListView` keeps the current
+     * first visible position and the group stays where the user tapped it.
+     */
+    private fun toggleSite(siteKey: String) {
+        expandedSites.toggle(siteKey)
+        refreshListRows()
     }
 
     /** Category chips: All, each category in stored order, then Uncategorized (only if any exist). */
