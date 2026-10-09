@@ -368,7 +368,7 @@ Added after the B4-era snapshot above; supersedes the "read-only"/"B5 next" stat
 
 ## 33. Update: Android LIST virtualization (accepted; not a new named stage)
 
-**Status:** accepted after code review, full Android JVM tests, Android debug build, androidTest compilation, real-device benchmark and manual device QA. The benchmark harness is committed (`a3cd2fe`); the virtualization source change itself is **accepted but still uncommitted** in the worktree at the time of writing. Verify with `git status`/`git log` rather than trusting this line.
+**Status:** accepted after code review, full Android JVM tests, Android debug build, androidTest compilation, real-device benchmark and manual device QA. The benchmark harness is committed (`a3cd2fe`); the virtualization source change itself was accepted and later committed as `7c73715` (`perf(android): virtualize vault entry list`). Verify with `git log` rather than trusting this line.
 
 **Process:** measured first, optimized second. A committed on-device benchmark (`ListRebuildBenchmark`, deterministic synthetic `EntrySummary` data, real `MainActivity`) measured the old design before any change. The earlier RecyclerView-vs-ListView question was closed in favor of framework `ListView` + `BaseAdapter`; virtualization was done before site/profile grouping.
 
@@ -410,7 +410,7 @@ At 50,000 entries also: heap delta for the measured list state ~1.15 MiB; search
 
 ## 34. Update: Android site/profile grouping (accepted; not a new named stage)
 
-**Status:** implemented, reviewed, benchmarked on a real device and manually QA'd; accepted. The source change (core `site.rs`, bridge `EntrySummary.site_key`, Kotlin row model/adapter/MainActivity, EN/RU strings, benchmark harness, tests) is **still uncommitted and unstaged** in the worktree at HEAD `7c73715`. Verify with `git status`/`git log` rather than trusting this line. No new named `1T-B6` stage exists.
+**Status:** implemented, reviewed, benchmarked on a real device and manually QA'd; accepted. The source change (core `site.rs`, bridge `EntrySummary.site_key`, Kotlin row model/adapter/MainActivity, EN/RU strings, benchmark harness, tests) was committed and pushed as `5a6c664` (`feat(android): group vault entries by site`, on top of the virtualization commit `7c73715`); the local and `origin/redesign/light-ui-v1.1` branches were verified aligned after the push. Grouping is complete within 1T. Verify with `git log` rather than trusting this line. No new named `1T-B6` stage exists.
 
 **Architecture:** persisted `VaultData` is unchanged — Entry objects only, no Site/Profile entity; one Entry is one account/profile. `localvault-core` owns `localvault_core::site::site_key(url: &str) -> Option<String>` (pure: no network, persistence, clock or Android dependency; reuses the existing `url` dependency). The bridge adds `site_key: Option<String>` to the non-secret `EntrySummary`, computed Rust-side on each list call and never stored; no secret field was added, UniFFI stays `=0.32.0`, no async. Kotlin never normalizes URLs; it owns visual grouping and expanded/collapsed state only. Groups expand inline; there is no separate Site screen. Desktop (`src/App.tsx`) is unchanged and does not yet consume `site_key`; "New profile for this site" stays deferred to the design/UX pass. No change to vault format, schema, crypto, KDF, session/key ownership, SAF/save, lifecycle (`onStop` lock), TOTP, clipboard, permissions or package identity.
 
