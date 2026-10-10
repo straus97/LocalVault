@@ -94,8 +94,14 @@ enum class EvictionOutcome {
     KEEP,
 }
 
-fun evictionOutcomeFor(hasUnresolvedMarker: Boolean): EvictionOutcome =
-    if (hasUnresolvedMarker) EvictionOutcome.KEEP else EvictionOutcome.RELEASE_AND_FORGET
+/**
+ * [saveInFlight] is true while a save's thread may still be running (see
+ * `MutationOwnership.reopenBlocked`): its marker may not exist yet or may be
+ * written right after the marker check, so nothing may be released or
+ * forgotten for any evicted vault until it finishes.
+ */
+fun evictionOutcomeFor(hasUnresolvedMarker: Boolean, saveInFlight: Boolean = false): EvictionOutcome =
+    if (hasUnresolvedMarker || saveInFlight) EvictionOutcome.KEEP else EvictionOutcome.RELEASE_AND_FORGET
 
 class FileRecoverySnapshotStore(context: Context) : RecoverySnapshotStore {
 

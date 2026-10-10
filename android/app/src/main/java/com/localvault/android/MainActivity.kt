@@ -244,6 +244,43 @@ internal fun entryDeleteFailureNotice(outcome: SaveOutcome): EntryDeleteNotice =
         -> EntryDeleteNotice.ACTION_FAILED
     }
 
+/**
+ * The single physical-ownership slot for an in-flight entry/category/TOTP
+ * mutation (see `MainActivity.mutationOwnership`). Main-thread-confined:
+ * every [begin] and [endIfOwned] call happens on the UI thread (completions
+ * arrive via `runOnUiThread`), so it needs no locking.
+ */
+internal class MutationOwnership {
+    private var tokenCounter = 0L
+    private var activeToken: Long? = null
+
+    /** A fresh ownership token, or null if a mutation already owns the slot. */
+    fun begin(): Long? {
+        if (activeToken != null) return null
+        val token = ++tokenCounter
+        activeToken = token
+        return token
+    }
+
+    /** No-op unless [token] is still the current owner. */
+    fun endIfOwned(token: Long) {
+        if (activeToken == token) {
+            activeToken = null
+        }
+    }
+
+    /**
+     * True while a save's background thread may still be running, even if the
+     * session that started it was already locked. Pre-open reconciliation and
+     * recovery restore must not start then: the gate would read the primary
+     * and clear the marker while the in-flight save can still write it,
+     * leaving a primary state no marker covers. Not time-limited; the
+     * save's completion callback is the only thing that releases it.
+     */
+    val reopenBlocked: Boolean
+        get() = activeToken != null
+}
+
 class MainActivity : Activity() {
 
     private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS, ENTRY_EDIT, CATEGORY_MANAGE, TOTP_SETUP, RECOVERY_NEEDED }
@@ -456,23 +493,19 @@ class MainActivity : Activity() {
     // abandoned attempt can therefore never clear a newer attempt's
     // ownership, because with a single slot a newer attempt could not have
     // started in the first place while the older one still held it.
-    private var mutationTokenCounter = 0L
-    private var activeMutationToken: Long? = null
+    //
+    // Because the token outlives the lock, it is also what tells
+    // [startUnlock]/[runRestore] that an earlier save's thread may still be
+    // writing the primary: [MutationOwnership.reopenBlocked] refuses to
+    // reconcile, open or restore the vault until that thread's completion
+    // callback has released it.
+    private val mutationOwnership = MutationOwnership()
 
     /** Returns a fresh ownership token, or null if a mutation is already in flight. */
-    private fun beginMutation(): Long? {
-        if (activeMutationToken != null) return null
-        val token = ++mutationTokenCounter
-        activeMutationToken = token
-        return token
-    }
+    private fun beginMutation(): Long? = mutationOwnership.begin()
 
     /** No-op unless [token] is still the current owner -- see the field doc comment above. */
-    private fun endMutationIfOwned(token: Long) {
-        if (activeMutationToken == token) {
-            activeMutationToken = null
-        }
-    }
+    private fun endMutationIfOwned(token: Long) = mutationOwnership.endIfOwned(token)
 
     // Session-scoped save coordinator (Blocker 1 fix): constructed exactly
     // once per live [session], from the exact ciphertext bytes that produced
@@ -854,7 +887,7 @@ class MainActivity : Activity() {
             contentResolver.persistedUriPermissions.any { it.uri == vault.uri && it.isReadPermission }
 
         if (!stillGranted) {
-            forgetVault(vault.uri)
+            if (!forgetVault(vault.uri)) return
             statusRes = R.string.msg_recent_unavailable
             render()
             return
@@ -883,10 +916,17 @@ class MainActivity : Activity() {
      * unresolved save is left fully intact -- grant and recovery state both
      * -- so it stays reachable/reconcilable despite falling out of the
      * visible recent list (see [evictionOutcomeFor]).
+     *
+     * The same applies while any save is still in flight ([mutationOwnership]
+     * survives lock): its marker may not exist yet, or may appear between the
+     * check below and the delete, so nothing evicted is released or forgotten
+     * then. The in-flight save's vault is not tracked separately; an unrelated
+     * vault evicted in that window just keeps its grant and recovery files.
      */
     private fun rememberVault(vault: RecentVault) {
+        val saveInFlight = mutationOwnership.reopenBlocked
         for (evicted in recents.promote(vault)) {
-            val outcome = evictionOutcomeFor(recovery.hasUnresolvedMarker(evicted.uri.toString()))
+            val outcome = evictionOutcomeFor(recovery.hasUnresolvedMarker(evicted.uri.toString()), saveInFlight)
             if (outcome == EvictionOutcome.RELEASE_AND_FORGET) {
                 releaseGrant(evicted.uri)
                 recovery.forget(evicted.uri.toString())
@@ -894,10 +934,22 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun forgetVault(uri: Uri) {
+    /**
+     * Returns false, having changed nothing, while a save is still in flight:
+     * forgetting would delete the recovery snapshot/marker that save depends
+     * on and release the write grant it is about to use. The check precedes
+     * every state change here, including the recent-list removal.
+     */
+    private fun forgetVault(uri: Uri): Boolean {
+        if (mutationOwnership.reopenBlocked) {
+            toast(R.string.msg_save_still_finishing)
+            return false
+        }
+
         recents.remove(uri)
         releaseGrant(uri)
         recovery.forget(uri.toString())
+        return true
     }
 
     /**
@@ -908,6 +960,13 @@ class MainActivity : Activity() {
      * introduces no UI that can actually leave a save unresolved yet.
      */
     private fun confirmForgetVault(vault: RecentVault) {
+        // Refused before the warning dialog: a marker written by an
+        // in-flight save is not an abandoned, user-discardable one.
+        if (mutationOwnership.reopenBlocked) {
+            toast(R.string.msg_save_still_finishing)
+            return
+        }
+
         if (!recovery.hasUnresolvedMarker(vault.uri.toString())) {
             forgetVault(vault.uri)
             statusRes = 0
@@ -919,9 +978,10 @@ class MainActivity : Activity() {
             .setTitle(R.string.forget_vault_unresolved_title)
             .setMessage(R.string.forget_vault_unresolved_message)
             .setPositiveButton(android.R.string.ok) { _, _ ->
-                forgetVault(vault.uri)
-                statusRes = 0
-                render()
+                if (forgetVault(vault.uri)) {
+                    statusRes = 0
+                    render()
+                }
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
@@ -1323,6 +1383,14 @@ class MainActivity : Activity() {
     private fun startUnlock() {
         val uri = vaultUri ?: return
         val field = passwordField ?: return
+
+        // An earlier save may still be writing this vault (it survives
+        // lock/onStop). Refuse before reading or wiping the password so the
+        // user can simply tap Unlock again once it has finished.
+        if (mutationOwnership.reopenBlocked) {
+            toast(R.string.msg_save_still_finishing)
+            return
+        }
 
         val password = field.text.toString()
         if (password.isEmpty()) {
@@ -2935,6 +3003,13 @@ class MainActivity : Activity() {
      * longer owns.
      */
     private fun runRestore(uri: Uri) {
+        // Same in-flight-save guard as startUnlock: never write the
+        // snapshot over a primary an earlier save thread may still touch.
+        if (mutationOwnership.reopenBlocked) {
+            toast(R.string.msg_save_still_finishing)
+            return
+        }
+
         restoring = true
         render()
 

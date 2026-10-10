@@ -1,6 +1,7 @@
 package com.localvault.android
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -1057,6 +1058,141 @@ class VaultSaveCoordinatorTest {
             assertSame("$name must propagate the discard failure", failure, thrown)
             assertEquals("$name commit count", 0, session.commitCount)
             // Recovery state is still intact for next-unlock reconciliation.
+            assertTrue("$name marker kept", recovery.hasUnresolvedMarker(vaultUri))
+        }
+    }
+
+    // ---- Second stale check: abort cleanup ordering (audit finding P2-5) ----
+
+    private val externallyChangedBytes = "raced-external-write".toByteArray()
+
+    /** Both second-stale-check abort paths, as a way to configure the fakes. */
+    private val secondCheckAbortModes: List<Triple<String, SaveOutcome?, (FakeSafDocumentIo, FakeVaultSession) -> Unit>> =
+        listOf(
+            Triple("changed externally", SaveOutcome.ChangedExternally) { io, _ ->
+                // Stage call lands between stale check 1 and 2.
+                io.onBeforeRead = {
+                    if (io.readCount == 2) io.setContent(vaultUri, externallyChangedBytes)
+                }
+            },
+            Triple("recheck read throws", null) { io, _ ->
+                io.onBeforeRead = { if (io.readCount == 2) throw IOException("recheck failed") }
+            },
+        )
+
+    private fun assertAbortOutcome(name: String, expected: SaveOutcome?, actual: SaveOutcome) {
+        if (expected != null) {
+            assertEquals("$name outcome", expected, actual)
+        } else {
+            assertTrue("$name outcome was $actual", actual is SaveOutcome.UnexpectedError)
+        }
+    }
+
+    @Test
+    fun second_stale_check_abort_clears_the_marker_even_when_the_session_was_already_closed() {
+        for ((name, expected, configure) in secondCheckAbortModes) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            val recovery = FakeRecoverySnapshotStore()
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+            session.discardException = IllegalStateException("VaultSession object has already been destroyed")
+            configure(io, session)
+
+            val outcome = coordinator(io, recovery, session)
+                .saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+
+            assertAbortOutcome(name, expected, outcome)
+            assertEquals("$name discard attempted once", 1, session.discardCount)
+            assertEquals("$name commit count", 0, session.commitCount)
+            assertEquals("$name must never write the primary", 0, io.writes.size)
+            // No false recoverable marker may survive, or the next unlock
+            // would offer the stale snapshot over the newer primary.
+            assertFalse("$name marker cleared", recovery.hasUnresolvedMarker(vaultUri))
+            if (expected == SaveOutcome.ChangedExternally) {
+                assertTrue(io.contentOf(vaultUri)!!.contentEquals(externallyChangedBytes))
+            }
+        }
+    }
+
+    @Test
+    fun second_stale_check_abort_with_a_closed_session_leaves_the_next_unlock_clean() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+        session.discardException = IllegalStateException("VaultSession object has already been destroyed")
+        io.onBeforeRead = { if (io.readCount == 2) io.setContent(vaultUri, externallyChangedBytes) }
+
+        val outcome = coordinator(io, recovery, session)
+            .saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+        assertEquals(SaveOutcome.ChangedExternally, outcome)
+
+        // The externally changed primary opens normally: no recovery prompt.
+        io.onBeforeRead = null
+        val gate = runUnlockPreOpenGate(
+            readMarker = { recovery.readMarker(vaultUri) },
+            readCurrentBytes = { io.readAll(vaultUri) },
+            clearMarker = { recovery.clearMarker(vaultUri) },
+            openPrimary = { bytes -> bytes },
+        )
+        assertTrue(gate is UnlockGateResult.Opened<*>)
+        assertNull((gate as UnlockGateResult.Opened<*>).reconciliationOutcome)
+    }
+
+    @Test
+    fun marker_cleanup_failure_on_a_second_stale_check_abort_is_not_reported_as_a_clean_outcome() {
+        for ((name, _, configure) in secondCheckAbortModes) {
+            for (closedSession in listOf(false, true)) {
+                val label = "$name (closedSession=$closedSession)"
+                val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+                val recovery = FakeRecoverySnapshotStore()
+                val session = FakeVaultSession(stagedBytes = stagedBytes)
+                if (closedSession) {
+                    session.discardException = IllegalStateException("VaultSession object has already been destroyed")
+                }
+                configure(io, session)
+                val failure = IOException("marker delete failed")
+                recovery.clearMarkerException = failure
+
+                val thrown =
+                    try {
+                        coordinator(io, recovery, session)
+                            .saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+                        null
+                    } catch (error: IOException) {
+                        error
+                    }
+
+                // Neither Success nor ChangedExternally ("no marker left
+                // pending") may be claimed; the caller sees a failure.
+                assertSame("$label must surface the cleanup failure", failure, thrown)
+                assertTrue("$label marker still present", recovery.hasUnresolvedMarker(vaultUri))
+                assertEquals("$label must never write the primary", 0, io.writes.size)
+                assertEquals("$label commit count", 0, session.commitCount)
+            }
+        }
+    }
+
+    @Test
+    fun unrelated_discard_failure_on_a_second_stale_check_abort_is_not_swallowed() {
+        for ((name, _, configure) in secondCheckAbortModes) {
+            val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+            val recovery = FakeRecoverySnapshotStore()
+            val session = FakeVaultSession(stagedBytes = stagedBytes)
+            val failure = InternalException("unexpected bridge failure")
+            session.discardException = failure
+            configure(io, session)
+
+            val thrown =
+                try {
+                    coordinator(io, recovery, session)
+                        .saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+                    null
+                } catch (error: InternalException) {
+                    error
+                }
+
+            assertSame("$name must propagate the discard failure", failure, thrown)
+            assertEquals("$name must never write the primary", 0, io.writes.size)
+            // Fail closed: the marker is left for next-unlock reconciliation.
             assertTrue("$name marker kept", recovery.hasUnresolvedMarker(vaultUri))
         }
     }

@@ -24,6 +24,18 @@ class EvictionOutcomeTest {
     }
 
     @Test
+    fun a_save_in_flight_keeps_even_without_a_marker() {
+        assertEquals(
+            EvictionOutcome.KEEP,
+            evictionOutcomeFor(hasUnresolvedMarker = false, saveInFlight = true),
+        )
+        assertEquals(
+            EvictionOutcome.KEEP,
+            evictionOutcomeFor(hasUnresolvedMarker = true, saveInFlight = true),
+        )
+    }
+
+    @Test
     fun eviction_with_no_unresolved_marker_forgets_recovery_state_for_that_vault() {
         val uri = "content://provider/document/evicted"
         val store = FakeRecoverySnapshotStore()

@@ -306,8 +306,7 @@ class VaultSaveCoordinator(
             try {
                 io.readAll(vaultUri)
             } catch (error: Exception) {
-                session.discardStagedSave()
-                recovery.clearMarker(vaultUri)
+                abortBeforePrimaryWrite(vaultUri)
                 return SaveOutcome.UnexpectedError(error)
             }
         if (Sha256.hex(recheckBytes) != baselineSha256) {
@@ -315,8 +314,7 @@ class VaultSaveCoordinator(
             // the marker (nothing pending to reconcile) and do not offer
             // the recovery snapshot -- it reflects our now-stale view, not
             // the externally changed content.
-            session.discardStagedSave()
-            recovery.clearMarker(vaultUri)
+            abortBeforePrimaryWrite(vaultUri)
             return SaveOutcome.ChangedExternally
         }
 
@@ -326,7 +324,7 @@ class VaultSaveCoordinator(
         try {
             io.writeTruncated(vaultUri, stagedBytes)
         } catch (error: Exception) {
-            discardStagedAfterFailedWrite()
+            discardStagedIgnoringClosedSession()
             return SaveOutcome.WriteFailed
         }
 
@@ -337,11 +335,11 @@ class VaultSaveCoordinator(
             try {
                 io.readAll(vaultUri)
             } catch (error: Exception) {
-                discardStagedAfterFailedWrite()
+                discardStagedIgnoringClosedSession()
                 return SaveOutcome.WriteFailed
             }
         if (!readback.contentEquals(stagedBytes)) {
-            discardStagedAfterFailedWrite()
+            discardStagedIgnoringClosedSession()
             return SaveOutcome.WriteFailed
         }
 
@@ -354,9 +352,24 @@ class VaultSaveCoordinator(
     }
 
     /**
-     * Drops the Rust staged candidate after an unverified primary write so a
-     * later retry is not rejected as `PendingUnsavedChanges`. Touches no
-     * recovery state: the marker and snapshot stay for next-unlock
+     * Cleanup for the second stale-check aborts (step 7), where the primary
+     * was never written: drops the staged candidate, then clears the marker
+     * so no false recovery offer survives. The discard comes first but is
+     * tolerant of an already-closed session (see
+     * [discardStagedIgnoringClosedSession]) so a concurrent lock/onStop can
+     * never skip the marker clear. Anything else thrown by the discard, or
+     * by [RecoverySnapshotStore.clearMarker] itself, propagates: the marker
+     * is then still present, and the caller must not see a clean outcome.
+     */
+    private fun abortBeforePrimaryWrite(vaultUri: String) {
+        discardStagedIgnoringClosedSession()
+        recovery.clearMarker(vaultUri)
+    }
+
+    /**
+     * Drops the Rust staged candidate so a later retry is not rejected as
+     * `PendingUnsavedChanges`. Touches no recovery state. After an
+     * unverified primary write the marker and snapshot stay for next-unlock
      * reconciliation, and the baseline is not advanced. The live session
      * keeps its verified in-memory state; a retry is guarded by stale check
      * #1 (a primary changed by the failed write yields `ChangedExternally`).
@@ -366,7 +379,7 @@ class VaultSaveCoordinator(
      * the session, which also dropped the staged state. Anything else
      * (e.g. a bridge `InternalException`) must propagate.
      */
-    private fun discardStagedAfterFailedWrite() {
+    private fun discardStagedIgnoringClosedSession() {
         try {
             session.discardStagedSave()
         } catch (closed: IllegalStateException) {
