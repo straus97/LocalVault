@@ -211,6 +211,39 @@ internal fun shouldRedrawAfterStaleEntryMutation(
         TotpRedrawScreen.ENTRY_EDIT, TotpRedrawScreen.TOTP_SETUP, TotpRedrawScreen.OTHER -> false
     }
 
+/**
+ * Whether a finished mutation proved the *current* vault is not writable, so
+ * its stored recent-vault hint must be downgraded. Only a completion from the
+ * coordinator that still owns the live session may touch metadata: a stale
+ * result from a replaced/locked coordinator belongs to a session that may
+ * since have been reopened (or switched to another vault) and must not change
+ * anything. The hint is UX metadata only; the real checks stay in
+ * [VaultSaveCoordinator].
+ */
+internal fun shouldDowngradeGrantHint(outcome: SaveOutcome, coordinatorLive: Boolean): Boolean =
+    outcome == SaveOutcome.ProviderNotWritable && coordinatorLive
+
+/** What an entry-delete failure must tell the user (DETAIL has no status area). */
+internal enum class EntryDeleteNotice { NONE, WRITE_ACCESS_UNAVAILABLE, ACTION_FAILED }
+
+/**
+ * Maps a delete [SaveOutcome] to the notice DETAIL must show. A delete that
+ * did not persist is never silent and never claims success; validation
+ * rejections of a delete (e.g. unknown entry) are a generic failure, not the
+ * "entry is invalid, check the fields" wording meant for the edit form.
+ * `ChangedExternally` is handled separately (it locks) and yields no notice.
+ */
+internal fun entryDeleteFailureNotice(outcome: SaveOutcome): EntryDeleteNotice =
+    when (outcome) {
+        SaveOutcome.Success, SaveOutcome.ChangedExternally -> EntryDeleteNotice.NONE
+        SaveOutcome.ProviderNotWritable -> EntryDeleteNotice.WRITE_ACCESS_UNAVAILABLE
+        is SaveOutcome.ValidationFailed,
+        SaveOutcome.RecoverySnapshotFailed,
+        SaveOutcome.WriteFailed,
+        is SaveOutcome.UnexpectedError,
+        -> EntryDeleteNotice.ACTION_FAILED
+    }
+
 class MainActivity : Activity() {
 
     private enum class Screen { NO_FILE, FILE_SELECTED, UNLOCKING, LIST, DETAIL, CREATE_PASSWORD, CREATE_IN_PROGRESS, ENTRY_EDIT, CATEGORY_MANAGE, TOTP_SETUP, RECOVERY_NEEDED }
@@ -225,6 +258,7 @@ class MainActivity : Activity() {
         // onActivityResult can apply the accepted grant-intersection logic
         // (Revision 3, section 3) instead of the plain read-only path.
         const val REQUEST_ENABLE_WRITE = 2
+        const val STATE_ENABLE_EDITING_TARGET = "enable_editing_target"
 
         // 1T-B5b-3: `ACTION_CREATE_DOCUMENT` for a brand-new vault. Distinct
         // from both codes above so onActivityResult can apply the
@@ -274,6 +308,19 @@ class MainActivity : Activity() {
     // finishRestore for the exact lifecycle.
     private var recoveryUnresolvedSha256: String? = null
     private var restoring: Boolean = false
+
+    // True while the unlocked vault is known to be unwritable: set from the
+    // live grant + provider checks made at unlock (or when a save proves it).
+    // Only drives UX (notice + disabled edit actions) -- never an authorization
+    // source; VaultSaveCoordinator re-checks on every save.
+    private var readOnlyVault: Boolean = false
+
+    // The recent vault an in-flight "Enable editing" picker was launched for.
+    // Lets the result be rejected before any grant is persisted if the user
+    // picked a different document (or the same file via another provider URI).
+    // Survives Activity recreation via onSaveInstanceState (one non-secret
+    // string); restored in onCreate before any result can be delivered.
+    private val pendingEnableEditing = PendingEnableEditingTarget()
 
     private var session: VaultSession? = null
     private var entries: List<EntrySummary> = emptyList()
@@ -492,6 +539,12 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // The only state restored across recreation: the pending Enable
+        // editing target (a non-secret URI string). Everything else -- session,
+        // forms, screen -- deliberately starts fresh. onCreate precedes any
+        // onActivityResult delivery.
+        pendingEnableEditing.restore(savedInstanceState?.getString(STATE_ENABLE_EDITING_TARGET))
+
         // Screenshots and recents thumbnails are blocked in every build except
         // a debuggable one (so development screenshots stay possible). This is
         // derived from the app's real debuggable state, not a hard-coded flag.
@@ -559,6 +612,12 @@ class MainActivity : Activity() {
     @Suppress("OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         handleBack()
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+
+        pendingEnableEditing.snapshot()?.let { outState.putString(STATE_ENABLE_EDITING_TARGET, it) }
     }
 
     override fun onResume() {
@@ -651,8 +710,10 @@ class MainActivity : Activity() {
 
         // Remember the vault only if a persistable READ grant was actually
         // taken; otherwise the Uri would just go stale after a restart.
+        // The hint follows any persisted WRITE grant that still exists, so
+        // re-choosing an already-upgraded vault does not downgrade it.
         if (takePersistableRead(uri, data.flags)) {
-            rememberVault(RecentVault(uri, name))
+            rememberVault(RecentVault(uri, name, liveGrantHint(uri)))
         }
 
         selectVault(uri, name)
@@ -669,16 +730,50 @@ class MainActivity : Activity() {
      * before editing if a session was dropped.
      */
     private fun finishEnableWriteAccess(resultCode: Int, data: Intent?) {
+        val requested = pendingEnableEditing.consume()
+
         if (resultCode != RESULT_OK) return
         val uri = data?.data ?: return
 
+        // Checked BEFORE any persistable grant is taken: a different document
+        // (or the same file reached through another provider URI) must not
+        // persist an unrelated grant or touch any recent-vault record. A lost
+        // request fails closed too, but with its own accurate message.
+        when (checkEnableEditingTarget(requested, uri.toString())) {
+            EnableEditingTargetCheck.MATCH -> Unit
+            EnableEditingTargetCheck.MISMATCH -> {
+                statusRes = R.string.msg_enable_editing_wrong_document
+                render()
+                return
+            }
+            EnableEditingTargetCheck.LOST -> {
+                statusRes = R.string.msg_enable_editing_request_lost
+                render()
+                return
+            }
+        }
+
         val granted = grantedPermissionsFrom(data.flags)
         val grant = takeGrantedPersistablePermissions(contentResolver, uri, granted)
+        val outcome = enableEditingOutcome(grant, documentIo.supportsWrite(uri.toString()))
 
-        recents.updateGrant(uri, grant)
-        statusRes = if (grant == VaultGrant.READ_WRITE) 0 else R.string.msg_write_access_not_granted
+        recents.updateGrant(uri, grantHintFor(outcome == EnableEditingOutcome.ENABLED))
+        statusRes =
+            when (outcome) {
+                EnableEditingOutcome.ENABLED -> 0
+                EnableEditingOutcome.NOT_GRANTED -> R.string.msg_write_access_not_granted
+                EnableEditingOutcome.PROVIDER_NOT_WRITABLE -> R.string.msg_write_not_supported
+            }
         render()
     }
+
+    /** Hint from the live persisted-grant list only (no provider I/O); failures read as read-only. */
+    private fun liveGrantHint(uri: Uri): VaultGrant =
+        try {
+            reopenGrantHint(documentIo.hasPersistedWriteGrant(uri.toString()))
+        } catch (ignored: Exception) {
+            VaultGrant.READ_ONLY
+        }
 
     // ---------------------------------------------------------------- back
 
@@ -733,6 +828,8 @@ class MainActivity : Activity() {
             Toast.LENGTH_LONG,
         ).show()
 
+        pendingEnableEditing.begin(vault.uri.toString())
+
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
         intent.addCategory(Intent.CATEGORY_OPENABLE)
         intent.type = "*/*"
@@ -763,7 +860,7 @@ class MainActivity : Activity() {
             return
         }
 
-        rememberVault(vault)
+        rememberVault(vault.copy(grant = liveGrantHint(vault.uri)))
         selectVault(vault.uri, vault.name)
     }
 
@@ -1074,6 +1171,9 @@ class MainActivity : Activity() {
                 // ciphertext bytes verify_and_finalize accepted -- see
                 // CreateVaultOutcome.Success's own doc comment.
                 saveCoordinator = VaultSaveCoordinator(outcome.session, documentIo, recovery, outcome.committedEnvelopeBytes)
+                // Creation itself just proved a persisted write grant and a
+                // live writable document.
+                readOnlyVault = false
                 entries = emptyList()
                 categories = emptyList()
                 categoryFilter = CategoryFilter.All
@@ -1261,6 +1361,7 @@ class MainActivity : Activity() {
         var unreadable = false
         var reconciliationOutcome: ReconciliationOutcome? = null
         var recoveryPrimarySha: String? = null
+        var readOnly = false
 
         try {
             when (
@@ -1281,6 +1382,17 @@ class MainActivity : Activity() {
                     reconciliationOutcome = gateResult.reconciliationOutcome
                     rows = opened.listEntries()
                     cats = opened.listCategories()
+                    // Live check on this background thread (the provider query
+                    // may block). Any failure reads as read-only: fail closed.
+                    readOnly =
+                        try {
+                            isVaultReadOnly(
+                                documentIo.hasPersistedWriteGrant(uri.toString()),
+                                documentIo.supportsWrite(uri.toString()),
+                            )
+                        } catch (ignored: Exception) {
+                            true
+                        }
                 }
             }
         } catch (error: BridgeException.AuthenticationFailed) {
@@ -1319,6 +1431,7 @@ class MainActivity : Activity() {
                 unreadable,
                 reconciliationOutcome,
                 recoveryPrimarySha,
+                readOnly,
             )
         }
     }
@@ -1357,6 +1470,7 @@ class MainActivity : Activity() {
         unreadable: Boolean,
         reconciliationOutcome: ReconciliationOutcome? = null,
         recoveryPrimarySha: String? = null,
+        readOnly: Boolean = false,
     ) {
         if (generation != unlockGeneration || screen != Screen.UNLOCKING || isFinishing || isDestroyed) {
             closeQuietly(opened)
@@ -1385,6 +1499,10 @@ class MainActivity : Activity() {
             // source of truth for external-change detection, exactly as
             // 1T-B5a/B5b-2 already proved it.
             saveCoordinator = VaultSaveCoordinator(opened, documentIo, recovery, openedEnvelopeBytes)
+            // Past the generation guard above, so [uri] is this live session's
+            // vault: a stale unlock never reaches this metadata update.
+            readOnlyVault = readOnly
+            recents.updateGrant(uri, grantHintFor(!readOnly))
             entries = rows
             categories = cats
             categoryFilter = CategoryFilter.All
@@ -1427,6 +1545,7 @@ class MainActivity : Activity() {
         val current = session
         session = null
         saveCoordinator = null
+        readOnlyVault = false
         entries = emptyList()
         categories = emptyList()
         categoryFilter = CategoryFilter.All
@@ -1679,6 +1798,21 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    /**
+     * A save just proved the current vault is not writable: remember that for
+     * the UI (read-only notice, disabled edit actions) and downgrade its
+     * recent-vault hint so "Enable editing" is offered. Gated on
+     * [coordinatorLive] -- see [shouldDowngradeGrantHint] -- so a late result
+     * from a replaced/locked session never changes metadata, and [vaultUri] is
+     * necessarily the live session's vault. Metadata only; real checks stay in
+     * [VaultSaveCoordinator].
+     */
+    private fun noteProviderNotWritable(outcome: SaveOutcome, coordinatorLive: Boolean) {
+        if (!shouldDowngradeGrantHint(outcome, coordinatorLive)) return
+        readOnlyVault = true
+        vaultUri?.let { recents.updateGrant(it, VaultGrant.READ_ONLY) }
+    }
+
     private fun refreshEntriesAndCategories() {
         val current = session ?: return
 
@@ -1756,6 +1890,7 @@ class MainActivity : Activity() {
 
         val activityAlive = !isFinishing && !isDestroyed
         val coordinatorLive = coordinator === saveCoordinator
+        noteProviderNotWritable(outcome, coordinatorLive)
 
         // Blocker 2: ChangedExternally means the live session no longer
         // represents disk truth -- a security-relevant fact independent of
@@ -1885,6 +2020,7 @@ class MainActivity : Activity() {
 
         val activityAlive = !isFinishing && !isDestroyed
         val coordinatorLive = coordinator === saveCoordinator
+        noteProviderNotWritable(outcome, coordinatorLive)
 
         // See finishEntrySave's identical handling for why this precedes,
         // is independent of the generation-staleness gate below, and is
@@ -1904,26 +2040,31 @@ class MainActivity : Activity() {
             return
         }
 
-        when (outcome) {
-            SaveOutcome.Success -> {
-                refreshEntriesAndCategories()
-                clearEntryEditState()
-                detail = null
-                toast(R.string.msg_entry_deleted)
-                statusRes = 0
-                screen = Screen.LIST
-            }
-
-            // Handled unconditionally above; never reached here.
-            SaveOutcome.ChangedExternally -> Unit
-
-            SaveOutcome.ProviderNotWritable -> statusRes = R.string.msg_write_access_unavailable
-            is SaveOutcome.ValidationFailed -> statusRes = R.string.msg_invalid_entry
-            SaveOutcome.RecoverySnapshotFailed, SaveOutcome.WriteFailed -> statusRes = R.string.msg_action_failed
-            is SaveOutcome.UnexpectedError -> statusRes = R.string.msg_action_failed
+        if (outcome == SaveOutcome.Success) {
+            refreshEntriesAndCategories()
+            clearEntryEditState()
+            detail = null
+            toast(R.string.msg_entry_deleted)
+            statusRes = 0
+            screen = Screen.LIST
+            render()
+            return
         }
 
-        render()
+        // A delete that did not persist: stay on DETAIL with the record
+        // intact. DETAIL has no status area, so (like a failed TOTP remove)
+        // the failure is a toast -- never silent, never a success message.
+        statusRes = 0
+        when (entryDeleteFailureNotice(outcome)) {
+            EntryDeleteNotice.WRITE_ACCESS_UNAVAILABLE -> {
+                toast(R.string.msg_write_access_unavailable)
+                // Read-only is now known: redraw DETAIL so it shows the
+                // read-only notice and disables the edit actions.
+                if (readOnlyVault) render()
+            }
+            EntryDeleteNotice.ACTION_FAILED -> toast(R.string.msg_action_failed)
+            EntryDeleteNotice.NONE -> Unit
+        }
     }
 
     // ---------------------------------------------------------------- category management
@@ -2088,6 +2229,7 @@ class MainActivity : Activity() {
 
         val activityAlive = !isFinishing && !isDestroyed
         val coordinatorLive = coordinator === saveCoordinator
+        noteProviderNotWritable(outcome, coordinatorLive)
 
         // See finishEntrySave's identical handling for why ChangedExternally
         // precedes, and is independent of, everything below -- including
@@ -2146,7 +2288,10 @@ class MainActivity : Activity() {
             // Handled unconditionally above; never reached here.
             SaveOutcome.ChangedExternally -> Unit
 
-            SaveOutcome.ProviderNotWritable -> statusRes = R.string.msg_write_access_unavailable
+            // The read-only notice (now shown by noteProviderNotWritable's
+            // flag) already carries this message; don't repeat it as a status.
+            SaveOutcome.ProviderNotWritable ->
+                statusRes = if (readOnlyVault) 0 else R.string.msg_write_access_unavailable
 
             is SaveOutcome.ValidationFailed -> {
                 statusRes =
@@ -2357,6 +2502,7 @@ class MainActivity : Activity() {
 
         val activityAlive = !isFinishing && !isDestroyed
         val coordinatorLive = coordinator === saveCoordinator
+        noteProviderNotWritable(outcome, coordinatorLive)
         val action = totpOutcomeAction(kind, outcome)
 
         // ChangedExternally (and a locked session) take precedence over
@@ -2573,7 +2719,10 @@ class MainActivity : Activity() {
     }
 
     private fun toast(messageRes: Int) {
-        Toast.makeText(this, messageRes, Toast.LENGTH_SHORT).show()
+        // The read-only guidance has several steps; give it time to be read.
+        val length =
+            if (messageRes == R.string.msg_write_access_unavailable) Toast.LENGTH_LONG else Toast.LENGTH_SHORT
+        Toast.makeText(this, messageRes, length).show()
     }
 
     // ---------------------------------------------------------------- helpers
@@ -3145,8 +3294,12 @@ class MainActivity : Activity() {
         addToContent(newText(getString(R.string.categories_title), size = 22f, bold = true), topMargin = 12)
 
         addStatus()
+        addReadOnlyNotice(topMargin = 16)
 
-        addSecondaryButton(getString(R.string.add_category), topMargin = 16) { showAddCategoryDialog() }
+        addToContent(
+            newSecondaryButton(getString(R.string.add_category)) { showAddCategoryDialog() }.disabledWhenReadOnly(),
+            topMargin = 16,
+        )
 
         if (categories.isEmpty()) {
             addBody(getString(R.string.no_categories), color = R.color.lv_text_tertiary, topMargin = 16)
@@ -3166,8 +3319,12 @@ class MainActivity : Activity() {
             )
 
             val actions = newActionFlow()
-            actions.addAction(newSecondaryButton(getString(R.string.rename), compact = true) { showRenameCategoryDialog(category) })
-            actions.addAction(newSecondaryButton(getString(R.string.delete), compact = true) { confirmDeleteCategory(category) })
+            actions.addAction(
+                newSecondaryButton(getString(R.string.rename), compact = true) { showRenameCategoryDialog(category) }.disabledWhenReadOnly(),
+            )
+            actions.addAction(
+                newSecondaryButton(getString(R.string.delete), compact = true) { confirmDeleteCategory(category) }.disabledWhenReadOnly(),
+            )
             card.addView(actions, matchParams(top = 12))
 
             addToContent(card, topMargin = 8)
@@ -3199,7 +3356,10 @@ class MainActivity : Activity() {
         val titleRow = newActionFlow()
         val title = newText(getString(R.string.app_name), size = 22f, bold = true)
         titleRow.addAction(title)
-        titleRow.addAction(newSecondaryButton(getString(R.string.add_entry), compact = true) { startCreateEntry() }, endAligned = true)
+        titleRow.addAction(
+            newSecondaryButton(getString(R.string.add_entry), compact = true) { startCreateEntry() }.disabledWhenReadOnly(),
+            endAligned = true,
+        )
         titleRow.addAction(newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() }, endAligned = true)
         addToContent(titleRow, topMargin = 4, parent = header)
 
@@ -3208,6 +3368,7 @@ class MainActivity : Activity() {
         fileName.ellipsize = TextUtils.TruncateAt.END
         addToContent(fileName, topMargin = 2, parent = header)
         addBackupWarningIfNeeded(vaultName, parent = header)
+        addReadOnlyNotice(topMargin = 10, parent = header)
 
         val search = newSearchField()
         searchField = search
@@ -3374,15 +3535,19 @@ class MainActivity : Activity() {
         // screen width and the trailing Lock button was clipped.
         val bar = newActionFlow()
         bar.addAction(newTextButton(getString(R.string.back)) { closeDetail() })
-        bar.addAction(newSecondaryButton(getString(R.string.edit), compact = true) { startEditEntry() }, endAligned = true)
         bar.addAction(
-            newSecondaryButton(getString(R.string.delete), compact = true) { confirmDeleteEntry() },
+            newSecondaryButton(getString(R.string.edit), compact = true) { startEditEntry() }.disabledWhenReadOnly(),
+            endAligned = true,
+        )
+        bar.addAction(
+            newSecondaryButton(getString(R.string.delete), compact = true) { confirmDeleteEntry() }.disabledWhenReadOnly(),
             endAligned = true,
         )
         bar.addAction(newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() }, endAligned = true)
         addToContent(bar, topMargin = 0)
 
         addToContent(newText(current.title, size = 24f, bold = true), topMargin = 12)
+        addReadOnlyNotice(topMargin = 12)
 
         val info = newCard()
         var first = true
@@ -3448,8 +3613,12 @@ class MainActivity : Activity() {
 
             // 1T-B5c-2: the key itself is never shown; only replace/remove.
             val keyActions = newActionFlow()
-            keyActions.addAction(newSecondaryButton(getString(R.string.totp_replace), compact = true) { startTotpSetup() })
-            keyActions.addAction(newSecondaryButton(getString(R.string.totp_remove), compact = true) { confirmRemoveTotp() })
+            keyActions.addAction(
+                newSecondaryButton(getString(R.string.totp_replace), compact = true) { startTotpSetup() }.disabledWhenReadOnly(),
+            )
+            keyActions.addAction(
+                newSecondaryButton(getString(R.string.totp_remove), compact = true) { confirmRemoveTotp() }.disabledWhenReadOnly(),
+            )
             totp.addView(keyActions, matchParams(top = 8))
             addToContent(totp, topMargin = 12)
 
@@ -3462,7 +3631,7 @@ class MainActivity : Activity() {
                 matchParams(top = 4),
             )
             totp.addView(
-                newSecondaryButton(getString(R.string.totp_setup_action), compact = true) { startTotpSetup() },
+                newSecondaryButton(getString(R.string.totp_setup_action), compact = true) { startTotpSetup() }.disabledWhenReadOnly(),
                 wrapParams(top = 12, gravity = Gravity.START),
             )
             addToContent(totp, topMargin = 12)
@@ -3656,6 +3825,32 @@ class MainActivity : Activity() {
         message.setPadding(dp(14), dp(10), dp(14), dp(10))
         message.background = getDrawable(R.drawable.bg_error)
         addToContent(message, topMargin = topMargin, parent = parent)
+    }
+
+    /**
+     * Shown on LIST, DETAIL and CATEGORY_MANAGE while [readOnlyVault]: says the
+     * vault is read-only and how to enable editing. Reading, searching,
+     * categories and grouping all stay available.
+     */
+    private fun addReadOnlyNotice(topMargin: Int, parent: LinearLayout = content) {
+        if (!readOnlyVault) return
+
+        val notice = newCard()
+        notice.addView(newText(getString(R.string.msg_write_access_unavailable), size = 13f, color = R.color.lv_text_secondary))
+        addToContent(notice, topMargin = topMargin, parent = parent)
+    }
+
+    /**
+     * Greys out and disables a save-dependent action while [readOnlyVault], so
+     * the user learns the state before filling a form. Presentation only: the
+     * live checks in [VaultSaveCoordinator] remain the real boundary.
+     */
+    private fun <T : Button> T.disabledWhenReadOnly(): T {
+        if (readOnlyVault) {
+            isEnabled = false
+            alpha = 0.4f
+        }
+        return this
     }
 
     private fun addPrimaryButton(label: String, topMargin: Int, onClick: () -> Unit) {

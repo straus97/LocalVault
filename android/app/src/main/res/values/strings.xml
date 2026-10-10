@@ -121,7 +121,10 @@
     <string name="msg_entry_deleted">Entry deleted.</string>
     <string name="msg_invalid_entry">This entry is invalid. Check the fields and try again.</string>
     <string name="msg_vault_changed_externally">The vault changed externally. Reopen it to continue.</string>
-    <string name="msg_write_access_unavailable">Write access is unavailable for this vault. Editing is disabled.</string>
+    <string name="msg_write_access_unavailable">This vault is read-only, so changes cannot be saved. To enable editing: lock the vault, choose \"Enable editing\" on the start screen, then select the same file again. Some storage locations do not allow editing.</string>
+    <string name="msg_enable_editing_wrong_document">That is not the same document. Select the same file again, from the same location (app or folder) you used before.</string>
+    <string name="msg_enable_editing_request_lost">The app lost track of which vault you were enabling editing for. Nothing was changed. Choose \"Enable editing\" again and select the file.</string>
+    <string name="msg_write_not_supported">This storage location does not allow editing this file, so the vault stays read-only.</string>
 
     <string name="manage_categories">Manage categories</string>
     <string name="categories_title">Categories</string>
