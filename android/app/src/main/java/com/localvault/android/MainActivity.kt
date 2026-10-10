@@ -2675,18 +2675,21 @@ class MainActivity : Activity() {
 
             card.addView(newText(vault.name.ifEmpty { getString(R.string.default_vault_name) }, size = 16f, bold = true))
 
-            val actions = LinearLayout(this)
-            actions.orientation = LinearLayout.HORIZONTAL
-            actions.gravity = Gravity.END
+            // Wrapping, end-aligned row: in a LinearLayout the second button
+            // received only the width the first one left over, which at large
+            // font scales is a sliver (text wrapped one character per line).
+            val actions = newActionFlow()
             if (vault.grant == VaultGrant.READ_ONLY) {
-                actions.addView(
+                actions.addAction(
                     newTextButton(getString(R.string.enable_editing)) { requestWriteAccess(vault) },
+                    endAligned = true,
                 )
             }
-            actions.addView(
+            actions.addAction(
                 newTextButton(getString(R.string.remove_from_history)) { confirmForgetVault(vault) },
+                endAligned = true,
             )
-            card.addView(actions, wrapParams(top = 8, gravity = Gravity.END))
+            card.addView(actions, matchParams(top = 8))
 
             addToContent(card, topMargin = 8)
         }
@@ -3162,14 +3165,10 @@ class MainActivity : Activity() {
                 matchParams(top = 2),
             )
 
-            val actions = LinearLayout(this)
-            actions.orientation = LinearLayout.HORIZONTAL
-            actions.addView(newSecondaryButton(getString(R.string.rename), compact = true) { showRenameCategoryDialog(category) })
-            actions.addView(
-                newSecondaryButton(getString(R.string.delete), compact = true) { confirmDeleteCategory(category) },
-                wrapParams(left = 8),
-            )
-            card.addView(actions, wrapParams(top = 12, gravity = Gravity.START))
+            val actions = newActionFlow()
+            actions.addAction(newSecondaryButton(getString(R.string.rename), compact = true) { showRenameCategoryDialog(category) })
+            actions.addAction(newSecondaryButton(getString(R.string.delete), compact = true) { confirmDeleteCategory(category) })
+            card.addView(actions, matchParams(top = 12))
 
             addToContent(card, topMargin = 8)
         }
@@ -3191,23 +3190,17 @@ class MainActivity : Activity() {
         // that separated the count from the first row.
         header.setPadding(dp(20), dp(16), dp(20), dp(4))
 
-        // Stable heading + Lock on one row; the (possibly long) vault file name
-        // sits below on its own single, end-ellipsized line so it can never
-        // wrap awkwardly next to the button.
-        val titleRow = LinearLayout(this)
-        titleRow.orientation = LinearLayout.HORIZONTAL
-        titleRow.gravity = Gravity.CENTER_VERTICAL
-
+        // Stable heading + Add/Lock; the (possibly long) vault file name sits
+        // below on its own single, end-ellipsized line so it can never wrap
+        // awkwardly next to the buttons. A wrapping row (not a LinearLayout
+        // with a weighted title): when the heading plus both buttons do not
+        // fit -- large font, RU labels -- the buttons drop to a second line
+        // instead of squeezing the heading and clipping Lock.
+        val titleRow = newActionFlow()
         val title = newText(getString(R.string.app_name), size = 22f, bold = true)
-        titleRow.addView(title, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        titleRow.addView(
-            newSecondaryButton(getString(R.string.add_entry), compact = true) { startCreateEntry() },
-            wrapParams(left = 8),
-        )
-        titleRow.addView(
-            newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() },
-            wrapParams(left = 8),
-        )
+        titleRow.addAction(title)
+        titleRow.addAction(newSecondaryButton(getString(R.string.add_entry), compact = true) { startCreateEntry() }, endAligned = true)
+        titleRow.addAction(newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() }, endAligned = true)
         addToContent(titleRow, topMargin = 4, parent = header)
 
         val fileName = newText(vaultName, size = 14f, color = R.color.lv_text_secondary)
@@ -3376,20 +3369,17 @@ class MainActivity : Activity() {
             return
         }
 
-        val bar = LinearLayout(this)
-        bar.orientation = LinearLayout.HORIZONTAL
-        bar.gravity = Gravity.CENTER_VERTICAL
-        bar.addView(newTextButton(getString(R.string.back)) { closeDetail() })
-        bar.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))
-        bar.addView(newSecondaryButton(getString(R.string.edit), compact = true) { startEditEntry() })
-        bar.addView(
+        // A wrapping row, not a LinearLayout: with RU labels, the 88dp Button
+        // minimum width or a larger font scale the four actions exceed the
+        // screen width and the trailing Lock button was clipped.
+        val bar = newActionFlow()
+        bar.addAction(newTextButton(getString(R.string.back)) { closeDetail() })
+        bar.addAction(newSecondaryButton(getString(R.string.edit), compact = true) { startEditEntry() }, endAligned = true)
+        bar.addAction(
             newSecondaryButton(getString(R.string.delete), compact = true) { confirmDeleteEntry() },
-            wrapParams(left = 8),
+            endAligned = true,
         )
-        bar.addView(
-            newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() },
-            wrapParams(left = 8),
-        )
+        bar.addAction(newSecondaryButton(getString(R.string.lock), compact = true) { lockVault() }, endAligned = true)
         addToContent(bar, topMargin = 0)
 
         addToContent(newText(current.title, size = 24f, bold = true), topMargin = 12)
@@ -3423,15 +3413,11 @@ class MainActivity : Activity() {
         passwordValueView = value
         secret.addView(value, matchParams(top = 4))
 
-        val buttons = LinearLayout(this)
-        buttons.orientation = LinearLayout.HORIZONTAL
+        val buttons = newActionFlow()
         val toggle = newSecondaryButton(getString(R.string.show_password), compact = true) { togglePassword() }
         passwordToggleButton = toggle
-        buttons.addView(toggle)
-        buttons.addView(
-            newSecondaryButton(getString(R.string.copy_password), compact = true) { copyPassword() },
-            wrapParams(left = 8),
-        )
+        buttons.addAction(toggle)
+        buttons.addAction(newSecondaryButton(getString(R.string.copy_password), compact = true) { copyPassword() })
         secret.addView(buttons, matchParams(top = 12))
         addToContent(secret, topMargin = 12)
 
@@ -3461,14 +3447,10 @@ class MainActivity : Activity() {
             )
 
             // 1T-B5c-2: the key itself is never shown; only replace/remove.
-            val keyActions = LinearLayout(this)
-            keyActions.orientation = LinearLayout.HORIZONTAL
-            keyActions.addView(newSecondaryButton(getString(R.string.totp_replace), compact = true) { startTotpSetup() })
-            keyActions.addView(
-                newSecondaryButton(getString(R.string.totp_remove), compact = true) { confirmRemoveTotp() },
-                wrapParams(left = 8),
-            )
-            totp.addView(keyActions, wrapParams(top = 8, gravity = Gravity.START))
+            val keyActions = newActionFlow()
+            keyActions.addAction(newSecondaryButton(getString(R.string.totp_replace), compact = true) { startTotpSetup() })
+            keyActions.addAction(newSecondaryButton(getString(R.string.totp_remove), compact = true) { confirmRemoveTotp() })
+            totp.addView(keyActions, matchParams(top = 8))
             addToContent(totp, topMargin = 12)
 
             startTotp(current.id)
@@ -3498,6 +3480,9 @@ class MainActivity : Activity() {
     }
 
     // ---------------------------------------------------------------- view factories
+
+    /** Wrapping button row (8dp gaps) that cannot push a button past the screen edge. */
+    private fun newActionFlow(): FlowRowLayout = FlowRowLayout(this, gapPx = dp(8), lineGapPx = dp(4))
 
     private fun newChip(label: String, selected: Boolean, onClick: () -> Unit): TextView {
         val chip = TextView(this)
