@@ -12,3 +12,17 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+# Android-only. Never use `--release` for the Android bridge.
+# - UniFFI's panic containment (catch_unwind at the FFI boundary) requires
+#   unwinding; under panic = "abort" a Rust panic kills the whole process.
+# - Cargo rejects `panic` in a package-specific profile, so a dedicated
+#   profile is the only way to scope this to Android without touching the
+#   desktop `release` profile above.
+# - strip = "debuginfo" (not true) keeps the ELF .symtab, which uniffi-bindgen
+#   needs to extract UNIFFI_META symbols; the script strips the copied
+#   jniLibs .so afterward.
+[profile.android-release]
+inherits = "release"
+panic = "unwind"
+strip = "debuginfo"

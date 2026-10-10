@@ -7,14 +7,40 @@
 
       1. verify expected toolchain paths;
       2. reset the generated output directories under android/app/build/generated;
-      3. cargo-ndk build the localvault-android-bridge cdylib for arm64-v8a;
+      3. cargo-ndk build the localvault-android-bridge cdylib for arm64-v8a
+         with the selected -RustProfile;
       4. build the host-only uniffi-bindgen (pinned UniFFI 0.32.0) and generate
-         the Kotlin binding in library mode from the cross-compiled .so;
+         the Kotlin binding in library mode from the cross-compiled .so
+         produced by the selected profile;
       5. place the .so into the generated jniLibs/arm64-v8a/ source set
          (the Kotlin binding is written directly into the generated Kotlin
-         source set by step 4);
+         source set by step 4); for -RustProfile android-release only, the
+         jniLibs COPY is then stripped with the pinned NDK llvm-strip;
       6. run `gradlew assembleDebug`;
       7. verify the APK contains no compatibility fixture.
+
+    Rust profiles (-RustProfile, default: debug):
+
+      debug            `cargo ndk ... build -p localvault-android-bridge`
+                       (dev profile, panic=unwind). Artifact:
+                       src-tauri/target/aarch64-linux-android/debug/.
+                       Unchanged behavior; the .so is not stripped.
+
+      android-release  `cargo ndk ... build -p localvault-android-bridge
+                       --profile android-release` (root Cargo.toml custom
+                       profile: inherits release, panic=unwind,
+                       strip=debuginfo). Artifact:
+                       src-tauri/target/aarch64-linux-android/android-release/.
+                       The Cargo artifact keeps its ELF .symtab so UniFFI
+                       metadata extraction works; only the jniLibs copy is
+                       stripped (llvm-strip --strip-all), after binding
+                       generation.
+
+    `release` is intentionally NOT a valid value: the workspace
+    [profile.release] is panic=abort (desktop), which defeats UniFFI's panic
+    containment.
+
+    Gradle remains assembleDebug in both modes (no release buildType/signing).
 
     Nothing generated (the .so, the generated Kotlin, the APK) is committed:
     android/.gitignore excludes app/build/ entirely. The compatibility fixtures
@@ -28,6 +54,11 @@
     build-tools;36.0.0.
 #>
 
+param(
+    [ValidateSet("debug", "android-release")]
+    [string]$RustProfile = "debug"
+)
+
 $ErrorActionPreference = "Stop"
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
@@ -37,17 +68,20 @@ $Cargo = Join-Path $CargoBin "cargo.exe"
 
 $AndroidSdkRoot = "C:\Users\nikita\AppData\Local\Android\Sdk"
 $AndroidNdkHome = Join-Path $AndroidSdkRoot "ndk\27.2.12479018"
+$NdkLlvmStrip = Join-Path $AndroidNdkHome "toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-strip.exe"
 $JavaHome = "C:\Program Files\Java\jdk-17"
 
 $AppGeneratedRoot = Join-Path $AndroidRoot "app\build\generated"
 $JniLibsOutDir = Join-Path $AppGeneratedRoot "jniLibs"
 $KotlinOutDir = Join-Path $AppGeneratedRoot "uniffiKotlin"
 
-Write-Host "== LocalVault Android debug build ==" -ForegroundColor Cyan
+Write-Host "== LocalVault Android debug build (Rust profile: $RustProfile) ==" -ForegroundColor Cyan
 
 # --- 1. verify expected toolchain paths ------------------------------------
 Write-Host "-- Step 1: verifying toolchain paths"
-foreach ($path in @($Cargo, $AndroidSdkRoot, $AndroidNdkHome, $JavaHome)) {
+$RequiredPaths = @($Cargo, $AndroidSdkRoot, $AndroidNdkHome, $JavaHome)
+if ($RustProfile -eq "android-release") { $RequiredPaths += $NdkLlvmStrip }
+foreach ($path in $RequiredPaths) {
     if (-not (Test-Path $path)) {
         throw "Required toolchain path missing: $path"
     }
@@ -69,15 +103,20 @@ foreach ($dir in @($JniLibsOutDir, $KotlinOutDir)) {
 Write-Host "   generated directories reset under $AppGeneratedRoot"
 
 # --- 3. cargo-ndk build the bridge for arm64-v8a ----------------------------
-Write-Host "-- Step 3: cargo-ndk build (arm64-v8a)"
+Write-Host "-- Step 3: cargo-ndk build (arm64-v8a, Rust profile: $RustProfile)"
 Push-Location $RepoRoot
 try {
-    & $Cargo ndk -t arm64-v8a build -p localvault-android-bridge
+    if ($RustProfile -eq "android-release") {
+        & $Cargo ndk -t arm64-v8a build -p localvault-android-bridge --profile android-release
+    } else {
+        & $Cargo ndk -t arm64-v8a build -p localvault-android-bridge
+    }
     if ($LASTEXITCODE -ne 0) { throw "cargo-ndk build failed (exit $LASTEXITCODE)" }
 } finally {
     Pop-Location
 }
-$BuiltSo = Join-Path $RepoRoot "src-tauri\target\aarch64-linux-android\debug\liblocalvault_android_bridge.so"
+# Cargo's output directory is named after the profile ("debug" for dev).
+$BuiltSo = Join-Path $RepoRoot "src-tauri\target\aarch64-linux-android\$RustProfile\liblocalvault_android_bridge.so"
 if (-not (Test-Path $BuiltSo)) {
     throw "Expected built .so not found at $BuiltSo"
 }
@@ -101,7 +140,15 @@ Write-Host "   Kotlin bindings written under $KotlinOutDir"
 Write-Host "-- Step 5: placing .so into generated jniLibs/arm64-v8a/"
 $JniLibsAbiDir = Join-Path $JniLibsOutDir "arm64-v8a"
 New-Item -ItemType Directory -Force -Path $JniLibsAbiDir | Out-Null
-Copy-Item $BuiltSo (Join-Path $JniLibsAbiDir "liblocalvault_android_bridge.so") -Force
+$JniLibsSo = Join-Path $JniLibsAbiDir "liblocalvault_android_bridge.so"
+Copy-Item $BuiltSo $JniLibsSo -Force
+if ($RustProfile -eq "android-release") {
+    # Strip only the shipped COPY, and only now that UniFFI binding generation
+    # (step 4) has already read the symbol table from the original $BuiltSo.
+    & $NdkLlvmStrip --strip-all $JniLibsSo
+    if ($LASTEXITCODE -ne 0) { throw "llvm-strip failed (exit $LASTEXITCODE)" }
+    Write-Host "   stripped jniLibs copy ($((Get-Item $BuiltSo).Length) -> $((Get-Item $JniLibsSo).Length) bytes); original Cargo artifact untouched"
+}
 Write-Host "   done"
 
 # --- 6. run Gradle debug build -----------------------------------------------

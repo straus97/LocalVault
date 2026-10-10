@@ -128,7 +128,7 @@ Categories and TOTP, plus a visual polish follow-up:
 - Wrong-password vs. corrupted-ciphertext indistinguishability is preserved in `BridgeError::AuthenticationFailed` — no finer authentication oracle was added.
 - Vault session locks immediately on backgrounding (`onStop`) or explicit Lock/Back from an unlocked screen — Android currently has **no** inactivity-timeout grace period (unlike desktop's 60s); this is intentionally more conservative, not a gap.
 - Screenshots: blocked via `FLAG_SECURE` except in debuggable builds. Non-debug/release screenshot-blocking has not been exercised in an actual release build.
-- **Open blocker:** workspace `[profile.release]` has `panic = "abort"`, which can prevent UniFFI's panic containment (which expects unwinding) from working in an Android **release** build. Not yet a problem because all Android work so far has used debug builds (default unwind). Must be deliberately resolved — without naively changing the shared release profile, which could affect the Windows release — before any production Android release. **Not solved.**
+- **Open blocker:** workspace `[profile.release]` has `panic = "abort"`, which can prevent UniFFI's panic containment (which expects unwinding) from working in an Android **release** build. Not yet a problem because all Android work so far has used debug builds (default unwind). Must be deliberately resolved — without naively changing the shared release profile, which could affect the Windows release — before any production Android release. **Not solved.** *(Historical; **resolved at the configuration level** by the Android-only `android-release` profile — see §35.)*
 - `applicationId`/package was `com.localvault.android.proof` — an intentional temporary bootstrap identity at the B4 snapshot; since replaced by `com.localvault.android` (see §32).
 
 ## 13. Clipboard model (current, from B3, unchanged by B4's TOTP-copy reuse)
@@ -194,7 +194,7 @@ None of these are blocking or scheduled into a specific stage yet; keep them on 
 
 ## 20. Known blockers
 
-- **Android release `panic = "abort"`** (see §12) — must be resolved before any production Android release build. Not solved.
+- **Android release `panic = "abort"`** (see §12) — must be resolved before any production Android release build. ~~Not solved.~~ **RESOLVED (configuration level) — see §35.**
 - **`applicationId`/package** was `com.localvault.android.proof` (B4-era blocker) — resolved; now `com.localvault.android` (see §32).
 
 ## 21. Test baseline at 1T-B4
@@ -223,7 +223,7 @@ None of these are blocking or scheduled into a specific stage yet; keep them on 
 - `applicationId`/package cleanup (done since — see §32).
 - Site/profile grouping decision (§18).
 - Large-vault list performance/optimization decision (B4-era note: was a plain `LinearLayout`, not validated at scale; since measured and resolved by `ListView` virtualization — see §33).
-- The Android release `panic = "abort"` blocker (§20).
+- The Android release `panic = "abort"` blocker (§20) — since resolved at the configuration level, see §35.
 - A final Android security/UX/regression pass once write support lands.
 
 ## 23. Next: 1T-B5 — safe Android write/create/CRUD foundation (historical — B5 is now implemented, see §31)
@@ -355,7 +355,7 @@ Added after the B4-era snapshot above; supersedes the "read-only"/"B5 next" stat
 - Purpose: so `stage_*` mutations can reseal the encrypted envelope without storing the master password or re-running Argon2id on every save. This matches the desktop session model conceptually.
 - Lock/drop of the session or pending creation drops (zeroizes) the Vault Key along with the rest of the state. While unlocked, the process necessarily holds decrypted secret state and the Vault Key in memory; hostile process-memory inspection while unlocked remains outside the protection boundary in `@docs/SECURITY_MODEL.md`.
 
-**What remains in 1T (do not mark 1T complete; `applicationId`/package cleanup was listed here at the time of writing and is now done — see §32):** site/profile grouping decision / Android vs. desktop UX model (§18), large-vault list performance measurement/optimization, the Android release `panic = "abort"` blocker (§12/§20), known visual polish (including the DETAIL top-action overflow/cutoff), and the final Android security/UX/regression pass. A later dedicated desktop + Android design/UX pass is still planned; the current UI is not considered final. No further named 1T-B stage exists in the roadmap; the next task is chosen from this list and confirmed with the user. Sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
+**What remains in 1T (do not mark 1T complete; `applicationId`/package cleanup was listed here at the time of writing and is now done — see §32):** site/profile grouping decision / Android vs. desktop UX model (§18), large-vault list performance measurement/optimization, the Android release `panic = "abort"` blocker (§12/§20; **since resolved — §35**), known visual polish (including the DETAIL top-action overflow/cutoff), and the final Android security/UX/regression pass. A later dedicated desktop + Android design/UX pass is still planned; the current UI is not considered final. No further named 1T-B stage exists in the roadmap; the next task is chosen from this list and confirmed with the user. Sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
 
 ## 32. Update: `applicationId`/package cleanup (done; not a new named stage)
 
@@ -364,7 +364,7 @@ Added after the B4-era snapshot above; supersedes the "read-only"/"B5 next" stat
 - **Deliberately untouched:** Rust UniFFI namespace/crate names (`uniffi.localvault_android_bridge`, `localvault-android-bridge`), UniFFI `=0.32.0`, JNA wiring, vault format, permissions (none), lifecycle, UI, and the `SecureClipboard` extras key `com.localvault.android.clip_owner` (a non-secret clip-extras key that never contained `.proof`).
 - **Consequence for installed builds:** a build with the new `applicationId` is a different app to Android from a build with the old one. It does not share the old app's private data (recent-vault history, recovery snapshots) or its persisted SAF URI grants; the old proof install may coexist with the new app; if it is no longer wanted, it must be uninstalled separately. The new app must re-select vaults through the picker. Vault files themselves are unaffected.
 - **Validation:** full Android JVM suite and the full `android/scripts/build-android-debug.ps1` (see the task report); no device QA required or performed.
-- **Still remaining in 1T (do not mark 1T complete):** site/profile grouping decision (§18); large-vault list performance measurement/optimization; the Android release `panic = "abort"` blocker (§12/§20); known visual polish, including the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass; and a later dedicated desktop + Android design/UX pass (the current UI is not final). No further named 1T-B stage exists; sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T. **Superseded in part by §33 and §34:** large-vault performance is now done, and site/profile grouping is implemented and accepted.
+- **Still remaining in 1T (do not mark 1T complete):** site/profile grouping decision (§18); large-vault list performance measurement/optimization; the Android release `panic = "abort"` blocker (§12/§20; **since resolved — §35**); known visual polish, including the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass; and a later dedicated desktop + Android design/UX pass (the current UI is not final). No further named 1T-B stage exists; sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T. **Superseded in part by §33 and §34:** large-vault performance is now done, and site/profile grouping is implemented and accepted.
 
 ## 33. Update: Android LIST virtualization (accepted; not a new named stage)
 
@@ -406,7 +406,7 @@ At 50,000 entries also: heap delta for the measured list state ~1.15 MiB; search
 
 **Next implementation work — Android site/profile grouping (decided; since implemented and accepted — see §34):** grouped site rows with inline expansion; no separate Site screen; invalid/unparseable URLs may stay ungrouped on Android for 1T; "New profile for this site" stays deferred to the design/UX pass; `localvault-core` owns a normalized `site_key(url) -> Option<String>`; the bridge exposes the derived key; Kotlin owns visual grouping and expanded state; no new persisted site entity; desktop unchanged for this slice.
 
-**Still remaining in 1T (1T is NOT complete; grouping implementation is now done — §34):** the Android release `panic = "abort"` blocker (§12/§20); known visual polish including the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass; and the later coordinated design/UX pass. No new named B stage is created; sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
+**Still remaining in 1T (1T is NOT complete; grouping implementation is now done — §34):** the Android release `panic = "abort"` blocker (§12/§20; **since resolved — §35**); known visual polish including the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass; and the later coordinated design/UX pass. No new named B stage is created; sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
 
 ## 34. Update: Android site/profile grouping (accepted; not a new named stage)
 
@@ -439,4 +439,40 @@ At 50,000 entries also: expand one site group median frame 67.52 ms, collapse 68
 
 **Manual QA (PASSED):** on the Xiaomi device with the synthetic 300-entry vault `qa/LocalVault-Android-List-QA-300.lvault` (ignored by Git, never modified; password intentionally not recorded here): grouped site rows; inline expand/collapse; child ordering; row recycling during long scrolling with no stale title/login/indicator state; opening a child's DETAIL; DETAIL → back preserving expansion and approximate scroll position; search; categories; category + search; no leakage of unmatched sibling profiles; visible entry count semantics; lock/reopen resetting expansion; general stability. The previously known tiny DETAIL → LIST return delay remains non-blocking.
 
-**Still remaining in 1T (1T is NOT complete):** the Android release `panic = "abort"` blocker (§12/§20); the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass; and the later coordinated desktop + Android visual/design polish (the current Android design is not final). Sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
+**Still remaining in 1T (1T is NOT complete):** the Android release `panic = "abort"` blocker (§12/§20) was resolved at the configuration level — see §35; the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass; and the later coordinated desktop + Android visual/design polish (the current Android design is not final). Sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.
+
+## 35. Update: Android release panic strategy (RESOLVED at the configuration level; not a new named stage)
+
+**Status:** implemented and accepted; no new `1T-B6` stage exists. The change is in the working tree (root `Cargo.toml`, `android/scripts/build-android-debug.ps1`) and was uncommitted when this section was written — verify with `git log`/`git status` rather than trusting this line.
+
+**Problem (audit):** the workspace `[profile.release]` (moved unchanged from the v1.0.0 desktop `src-tauri/Cargo.toml`) has `panic = "abort"`. UniFFI 0.32.0 wraps every generated `extern "C"` export, object clone/free and rustbuffer helper in `uniffi::rust_call` → `catch_unwind`, which can only work with unwinding. Under abort, any Rust panic kills the whole Android process (SIGABRT, no Kotlin exception, no `Drop`/zeroize). No Android release build path existed, so the blocker was latent (all Android builds were dev/unwind).
+
+**Why a custom profile:** Cargo rejects `panic` in a package-specific profile (`panic may not be specified in a package profile`, verified), and changing global `[profile.release]` would silently change the Windows release's fail-closed semantics, so a separate profile is used. Verified in a scratch workspace that `--release` still aborts while `--profile android-release` unwinds, with separate output directories.
+
+**Implementation:**
+- Root `Cargo.toml` (appended after, not touching, `[profile.release]`): `[profile.android-release]` = `inherits = "release"`, `panic = "unwind"`, `strip = "debuginfo"`. `strip = "debuginfo"` (not `true`) keeps `.symtab`, which `uniffi-bindgen` library-mode needs to read `UNIFFI_META` symbols.
+- `android/scripts/build-android-debug.ps1` gains `-RustProfile` (`debug` default | `android-release`; `release` rejected by `ValidateSet`). `debug` is unchanged. `android-release` runs `cargo ndk -t arm64-v8a build -p localvault-android-bridge --profile android-release` (artifact `src-tauri/target/aarch64-linux-android/android-release/liblocalvault_android_bridge.so`), generates Kotlin bindings from that original unstripped `.so`, copies it to jniLibs, and only then strips the copy with the pinned NDK 27.2.12479018 `llvm-strip --strip-all`. Gradle remains `assembleDebug`; **no Gradle release buildType or signing exists.** Never use `--release` for the Android bridge. No Rust, Kotlin, Gradle or member-manifest change.
+
+**Panic surface (audit):** no `unwrap`/`expect`/`panic!`/`assert` in bridge or core production code (tests only); arithmetic/indexing are guarded; poisoned mutexes are recovered. The only realistic residual panic path is `Uuid::new_v4()` (panics if OS randomness fails), reached via create-vault/entry/category; deliberately left unchanged. Every `stage_*` works on a clone and only the final `state.staged = Some(..)` touches session state; Rust does no file I/O, so a caught panic cannot partially commit persisted state. With unwind, Kotlin sees `InternalException` (a `kotlin.Exception`, not `BridgeException`); existing broad `catch` sites show generic failures. No `catch_unwind`, panic-to-`BridgeError` mapping or `InternalException`-specific Kotlin handling was added (not needed; would hide programmer errors).
+
+**Validation (accepted):** `cargo fmt --check`; `cargo test --lib --workspace` (178 desktop + 82 bridge + 63 core pass); `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `cargo check`; `cargo check --release`; `cargo check -p localvault-android-bridge --profile android-release`; `cargo ndk … --profile android-release -v` (91 rustc invocations, no `-C panic=abort`); build script in both modes; `-RustProfile release` rejected; `git diff --check`. ELF inspection: `.symtab` and 31 `UNIFFI_META` symbols present before stripping; unwind panic runtime (`panic_unwind`, `_Unwind_RaiseException`, `rust_eh_personality`), no `panic_abort`; generated Kotlin byte-identical to the debug binding; jniLibs copy stripped (1,396,664 → 1,040,608 bytes) yet still exporting 46 `uniffi_localvault*` dynamic symbols; the APK's native library is byte-identical to the stripped jniLibs copy. `[profile.release]` diff proven untouched; both immutable Windows EXEs unchanged (`A5707B99…C481`).
+
+**Device QA (accepted by the user)** — Xiaomi 24115RA8EG, Android 16 / SDK 36, ADB `23e9e31e`; the APK built with the `android-release` Rust profile was installed and its native library hash-verified against the stripped jniLibs copy:
+1. The encrypted synthetic 300-entry QA vault opened.
+2. Browsing, site grouping, expand/collapse, search, categories and entry detail worked.
+3. A separate new vault was created on the device.
+4. Creating and saving a test entry succeeded.
+5. The entry persisted across lock and reopen.
+6. Deleting the entry succeeded.
+7. It stayed deleted after another reopen.
+8. No crash or freeze was reported.
+
+**Limitations (stated honestly):**
+- **The imported 300-entry vault was read-only** (the UI reported write access unavailable). The root cause is **not established** — it may relate to SAF permissions/provider capabilities, but that is unverified. Mutation of the imported vault was therefore **not** tested; read operations were verified there, and create/write/delete/reopen were verified in the newly created vault. Follow-up for the final Android permissions/UX/regression pass; not resolved.
+- **No deliberate Rust panic was injected on the physical device**; on-device panic containment is not directly proven. No final automated device logcat gate was completed.
+- Non-panic aborts (out-of-memory, stack overflow) remain possible regardless of panic strategy.
+- Android release packaging/signing is not implemented; this does **not** mean the Android release pipeline is ready to ship.
+
+**QA fixture (local, git-ignored via `.qa-local\.gitignore`, never to be modified):** master `D:\LocalVault\.qa-local\LocalVault-Android-Smoke-300.lvault`, SHA-256 `96D26061A44AD53ABA883BEE113F7F4AE847D28CD4FBB50289AACC848FB388FE` (300 entries, 8 categories, fake data; production core and bridge `open_vault` verified it). Generator and README: `D:\LocalVault\.qa-local\android-smoke-generator\` (`cargo run --offline -- generate|verify`). The device receives a byte-identical copy, never the master.
+
+**Still remaining in 1T (1T is NOT complete):** the DETAIL top-action overflow/cutoff; the final Android security/UX/regression pass (including the imported-vault read-only follow-up above); and the later coordinated desktop + Android visual/design polish. Android release packaging/signing is separate later work. Sync (1U/1V) and QR/biometrics/Autofill (1W) stay out of 1T.

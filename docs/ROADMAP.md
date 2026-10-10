@@ -73,10 +73,11 @@ Android LIST virtualization (not a new named stage) is also accepted: large-vaul
 
 Android site/profile grouping (not a new named stage) is also accepted (committed and pushed in `5a6c664`; grouping is complete within 1T): core-owned `localvault_core::site::site_key(url) -> Option<String>` (hostname-based, lowercase, one leading `www.` stripped, port/path/etc. ignored, malformed or empty-authority input → `None`), exposed by the bridge as `EntrySummary.site_key`; Kotlin groups after filtering (collapsed by default, inline expansion keyed by site key, UI-only state, no Site screen, no persisted site entity); desktop unchanged; "New profile for this site" deferred to the design/UX pass. The virtualized ListView stays intact (69 Views / 8 ListView children from 1k to 50k entries on the Xiaomi device, no OOM). 50k text search remains O(n) (~229 ms `mail` frame median), not optimized and non-blocking. Manual QA on the 300-entry synthetic vault passed. Detail: `@docs/HANDOFF_1T_PROGRESS.md` §34.
 
+The Android-release panic-strategy blocker is **resolved at the configuration level** (not a new named stage): an Android-only Cargo profile `android-release` (`panic = "unwind"`, `strip = "debuginfo"`) built via `android\scripts\build-android-debug.ps1 -RustProfile android-release`; the global desktop `[profile.release]` stays `panic = "abort"` and unchanged. Validated by the standard gates, ELF/UniFFI analysis and a physical-device smoke (300-entry vault read paths; create/save/reopen/delete in a new vault). No on-device panic injection was done, non-panic aborts such as OOM remain possible, and Android release packaging/signing is not implemented. Detail: `@docs/SECURITY_MODEL.md`, `@docs/HANDOFF_1T_PROGRESS.md` §35.
+
 Still outstanding before 1T can close — **do not treat 1T as complete**:
-- the Android-release `panic = "abort"` blocker (see `@docs/SECURITY_MODEL.md`);
 - known visual polish, including the DETAIL top-action overflow/cutoff;
-- a final Android security/UX/regression pass.
+- a final Android security/UX/regression pass (including a follow-up on why the imported 300-entry vault showed write access unavailable on the device — cause unverified).
 
 A later dedicated, coordinated desktop + Android design/UX pass is still planned and not implemented; the current UI (including the Android LIST layout/spacing) is not considered final.
 
