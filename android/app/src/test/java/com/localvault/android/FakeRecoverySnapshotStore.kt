@@ -25,6 +25,10 @@ class FakeRecoverySnapshotStore : RecoverySnapshotStore {
     /** When set, [clearMarker] throws this instead of returning normally. */
     var clearMarkerException: Exception? = null
 
+    /** When set, [forget] throws this, deleting nothing (the real store's
+     * "not verifiably gone" signal). */
+    var forgetException: Exception? = null
+
     /** When true, [clearMarker] returns without throwing but does not
      * actually remove the marker -- simulates a silent
      * AtomicFile/File.delete() failure (the more realistic failure mode
@@ -66,6 +70,7 @@ class FakeRecoverySnapshotStore : RecoverySnapshotStore {
     }
 
     override fun forget(vaultUri: String) {
+        forgetException?.let { throw it }
         snapshots.remove(vaultUri)
         markers.remove(vaultUri)
     }

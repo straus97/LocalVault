@@ -928,8 +928,9 @@ class MainActivity : Activity() {
         for (evicted in recents.promote(vault)) {
             val outcome = evictionOutcomeFor(recovery.hasUnresolvedMarker(evicted.uri.toString()), saveInFlight)
             if (outcome == EvictionOutcome.RELEASE_AND_FORGET) {
-                releaseGrant(evicted.uri)
-                recovery.forget(evicted.uri.toString())
+                // The grant is released only once the recovery files are
+                // verifiably gone; on failure it stays. Automatic, so no UI.
+                recovery.forgetThen(evicted.uri.toString()) { releaseGrant(evicted.uri) }
             }
         }
     }
@@ -939,6 +940,11 @@ class MainActivity : Activity() {
      * forgetting would delete the recovery snapshot/marker that save depends
      * on and release the write grant it is about to use. The check precedes
      * every state change here, including the recent-list removal.
+     *
+     * Also returns false, changing nothing else, when the recovery files could
+     * not be verifiably removed: the recent entry and grant stay so the user
+     * can retry and the recovery state stays reachable. The recovery cleanup
+     * runs first for that reason.
      */
     private fun forgetVault(uri: Uri): Boolean {
         if (mutationOwnership.reopenBlocked) {
@@ -946,10 +952,13 @@ class MainActivity : Activity() {
             return false
         }
 
-        recents.remove(uri)
-        releaseGrant(uri)
-        recovery.forget(uri.toString())
-        return true
+        val forgotten =
+            recovery.forgetThen(uri.toString()) {
+                recents.remove(uri)
+                releaseGrant(uri)
+            }
+        if (!forgotten) toast(R.string.msg_forget_vault_failed)
+        return forgotten
     }
 
     /**
@@ -968,9 +977,10 @@ class MainActivity : Activity() {
         }
 
         if (!recovery.hasUnresolvedMarker(vault.uri.toString())) {
-            forgetVault(vault.uri)
-            statusRes = 0
-            render()
+            if (forgetVault(vault.uri)) {
+                statusRes = 0
+                render()
+            }
             return
         }
 
@@ -1580,9 +1590,11 @@ class MainActivity : Activity() {
             expandedSites.clear()
             statusRes = 0
             screen = Screen.LIST
-        } else if (unreadable && recents.load().any { it.uri == uri }) {
+        } else if (unreadable && recents.load().any { it.uri == uri } && forgetVault(uri)) {
             // A remembered vault that can no longer be read is stale: forget it.
-            forgetVault(uri)
+            // Only when that really happened -- otherwise (cleanup failed or a
+            // save is still finishing) it falls through to the ordinary read
+            // error and the entry stays, rather than claiming it was removed.
             vaultUri = null
             vaultName = ""
             statusRes = R.string.msg_recent_unavailable

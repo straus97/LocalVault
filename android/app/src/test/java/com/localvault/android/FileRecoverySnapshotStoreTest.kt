@@ -44,6 +44,7 @@ class FileRecoverySnapshotStoreTest {
     private lateinit var store: FileRecoverySnapshotStore
 
     private var deleteIneffective = false
+    private var snapshotDeleteIneffective = false
     private var restoreFromBackupFails = false
     private var readFailure: Throwable? = null
 
@@ -62,6 +63,8 @@ class FileRecoverySnapshotStoreTest {
                         it.deleteIsIneffective = deleteIneffective
                         it.restoreFromBackupFails = restoreFromBackupFails
                         it.readFailure = readFailure
+                    } else if (file.name.endsWith(".snapshot")) {
+                        it.deleteIsIneffective = snapshotDeleteIneffective
                     }
                 }
             },
@@ -289,6 +292,148 @@ class FileRecoverySnapshotStoreTest {
 
         assertNull(store.readMarker(uri))
         assertNull(store.readSnapshotBytes(uri))
+        assertFilesGone()
+    }
+
+    // --- forget -----------------------------------------------------------
+
+    private fun snapshotFile() = File(directory, "${Sha256.hex(uri.toByteArray())}.snapshot")
+
+    private fun snapshotNewFile() = File(snapshotFile().path + ".new")
+
+    private fun snapshotBackupFile() = File(snapshotFile().path + ".bak")
+
+    private fun assertFilesGone() {
+        for (file in listOf(markerFile(), backupFile(), newFile(), snapshotFile(), snapshotBackupFile(), snapshotNewFile())) {
+            assertFalse("${file.name} should be gone", file.exists())
+        }
+    }
+
+    @Test
+    fun forget_of_a_vault_with_nothing_stored_is_idempotent() {
+        store.forget(uri)
+        store.forget(uri)
+
+        assertNull(store.readMarker(uri))
+        assertNull(store.readSnapshotBytes(uri))
+    }
+
+    @Test
+    fun forget_removes_every_leftover_atomicfile_artifact() {
+        writeMarker()
+        markerFile().copyTo(backupFile())
+        newFile().writeText("incomplete")
+        snapshotFile().copyTo(snapshotBackupFile())
+        snapshotNewFile().writeText("incomplete")
+
+        store.forget(uri)
+
+        assertFilesGone()
+        assertNull(store.readMarker(uri))
+        assertNull(store.readSnapshotBytes(uri))
+        store.forget(uri)
+    }
+
+    @Test
+    fun forget_only_touches_the_given_vault() {
+        val otherUri = "content://provider/document/other-vault"
+        writeMarker()
+        assertTrue(store.writeAndVerify(otherUri, newBytes, "b", "e", 2L))
+
+        store.forget(uri)
+
+        assertEquals("b", store.readMarker(otherUri)?.baselineSha256)
+        assertArrayEquals(newBytes, store.readSnapshotBytes(otherUri))
+    }
+
+    @Test
+    fun forget_fails_and_keeps_snapshot_when_the_marker_cannot_be_deleted() {
+        writeMarker()
+        deleteIneffective = true
+
+        assertThrows(IOException::class.java) { newStore().forget(uri) }
+
+        // The marker is still live and still has the snapshot it depends on.
+        deleteIneffective = false
+        val healthy = newStore()
+        assertNotNull(healthy.readMarker(uri))
+        assertArrayEquals(baselineBytes, healthy.readSnapshotBytes(uri))
+        assertTrue(healthy.hasUnresolvedMarker(uri))
+    }
+
+    @Test
+    fun forget_fails_when_the_marker_is_undeletable_for_real() {
+        // A non-empty directory at the marker path: File.delete() fails with
+        // no exception, which AtomicFile.delete() would swallow.
+        assertTrue(markerFile().mkdirs())
+        File(markerFile(), "child").writeText("x")
+        snapshotFile().writeBytes(baselineBytes)
+
+        assertThrows(IOException::class.java) { store.forget(uri) }
+
+        assertTrue(store.hasUnresolvedMarker(uri))
+        assertArrayEquals(baselineBytes, store.readSnapshotBytes(uri))
+    }
+
+    @Test
+    fun forget_fails_when_only_the_snapshot_cannot_be_deleted() {
+        writeMarker()
+        snapshotDeleteIneffective = true
+
+        assertThrows(IOException::class.java) { newStore().forget(uri) }
+
+        // The marker was removed first; no marker is left without a snapshot,
+        // and the retained snapshot is still readable.
+        val healthy = newStore()
+        assertNull(healthy.readMarker(uri))
+        assertFalse(healthy.hasUnresolvedMarker(uri))
+        assertArrayEquals(baselineBytes, healthy.readSnapshotBytes(uri))
+
+        // Once deletion works again, a retry completes the forget.
+        snapshotDeleteIneffective = false
+        newStore().forget(uri)
+        assertFilesGone()
+    }
+
+    @Test
+    fun forget_fails_when_the_snapshot_is_undeletable_for_real() {
+        assertTrue(snapshotFile().mkdirs())
+        File(snapshotFile(), "child").writeText("x")
+
+        assertThrows(IOException::class.java) { store.forget(uri) }
+    }
+
+    @Test
+    fun forget_fails_on_a_surviving_marker_backup() {
+        writeMarker()
+        assertTrue(markerFile().renameTo(backupFile()))
+        deleteIneffective = true
+
+        assertThrows(IOException::class.java) { newStore().forget(uri) }
+        assertTrue(backupFile().exists())
+        assertTrue("the surviving backup is still a live marker", newStore().hasUnresolvedMarker(uri))
+    }
+
+    @Test
+    fun forget_fails_on_a_surviving_marker_new_file() {
+        newFile().writeText("incomplete")
+        deleteIneffective = true
+
+        assertThrows(IOException::class.java) { newStore().forget(uri) }
+        assertTrue(newFile().exists())
+    }
+
+    @Test
+    fun forget_fails_on_surviving_snapshot_backup_and_new_files() {
+        snapshotBackupFile().writeText("old")
+        snapshotDeleteIneffective = true
+        assertThrows(IOException::class.java) { newStore().forget(uri) }
+        assertTrue(snapshotBackupFile().exists())
+
+        snapshotBackupFile().delete()
+        snapshotNewFile().writeText("incomplete")
+        assertThrows(IOException::class.java) { newStore().forget(uri) }
+        assertTrue(snapshotNewFile().exists())
     }
 
     // --- consumers, driven by the production store -------------------------

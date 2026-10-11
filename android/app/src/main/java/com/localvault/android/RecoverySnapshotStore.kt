@@ -78,9 +78,35 @@ interface RecoverySnapshotStore {
      */
     fun clearMarker(vaultUri: String)
 
-    /** Deletes both the snapshot and its marker entirely: the "forget
-     * vault" cleanup (accepted review, Revision 3, section 7). */
+    /**
+     * Deletes both the snapshot and its marker entirely: the "forget
+     * vault" cleanup (accepted review, Revision 3, section 7).
+     *
+     * Idempotent when nothing exists. Returns normally only once both are
+     * verifiably gone; if an existing file could not be removed it throws
+     * [IOException], and the caller must not treat the vault as forgotten (see
+     * [forgetThen]).
+     */
     fun forget(vaultUri: String)
+}
+
+/**
+ * Forgets [vaultUri]'s recovery state, and only if that verifiably succeeded
+ * runs [afterForgotten] (removing the recent-vault entry, releasing the SAF
+ * grant). Returns `false`, having run nothing, when the recovery files could not
+ * be removed: the history entry and grant must then stay so the cleanup can be
+ * retried and any recovery state stays reachable. Only [IOException] -- the
+ * store's "not verifiably gone" signal -- is treated as failure.
+ */
+inline fun RecoverySnapshotStore.forgetThen(vaultUri: String, afterForgotten: () -> Unit): Boolean {
+    try {
+        forget(vaultUri)
+    } catch (error: IOException) {
+        return false
+    }
+
+    afterForgotten()
+    return true
 }
 
 /**
@@ -289,15 +315,40 @@ class FileRecoverySnapshotStore internal constructor(
     override fun clearMarker(vaultUri: String) {
         val marker = sidecarFile(vaultUri)
         marker.delete()
-        if (!isDefinitelyAbsent(marker) || !isDefinitelyNotPresent(marker, NEW_SUFFIX)) {
+        if (!isGone(marker)) {
             throw IOException("recovery marker still present after delete")
         }
     }
 
+    /**
+     * Deletes the marker, then the snapshot, verifying each against the
+     * filesystem exactly as [clearMarker] does (base, `.bak` and `.new`), and
+     * throws [IOException] at the first one that is not verifiably gone. The
+     * marker goes first and a marker failure stops the whole operation: the
+     * snapshot is what a surviving marker's recovery depends on, so it is never
+     * removed out from under one. A failure after the marker is gone can only
+     * leave an orphaned ciphertext snapshot, never a marker without data.
+     * Already-absent artifacts pass the same check, so forgetting twice (or a
+     * vault that never saved) stays idempotent. Only files keyed to
+     * [vaultUri] are touched.
+     */
     override fun forget(vaultUri: String) {
-        snapshotFile(vaultUri).delete()
-        sidecarFile(vaultUri).delete()
+        val marker = sidecarFile(vaultUri)
+        marker.delete()
+        if (!isGone(marker)) {
+            throw IOException("recovery marker still present after delete")
+        }
+
+        val snapshot = snapshotFile(vaultUri)
+        snapshot.delete()
+        if (!isGone(snapshot)) {
+            throw IOException("recovery snapshot still present after delete")
+        }
     }
+
+    /** All three `AtomicFile` artifacts (base, `.bak`, `.new`) verifiably absent. */
+    private fun isGone(file: AtomicBlob): Boolean =
+        isDefinitelyAbsent(file) && isDefinitelyNotPresent(file, NEW_SUFFIX)
 
     private fun atomicWrite(file: AtomicBlob, bytes: ByteArray): Boolean {
         val stream =
