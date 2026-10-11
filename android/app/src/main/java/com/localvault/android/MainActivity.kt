@@ -2,6 +2,7 @@ package com.localvault.android
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.DialogInterface
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.res.ColorStateList
@@ -561,9 +562,24 @@ class MainActivity : Activity() {
     private var totpSetupReplacing: Boolean = false
     private var totpSetupField: EditText? = null
 
-    // The Remove-2FA confirmation dialog, kept only so it can be dismissed
-    // on lock/onStop/onDestroy. Carries no secret.
-    private var removeTotpDialog: AlertDialog? = null
+    // Owns every dialog that shows decrypted vault metadata or whose positive
+    // action acts on the open session (entry delete, category add/rename/
+    // delete, Remove-2FA, recovery restore). lockVault/onDestroy and every
+    // session replacement call invalidateAndDismissAll(), which both
+    // dismisses them and makes any late click callback inert. Holds no vault
+    // data; see SessionDialogGuard.
+    private val dialogGuard = SessionDialogGuard()
+
+    /** Click listener that does nothing if the session epoch moved on since [ticket] was taken. */
+    private fun guardedClick(ticket: SessionDialogGuard.Ticket, action: () -> Unit): DialogInterface.OnClickListener =
+        DialogInterface.OnClickListener { _, _ -> dialogGuard.runIfCurrent(ticket, action) }
+
+    /** Shows [dialog] under [ticket]'s tracking; drops it from tracking when it goes away. */
+    private fun showGuardedDialog(ticket: SessionDialogGuard.Ticket, dialog: AlertDialog) {
+        val attachment = dialogGuard.attach(ticket) { dialog.dismiss() } ?: return
+        dialog.setOnDismissListener { dialogGuard.detach(attachment) }
+        dialog.show()
+    }
 
     // Bumped on every lock/stop/destroy so a late background result for an
     // abandoned unlock is discarded (and its session closed) instead of shown.
@@ -704,7 +720,7 @@ class MainActivity : Activity() {
         categoryMutationGeneration++
         clearEntryEditState()
         clearTotpSetupState()
-        dismissRemoveTotpDialog()
+        dialogGuard.invalidateAndDismissAll()
         val current = session
         session = null
         saveCoordinator = null
@@ -1235,6 +1251,7 @@ class MainActivity : Activity() {
                 }
 
                 clearCreateState()
+                dialogGuard.invalidateAndDismissAll()
                 closeQuietly(session)
                 session = outcome.session
                 // Blocker 1 fix: constructed from the exact committed
@@ -1570,6 +1587,7 @@ class MainActivity : Activity() {
         }
 
         if (opened != null && openedEnvelopeBytes != null) {
+            dialogGuard.invalidateAndDismissAll()
             session = opened
             // Blocker 1 fix: constructed from the exact ciphertext bytes that
             // produced this session -- never re-read from disk per mutation,
@@ -1620,7 +1638,7 @@ class MainActivity : Activity() {
         categoryMutationGeneration++
         clearEntryEditState()
         clearTotpSetupState()
-        dismissRemoveTotpDialog()
+        dialogGuard.invalidateAndDismissAll()
 
         val current = session
         session = null
@@ -2061,12 +2079,15 @@ class MainActivity : Activity() {
         val entryId = detail?.id ?: return
         val title = detail?.title ?: ""
 
-        AlertDialog.Builder(this)
-            .setTitle(R.string.confirm_delete_entry_title)
-            .setMessage(getString(R.string.confirm_delete_entry_message, title))
-            .setPositiveButton(R.string.delete) { _, _ -> startDeleteEntry(entryId) }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
+        val ticket = dialogGuard.begin()
+        val dialog =
+            AlertDialog.Builder(this)
+                .setTitle(R.string.confirm_delete_entry_title)
+                .setMessage(getString(R.string.confirm_delete_entry_message, title))
+                .setPositiveButton(R.string.delete, guardedClick(ticket) { startDeleteEntry(entryId) })
+                .setNegativeButton(android.R.string.cancel, null)
+                .create()
+        showGuardedDialog(ticket, dialog)
     }
 
     private fun startDeleteEntry(entryId: String) {
@@ -2191,31 +2212,43 @@ class MainActivity : Activity() {
 
     private fun showAddCategoryDialog() {
         val field = newDialogField()
-        AlertDialog.Builder(this)
-            .setTitle(R.string.add_category)
-            .setView(dialogFieldWrapper(field))
-            .setPositiveButton(R.string.save) { _, _ -> submitCreateCategory(field.text.toString()) }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
+        val ticket = dialogGuard.begin()
+        val dialog =
+            AlertDialog.Builder(this)
+                .setTitle(R.string.add_category)
+                .setView(dialogFieldWrapper(field))
+                .setPositiveButton(R.string.save, guardedClick(ticket) { submitCreateCategory(field.text.toString()) })
+                .setNegativeButton(android.R.string.cancel, null)
+                .create()
+        showGuardedDialog(ticket, dialog)
     }
 
     private fun showRenameCategoryDialog(category: CategorySummary) {
         val field = newDialogField(category.name)
-        AlertDialog.Builder(this)
-            .setTitle(R.string.rename_category)
-            .setView(dialogFieldWrapper(field))
-            .setPositiveButton(R.string.save) { _, _ -> submitRenameCategory(category.id, field.text.toString()) }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
+        val ticket = dialogGuard.begin()
+        val dialog =
+            AlertDialog.Builder(this)
+                .setTitle(R.string.rename_category)
+                .setView(dialogFieldWrapper(field))
+                .setPositiveButton(
+                    R.string.save,
+                    guardedClick(ticket) { submitRenameCategory(category.id, field.text.toString()) },
+                )
+                .setNegativeButton(android.R.string.cancel, null)
+                .create()
+        showGuardedDialog(ticket, dialog)
     }
 
     private fun confirmDeleteCategory(category: CategorySummary) {
-        AlertDialog.Builder(this)
-            .setTitle(R.string.confirm_delete_category_title)
-            .setMessage(getString(R.string.confirm_delete_category_message, category.name))
-            .setPositiveButton(R.string.delete) { _, _ -> submitDeleteCategory(category.id) }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
+        val ticket = dialogGuard.begin()
+        val dialog =
+            AlertDialog.Builder(this)
+                .setTitle(R.string.confirm_delete_category_title)
+                .setMessage(getString(R.string.confirm_delete_category_message, category.name))
+                .setPositiveButton(R.string.delete, guardedClick(ticket) { submitDeleteCategory(category.id) })
+                .setNegativeButton(android.R.string.cancel, null)
+                .create()
+        showGuardedDialog(ticket, dialog)
     }
 
     private fun submitCreateCategory(name: String) {
@@ -2407,15 +2440,6 @@ class MainActivity : Activity() {
         // field's own doc comment.
     }
 
-    private fun dismissRemoveTotpDialog() {
-        val dialog = removeTotpDialog
-        removeTotpDialog = null
-        try {
-            dialog?.dismiss()
-        } catch (ignored: Exception) {
-        }
-    }
-
     private fun startTotpSetup() {
         val current = detail ?: return
         if (screen != Screen.DETAIL) return
@@ -2476,20 +2500,15 @@ class MainActivity : Activity() {
         val coordinator = saveCoordinator ?: return
         val entryId = current.id
 
-        dismissRemoveTotpDialog()
-
+        val ticket = dialogGuard.begin()
         val dialog =
             AlertDialog.Builder(this)
                 .setTitle(R.string.confirm_remove_totp_title)
                 .setMessage(R.string.confirm_remove_totp_message)
-                .setPositiveButton(R.string.totp_remove) { _, _ -> startRemoveTotp(entryId, coordinator) }
+                .setPositiveButton(R.string.totp_remove, guardedClick(ticket) { startRemoveTotp(entryId, coordinator) })
                 .setNegativeButton(android.R.string.cancel, null)
                 .create()
-        dialog.setOnDismissListener {
-            if (removeTotpDialog === dialog) removeTotpDialog = null
-        }
-        removeTotpDialog = dialog
-        dialog.show()
+        showGuardedDialog(ticket, dialog)
     }
 
     /**
@@ -3000,12 +3019,15 @@ class MainActivity : Activity() {
     private fun showRecoveryRestoreConfirm() {
         val uri = vaultUri ?: return
 
-        AlertDialog.Builder(this)
-            .setTitle(R.string.confirm_restore_title)
-            .setMessage(R.string.confirm_restore_message)
-            .setPositiveButton(R.string.restore_previous_version) { _, _ -> runRestore(uri) }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
+        val ticket = dialogGuard.begin()
+        val dialog =
+            AlertDialog.Builder(this)
+                .setTitle(R.string.confirm_restore_title)
+                .setMessage(R.string.confirm_restore_message)
+                .setPositiveButton(R.string.restore_previous_version, guardedClick(ticket) { runRestore(uri) })
+                .setNegativeButton(android.R.string.cancel, null)
+                .create()
+        showGuardedDialog(ticket, dialog)
     }
 
     /**
@@ -3174,12 +3196,14 @@ class MainActivity : Activity() {
 
         card.addView(newText(getString(R.string.website), size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 16))
         val urlField = newField()
+        urlField.inputType = InputPrivacy.IDENTIFIER_TEXT
         urlField.setText(snapshot?.url ?: existing?.url ?: "")
         editUrlField = urlField
         card.addView(urlField, matchParams(top = 6))
 
         card.addView(newText(getString(R.string.username), size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 16))
         val usernameField = newField()
+        usernameField.inputType = InputPrivacy.IDENTIFIER_TEXT
         usernameField.setText(snapshot?.username ?: existing?.username ?: "")
         editUsernameField = usernameField
         card.addView(usernameField, matchParams(top = 6))
@@ -3209,6 +3233,7 @@ class MainActivity : Activity() {
 
         card.addView(newText(getString(R.string.field_tags), size = 13f, color = R.color.lv_text_tertiary), matchParams(top = 16))
         val tagsField = newField()
+        tagsField.inputType = InputPrivacy.IDENTIFIER_TEXT
         tagsField.hint = getString(R.string.field_tags_hint)
         tagsField.setText(snapshot?.tags ?: existing?.tags?.joinToString(", ") ?: "")
         editTagsField = tagsField
@@ -3871,6 +3896,11 @@ class MainActivity : Activity() {
         field.setPadding(dp(14), dp(12), dp(14), dp(12))
         field.isSaveEnabled = false
         field.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+        // Every field -- including the vault-content ones that set no IME
+        // action of their own -- asks the keyboard not to learn from it.
+        // Callers that set imeOptions afterwards overwrite this and must
+        // include the flag themselves (pinned by InputPrivacyTest).
+        field.imeOptions = InputPrivacy.withNoPersonalizedLearning(field.imeOptions)
         return field
     }
 
