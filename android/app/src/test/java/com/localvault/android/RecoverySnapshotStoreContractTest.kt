@@ -16,7 +16,8 @@ import org.junit.Test
  * throw without Robolectric, which is deliberately not added here per the
  * accepted review's guidance against overengineering this seam) -- its
  * actual durability is a real-device QA item. This test instead pins the
- * *contract* both implementations must uphold.
+ * *contract* both implementations must uphold. The real store's read/clear
+ * logic is exercised separately in [FileRecoverySnapshotStoreTest].
  */
 class RecoverySnapshotStoreContractTest {
 
@@ -45,6 +46,20 @@ class RecoverySnapshotStoreContractTest {
         assertNull(store.readMarker(uri))
         assertNull(store.readSnapshotBytes(uri))
         assertFalse(store.hasUnresolvedMarker(uri))
+    }
+
+    @Test
+    fun an_undeterminable_marker_state_counts_as_unresolved() {
+        val store = FakeRecoverySnapshotStore()
+        store.readMarkerException = java.io.IOException("recovery store unavailable")
+
+        // Fail closed: callers that decide whether recovery state may be
+        // discarded must never read "could not tell" as "nothing pending".
+        assertTrue(store.hasUnresolvedMarker(uri))
+        assertEquals(
+            EvictionOutcome.KEEP,
+            evictionOutcomeFor(store.hasUnresolvedMarker(uri)),
+        )
     }
 
     @Test

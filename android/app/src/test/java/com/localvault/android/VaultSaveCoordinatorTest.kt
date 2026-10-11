@@ -1172,6 +1172,36 @@ class VaultSaveCoordinatorTest {
     }
 
     @Test
+    fun marker_cleanup_failure_after_a_verified_write_is_not_reported_as_success() {
+        val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))
+        val recovery = FakeRecoverySnapshotStore()
+        val session = FakeVaultSession(stagedBytes = stagedBytes)
+        val failure = IOException("marker delete failed")
+        recovery.clearMarkerException = failure
+        val coordinator = coordinator(io, recovery, session)
+
+        val thrown =
+            try {
+                coordinator.saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 1_000L)
+                null
+            } catch (error: IOException) {
+                error
+            }
+
+        assertSame(failure, thrown)
+        assertTrue(recovery.hasUnresolvedMarker(vaultUri))
+        assertEquals(1, session.commitCount)
+        assertTrue(io.contentOf(vaultUri)!!.contentEquals(stagedBytes))
+
+        // The baseline was not advanced, so a retry is refused up front.
+        assertEquals(
+            SaveOutcome.ChangedExternally,
+            coordinator.saveUpdateEntry(vaultUri, "entry-1", sampleInput(), 2_000L),
+        )
+        assertEquals(1, io.writes.size)
+    }
+
+    @Test
     fun unrelated_discard_failure_on_a_second_stale_check_abort_is_not_swallowed() {
         for ((name, _, configure) in secondCheckAbortModes) {
             val io = FakeSafDocumentIo(mapOf(vaultUri to originalBytes))

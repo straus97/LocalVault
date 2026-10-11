@@ -345,6 +345,12 @@ class VaultSaveCoordinator(
 
         // Step 11a: commit. Only now may the caller report success.
         session.commitStagedSave()
+        // clearMarker throws if the marker could not be verifiably removed.
+        // That propagates (never Success) and leaves the baseline un-advanced
+        // on purpose: the primary and session are already consistent, the
+        // lingering marker reconciles as SAVED on next unlock, and a retry
+        // from this stale session is refused by stale check #1 rather than
+        // re-applied (e.g. a duplicate create).
         recovery.clearMarker(vaultUri)
         baselineSha256 = expectedNewSha256
 
