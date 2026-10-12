@@ -26,3 +26,40 @@ internal object InputPrivacy {
      */
     const val IDENTIFIER_TEXT: Int = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
 }
+
+/**
+ * Show/Hide state for the entry-editor password field. Pure and in-memory:
+ * it holds only a boolean, never the password, and is never saved to
+ * savedInstanceState or any store. A fresh instance (or [reset]) is hidden.
+ */
+internal class PasswordVisibility {
+    var shown: Boolean = false
+        private set
+
+    /** Flips visibility and returns the new state. */
+    fun toggle(): Boolean {
+        shown = !shown
+        return shown
+    }
+
+    /** Returns true if the state changed (i.e. it had been shown). */
+    fun reset(): Boolean {
+        val changed = shown
+        shown = false
+        return changed
+    }
+
+    val inputType: Int get() = inputTypeFor(shown)
+
+    companion object {
+        /** The pre-existing concealed password input type, unchanged. */
+        const val HIDDEN_INPUT_TYPE: Int = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+
+        /** Revealed text; suggestions stay suppressed so nothing is offered or learned from it. */
+        const val SHOWN_INPUT_TYPE: Int =
+            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+
+        fun inputTypeFor(shown: Boolean): Int = if (shown) SHOWN_INPUT_TYPE else HIDDEN_INPUT_TYPE
+    }
+}

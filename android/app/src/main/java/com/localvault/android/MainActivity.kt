@@ -36,6 +36,7 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
+import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ProgressBar
@@ -537,6 +538,8 @@ class MainActivity : Activity() {
     private var editUrlField: EditText? = null
     private var editUsernameField: EditText? = null
     private var editPasswordField: EditText? = null
+    private var editPasswordToggle: ImageButton? = null
+    private val editPasswordVisibility = PasswordVisibility()
     private var editNotesField: EditText? = null
     private var editTagsField: EditText? = null
     private var editFavoriteCheckbox: CheckBox? = null
@@ -693,6 +696,7 @@ class MainActivity : Activity() {
             Screen.LIST, Screen.DETAIL, Screen.UNLOCKING, Screen.CATEGORY_MANAGE, Screen.RECOVERY_NEEDED -> lockVault()
             Screen.ENTRY_EDIT -> {
                 editPasswordField?.let { wipe(it) }
+                resetEditPasswordVisibility()
                 lockVault()
             }
             Screen.TOTP_SETUP -> {
@@ -1764,6 +1768,7 @@ class MainActivity : Activity() {
 
     private fun clearEntryEditState() {
         editPasswordField?.let { wipe(it) }
+        resetEditPasswordVisibility()
         editEntryId = null
         editCategoryId = null
         editInitialPassword = null
@@ -2879,6 +2884,8 @@ class MainActivity : Activity() {
         editUrlField = null
         editUsernameField = null
         editPasswordField = null
+        editPasswordToggle = null
+        editPasswordVisibility.reset()
         editNotesField = null
         editTagsField = null
         editFavoriteCheckbox = null
@@ -3217,7 +3224,8 @@ class MainActivity : Activity() {
         // wiped it, so a retry always requires the password to be retyped.
         pwField.setText(editInitialPassword ?: "")
         editPasswordField = pwField
-        card.addView(pwField, matchParams(top = 6))
+        editPasswordVisibility.reset()
+        card.addView(newEditPasswordRow(pwField), matchParams(top = 6))
         // Consumed into the visible field; never retained a second place
         // beyond it (accepted task section F).
         editInitialPassword = null
@@ -3846,6 +3854,53 @@ class MainActivity : Activity() {
         button.minHeight = dp(48)
         button.minimumHeight = dp(48)
         return button
+    }
+
+    /** Field plus an eye / eye-off control; the control only flips the field's input type. */
+    private fun newEditPasswordRow(field: EditText): LinearLayout {
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.gravity = Gravity.CENTER_VERTICAL
+        row.addView(field, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        val toggle = ImageButton(this)
+        toggle.background = getDrawable(R.drawable.bg_button_text)
+        toggle.scaleType = android.widget.ImageView.ScaleType.CENTER
+        toggle.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+        toggle.setOnClickListener { toggleEditPasswordVisibility() }
+        editPasswordToggle = toggle
+        applyEditPasswordToggleAppearance()
+        row.addView(toggle, LinearLayout.LayoutParams(dp(48), dp(48)).also { it.marginStart = dp(4) })
+        return row
+    }
+
+    private fun toggleEditPasswordVisibility() {
+        editPasswordVisibility.toggle()
+        applyEditPasswordVisibility()
+    }
+
+    private fun resetEditPasswordVisibility() {
+        if (editPasswordVisibility.reset()) applyEditPasswordVisibility()
+    }
+
+    /** Re-applies the input type while keeping text, selection and IME options intact. */
+    private fun applyEditPasswordVisibility() {
+        editPasswordField?.let { field ->
+            val start = field.selectionStart
+            val end = field.selectionEnd
+            val imeOptions = field.imeOptions
+            field.inputType = editPasswordVisibility.inputType
+            field.setImeOptions(imeOptions)
+            val length = field.text?.length ?: 0
+            if (start in 0..length && end in 0..length) field.setSelection(start, end)
+        }
+        applyEditPasswordToggleAppearance()
+    }
+
+    private fun applyEditPasswordToggleAppearance() {
+        val toggle = editPasswordToggle ?: return
+        val shown = editPasswordVisibility.shown
+        toggle.setImageResource(if (shown) R.drawable.ic_eye_off else R.drawable.ic_eye)
+        toggle.contentDescription = getString(if (shown) R.string.hide_password else R.string.show_password)
     }
 
     private fun newPasswordField(): EditText {
