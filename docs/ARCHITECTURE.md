@@ -106,7 +106,7 @@ localvault-core (Rust, no Tauri/platform dependency)
     +-- future sync metadata and merge/conflict semantics  [NOT STARTED]
     |
     +-- Desktop/Tauri adapter   (src-tauri, current app)
-    +-- Android adapter         (1T — implemented through B5c; 1T not complete)
+    +-- Android adapter         (1T — closed as an engineering milestone; not a production release)
 ```
 
 ## What must stay outside the shared core (platform adapter responsibility)
@@ -127,7 +127,9 @@ localvault-core (Rust, no Tauri/platform dependency)
 - Adapters must not implement or re-implement cryptography, KDF, AEAD, vault format parsing, migrations, or TOTP generation — all of that stays in the core.
 - The favicon network path (`site_icon_fetcher.rs`) is a desktop-only, explicit, narrow exception and should not be assumed available on constrained mobile contexts without re-review; it must not be treated as precedent for adding network dependencies elsewhere.
 
-## Android architecture (1T, implemented through 1T-B5c)
+## Android architecture (1T, closed at `7a90301` as an engineering milestone; see `@docs/HANDOFF_1T_COMPLETE.md`)
+
+Closeout-era additions are Kotlin-adapter-only and add no core logic: SAF read-only-by-default with an explicit writable grant (`VaultGrant.kt`), fail-closed recovery-marker handling and verified cleanup (`RecoverySnapshotStore.kt`), in-flight save/reopen/restore/history-cleanup guards (`VaultSaveCoordinator.kt`, `MainActivity.kt`), session-dialog and input-privacy helpers (`SessionDialogGuard.kt`, `InputPrivacy.kt`), and backup/data-extraction exclusion (`res/xml/backup_rules.xml`, `res/xml/data_extraction_rules.xml`). Crypto, format, schema and TOTP remain solely in `localvault-core`. The coordinator's optional `onAfterMarkerWritten`/`onAfterPrimaryWrite` hooks exist for tests only; production `MainActivity` does not wire them.
 
 Android gets a thin adapter analogous to the current `src-tauri` adapter, chosen by the 1T-A/1T-A2 architecture audits and implemented starting at 1T-B1b:
 

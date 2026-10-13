@@ -1,5 +1,7 @@
 # LocalVault 1T Progress Handoff
 
+> **Historical snapshot.** 1T has since been closed as an engineering milestone with documented limits — see `@docs/HANDOFF_1T_COMPLETE.md`, which (with Git and `@docs/PROJECT_STATUS.md`) overrides anything below that says 1T is in progress or lists "remaining before 1T can close".
+
 ## 1. Purpose / how to use
 
 This is the authoritative handoff for a **new** Claude chat (or any fresh engineer) picking up LocalVault after 1T-B1 through 1T-B4. It exists because 1T (Android) is still in progress, not complete, and the next task (1T-B5, Android write/create/CRUD) is architecturally significant enough to deserve a clean context rather than continuing in a chat that has accumulated a long implementation history.
@@ -443,7 +445,7 @@ At 50,000 entries also: expand one site group median frame 67.52 ms, collapse 68
 
 ## 35. Update: Android release panic strategy (RESOLVED at the configuration level; not a new named stage)
 
-**Status:** implemented and accepted; no new `1T-B6` stage exists. The change is in the working tree (root `Cargo.toml`, `android/scripts/build-android-debug.ps1`) and was uncommitted when this section was written — verify with `git log`/`git status` rather than trusting this line.
+**Status:** implemented and accepted; no new `1T-B6` stage exists. The change (root `Cargo.toml`, `android/scripts/build-android-debug.ps1`) was uncommitted when this section was written and has since been committed as `0e44311`.
 
 **Problem (audit):** the workspace `[profile.release]` (moved unchanged from the v1.0.0 desktop `src-tauri/Cargo.toml`) has `panic = "abort"`. UniFFI 0.32.0 wraps every generated `extern "C"` export, object clone/free and rustbuffer helper in `uniffi::rust_call` → `catch_unwind`, which can only work with unwinding. Under abort, any Rust panic kills the whole Android process (SIGABRT, no Kotlin exception, no `Drop`/zeroize). No Android release build path existed, so the blocker was latent (all Android builds were dev/unwind).
 

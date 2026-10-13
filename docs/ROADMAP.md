@@ -28,11 +28,11 @@ Stages 1S through 1X. Each stage depends on the prior stage's exit criteria bein
 
 Output of 1S-A was a low-risk extraction plan for the reusable Rust crate/library now established as `localvault-core`. 1S must also prepare for future sync metadata but must **not** implement synchronization prematurely.
 
-**Depends on:** 1R (complete). **Stage status:** 1S complete; 1T is in progress (see the 1T section).
+**Depends on:** 1R (complete). **Stage status:** 1S complete; 1T closed as an engineering milestone with documented limits (see the 1T section).
 
 **Progress (extraction checkpoints, in order):** `localvault-core` exists as a workspace member (`bcdb1ad` compatibility safety net, `07e15fd` workspace skeleton), and three low-risk mechanical extractions have landed into it: crypto primitives + vault envelope/format (1S-C1, `4721b05`), the persisted vault domain/data model (1S-C2, `bfd7fec`), and the TOTP RFC 6238 parser/generator (1S-C3, `8f0d5a3`). These are ownership/module-boundary moves only, with no cryptographic or behavioral changes. A subsequent remaining-work audit (performed at `962f2a7`) re-verified the full 1S-A checklist above — including `AppState` dependencies, filesystem boundary, mobile constraints, and future sync constraints — against the post-extraction state, and found no blocker to starting 1T. **Stage 1S is complete.** Password-health placement and password-generator placement remain undecided long-term architecture questions, but neither is a 1T prerequisite: both are pure, low-coupling modules the audit found extractable later without schema/crypto risk if and when Android actually needs them. See `@docs/HANDOFF_1S_COMPLETE.md` for the closure handoff.
 
-## 1T — Android mobile MVP (IN PROGRESS)
+## 1T — Android mobile MVP (COMPLETE as an engineering/acceptance milestone, with documented limits)
 
 Android is the first and only planned mobile implementation.
 
@@ -50,7 +50,7 @@ Scope:
 
 **Depends on:** 1S (complete — see the 1S section above and `@docs/HANDOFF_1S_COMPLETE.md`).
 
-**Status: in progress, not complete.** Architecture (1T-A/1T-A2) chose native Android Kotlin UI over stable UniFFI `=0.32.0` Kotlin/JNA bindings, over a new `localvault-android-bridge` crate, over unchanged `localvault-core` — see `@docs/ARCHITECTURE.md` for the full boundary and `@docs/HANDOFF_1T_PROGRESS.md` for the complete history and next-session startup checklist.
+**Status: closed at `7a90301` as an engineering implementation and current-acceptance milestone — not a production release.** Closeout summary, device-QA evidence and the residual (device-only, not-yet-verified) limitations are in `@docs/HANDOFF_1T_COMPLETE.md`; the older stage narrative below is historical. Architecture (1T-A/1T-A2) chose native Android Kotlin UI over stable UniFFI `=0.32.0` Kotlin/JNA bindings, over a new `localvault-android-bridge` crate, over unchanged `localvault-core` — see `@docs/ARCHITECTURE.md` for the full boundary and `@docs/HANDOFF_1T_PROGRESS.md` for the complete history and next-session startup checklist.
 
 Completed so far, in order:
 - **1T-B1a** (no commit): read-only toolchain/environment proof — pinned Android Rust target, NDK, `cargo-ndk`; confirmed unmodified `localvault-core` builds for Android ARM64.
@@ -75,13 +75,13 @@ Android site/profile grouping (not a new named stage) is also accepted (committe
 
 The Android-release panic-strategy blocker is **resolved at the configuration level** (not a new named stage): an Android-only Cargo profile `android-release` (`panic = "unwind"`, `strip = "debuginfo"`) built via `android\scripts\build-android-debug.ps1 -RustProfile android-release`; the global desktop `[profile.release]` stays `panic = "abort"` and unchanged. Validated by the standard gates, ELF/UniFFI analysis and a physical-device smoke (300-entry vault read paths; create/save/reopen/delete in a new vault). No on-device panic injection was done, non-panic aborts such as OOM remain possible, and Android release packaging/signing is not implemented. Detail: `@docs/SECURITY_MODEL.md`, `@docs/HANDOFF_1T_PROGRESS.md` §35.
 
-Still outstanding before 1T can close — **do not treat 1T as complete**:
-- known visual polish, including the DETAIL top-action overflow/cutoff;
-- a final Android security/UX/regression pass (including a follow-up on why the imported 300-entry vault showed write access unavailable on the device — cause unverified).
+Closeout stabilization after the items above (all unnamed, committed on this branch): `0e44311` (panic profile), `7c8b253` (wrapping action rows), `711cda7` (SAF read-only by default + explicit writable grant), `8bfc10d` (in-flight save/recovery guards), `cd69c4b` (recovery marker fail-closed), `f7b4633` (verified recovery cleanup before forgetting), `f51190d` (session dialogs, input privacy, backup/data-extraction rules), `7a90301` (entry password visibility). Validated by the Android JVM suite (355 reported, 0 failures/errors, 1 skipped benchmark), a debug APK built with Rust profile `android-release`, and physical Xiaomi 24115RA8EG (Android 16 / SDK 36) QA including external-change refusal.
 
-A later dedicated, coordinated desktop + Android design/UX pass is still planned and not implemented; the current UI (including the Android LIST layout/spacing) is not considered final.
+**Residual, kept visible (not PASS):** device-only fault tests — process death around the primary write, the full `UNKNOWN_NEEDS_RECOVERY` restore through a real SAF provider, real `AtomicFile` crash behavior, a slow-provider in-flight reopen guard, and OEM device-transfer exclusion — plus release signing/packaging (1X). No debug fault-injection mechanism exists. See `@docs/HANDOFF_1T_COMPLETE.md` §6.
 
-No further named 1T-B stage is defined; the next task is chosen from this list. Do not mix sync work into 1T.
+A later dedicated, coordinated desktop + Android design/UX pass is still planned (un-numbered) and not implemented; the current Android UI is not considered final.
+
+No further named 1T stage is defined and no new numbered stage is introduced. The next stages remain 1U → 1V → 1W → 1X below. Do not mix sync work into Android stabilization.
 
 
 ## 1U — Sync foundation
@@ -120,7 +120,7 @@ A paid LocalVault-owned server is **not** required for the first sync implementa
 - Android secure clipboard behavior
 - Android secure-storage integration where justified for approved convenience-unlock mechanisms
 
-**Depends on:** 1T (Android MVP).
+**Depends on:** 1T (Android MVP — closed; see `@docs/HANDOFF_1T_COMPLETE.md`). None of these features exist yet.
 
 ## 1X — Final product hardening / release
 

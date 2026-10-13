@@ -4,11 +4,12 @@ Stable rules for working on LocalVault. This file intentionally does not contain
 
 ## Required reading by task type
 
+- Starting or resuming development in a new session: begin with `@docs/HANDOFF_1T_COMPLETE.md` (Android 1T closeout: current checkpoint, accepted features, residual limits, startup checklist), then `@docs/PROJECT_STATUS.md`
 - Starting any task: `@docs/PROJECT_STATUS.md` (current branch/HEAD, what's done, what's next)
 - Planning new work / sequencing stages: `@docs/ROADMAP.md`
 - Touching module boundaries, crate structure, or mobile/sync prep: `@docs/ARCHITECTURE.md`
 - Touching crypto, clipboard, lock behavior, TOTP, or anything secret-handling: `@docs/SECURITY_MODEL.md`
-- Resuming after the 1R TOTP milestone / starting 1S: `@docs/HANDOFF_1R_COMPLETE.md`
+- Historical only (not a starting point): `@docs/HANDOFF_1R_COMPLETE.md` (1R TOTP milestone), `@docs/HANDOFF_1S_COMPLETE.md` (1S core extraction), `@docs/HANDOFF_1T_PROGRESS.md` (B4-era Android narrative; superseded by the 1T closeout handoff)
 
 ## What LocalVault is
 
