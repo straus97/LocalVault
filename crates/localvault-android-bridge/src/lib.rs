@@ -27,7 +27,7 @@ use localvault_core::{
     site::site_key,
     totp::{generate_totp, parse_totp_input},
     vault::{
-        data::{VaultCategory, VaultData, VaultEntry},
+        data::{VaultCategory, VaultData, VaultDataError, VaultEntry},
         format::{
             create_envelope_with_key, open_envelope_with_key, reseal_envelope, CryptoError,
             SecretKey, VaultEnvelope, VaultError,
@@ -491,10 +491,7 @@ impl VaultSession {
 
         candidate.updated_at_ms = candidate.updated_at_ms.max(effective_updated_at_ms);
 
-        candidate.upgrade_legacy_schema_for_write();
-        candidate
-            .validate()
-            .map_err(|_| BridgeError::InvalidInput)?;
+        candidate.prepare_for_write().map_err(map_prepare_error)?;
 
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
@@ -555,10 +552,7 @@ impl VaultSession {
 
         candidate.updated_at_ms = candidate.updated_at_ms.max(now_ms);
 
-        candidate.upgrade_legacy_schema_for_write();
-        candidate
-            .validate()
-            .map_err(|_| BridgeError::InvalidInput)?;
+        candidate.prepare_for_write().map_err(map_prepare_error)?;
 
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
@@ -611,10 +605,7 @@ impl VaultSession {
 
         candidate.updated_at_ms = candidate.updated_at_ms.max(now_ms);
 
-        candidate.upgrade_legacy_schema_for_write();
-        candidate
-            .validate()
-            .map_err(|_| BridgeError::InvalidInput)?;
+        candidate.prepare_for_write().map_err(map_prepare_error)?;
 
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
@@ -664,10 +655,7 @@ impl VaultSession {
 
         candidate.updated_at_ms = candidate.updated_at_ms.max(now_ms);
 
-        candidate.upgrade_legacy_schema_for_write();
-        candidate
-            .validate()
-            .map_err(|_| BridgeError::InvalidInput)?;
+        candidate.prepare_for_write().map_err(map_prepare_error)?;
 
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
@@ -732,10 +720,7 @@ impl VaultSession {
 
         candidate.updated_at_ms = candidate.updated_at_ms.max(effective_updated_at_ms);
 
-        candidate.upgrade_legacy_schema_for_write();
-        candidate
-            .validate()
-            .map_err(|_| BridgeError::InvalidInput)?;
+        candidate.prepare_for_write().map_err(map_prepare_error)?;
 
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
@@ -804,10 +789,7 @@ impl VaultSession {
 
         candidate.updated_at_ms = candidate.updated_at_ms.max(now_ms);
 
-        candidate.upgrade_legacy_schema_for_write();
-        candidate
-            .validate()
-            .map_err(|_| BridgeError::InvalidInput)?;
+        candidate.prepare_for_write().map_err(map_prepare_error)?;
 
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?,
@@ -993,26 +975,36 @@ fn parse_optional_category_id(value: &Option<String>) -> Result<Option<Uuid>, Br
     }
 }
 
+/// Maps a failed `VaultData::prepare_for_write` to the bridge's existing,
+/// oracle-safe errors. Revision exhaustion is not the caller's input being
+/// wrong, so it surfaces as the generic `OperationFailed` (no new variant: the
+/// UniFFI error enum, and with it the generated Kotlin, stays unchanged).
+/// Everything else -- validation failures -- stays `InvalidInput` as before.
+fn map_prepare_error(error: VaultDataError) -> BridgeError {
+    match error {
+        VaultDataError::RevisionOverflow => BridgeError::OperationFailed,
+        _ => BridgeError::InvalidInput,
+    }
+}
+
 /// Finishes a staged mutation for `stage_set_entry_totp` and
-/// `stage_remove_entry_totp`: applies the shared legacy-schema upgrade rule,
-/// validates, serializes, reseals under the session's existing envelope/Vault
-/// Key, records the candidate as the single staged mutation, and returns the
-/// resealed envelope's bytes.
+/// `stage_remove_entry_totp`: applies the shared write-preparation rule
+/// (`VaultData::prepare_for_write`: legacy-schema upgrade, one checked revision
+/// increment, validation), serializes, reseals under the session's existing
+/// envelope/Vault Key, records the candidate as the single staged mutation, and
+/// returns the resealed envelope's bytes.
 ///
-/// The order is the same as every other `stage_*` method -- upgrade
-/// (`VaultData::upgrade_legacy_schema_for_write`, the one shared core rule)
-/// strictly *before* `validate`, because `validate` rejects TOTP in a schema-1
-/// vault. The caller must already have checked the session is unlocked and no
-/// stage is pending. Used only by the two TOTP stage methods; the older
-/// `stage_*` methods keep their own inline copies untouched.
+/// The order is the same as every other `stage_*` method. The caller must
+/// already have checked the session is unlocked and no stage is pending. Used
+/// only by the two TOTP stage methods; the older `stage_*` methods keep their
+/// own inline copies of this tail, all calling the same core rule. Only the
+/// *candidate* is prepared: the committed `state.data` (and its revision) is
+/// not touched until `commit_staged_save`.
 fn seal_and_stage(
     state: &mut SessionState,
     mut candidate: VaultData,
 ) -> Result<Vec<u8>, BridgeError> {
-    candidate.upgrade_legacy_schema_for_write();
-    candidate
-        .validate()
-        .map_err(|_| BridgeError::InvalidInput)?;
+    candidate.prepare_for_write().map_err(map_prepare_error)?;
 
     let plaintext =
         Zeroizing::new(serde_json::to_vec(&candidate).map_err(|_| BridgeError::OperationFailed)?);
@@ -1190,6 +1182,8 @@ mod tests {
         "f5bf1fcdb11115f0fa39598389a7a8ce3b9c44b78ddfd5295b57845b52155f55";
     const SCHEMA1_FIXTURE_SHA256: &str =
         "17edf060385cca1a778b2236842ecfa44d21aa174d9b70092c1d9cbdd0fcb9a8";
+    const SCHEMA3_FIXTURE_SHA256: &str =
+        "71d2efb0150e7f818cf1acf61ce25f6e1dda06370f8df85056dc671fdc3e81c8";
 
     const TEST_MASTER_PASSWORD: &str = "compat-baseline-master-password-test-only";
     const WRONG_PASSWORD: &str = "definitely-wrong-password-test-only";
@@ -1225,6 +1219,10 @@ mod tests {
         read_fixture("schema1_baseline.envelope.json", SCHEMA1_FIXTURE_SHA256)
     }
 
+    fn schema3() -> Vec<u8> {
+        read_fixture("schema3_baseline.envelope.json", SCHEMA3_FIXTURE_SHA256)
+    }
+
     fn open_ok(bytes: Vec<u8>) -> Arc<VaultSession> {
         match open_vault(bytes, TEST_MASTER_PASSWORD.to_owned()) {
             Ok(session) => session,
@@ -1248,11 +1246,31 @@ mod tests {
             .schema_version
     }
 
+    /// The committed (not staged) payload revision held by the session.
+    fn revision(session: &VaultSession) -> u64 {
+        session
+            .guard()
+            .as_ref()
+            .expect("session is unlocked")
+            .data
+            .revision
+    }
+
+    fn has_staged(session: &VaultSession) -> bool {
+        session
+            .guard()
+            .as_ref()
+            .expect("session is unlocked")
+            .staged
+            .is_some()
+    }
+
     #[test]
     fn schema2_fixture_opens_and_lists_entries() {
         let session = open_ok(schema2());
 
         assert_eq!(schema_version(&session), 2);
+        assert_eq!(revision(&session), 0);
 
         let entries = session.list_entries().unwrap();
         assert_eq!(entries.len(), 2);
@@ -1275,6 +1293,7 @@ mod tests {
         let session = open_ok(schema1());
 
         assert_eq!(schema_version(&session), 1);
+        assert_eq!(revision(&session), 0);
         assert_eq!(session.list_entries().unwrap().len(), 2);
     }
 
@@ -2033,7 +2052,8 @@ mod tests {
             .unwrap();
 
         let staged_session = reopen_bytes(&staged_bytes);
-        assert_eq!(schema_version(&staged_session), 2);
+        assert_eq!(schema_version(&staged_session), 3);
+        assert_eq!(revision(&staged_session), 1);
         assert_eq!(staged_session.entry_details(id).unwrap().title, "Upgraded");
     }
 
@@ -2070,7 +2090,10 @@ mod tests {
         // Simulates Kotlin reading back exactly what it wrote.
         let session = pending.verify_and_finalize(initial_bytes).unwrap();
 
-        assert_eq!(schema_version(&session), 2);
+        assert_eq!(schema_version(&session), 3);
+        // A brand-new vault does not acquire a revision merely because its
+        // initial file was written.
+        assert_eq!(revision(&session), 0);
         assert!(session.list_entries().unwrap().is_empty());
         assert!(session.list_categories().unwrap().is_empty());
     }
@@ -2795,7 +2818,8 @@ mod tests {
         // The staged bytes are an independent, reopenable vault with a
         // working TOTP, computed by core (SHA1 / 6 digits / 30 s defaults).
         let reopened = reopen_bytes(&staged);
-        assert_eq!(schema_version(&reopened), 2);
+        assert_eq!(schema_version(&reopened), 3);
+        assert_eq!(revision(&reopened), 1);
         assert!(reopened.entry_details(id.clone()).unwrap().totp_enabled);
 
         let status = reopened.totp_status(id.clone(), RFC_UNIX_SECONDS).unwrap();
@@ -3155,7 +3179,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_set_entry_totp_on_schema1_upgrades_to_schema2_and_generates_a_working_code() {
+    fn stage_set_entry_totp_on_schema1_upgrades_to_schema3_and_generates_a_working_code() {
         let session = open_ok(schema1());
         assert_eq!(schema_version(&session), 1);
         let id = id_of(&session, "Legacy Fixture Login");
@@ -3177,10 +3201,11 @@ mod tests {
         assert_eq!(entry_rows(&session), rows_before);
 
         // The staged bytes reopen through the real open path
-        // (open_envelope_with_key + VaultData::validate) as schema 2 with a
-        // working TOTP, and everything else is preserved.
+        // (open_envelope_with_key + VaultData::validate) as schema 3 at
+        // revision 1 with a working TOTP, and everything else is preserved.
         let reopened = reopen_bytes(&staged);
-        assert_eq!(schema_version(&reopened), 2);
+        assert_eq!(schema_version(&reopened), 3);
+        assert_eq!(revision(&reopened), 1);
         assert!(reopened.entry_details(id.clone()).unwrap().totp_enabled);
         assert_eq!(
             reopened
@@ -3213,9 +3238,11 @@ mod tests {
 
         assert_no_totp_plaintext(&staged);
 
-        // Commit promotes both the schema upgrade and the TOTP.
+        // Commit promotes the schema upgrade, the revision and the TOTP.
+        assert_eq!(revision(&session), 0);
         session.commit_staged_save().unwrap();
-        assert_eq!(schema_version(&session), 2);
+        assert_eq!(schema_version(&session), 3);
+        assert_eq!(revision(&session), 1);
         assert_eq!(
             session
                 .totp_status(id.clone(), RFC_UNIX_SECONDS)
@@ -3267,5 +3294,451 @@ mod tests {
         assert!(session
             .stage_set_entry_totp(id, RFC_BASE32.to_owned(), UPDATE_NOW_MS)
             .is_ok());
+    }
+
+    // -- Stage 1U-2: schema 3 and authenticated revision tracking ---------
+
+    fn category_input(name: &str) -> CategoryInput {
+        CategoryInput {
+            name: name.to_owned(),
+        }
+    }
+
+    fn set_revision(session: &VaultSession, value: u64) {
+        session
+            .guard()
+            .as_mut()
+            .expect("session is unlocked")
+            .data
+            .revision = value;
+    }
+
+    fn site_icon_rows(session: &VaultSession) -> Vec<(String, String, i64)> {
+        session
+            .guard()
+            .as_ref()
+            .expect("session is unlocked")
+            .data
+            .site_icons
+            .iter()
+            .map(|icon| {
+                (
+                    icon.hostname.clone(),
+                    icon.png_base64.clone(),
+                    icon.updated_at_ms,
+                )
+            })
+            .collect()
+    }
+
+    /// An encrypted vault whose payload is exactly `payload`, bypassing
+    /// `VaultData` so malformed and future payloads can be built.
+    fn envelope_bytes_for_payload(payload: &serde_json::Value) -> Vec<u8> {
+        let plaintext = serde_json::to_vec(payload).unwrap();
+
+        let envelope =
+            localvault_core::vault::format::create_envelope(TEST_MASTER_PASSWORD, &plaintext)
+                .unwrap();
+
+        serde_json::to_vec(&envelope).unwrap()
+    }
+
+    fn fresh_payload() -> serde_json::Value {
+        serde_json::to_value(VaultData::new(1_700_000_000_000).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn schema3_fixture_opens_with_its_stored_revision() {
+        let session = open_ok(schema3());
+
+        assert_eq!(schema_version(&session), 3);
+        assert_eq!(revision(&session), 7);
+
+        let entries = session.list_entries().unwrap();
+        let mut titles: Vec<&str> = entries.iter().map(|entry| entry.title.as_str()).collect();
+        titles.sort_unstable();
+        assert_eq!(
+            titles,
+            ["Fixture Schema3 Login", "Fixture Schema3 TOTP Account"]
+        );
+
+        let totp_id = id_of(&session, "Fixture Schema3 TOTP Account");
+        let status = session.totp_status(totp_id, 1_700_000_100).unwrap();
+        assert_eq!(status.code, "38222816");
+    }
+
+    #[test]
+    fn opening_and_reading_never_migrates_or_stages_anything() {
+        for (bytes, expected_schema, expected_revision) in
+            [(schema1(), 1, 0), (schema2(), 2, 0), (schema3(), 3, 7)]
+        {
+            let session = open_ok(bytes);
+
+            session.list_entries().unwrap();
+            session.list_categories().unwrap();
+
+            assert_eq!(schema_version(&session), expected_schema);
+            assert_eq!(revision(&session), expected_revision);
+            assert!(!has_staged(&session));
+        }
+    }
+
+    #[test]
+    fn first_save_migrates_legacy_vaults_to_schema3_revision_one_and_preserves_data() {
+        for (bytes, from_schema) in [(schema1(), 1), (schema2(), 2)] {
+            let session = open_ok(bytes);
+            assert_eq!(schema_version(&session), from_schema);
+
+            let (vault_id, created_at_ms, _) = vault_meta(&session);
+            let rows_before = entry_rows(&session);
+            let categories_before = category_rows(&session);
+            let totp_before = totp_flags(&session);
+            let icons_before = site_icon_rows(&session);
+            assert_eq!(icons_before.len(), 1);
+
+            let staged = session
+                .stage_create_category(category_input("Migration Marker"), UPDATE_NOW_MS)
+                .unwrap();
+
+            // Staging alone changes nothing that is committed.
+            assert_eq!(schema_version(&session), from_schema);
+            assert_eq!(revision(&session), 0);
+
+            let reopened = reopen_bytes(&staged);
+            assert_eq!(schema_version(&reopened), 3);
+            assert_eq!(revision(&reopened), 1);
+
+            let (reopened_vault_id, reopened_created_at_ms, _) = vault_meta(&reopened);
+            assert_eq!(reopened_vault_id, vault_id);
+            assert_eq!(reopened_created_at_ms, created_at_ms);
+            assert_eq!(entry_rows(&reopened), rows_before);
+            assert_eq!(totp_flags(&reopened), totp_before);
+            assert_eq!(site_icon_rows(&reopened), icons_before);
+            assert_eq!(category_rows(&reopened).len(), categories_before.len() + 1);
+
+            session.commit_staged_save().unwrap();
+            assert_eq!(schema_version(&session), 3);
+            assert_eq!(revision(&session), 1);
+        }
+    }
+
+    #[test]
+    fn each_committed_save_increments_the_revision_by_exactly_one() {
+        let session = open_ok(schema3());
+        let id = id_of(&session, "Fixture Schema3 Login");
+
+        for expected in 8..=10u64 {
+            let staged = session
+                .stage_update_entry(id.clone(), update_input("Bump"), UPDATE_NOW_MS)
+                .unwrap();
+
+            // The candidate carries the next revision; the committed state
+            // does not move until the commit.
+            assert_eq!(revision(&reopen_bytes(&staged)), expected);
+            assert_eq!(revision(&session), expected - 1);
+
+            session.commit_staged_save().unwrap();
+
+            assert_eq!(revision(&session), expected);
+        }
+    }
+
+    #[test]
+    fn discarded_stage_preserves_the_revision_and_the_next_stage_reuses_it() {
+        let session = open_ok(schema3());
+        let id = id_of(&session, "Fixture Schema3 Login");
+
+        let first = session
+            .stage_update_entry(id.clone(), update_input("Discarded"), UPDATE_NOW_MS)
+            .unwrap();
+        assert_eq!(revision(&reopen_bytes(&first)), 8);
+
+        session.discard_staged_save();
+
+        assert!(!has_staged(&session));
+        assert_eq!(revision(&session), 7);
+        assert_eq!(schema_version(&session), 3);
+
+        // Nothing is left to commit, and a failed commit moves nothing.
+        assert_eq!(
+            session.commit_staged_save().err(),
+            Some(BridgeError::InvalidInput)
+        );
+        assert_eq!(revision(&session), 7);
+
+        // The retry is revision 8 again, not 9: the discarded attempt never
+        // counted.
+        let second = session
+            .stage_update_entry(id, update_input("Retried"), UPDATE_NOW_MS)
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(revision(&reopen_bytes(&second)), 8);
+
+        session.commit_staged_save().unwrap();
+        assert_eq!(revision(&session), 8);
+    }
+
+    #[test]
+    fn rejected_stage_leaves_no_candidate_and_no_revision_change() {
+        let session = open_ok(schema3());
+
+        assert_eq!(
+            session
+                .stage_create_entry(create_input("   "), UPDATE_NOW_MS)
+                .err(),
+            Some(BridgeError::InvalidInput)
+        );
+
+        assert!(!has_staged(&session));
+        assert_eq!(revision(&session), 7);
+        assert_eq!(schema_version(&session), 3);
+    }
+
+    #[test]
+    fn every_stage_method_advances_the_candidate_revision_by_exactly_one() {
+        type Stage = Box<dyn Fn(&VaultSession) -> Result<Vec<u8>, BridgeError>>;
+
+        let operations: Vec<(&str, Stage)> = vec![
+            (
+                "update_entry",
+                Box::new(|session| {
+                    let id = id_of(session, "Fixture Schema3 Login");
+                    session.stage_update_entry(id, update_input("Op"), UPDATE_NOW_MS)
+                }),
+            ),
+            (
+                "create_entry",
+                Box::new(|session| session.stage_create_entry(create_input("Op"), UPDATE_NOW_MS)),
+            ),
+            (
+                "delete_entry",
+                Box::new(|session| {
+                    let id = id_of(session, "Fixture Schema3 Login");
+                    session.stage_delete_entry(id, UPDATE_NOW_MS)
+                }),
+            ),
+            (
+                "create_category",
+                Box::new(|session| {
+                    session.stage_create_category(category_input("Op"), UPDATE_NOW_MS)
+                }),
+            ),
+            (
+                "update_category",
+                Box::new(|session| {
+                    let id = category_id_of(session, "Fixture Schema3 Category");
+                    session.stage_update_category(id, category_input("Renamed"), UPDATE_NOW_MS)
+                }),
+            ),
+            (
+                "set_entry_totp",
+                Box::new(|session| {
+                    let id = id_of(session, "Fixture Schema3 Login");
+                    session.stage_set_entry_totp(id, RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+                }),
+            ),
+            (
+                "remove_entry_totp",
+                Box::new(|session| {
+                    let id = id_of(session, "Fixture Schema3 TOTP Account");
+                    session.stage_remove_entry_totp(id, UPDATE_NOW_MS)
+                }),
+            ),
+        ];
+
+        for (label, stage) in &operations {
+            let session = open_ok(schema3());
+
+            let staged = stage(&session).unwrap_or_else(|_| panic!("{label} should stage"));
+
+            assert_eq!(revision(&reopen_bytes(&staged)), 8, "{label}");
+            assert_eq!(revision(&session), 7, "{label}");
+
+            session.commit_staged_save().unwrap();
+
+            assert_eq!(revision(&session), 8, "{label}");
+        }
+
+        // delete_category needs an unused category, so it is staged on top of
+        // a committed create (revision 8 -> 9).
+        let session = open_ok(schema3());
+        let created = session
+            .stage_create_category(category_input("Disposable"), UPDATE_NOW_MS)
+            .unwrap();
+        assert_eq!(revision(&reopen_bytes(&created)), 8);
+        session.commit_staged_save().unwrap();
+
+        let id = category_id_of(&session, "Disposable");
+        let deleted = session.stage_delete_category(id, UPDATE_NOW_MS).unwrap();
+        assert_eq!(revision(&reopen_bytes(&deleted)), 9);
+        assert_eq!(revision(&session), 8);
+        session.commit_staged_save().unwrap();
+        assert_eq!(revision(&session), 9);
+    }
+
+    #[test]
+    fn revision_overflow_is_rejected_by_every_stage_method_without_staging() {
+        let session = open_ok(schema3());
+        set_revision(&session, u64::MAX);
+
+        let login = id_of(&session, "Fixture Schema3 Login");
+        let totp_account = id_of(&session, "Fixture Schema3 TOTP Account");
+        let category = category_id_of(&session, "Fixture Schema3 Category");
+
+        let results = [
+            session
+                .stage_update_entry(login.clone(), update_input("Op"), UPDATE_NOW_MS)
+                .err(),
+            session
+                .stage_create_entry(create_input("Op"), UPDATE_NOW_MS)
+                .err(),
+            session
+                .stage_delete_entry(login.clone(), UPDATE_NOW_MS)
+                .err(),
+            session
+                .stage_create_category(category_input("Op"), UPDATE_NOW_MS)
+                .err(),
+            session
+                .stage_update_category(category, category_input("Op"), UPDATE_NOW_MS)
+                .err(),
+            session
+                .stage_set_entry_totp(login, RFC_BASE32.to_owned(), UPDATE_NOW_MS)
+                .err(),
+            session
+                .stage_remove_entry_totp(totp_account, UPDATE_NOW_MS)
+                .err(),
+        ];
+
+        // Exhaustion is a generic failure, not an input-validation error, and
+        // never wraps to 0.
+        for result in results {
+            assert_eq!(result, Some(BridgeError::OperationFailed));
+            assert!(!has_staged(&session));
+            assert_eq!(revision(&session), u64::MAX);
+        }
+
+        // One below the ceiling still stages, and lands exactly on it.
+        set_revision(&session, u64::MAX - 1);
+        let staged = session
+            .stage_create_category(category_input("Last"), UPDATE_NOW_MS)
+            .unwrap();
+        assert_eq!(revision(&reopen_bytes(&staged)), u64::MAX);
+    }
+
+    #[test]
+    fn unsupported_or_malformed_revision_payloads_are_rejected_on_open() {
+        let mut future = fresh_payload();
+        future["schema_version"] = serde_json::json!(4);
+        assert_eq!(
+            open_err(envelope_bytes_for_payload(&future), TEST_MASTER_PASSWORD),
+            BridgeError::UnsupportedFormat
+        );
+
+        let mut missing = fresh_payload();
+        assert!(missing
+            .as_object_mut()
+            .unwrap()
+            .remove("revision")
+            .is_some());
+        assert_eq!(
+            open_err(envelope_bytes_for_payload(&missing), TEST_MASTER_PASSWORD),
+            BridgeError::UnsupportedFormat
+        );
+
+        for malformed in [
+            serde_json::json!(null),
+            serde_json::json!("5"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+        ] {
+            let mut payload = fresh_payload();
+            payload["revision"] = malformed;
+            assert_eq!(
+                open_err(envelope_bytes_for_payload(&payload), TEST_MASTER_PASSWORD),
+                BridgeError::UnsupportedFormat
+            );
+        }
+
+        let mut legacy_with_revision = fresh_payload();
+        legacy_with_revision["schema_version"] = serde_json::json!(2);
+        legacy_with_revision["revision"] = serde_json::json!(1);
+        assert_eq!(
+            open_err(
+                envelope_bytes_for_payload(&legacy_with_revision),
+                TEST_MASTER_PASSWORD
+            ),
+            BridgeError::UnsupportedFormat
+        );
+
+        // Control: the same builder with a well-formed schema-3 payload opens.
+        let mut valid = fresh_payload();
+        valid["revision"] = serde_json::json!(5);
+        let session = open_ok(envelope_bytes_for_payload(&valid));
+        assert_eq!(revision(&session), 5);
+    }
+
+    #[test]
+    fn android_staged_payload_has_the_schema3_shape_shared_with_desktop() {
+        let session = open_ok(schema1());
+
+        let staged = session
+            .stage_create_category(category_input("Shape Marker"), UPDATE_NOW_MS)
+            .unwrap();
+
+        let envelope: VaultEnvelope = serde_json::from_slice(&staged).unwrap();
+        let plaintext =
+            localvault_core::vault::format::open_envelope(TEST_MASTER_PASSWORD, &envelope).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(plaintext.as_slice()).unwrap();
+
+        // Identical to `expected_schema3_top_level_keys` in the desktop
+        // `compat_baseline` integration test.
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+
+        let mut expected = vec![
+            "schema_version",
+            "vault_id",
+            "created_at_ms",
+            "updated_at_ms",
+            "entries",
+            "categories",
+            "site_icons",
+            "revision",
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(keys, expected);
+        assert_eq!(value["schema_version"], serde_json::json!(3));
+        assert_eq!(value["revision"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn closed_session_rejects_stage_and_commit_without_touching_revision_state() {
+        let session = open_ok(schema3());
+        let id = id_of(&session, "Fixture Schema3 Login");
+
+        session
+            .stage_update_entry(id.clone(), update_input("Pending"), UPDATE_NOW_MS)
+            .unwrap();
+        session.lock();
+
+        assert_eq!(
+            session.commit_staged_save().err(),
+            Some(BridgeError::SessionLocked)
+        );
+        assert_eq!(
+            session
+                .stage_update_entry(id, update_input("Late"), UPDATE_NOW_MS)
+                .err(),
+            Some(BridgeError::SessionLocked)
+        );
+
+        // Discarding against a locked session is a harmless no-op.
+        session.discard_staged_save();
     }
 }

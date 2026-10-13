@@ -1,13 +1,22 @@
 use std::{collections::HashSet, net::IpAddr};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::Error as _, ser::SerializeStruct, Deserialize, Deserializer, Serialize, Serializer,
+};
 use thiserror::Error;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const LEGACY_VAULT_DATA_SCHEMA_VERSION: u16 = 1;
-pub const VAULT_DATA_SCHEMA_VERSION: u16 = 2;
+
+/// Schema 2 added encrypted TOTP configuration. It predates the authenticated
+/// revision counter, so a schema-2 payload carries no `revision` field and has
+/// an effective revision of 0.
+pub const PRE_REVISION_VAULT_DATA_SCHEMA_VERSION: u16 = 2;
+
+/// Schema 3 adds the authenticated `revision` counter (Stage 1U-2).
+pub const VAULT_DATA_SCHEMA_VERSION: u16 = 3;
 
 pub const MAX_ENTRIES: usize = 50_000;
 pub const MAX_CATEGORIES: usize = 512;
@@ -38,6 +47,12 @@ pub const MAX_TAG_CHARS: usize = 64;
 pub enum VaultDataError {
     #[error("unsupported vault data schema version")]
     UnsupportedSchemaVersion,
+
+    #[error("vault revision metadata is invalid")]
+    InvalidRevision,
+
+    #[error("vault revision counter cannot be incremented further")]
+    RevisionOverflow,
 
     #[error("vault id must not be nil")]
     NilVaultId,
@@ -148,7 +163,14 @@ pub enum VaultDataError {
     InvalidCategoryTimestamp(Uuid),
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// The decrypted vault payload.
+///
+/// `revision` counts committed logical payload writes. It lives inside the
+/// encrypted payload, so it is authenticated by the payload AEAD. It is only
+/// serialized for schema 3 and later; legacy payloads (schema 1 and 2) have no
+/// such field and read as revision 0. Serialization and deserialization are
+/// therefore schema-aware and implemented by hand below.
+#[derive(Clone, PartialEq, Eq)]
 pub struct VaultData {
     pub schema_version: u16,
     pub vault_id: Uuid,
@@ -156,8 +178,109 @@ pub struct VaultData {
     pub updated_at_ms: i64,
     pub entries: Vec<VaultEntry>,
     pub categories: Vec<VaultCategory>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub site_icons: Vec<SiteIcon>,
+    pub revision: u64,
+}
+
+/// Wire shape of [`VaultData`] used only for deserialization.
+///
+/// `revision` is `None` only when the key is absent. A present key must be a
+/// genuine unsigned integer: `deserialize_with` forces `u64` parsing, so
+/// `null`, a string, a negative or a fractional number is a parse error rather
+/// than being silently read as "absent".
+#[derive(Deserialize)]
+struct VaultDataWire {
+    schema_version: u16,
+    vault_id: Uuid,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    entries: Vec<VaultEntry>,
+    categories: Vec<VaultCategory>,
+    #[serde(default)]
+    site_icons: Vec<SiteIcon>,
+    #[serde(default, deserialize_with = "present_revision")]
+    revision: Option<u64>,
+}
+
+fn present_revision<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    u64::deserialize(deserializer).map(Some)
+}
+
+impl<'de> Deserialize<'de> for VaultData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = VaultDataWire::deserialize(deserializer)?;
+
+        let revision = match (wire.schema_version, wire.revision) {
+            // Legacy payloads predate the counter.
+            (LEGACY_VAULT_DATA_SCHEMA_VERSION, None)
+            | (PRE_REVISION_VAULT_DATA_SCHEMA_VERSION, None) => 0,
+            // No LocalVault writer ever produced a revision in a legacy
+            // payload, so one is malformed metadata, not a harmless extra.
+            (LEGACY_VAULT_DATA_SCHEMA_VERSION, Some(_))
+            | (PRE_REVISION_VAULT_DATA_SCHEMA_VERSION, Some(_)) => {
+                return Err(D::Error::custom(VaultDataError::InvalidRevision));
+            }
+            // Schema 3 must state its revision explicitly.
+            (VAULT_DATA_SCHEMA_VERSION, Some(revision)) => revision,
+            (VAULT_DATA_SCHEMA_VERSION, None) => {
+                return Err(D::Error::custom(VaultDataError::InvalidRevision));
+            }
+            // Unsupported (future or zero) schemas are not interpreted here;
+            // `validate` rejects them, preserving the existing error class.
+            (_, revision) => revision.unwrap_or(0),
+        };
+
+        Ok(Self {
+            schema_version: wire.schema_version,
+            vault_id: wire.vault_id,
+            created_at_ms: wire.created_at_ms,
+            updated_at_ms: wire.updated_at_ms,
+            entries: wire.entries,
+            categories: wire.categories,
+            site_icons: wire.site_icons,
+            revision,
+        })
+    }
+}
+
+impl Serialize for VaultData {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let has_site_icons = !self.site_icons.is_empty();
+        let has_revision = self.schema_version >= VAULT_DATA_SCHEMA_VERSION;
+
+        let field_count = 6 + usize::from(has_site_icons) + usize::from(has_revision);
+
+        let mut state = serializer.serialize_struct("VaultData", field_count)?;
+
+        state.serialize_field("schema_version", &self.schema_version)?;
+        state.serialize_field("vault_id", &self.vault_id)?;
+        state.serialize_field("created_at_ms", &self.created_at_ms)?;
+        state.serialize_field("updated_at_ms", &self.updated_at_ms)?;
+        state.serialize_field("entries", &self.entries)?;
+        state.serialize_field("categories", &self.categories)?;
+
+        if has_site_icons {
+            state.serialize_field("site_icons", &self.site_icons)?;
+        }
+
+        // Legacy schemas never carried a revision; omitting it keeps a
+        // serialized legacy payload identical in shape to what older
+        // builds wrote.
+        if has_revision {
+            state.serialize_field("revision", &self.revision)?;
+        }
+
+        state.end()
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -240,28 +363,70 @@ impl VaultData {
             entries: Vec::new(),
             categories: Vec::new(),
             site_icons: Vec::new(),
+            revision: 0,
         })
     }
 
-    /// Upgrade an in-memory legacy schema-1 vault to the current schema
-    /// before it is persisted. A no-op if the vault is already current.
+    /// Upgrade an in-memory legacy (schema 1 or 2) vault to the current
+    /// schema. A no-op if the vault is already current.
     ///
-    /// This is the single, shared implementation of the "any write upgrades
-    /// a legacy vault" rule (see `@docs/SECURITY_MODEL.md`): every adapter
-    /// that persists a mutated `VaultData` must call this before `validate`
-    /// so desktop and Android apply exactly the same upgrade-on-write policy
-    /// rather than each reimplementing the one-line bump independently.
-    pub fn upgrade_legacy_schema_for_write(&mut self) {
-        if self.schema_version == LEGACY_VAULT_DATA_SCHEMA_VERSION {
+    /// This is the schema step only: it never touches `revision`. It exists so
+    /// an adapter can validate a TOTP-bearing candidate (schema 1 cannot carry
+    /// TOTP) *before* [`prepare_for_write`](Self::prepare_for_write). Every
+    /// persisted write must still go through `prepare_for_write`.
+    pub fn upgrade_legacy_schema(&mut self) {
+        if self.schema_version == LEGACY_VAULT_DATA_SCHEMA_VERSION
+            || self.schema_version == PRE_REVISION_VAULT_DATA_SCHEMA_VERSION
+        {
             self.schema_version = VAULT_DATA_SCHEMA_VERSION;
         }
     }
 
-    pub fn validate(&self) -> Result<(), VaultDataError> {
-        if self.schema_version != LEGACY_VAULT_DATA_SCHEMA_VERSION
-            && self.schema_version != VAULT_DATA_SCHEMA_VERSION
-        {
+    /// The single, shared write-preparation rule (see
+    /// `@docs/SECURITY_MODEL.md`). Every adapter that persists a mutated
+    /// `VaultData` (desktop and Android) must call this exactly once on the
+    /// *candidate* it is about to seal, never on the committed data.
+    ///
+    /// It upgrades a legacy schema to the current one, advances `revision` by
+    /// exactly one with a checked increment, and validates the result.
+    ///
+    /// Failure-atomic: on any error `self` is left exactly as it was passed in
+    /// (schema and revision included), and a revision at `u64::MAX` is reported
+    /// as [`VaultDataError::RevisionOverflow`] rather than wrapping.
+    pub fn prepare_for_write(&mut self) -> Result<(), VaultDataError> {
+        let original_schema = self.schema_version;
+        let original_revision = self.revision;
+
+        if !is_supported_schema(original_schema) {
             return Err(VaultDataError::UnsupportedSchemaVersion);
+        }
+
+        let next_revision = original_revision
+            .checked_add(1)
+            .ok_or(VaultDataError::RevisionOverflow)?;
+
+        self.upgrade_legacy_schema();
+        self.revision = next_revision;
+
+        if let Err(error) = self.validate() {
+            self.schema_version = original_schema;
+            self.revision = original_revision;
+
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), VaultDataError> {
+        if !is_supported_schema(self.schema_version) {
+            return Err(VaultDataError::UnsupportedSchemaVersion);
+        }
+
+        // Legacy schemas have no revision field, so a non-zero value could not
+        // be persisted faithfully.
+        if self.schema_version < VAULT_DATA_SCHEMA_VERSION && self.revision != 0 {
+            return Err(VaultDataError::InvalidRevision);
         }
 
         if self.vault_id.is_nil() {
@@ -659,6 +824,10 @@ fn validate_entry(entry: &VaultEntry, category_ids: &HashSet<Uuid>) -> Result<()
     Ok(())
 }
 
+fn is_supported_schema(schema_version: u16) -> bool {
+    (LEGACY_VAULT_DATA_SCHEMA_VERSION..=VAULT_DATA_SCHEMA_VERSION).contains(&schema_version)
+}
+
 fn valid_timestamps(created_at_ms: i64, updated_at_ms: i64) -> bool {
     created_at_ms >= 0 && updated_at_ms >= created_at_ms
 }
@@ -730,21 +899,281 @@ mod tests {
         assert!(data.validate().is_ok());
     }
 
+    fn json_with_schema(data: &VaultData, schema_version: u16) -> serde_json::Value {
+        let mut value = serde_json::to_value(data).unwrap();
+
+        value["schema_version"] = serde_json::json!(schema_version);
+
+        value
+    }
+
     #[test]
-    fn upgrade_legacy_schema_for_write_bumps_legacy_only() {
-        let mut legacy = VaultData::new(NOW_MS).unwrap();
-        legacy.schema_version = LEGACY_VAULT_DATA_SCHEMA_VERSION;
+    fn current_schema_is_three_and_new_vaults_start_at_revision_zero() {
+        assert_eq!(VAULT_DATA_SCHEMA_VERSION, 3);
 
-        legacy.upgrade_legacy_schema_for_write();
+        let data = VaultData::new(NOW_MS).unwrap();
 
-        assert_eq!(legacy.schema_version, VAULT_DATA_SCHEMA_VERSION);
+        assert_eq!(data.schema_version, 3);
+        assert_eq!(data.revision, 0);
+    }
+
+    #[test]
+    fn upgrade_legacy_schema_upgrades_schema_one_and_two_without_touching_revision() {
+        for legacy_version in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            let mut legacy = VaultData::new(NOW_MS).unwrap();
+            legacy.schema_version = legacy_version;
+
+            legacy.upgrade_legacy_schema();
+
+            assert_eq!(legacy.schema_version, VAULT_DATA_SCHEMA_VERSION);
+            assert_eq!(legacy.revision, 0);
+        }
 
         let mut current = VaultData::new(NOW_MS).unwrap();
-        current.schema_version = VAULT_DATA_SCHEMA_VERSION;
+        current.revision = 41;
 
-        current.upgrade_legacy_schema_for_write();
+        current.upgrade_legacy_schema();
 
         assert_eq!(current.schema_version, VAULT_DATA_SCHEMA_VERSION);
+        assert_eq!(current.revision, 41);
+    }
+
+    #[test]
+    fn prepare_for_write_upgrades_legacy_schemas_to_revision_one() {
+        for legacy_version in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            let mut data = valid_sample_data();
+            data.schema_version = legacy_version;
+
+            data.prepare_for_write().unwrap();
+
+            assert_eq!(data.schema_version, VAULT_DATA_SCHEMA_VERSION);
+            assert_eq!(data.revision, 1);
+            assert_eq!(data.entries.len(), 1);
+            assert_eq!(data.categories.len(), 1);
+        }
+    }
+
+    #[test]
+    fn prepare_for_write_increments_current_schema_by_exactly_one() {
+        let mut data = valid_sample_data();
+
+        for expected in 1..=3u64 {
+            data.prepare_for_write().unwrap();
+
+            assert_eq!(data.revision, expected);
+            assert_eq!(data.schema_version, VAULT_DATA_SCHEMA_VERSION);
+        }
+    }
+
+    #[test]
+    fn prepare_for_write_rejects_overflow_without_wrapping_or_mutating() {
+        let mut data = valid_sample_data();
+        data.revision = u64::MAX;
+
+        assert_eq!(
+            data.prepare_for_write(),
+            Err(VaultDataError::RevisionOverflow)
+        );
+
+        assert_eq!(data.revision, u64::MAX);
+        assert_eq!(data.schema_version, VAULT_DATA_SCHEMA_VERSION);
+
+        // One below the limit still works, and lands exactly on the limit.
+        data.revision = u64::MAX - 1;
+
+        data.prepare_for_write().unwrap();
+
+        assert_eq!(data.revision, u64::MAX);
+    }
+
+    #[test]
+    fn prepare_for_write_is_failure_atomic_when_validation_fails() {
+        let mut data = valid_sample_data();
+        data.schema_version = PRE_REVISION_VAULT_DATA_SCHEMA_VERSION;
+        data.entries[0].title = String::new();
+
+        assert!(matches!(
+            data.prepare_for_write(),
+            Err(VaultDataError::EmptyEntryTitle(_))
+        ));
+
+        assert_eq!(data.schema_version, PRE_REVISION_VAULT_DATA_SCHEMA_VERSION);
+        assert_eq!(data.revision, 0);
+    }
+
+    #[test]
+    fn prepare_for_write_rejects_unsupported_schemas_without_mutating() {
+        for unsupported in [0, VAULT_DATA_SCHEMA_VERSION + 1, u16::MAX] {
+            let mut data = valid_sample_data();
+            data.schema_version = unsupported;
+            data.revision = 5;
+
+            assert_eq!(
+                data.prepare_for_write(),
+                Err(VaultDataError::UnsupportedSchemaVersion)
+            );
+
+            assert_eq!(data.schema_version, unsupported);
+            assert_eq!(data.revision, 5);
+        }
+    }
+
+    #[test]
+    fn schema_three_serializes_revision_and_round_trips() {
+        let mut data = valid_sample_data();
+        data.revision = 12;
+
+        let value = serde_json::to_value(&data).unwrap();
+
+        assert_eq!(value["schema_version"], serde_json::json!(3));
+        assert_eq!(value["revision"], serde_json::json!(12));
+
+        let restored: VaultData = serde_json::from_value(value).unwrap();
+
+        restored.validate().unwrap();
+
+        assert_eq!(restored.revision, 12);
+        assert!(restored == data);
+    }
+
+    #[test]
+    fn legacy_schemas_never_serialize_a_revision() {
+        for legacy_version in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            let mut data = valid_sample_data();
+            data.schema_version = legacy_version;
+
+            let value = serde_json::to_value(&data).unwrap();
+
+            assert!(value.get("revision").is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_payload_without_revision_reads_as_revision_zero() {
+        for legacy_version in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            let mut value = json_with_schema(&valid_sample_data(), legacy_version);
+
+            assert!(value.as_object_mut().unwrap().remove("revision").is_some());
+
+            let restored: VaultData = serde_json::from_value(value).unwrap();
+
+            restored.validate().unwrap();
+
+            assert_eq!(restored.schema_version, legacy_version);
+            assert_eq!(restored.revision, 0);
+        }
+    }
+
+    #[test]
+    fn schema_three_payload_missing_revision_is_rejected() {
+        let mut value = serde_json::to_value(valid_sample_data()).unwrap();
+
+        assert!(value.as_object_mut().unwrap().remove("revision").is_some());
+
+        assert!(serde_json::from_value::<VaultData>(value).is_err());
+    }
+
+    #[test]
+    fn malformed_revision_values_are_rejected_in_every_schema() {
+        let malformed = [
+            serde_json::json!(null),
+            serde_json::json!("7"),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::json!([7]),
+            // One past u64::MAX.
+            serde_json::from_str::<serde_json::Value>("18446744073709551616").unwrap(),
+        ];
+
+        for schema_version in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+            VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            for revision in &malformed {
+                let mut value = json_with_schema(&valid_sample_data(), schema_version);
+
+                value["revision"] = revision.clone();
+
+                assert!(
+                    serde_json::from_value::<VaultData>(value).is_err(),
+                    "schema {schema_version} accepted revision {revision}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_payload_carrying_a_revision_is_rejected() {
+        for legacy_version in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            for revision in [0u64, 1, 9] {
+                let mut value = json_with_schema(&valid_sample_data(), legacy_version);
+
+                value["revision"] = serde_json::json!(revision);
+
+                assert!(serde_json::from_value::<VaultData>(value).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn schema_three_accepts_the_full_unsigned_range_of_revisions() {
+        for revision in [0u64, 1, u64::from(u32::MAX) + 1, u64::MAX] {
+            let mut value = serde_json::to_value(valid_sample_data()).unwrap();
+
+            value["revision"] = serde_json::json!(revision);
+
+            let restored: VaultData = serde_json::from_value(value).unwrap();
+
+            restored.validate().unwrap();
+
+            assert_eq!(restored.revision, revision);
+        }
+    }
+
+    #[test]
+    fn future_schema_is_rejected_by_validate_not_silently_downgraded() {
+        let mut value = serde_json::to_value(valid_sample_data()).unwrap();
+
+        value["schema_version"] = serde_json::json!(VAULT_DATA_SCHEMA_VERSION + 1);
+
+        let parsed: VaultData = serde_json::from_value(value).unwrap();
+
+        assert_eq!(parsed.schema_version, VAULT_DATA_SCHEMA_VERSION + 1);
+        assert_eq!(
+            parsed.validate(),
+            Err(VaultDataError::UnsupportedSchemaVersion)
+        );
+    }
+
+    #[test]
+    fn in_memory_legacy_schema_with_nonzero_revision_is_invalid() {
+        for legacy_version in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            let mut data = valid_sample_data();
+            data.schema_version = legacy_version;
+            data.revision = 1;
+
+            assert_eq!(data.validate(), Err(VaultDataError::InvalidRevision));
+        }
     }
 
     #[test]

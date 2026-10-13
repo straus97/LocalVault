@@ -15,6 +15,12 @@
 //!   DOES carry one cached site icon, because `VaultData::validate` only
 //!   restricts TOTP for legacy vaults -- `site_icons` has no schema gate.
 //!
+//! A third fixture, `fixtures/compat/schema3_baseline.envelope.json` (Stage
+//! 1U-2), is the schema-3 baseline: the same shape as schema 2 plus an explicit
+//! authenticated `revision` (7). It was generated once, with synthetic values
+//! only, through LocalVault's own `VaultData` / `create_envelope` APIs; the
+//! schema-1 and schema-2 fixtures were not regenerated or modified.
+//!
 //! The fixtures are ordinary encrypted `VaultEnvelope` JSON -- byte-for-byte
 //! what `save_envelope_atomic` would write to a `.lvault` file. They use the
 //! `.envelope.json` extension (not `.lvault`) purely so they are not
@@ -57,7 +63,8 @@ use localvault_core::totp::generate_totp;
 use localvault_core::vault::{
     data::{
         SiteIcon, TotpAlgorithm, TotpConfig, VaultCategory, VaultData, VaultEntry,
-        LEGACY_VAULT_DATA_SCHEMA_VERSION, VAULT_DATA_SCHEMA_VERSION,
+        LEGACY_VAULT_DATA_SCHEMA_VERSION, PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        VAULT_DATA_SCHEMA_VERSION,
     },
     format::open_envelope,
 };
@@ -86,6 +93,10 @@ fn schema1_fixture_path() -> PathBuf {
     fixtures_dir().join("schema1_baseline.envelope.json")
 }
 
+fn schema3_fixture_path() -> PathBuf {
+    fixtures_dir().join("schema3_baseline.envelope.json")
+}
+
 fn password() -> Zeroizing<String> {
     Zeroizing::new(MASTER_PASSWORD.to_owned())
 }
@@ -107,7 +118,8 @@ fn schema2_baseline_fixture_authenticates_and_recovers_expected_data() {
     data.validate()
         .expect("fixture VaultData is semantically valid");
 
-    assert_eq!(data.schema_version, VAULT_DATA_SCHEMA_VERSION);
+    assert_eq!(data.schema_version, PRE_REVISION_VAULT_DATA_SCHEMA_VERSION);
+    assert_eq!(data.revision, 0, "a schema-2 payload reads as revision 0");
     assert_eq!(data.categories.len(), 1);
     assert_eq!(data.categories[0].name, "Fixture Category");
     assert_eq!(data.entries.len(), 2);
@@ -178,6 +190,7 @@ fn schema1_baseline_fixture_authenticates_and_recovers_expected_data() {
         .expect("legacy fixture VaultData is semantically valid");
 
     assert_eq!(data.schema_version, LEGACY_VAULT_DATA_SCHEMA_VERSION);
+    assert_eq!(data.revision, 0, "a schema-1 payload reads as revision 0");
     assert_eq!(data.categories.len(), 1);
     assert_eq!(data.categories[0].name, "Legacy Fixture Category");
     assert_eq!(data.entries.len(), 2);
@@ -226,23 +239,61 @@ fn schema1_baseline_fixture_authenticates_and_recovers_expected_data() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn legacy_schema1_vault_upgrades_to_schema2_on_write_and_preserves_data() {
-    let fixture_bytes_before = fs::read(schema1_fixture_path()).expect("fixture is readable");
+fn legacy_schema1_vault_upgrades_to_schema3_on_write_and_preserves_data() {
+    assert_legacy_fixture_migrates_on_first_write(
+        schema1_fixture_path(),
+        LEGACY_VAULT_DATA_SCHEMA_VERSION,
+    );
+}
+
+#[test]
+fn legacy_schema2_vault_upgrades_to_schema3_on_write_and_preserves_data() {
+    assert_legacy_fixture_migrates_on_first_write(
+        schema2_fixture_path(),
+        PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+    );
+}
+
+/// Shared body for the schema-1 and schema-2 migrations: a legacy vault reads
+/// as revision 0, is left byte-for-byte alone by unlock, and is migrated to
+/// schema 3 at revision 1 by its first successful write.
+fn assert_legacy_fixture_migrates_on_first_write(fixture: PathBuf, from_schema: u16) {
+    let fixture_bytes_before = fs::read(&fixture).expect("fixture is readable");
 
     let temp = tempfile::tempdir().unwrap();
     let vault_path = temp.path().join("legacy-copy.lvault");
 
     // Work on a COPY in a temporary directory; the committed fixture is
     // never opened for writing.
-    fs::copy(schema1_fixture_path(), &vault_path).expect("fixture copies into temp dir");
+    fs::copy(&fixture, &vault_path).expect("fixture copies into temp dir");
+
+    // Opening and unlocking must never migrate a legacy vault.
+    UnlockedVaultSession::unlock(&vault_path, password())
+        .expect("legacy copy unlocks")
+        .lock();
+
+    assert_eq!(
+        fs::read(&vault_path).unwrap(),
+        fixture_bytes_before,
+        "unlocking a legacy vault must not rewrite it"
+    );
 
     let mut session =
         UnlockedVaultSession::unlock(&vault_path, password()).expect("legacy copy unlocks");
 
+    assert_eq!(session.data().schema_version, from_schema);
     assert_eq!(
-        session.data().schema_version,
-        LEGACY_VAULT_DATA_SCHEMA_VERSION
+        session.data().revision,
+        0,
+        "a legacy payload has an effective revision of 0"
     );
+
+    let original_vault_id = session.data().vault_id;
+    let original_totp: Vec<(Uuid, bool)> = session
+        .list_entries()
+        .iter()
+        .map(|entry| (entry.id, entry.totp_enabled))
+        .collect();
 
     let original_entry_count = session.data().entries.len();
     let original_titles: Vec<String> = session
@@ -280,6 +331,19 @@ fn legacy_schema1_vault_upgrades_to_schema2_on_write_and_preserves_data() {
         VAULT_DATA_SCHEMA_VERSION,
         "write to a legacy vault must upgrade it to the current schema"
     );
+    assert_eq!(
+        reopened.data().revision,
+        1,
+        "the migrating write is the first counted write"
+    );
+    assert_eq!(reopened.data().vault_id, original_vault_id);
+
+    let reopened_totp: Vec<(Uuid, bool)> = reopened
+        .list_entries()
+        .iter()
+        .map(|entry| (entry.id, entry.totp_enabled))
+        .collect();
+    assert_eq!(reopened_totp, original_totp);
 
     assert_eq!(reopened.data().entries.len(), original_entry_count);
 
@@ -331,11 +395,173 @@ fn legacy_schema1_vault_upgrades_to_schema2_on_write_and_preserves_data() {
         .expect("upgraded vault data is valid");
 
     // The committed fixture itself must be untouched by this test.
-    let fixture_bytes_after = fs::read(schema1_fixture_path()).expect("fixture is still readable");
+    let fixture_bytes_after = fs::read(&fixture).expect("fixture is still readable");
     assert_eq!(
         fixture_bytes_before, fixture_bytes_after,
-        "the committed schema-1 fixture must never be modified by this test"
+        "the committed legacy fixture must never be modified by this test"
     );
+}
+
+// ---------------------------------------------------------------------
+// C2. Schema-3 baseline fixture and revision tracking through the real
+//     desktop session
+// ---------------------------------------------------------------------
+
+#[test]
+fn schema3_baseline_fixture_authenticates_and_recovers_expected_data() {
+    let envelope = load_envelope(&schema3_fixture_path()).expect("fixture envelope parses");
+
+    let plaintext =
+        open_envelope(MASTER_PASSWORD, &envelope).expect("fixture authenticates and decrypts");
+
+    // The authenticated plaintext carries the schema-3 shape, including an
+    // explicit revision.
+    let value: serde_json::Value = serde_json::from_slice(plaintext.as_slice()).unwrap();
+    assert_eq!(value["schema_version"], serde_json::json!(3));
+    assert_eq!(value["revision"], serde_json::json!(7));
+
+    let data: VaultData =
+        serde_json::from_slice(plaintext.as_slice()).expect("fixture plaintext is valid VaultData");
+
+    data.validate()
+        .expect("fixture VaultData is semantically valid");
+
+    assert_eq!(data.schema_version, VAULT_DATA_SCHEMA_VERSION);
+    assert_eq!(data.revision, 7);
+    assert_eq!(data.categories.len(), 1);
+    assert_eq!(data.categories[0].name, "Fixture Schema3 Category");
+    assert_eq!(data.entries.len(), 2);
+
+    let login = data
+        .entries
+        .iter()
+        .find(|entry| entry.title == "Fixture Schema3 Login")
+        .expect("normal fixture entry is present");
+
+    assert_eq!(login.username, "fixture3.user@example.com");
+    assert_eq!(login.password, "FixtureSchema3Password123!");
+    assert_eq!(login.profile_name, "Fixture Schema3 Profile");
+    assert!(login.totp.is_none());
+
+    let totp_entry = data
+        .entries
+        .iter()
+        .find(|entry| entry.title == "Fixture Schema3 TOTP Account")
+        .expect("TOTP fixture entry is present");
+
+    let totp = totp_entry
+        .totp
+        .as_ref()
+        .expect("TOTP configuration is recovered");
+
+    assert_eq!(totp.algorithm, TotpAlgorithm::Sha256);
+    assert_eq!(totp.digits, 8);
+    assert_eq!(totp.period_seconds, 60);
+
+    // Captured once from the generating implementation.
+    let generated = generate_totp(totp, 1_700_000_100_000).expect("TOTP code computes");
+    assert_eq!(generated.code(), "38222816");
+
+    assert_eq!(data.site_icons.len(), 1);
+    assert_eq!(data.site_icons[0].hostname, "schema3.example.com");
+
+    let icon_bytes = BASE64_STANDARD
+        .decode(data.site_icons[0].png_base64.as_bytes())
+        .expect("cached icon payload is valid base64");
+    assert_eq!(icon_bytes, b"\x89PNG\r\n\x1a\nSCHEMA3FIXTURE1");
+}
+
+#[test]
+fn schema3_vault_unlocks_untouched_and_each_write_advances_revision_by_one() {
+    let fixture_bytes = fs::read(schema3_fixture_path()).expect("fixture is readable");
+
+    let temp = tempfile::tempdir().unwrap();
+    let vault_path = temp.path().join("schema3-copy.lvault");
+
+    fs::copy(schema3_fixture_path(), &vault_path).unwrap();
+
+    let mut session = UnlockedVaultSession::unlock(&vault_path, password()).unwrap();
+
+    assert_eq!(session.data().schema_version, VAULT_DATA_SCHEMA_VERSION);
+    assert_eq!(session.data().revision, 7);
+    assert_eq!(fs::read(&vault_path).unwrap(), fixture_bytes);
+
+    for expected in 8..=10u64 {
+        session
+            .create_category(
+                CategoryInput {
+                    name: format!("Revision Marker {expected}"),
+                },
+                NOW_MS + 100 + expected as i64,
+            )
+            .unwrap();
+
+        assert_eq!(session.data().revision, expected);
+
+        let envelope = load_envelope(&vault_path).unwrap();
+        let plaintext = open_envelope(MASTER_PASSWORD, &envelope).unwrap();
+        let on_disk: VaultData = serde_json::from_slice(plaintext.as_slice()).unwrap();
+
+        assert_eq!(on_disk.revision, expected);
+        assert_eq!(on_disk.schema_version, VAULT_DATA_SCHEMA_VERSION);
+    }
+
+    session.lock();
+
+    let reopened = UnlockedVaultSession::unlock(&vault_path, password()).unwrap();
+
+    assert_eq!(reopened.data().revision, 10);
+    assert_eq!(reopened.data().entries.len(), 2);
+
+    // The committed fixture is never modified.
+    assert_eq!(fs::read(schema3_fixture_path()).unwrap(), fixture_bytes);
+}
+
+/// The top-level plaintext keys of a schema-3 payload. The Android bridge
+/// tests pin the identical set, so desktop and Android cannot drift apart.
+fn expected_schema3_top_level_keys() -> BTreeSet<String> {
+    [
+        "schema_version",
+        "vault_id",
+        "created_at_ms",
+        "updated_at_ms",
+        "entries",
+        "categories",
+        "site_icons",
+        "revision",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+#[test]
+fn desktop_migrated_payload_has_the_schema3_shape_shared_with_android() {
+    let temp = tempfile::tempdir().unwrap();
+    let vault_path = temp.path().join("shape-copy.lvault");
+
+    fs::copy(schema1_fixture_path(), &vault_path).unwrap();
+
+    let mut session = UnlockedVaultSession::unlock(&vault_path, password()).unwrap();
+
+    session
+        .create_category(
+            CategoryInput {
+                name: "Shape Marker".to_owned(),
+            },
+            NOW_MS + 10,
+        )
+        .unwrap();
+
+    let envelope = load_envelope(&vault_path).unwrap();
+    let plaintext = open_envelope(MASTER_PASSWORD, &envelope).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(plaintext.as_slice()).unwrap();
+
+    let keys: BTreeSet<String> = value.as_object().unwrap().keys().cloned().collect();
+
+    assert_eq!(keys, expected_schema3_top_level_keys());
+    assert_eq!(value["schema_version"], serde_json::json!(3));
+    assert_eq!(value["revision"], serde_json::json!(1));
 }
 
 // ---------------------------------------------------------------------
@@ -343,7 +569,7 @@ fn legacy_schema1_vault_upgrades_to_schema2_on_write_and_preserves_data() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn plaintext_serialization_structure_matches_expected_schema_2_shape() {
+fn plaintext_serialization_structure_matches_expected_schema_3_shape() {
     let vault_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
     let category_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
     let totp_entry_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
@@ -387,6 +613,8 @@ fn plaintext_serialization_structure_matches_expected_schema_2_shape() {
 
     let value = serde_json::to_value(&data).unwrap();
 
+    // Schema 3: the legacy field set plus `revision`; `site_icons` is absent
+    // here because it is empty.
     let expected_top_level: BTreeSet<String> = [
         "schema_version",
         "vault_id",
@@ -394,6 +622,7 @@ fn plaintext_serialization_structure_matches_expected_schema_2_shape() {
         "updated_at_ms",
         "entries",
         "categories",
+        "revision",
     ]
     .into_iter()
     .map(String::from)
@@ -411,6 +640,8 @@ fn plaintext_serialization_structure_matches_expected_schema_2_shape() {
         value["schema_version"],
         serde_json::json!(VAULT_DATA_SCHEMA_VERSION)
     );
+    assert_eq!(value["schema_version"], serde_json::json!(3));
+    assert_eq!(value["revision"], serde_json::json!(0));
 
     let expected_entry_keys: BTreeSet<String> = [
         "id",
@@ -499,6 +730,39 @@ fn plaintext_serialization_structure_matches_expected_schema_2_shape() {
         category_value["name"],
         serde_json::json!("Structural Category")
     );
+}
+
+#[test]
+fn legacy_schema_payloads_serialize_without_a_revision_key() {
+    for legacy_version in [
+        LEGACY_VAULT_DATA_SCHEMA_VERSION,
+        PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+    ] {
+        let mut data = VaultData::new(NOW_MS).unwrap();
+        data.schema_version = legacy_version;
+        data.validate().unwrap();
+
+        let value = serde_json::to_value(&data).unwrap();
+
+        let keys: BTreeSet<String> = value.as_object().unwrap().keys().cloned().collect();
+
+        let expected_legacy: BTreeSet<String> = [
+            "schema_version",
+            "vault_id",
+            "created_at_ms",
+            "updated_at_ms",
+            "entries",
+            "categories",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        assert_eq!(
+            keys, expected_legacy,
+            "a legacy payload must keep exactly the pre-revision shape"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------

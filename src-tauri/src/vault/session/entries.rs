@@ -4,7 +4,7 @@ use serde::Serialize;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
-use localvault_core::vault::data::{TotpConfig, VaultEntry, VAULT_DATA_SCHEMA_VERSION};
+use localvault_core::vault::data::{TotpConfig, VaultEntry};
 
 use super::{SessionError, UnlockedVaultSession};
 
@@ -263,7 +263,9 @@ impl UnlockedVaultSession {
 
         candidate.entries.push(entry);
 
-        candidate.schema_version = VAULT_DATA_SCHEMA_VERSION;
+        // Schema step only (schema 1 cannot carry TOTP, so the validation below
+        // needs it); the revision is advanced once, in `commit_candidate`.
+        candidate.upgrade_legacy_schema();
 
         candidate.updated_at_ms = candidate.updated_at_ms.max(now_ms);
 
@@ -363,7 +365,8 @@ impl UnlockedVaultSession {
 
         candidate.entries[index] = replacement;
 
-        candidate.schema_version = VAULT_DATA_SCHEMA_VERSION;
+        // Schema step only; see `create_entry_with_totp`.
+        candidate.upgrade_legacy_schema();
 
         candidate.updated_at_ms = candidate.updated_at_ms.max(effective_updated_at_ms);
 

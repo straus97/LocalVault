@@ -203,9 +203,12 @@ impl UnlockedVaultSession {
             return Ok(false);
         }
 
-        self.data.upgrade_legacy_schema_for_write();
+        // Prepare a copy, never the committed data: if any later step fails
+        // the session keeps its pre-save schema and revision, so a retry
+        // advances the revision exactly once.
+        let mut candidate = self.data.clone();
 
-        self.data.validate()?;
+        candidate.prepare_for_write()?;
 
         // Refuse to overwrite a vault which changed after
         // this session was opened/saved.
@@ -216,7 +219,7 @@ impl UnlockedVaultSession {
         }
 
         let plaintext =
-            Zeroizing::new(serde_json::to_vec(&self.data).map_err(SessionError::Serialization)?);
+            Zeroizing::new(serde_json::to_vec(&candidate).map_err(SessionError::Serialization)?);
 
         let updated_envelope =
             reseal_envelope(&self.envelope, &self.vault_key, plaintext.as_slice())?;
@@ -224,6 +227,7 @@ impl UnlockedVaultSession {
         save_envelope_atomic_with_backup(&self.path, &self.backup_path, &updated_envelope)?;
 
         self.envelope = updated_envelope;
+        self.data = candidate;
         self.dirty = false;
 
         Ok(true)
@@ -237,9 +241,9 @@ impl UnlockedVaultSession {
             return Err(SessionError::PendingUnsavedChanges);
         }
 
-        candidate.upgrade_legacy_schema_for_write();
-
-        candidate.validate()?;
+        // `candidate` is owned here, so a failure below drops it and leaves the
+        // committed data (and its revision) untouched.
+        candidate.prepare_for_write()?;
 
         let current_on_disk = load_envelope(&self.path)?;
 
@@ -319,7 +323,7 @@ mod tests {
     use super::*;
     use crate::vault::storage::{load_envelope, save_envelope_atomic};
     use localvault_core::vault::{
-        data::VaultEntry,
+        data::{VaultEntry, VAULT_DATA_SCHEMA_VERSION},
         format::{create_envelope, open_envelope, CryptoError, VaultError},
     };
 
@@ -598,5 +602,268 @@ mod tests {
         let current = load_envelope(&path).unwrap();
 
         assert_eq!(current, replacement);
+    }
+
+    // -- Stage 1U-2: schema 3 and authenticated revision tracking ---------
+
+    fn persisted_data(path: &Path) -> VaultData {
+        let envelope = load_envelope(path).unwrap();
+
+        let plaintext = open_envelope(MASTER_PASSWORD, &envelope).unwrap();
+
+        serde_json::from_slice(plaintext.as_slice()).unwrap()
+    }
+
+    fn category(name: &str) -> CategoryInput {
+        CategoryInput {
+            name: name.to_owned(),
+        }
+    }
+
+    /// Writes a legacy (pre-revision) vault straight to disk, the way an
+    /// older build left it, so no current-code write path touches it first.
+    fn write_legacy_vault(path: &Path, schema_version: u16) -> VaultData {
+        let mut data = VaultData::new(NOW_MS).unwrap();
+        data.schema_version = schema_version;
+
+        let plaintext = Zeroizing::new(serde_json::to_vec(&data).unwrap());
+
+        let value: serde_json::Value = serde_json::from_slice(plaintext.as_slice()).unwrap();
+        assert!(value.get("revision").is_none());
+
+        let envelope = create_envelope(MASTER_PASSWORD, plaintext.as_slice()).unwrap();
+
+        save_envelope_atomic(path, &envelope).unwrap();
+
+        data
+    }
+
+    #[test]
+    fn new_vault_is_schema_three_at_revision_zero_and_creation_does_not_bump_it() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vault.lvault");
+
+        let session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
+
+        assert_eq!(session.data().schema_version, 3);
+        assert_eq!(session.data().revision, 0);
+
+        let persisted = persisted_data(&path);
+
+        assert_eq!(persisted.schema_version, 3);
+        assert_eq!(persisted.revision, 0);
+
+        let bytes_after_create = fs::read(&path).unwrap();
+
+        session.lock();
+
+        // Unlocking and locking a current vault rewrites nothing.
+        let reopened = UnlockedVaultSession::unlock(&path, test_password()).unwrap();
+
+        assert_eq!(reopened.data().revision, 0);
+
+        reopened.lock();
+
+        assert_eq!(fs::read(&path).unwrap(), bytes_after_create);
+    }
+
+    #[test]
+    fn each_successful_write_advances_the_persisted_revision_by_exactly_one() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vault.lvault");
+
+        let mut session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
+
+        // Transactional path (`commit_candidate`).
+        session
+            .create_category(category("One"), NOW_MS + 1)
+            .unwrap();
+
+        assert_eq!(session.data().revision, 1);
+        assert_eq!(persisted_data(&path).revision, 1);
+
+        // Dirty path (`save`).
+        session.data_mut().updated_at_ms = NOW_MS + 2;
+
+        assert!(session.save().unwrap());
+
+        assert_eq!(session.data().revision, 2);
+        assert_eq!(persisted_data(&path).revision, 2);
+
+        session
+            .create_category(category("Two"), NOW_MS + 3)
+            .unwrap();
+
+        assert_eq!(session.data().revision, 3);
+        assert_eq!(persisted_data(&path).revision, 3);
+
+        // A clean save writes nothing and so counts nothing.
+        assert!(!session.save().unwrap());
+
+        assert_eq!(persisted_data(&path).revision, 3);
+
+        session.lock();
+
+        let reopened = UnlockedVaultSession::unlock(&path, test_password()).unwrap();
+
+        assert_eq!(reopened.data().revision, 3);
+    }
+
+    #[test]
+    fn backup_keeps_the_previous_revision() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vault.lvault");
+
+        let mut session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
+
+        session
+            .create_category(category("One"), NOW_MS + 1)
+            .unwrap();
+        session
+            .create_category(category("Two"), NOW_MS + 2)
+            .unwrap();
+
+        assert_eq!(persisted_data(&path).revision, 2);
+        assert_eq!(persisted_data(session.backup_path()).revision, 1);
+    }
+
+    #[test]
+    fn external_change_refuses_the_commit_and_keeps_the_committed_revision() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vault.lvault");
+
+        let mut session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
+
+        session
+            .create_category(category("One"), NOW_MS + 1)
+            .unwrap();
+
+        let replacement =
+            create_envelope(MASTER_PASSWORD, b"external replacement payload").unwrap();
+
+        // Simulates a non-cooperating external writer.
+        save_envelope_atomic(&path, &replacement).unwrap();
+
+        let result = session.create_category(category("Two"), NOW_MS + 2);
+
+        assert!(matches!(result, Err(SessionError::ChangedOnDisk)));
+
+        assert_eq!(session.data().revision, 1);
+        assert_eq!(session.data().schema_version, 3);
+        assert_eq!(session.data().categories.len(), 1);
+        assert_eq!(load_envelope(&path).unwrap(), replacement);
+    }
+
+    #[test]
+    fn failed_save_keeps_legacy_schema_and_revision_so_a_retry_counts_once() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vault.lvault");
+
+        write_legacy_vault(&path, 2);
+
+        let mut session = UnlockedVaultSession::unlock(&path, test_password()).unwrap();
+
+        assert_eq!(session.data().schema_version, 2);
+        assert_eq!(session.data().revision, 0);
+
+        session.data_mut().updated_at_ms = NOW_MS + 1;
+
+        let replacement = create_envelope(MASTER_PASSWORD, b"external replacement").unwrap();
+
+        save_envelope_atomic(&path, &replacement).unwrap();
+
+        let result = session.save();
+
+        assert!(matches!(result, Err(SessionError::ChangedOnDisk)));
+
+        // Neither the schema upgrade nor the increment leaked into the
+        // committed in-memory data.
+        assert!(session.is_dirty());
+        assert_eq!(session.data().schema_version, 2);
+        assert_eq!(session.data().revision, 0);
+        assert_eq!(load_envelope(&path).unwrap(), replacement);
+    }
+
+    #[test]
+    fn revision_overflow_is_rejected_without_wrapping_or_writing() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vault.lvault");
+
+        let mut session = UnlockedVaultSession::create(&path, test_password(), NOW_MS).unwrap();
+
+        session.data.revision = u64::MAX;
+
+        let bytes_before = fs::read(&path).unwrap();
+
+        // Transactional path.
+        let result = session.create_category(category("Overflow"), NOW_MS + 1);
+
+        assert!(matches!(
+            result,
+            Err(SessionError::Data(VaultDataError::RevisionOverflow))
+        ));
+
+        assert_eq!(session.data().revision, u64::MAX);
+        assert!(session.data().categories.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+
+        // Dirty path.
+        session.data_mut().updated_at_ms = NOW_MS + 2;
+
+        let result = session.save();
+
+        assert!(matches!(
+            result,
+            Err(SessionError::Data(VaultDataError::RevisionOverflow))
+        ));
+
+        assert!(session.is_dirty());
+        assert_eq!(session.data().revision, u64::MAX);
+        assert_eq!(fs::read(&path).unwrap(), bytes_before);
+    }
+
+    #[test]
+    fn unlock_rejects_unsupported_future_schema() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vault.lvault");
+
+        let mut payload = serde_json::to_value(VaultData::new(NOW_MS).unwrap()).unwrap();
+
+        payload["schema_version"] = serde_json::json!(VAULT_DATA_SCHEMA_VERSION + 1);
+
+        let envelope =
+            create_envelope(MASTER_PASSWORD, &serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        save_envelope_atomic(&path, &envelope).unwrap();
+
+        let result = UnlockedVaultSession::unlock(&path, test_password());
+
+        assert!(matches!(
+            result,
+            Err(SessionError::Data(VaultDataError::UnsupportedSchemaVersion))
+        ));
+    }
+
+    #[test]
+    fn unlock_rejects_schema_three_payload_without_a_revision() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("vault.lvault");
+
+        let mut payload = serde_json::to_value(VaultData::new(NOW_MS).unwrap()).unwrap();
+
+        assert!(payload
+            .as_object_mut()
+            .unwrap()
+            .remove("revision")
+            .is_some());
+
+        let envelope =
+            create_envelope(MASTER_PASSWORD, &serde_json::to_vec(&payload).unwrap()).unwrap();
+
+        save_envelope_atomic(&path, &envelope).unwrap();
+
+        let result = UnlockedVaultSession::unlock(&path, test_password());
+
+        assert!(matches!(result, Err(SessionError::Deserialization(_))));
     }
 }

@@ -148,7 +148,10 @@ mod tests {
     use super::*;
 
     use crate::vault::storage::{load_envelope, save_envelope_atomic};
-    use localvault_core::vault::{data::VaultEntry, format::open_envelope};
+    use localvault_core::vault::{
+        data::{VaultData, VaultEntry},
+        format::open_envelope,
+    };
 
     const OLD_PASSWORD: &str = "old-master-password-test-only";
 
@@ -210,6 +213,55 @@ mod tests {
         );
 
         assert!(!session.is_dirty());
+    }
+
+    #[test]
+    fn password_change_does_not_bump_revision_or_rotate_the_vault_key() {
+        let temp = tempdir().unwrap();
+
+        let path = temp.path().join("vault.lvault");
+
+        let mut session = session_with_saved_entry(&path);
+
+        // `session_with_saved_entry` performed exactly one payload write.
+        assert_eq!(session.data().revision, 1);
+
+        let before = load_envelope(&path).unwrap();
+
+        let (key_before, plaintext_before) = open_envelope_with_key(OLD_PASSWORD, &before).unwrap();
+
+        let vault_id = session.data().vault_id;
+
+        session
+            .change_master_password(old_password(), new_password())
+            .unwrap();
+
+        // Only the wrapper changed: the raw envelope (and so its fingerprint)
+        // differs, but the encrypted payload and the revision inside it do not.
+        let after = load_envelope(&path).unwrap();
+
+        assert_ne!(after, before);
+        assert_eq!(after.payload, before.payload);
+
+        let (key_after, plaintext_after) = open_envelope_with_key(NEW_PASSWORD, &after).unwrap();
+
+        assert_eq!(key_after.as_slice(), key_before.as_slice());
+        assert_eq!(plaintext_after.as_slice(), plaintext_before.as_slice());
+
+        let persisted: VaultData = serde_json::from_slice(plaintext_after.as_slice()).unwrap();
+
+        assert_eq!(persisted.revision, 1);
+        assert_eq!(persisted.schema_version, 3);
+        assert_eq!(persisted.vault_id, vault_id);
+
+        assert_eq!(session.data().revision, 1);
+        assert_eq!(session.data().vault_id, vault_id);
+
+        session.lock();
+
+        let reopened = UnlockedVaultSession::unlock(&path, new_password()).unwrap();
+
+        assert_eq!(reopened.data().revision, 1);
     }
 
     #[test]
