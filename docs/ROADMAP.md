@@ -84,9 +84,17 @@ A later dedicated, coordinated desktop + Android design/UX pass is still planned
 No further named 1T stage is defined and no new numbered stage is introduced. The next stages remain 1U → 1V → 1W → 1X below. Do not mix sync work into Android stabilization.
 
 
-## 1U — Sync foundation
+## 1U — Sync foundation (IN PROGRESS: 1U-1 and 1U-2 complete)
 
-Design and implement:
+**Slice status (synchronization itself is NOT implemented):**
+- **1U-1 — COMPLETE** (`8d001a147201f2ba8f1afe625bcffc169d42c029`): pure sync-state classifier (`localvault_core::sync`): raw-envelope SHA-256 fingerprints, description-only classification, push-intent reconciliation. No I/O, provider or network.
+- **1U-2 — COMPLETE** (`d7b71a28ca466732b6eb838ca386af42e91ffbcb`): encrypted schema-3 revision migration — authenticated `revision: u64` in the AEAD payload, legacy schemas 1/2 readable, migration on a committed write, one shared core rule used by desktop and the Android bridge, envelope format and encryption unchanged. Verified on a disposable synthetic vault across Android and Windows (300 → 301 → 302 entries, matching SHA256 transfers).
+- **1U-3 — NEXT:** safe inspection of remote encrypted vault versions.
+- **Remaining 1U work:** local synchronization binding/state; Windows file-target adapter; Android SAF-target adapter; cross-platform synchronization acceptance.
+
+**Product direction for 1U (agreed):** manual synchronization first; a separate encrypted synchronization artifact; local primary vaults remain independent; automatic synchronization only after the manual foundation has been validated and hardened. Everything beyond that — provider choice, any network transport, and the detailed architecture proposals from the earlier 1U assessment — is **not yet approved and remains open**. Anti-rollback and remote revision validation are not implemented (the revision is not a freshness proof; see `@docs/SECURITY_MODEL.md`). Vault Key rotation is not implemented or approved.
+
+Design and implement (stage-level scope, unchanged):
 - provider abstraction
 - encrypted sync state
 - revision semantics
@@ -97,7 +105,7 @@ Design and implement:
 
 A paid LocalVault-owned server is **not** required for the first sync implementation. Preferred initial direction: an existing storage/sync provider or a generic provider abstraction, transporting only encrypted LocalVault state. Provider candidates (WebDAV, existing user cloud storage, OS-synchronized folder, provider APIs) should be evaluated at this stage rather than hard-coded earlier. Do not implement naive "last writer silently overwrites everything" sync. A custom zero-knowledge LocalVault sync service may be considered later but is not required for the first mobile/sync milestone.
 
-**Depends on:** 1S core extraction (sync metadata needs a stable core data model) and benefits from 1T existing (a second real platform to validate sync against), though sync design work can start once the core is stable.
+**Depends on:** 1S core extraction (sync metadata needs a stable core data model) and benefits from 1T existing (a second real platform to validate sync against), though sync design work can start once the core is stable. The stage order 1U → 1V → 1W → 1X is unchanged; 1U-1…1U-n are slices of 1U, not new numbered stages.
 
 ## 1V — Multi-device sync hardening
 

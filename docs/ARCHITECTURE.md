@@ -16,8 +16,10 @@ crates/localvault-core/src/
                                         # only narrow types it must expose flow out through vault::format
   vault/
     data.rs                            # persisted VaultData/VaultEntry/VaultCategory/SiteIcon,
-                                        # TotpConfig/TotpAlgorithm, schema validation, zeroization
+                                        # TotpConfig/TotpAlgorithm, schema 3 + revision, schema validation,
+                                        # prepare_for_write, zeroization
     format.rs                          # VaultEnvelope: authenticated create/open/reseal/rewrap
+  sync.rs                              # pure envelope-fingerprint + sync-state classifier (1U-1); no I/O
   site.rs                              # derived, non-persisted site_key(url) -> Option<String> (Android grouping)
   totp.rs                              # RFC 6238 parser + generator (bare Base32 / otpauth:// URI,
                                         # SHA1/SHA256/SHA512, caller-supplied time, no system clock)
@@ -63,6 +65,17 @@ Key dependencies:
 
 Each of these was a strict ownership/module-boundary move (1S-C1 `4721b05`, 1S-C2 `bfd7fec`, 1S-C3 `8f0d5a3`) — not a cryptographic redesign. See `@docs/PROJECT_STATUS.md` for the exact checkpoint commits and `@docs/SECURITY_MODEL.md` for the security properties these preserve unchanged.
 
+## Vault schema 3 and revision tracking (Stage 1U-2)
+
+Source authority: `crates/localvault-core/src/vault/data.rs`, `src-tauri/src/vault/session.rs`, `crates/localvault-android-bridge/src/lib.rs`.
+
+- The encrypted `VaultData` payload is schema **3** and carries `revision: u64`. New vaults start at revision 0. Schema 1 and 2 remain readable by current code (a legacy payload reads as revision 0; a legacy payload that contains a `revision` field, or a schema-3 payload without one, is rejected).
+- Opening or unlocking never migrates or rewrites the file. A legacy vault is migrated only by a successful payload write: the first such write produces schema 3 at revision 1, and each further committed payload write increments the revision by exactly one (checked; overflow is an error, never a wrap).
+- The rule is owned by the shared core: `VaultData::prepare_for_write` upgrades a legacy schema, increments the revision and validates, on a *candidate* copy and failure-atomically. Desktop (`UnlockedVaultSession::save` / `commit_candidate`) and the Android bridge (every `stage_*` mutation) both call it; neither re-implements it. Migration is therefore not orchestrated exclusively by `src-tauri`.
+- Failure behavior: desktop prepares a clone, so a failed save leaves the committed in-memory schema and revision unchanged and a retry advances the revision once. Android stages a candidate first and promotes it to the session only in `commit_staged_save`, after the SAF write is verified.
+- The envelope format and cryptography are unchanged. Changing the master-password wrapper (`rewrap_envelope_master_password`) keeps the Vault Key and encrypted payload, so it does **not** bump the payload revision, but it does change the raw envelope bytes and therefore the envelope fingerprint.
+- `localvault_core::sync` (1U-1) is **pure logic**: SHA-256 fingerprints of raw envelope bytes, a description-only classifier, and push-intent reconciliation. It performs no I/O, reads no clock, decrypts nothing, and does not read `revision`. No sync provider, remote adoption, automatic sync, network transport or sync UI exists; synchronization is not implemented.
+
 A pre-extraction compatibility safety net (1S-B1, `bcdb1ad`; `src-tauri/tests/compat_baseline.rs` plus committed schema-1/schema-2 fixtures) exercises real persisted-format compatibility — including the v1→v2 upgrade-on-write path and the fixed-time TOTP vector — through every extraction step. `src-tauri/tests/data_storage_integration.rs` separately covers the encrypted-storage round trip for the persisted data model against desktop storage.
 
 ## What still remains outside core (not yet extracted, and not all destined for core)
@@ -81,7 +94,7 @@ The following are still implemented only in `src-tauri`. Some are genuine platfo
 - password-health orchestration and current implementation (`app_state/password_health.rs`, `commands/password_health.rs`) — placement undecided
 - password generator (`password_generator.rs`) — placement undecided
 - Android adapter (`crates/localvault-android-bridge/`, `android/`) — exists and, as of 1T-B5c-2 (`4d75bb81042dfcf339073240472b2129265f23e1`), supports vault creation, transactional SAF saves, entry/category CRUD and TOTP set/replace/remove — see `@docs/HANDOFF_1T_PROGRESS.md`
-- synchronization — does not exist yet (1U/1V not started)
+- synchronization — not implemented. Only the pure 1U-1 classifier (`localvault_core::sync`) and the 1U-2 revision counter exist; there is no provider, transport or adoption logic (remaining 1U/1V work)
 
 The subset of this list that is a permanent platform-adapter responsibility (not just "not yet extracted") is listed separately below in "What must stay outside the shared core."
 
@@ -99,8 +112,10 @@ localvault-core (Rust, no Tauri/platform dependency)
     +-- KDF/key handling                      [DONE — 1S-C1]
     +-- data model (entries, categories, profiles)  [DONE — 1S-C2]
     +-- validation                            [DONE — 1S-C2]
-    +-- migrations (schema 1 -> 2 -> ...)      [schema constants/validation DONE — 1S-C2;
-    |                                           upgrade-on-write orchestration still in src-tauri/vault/session.rs]
+    +-- migrations (schema 1/2 -> 3)           [DONE — schema constants/validation 1S-C2; legacy-schema upgrade
+    |                                           and revision preparation in core (`VaultData::prepare_for_write`,
+    |                                           1U-2); adapters only call it]
+    +-- sync state classifier (pure)           [DONE — 1U-1 `localvault_core::sync`; no I/O, no provider]
     +-- password health                        [NOT STARTED — placement undecided; deferred, not required before 1T]
     +-- TOTP (RFC 6238 generation/validation)  [DONE — 1S-C3]
     +-- future sync metadata and merge/conflict semantics  [NOT STARTED]
