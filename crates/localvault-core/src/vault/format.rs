@@ -178,6 +178,31 @@ pub fn open_envelope(
 
     Ok(plaintext)
 }
+
+/// Authenticate and decrypt **only the payload** of `envelope` with an
+/// already-known Vault Key, using the same payload AEAD and associated data as
+/// [`open_envelope_with_key`].
+///
+/// This is the key-based counterpart used to inspect an envelope that was not
+/// produced by this session (for example a remote candidate) without needing
+/// the master password. It is read-only and never bypasses authentication: an
+/// authentication failure is reported as [`CryptoError::Decryption`], which is
+/// deliberately the same error for a wrong key, corruption and forgery.
+///
+/// The wrapper (`kdf`, `kdf_salt`, `wrapped_vault_key`) is **not** examined
+/// beyond the header sanity check in
+/// [`validate_header`](VaultEnvelope::validate_header). In particular, success
+/// here does not show that `wrapped_vault_key` unwraps to `vault_key` or that
+/// any master password opens this envelope.
+pub(crate) fn open_payload_with_key(
+    envelope: &VaultEnvelope,
+    vault_key: &SecretKey,
+) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    envelope.validate_header()?;
+
+    Ok(decrypt(vault_key, &envelope.payload, PAYLOAD_AAD)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +376,114 @@ mod tests {
         let result = create_envelope("", TEST_PAYLOAD);
 
         assert!(matches!(result, Err(VaultError::EmptyMasterPassword)));
+    }
+
+    #[test]
+    fn payload_opens_with_the_vault_key_and_matches_the_password_path() {
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        let (vault_key, via_password) = open_envelope_with_key(MASTER_PASSWORD, &envelope).unwrap();
+
+        let via_key = open_payload_with_key(&envelope, &vault_key).unwrap();
+
+        assert_eq!(via_key.as_slice(), TEST_PAYLOAD);
+        assert_eq!(via_key.as_slice(), via_password.as_slice());
+    }
+
+    #[test]
+    fn payload_open_rejects_wrong_key_and_tampering_without_distinguishing_them() {
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        let (vault_key, _plaintext) = open_envelope_with_key(MASTER_PASSWORD, &envelope).unwrap();
+
+        let mut wrong_key = vault_key.clone();
+        wrong_key[0] ^= 0x01;
+
+        let mut tampered_ciphertext = envelope.clone();
+        tampered_ciphertext.payload.ciphertext[0] ^= 0x01;
+
+        let mut tampered_nonce = envelope.clone();
+        tampered_nonce.payload.nonce[0] ^= 0x01;
+
+        for (envelope, key) in [
+            (&envelope, &wrong_key),
+            (&tampered_ciphertext, &vault_key),
+            (&tampered_nonce, &vault_key),
+        ] {
+            assert!(matches!(
+                open_payload_with_key(envelope, key),
+                Err(VaultError::Crypto(CryptoError::Decryption))
+            ));
+        }
+    }
+
+    #[test]
+    fn payload_open_uses_the_payload_aad_not_the_wrapped_key_aad() {
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        let (vault_key, _plaintext) = open_envelope_with_key(MASTER_PASSWORD, &envelope).unwrap();
+
+        // Swapping the payload blob for the wrapped-key blob must not
+        // authenticate: the associated data binds each blob to its role.
+        let mut swapped = envelope.clone();
+        swapped.payload = envelope.wrapped_vault_key.clone();
+
+        assert!(open_payload_with_key(&swapped, &vault_key).is_err());
+    }
+
+    #[test]
+    fn payload_open_rejects_an_unsupported_header_before_decrypting() {
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        let (vault_key, _plaintext) = open_envelope_with_key(MASTER_PASSWORD, &envelope).unwrap();
+
+        let mut wrong_magic = envelope.clone();
+        wrong_magic.magic = "NOTVAULT".to_owned();
+
+        let mut wrong_version = envelope.clone();
+        wrong_version.version += 1;
+
+        for rejected in [wrong_magic, wrong_version] {
+            assert_eq!(
+                open_payload_with_key(&rejected, &vault_key).unwrap_err(),
+                VaultError::UnsupportedFormat
+            );
+        }
+
+        let mut unreasonable_kdf = envelope;
+        unreasonable_kdf.kdf.memory_kib = MAX_MEMORY_KIB + 1;
+
+        assert!(matches!(
+            open_payload_with_key(&unreasonable_kdf, &vault_key),
+            Err(VaultError::Crypto(CryptoError::InvalidKdfParameters))
+        ));
+    }
+
+    #[test]
+    fn payload_open_ignores_a_changed_wrapper() {
+        const NEW_PASSWORD: &str = "new-master-password-payload-open-test-only";
+
+        let original = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        let (vault_key, _plaintext) = open_envelope_with_key(MASTER_PASSWORD, &original).unwrap();
+
+        let rewrapped =
+            rewrap_envelope_master_password(&original, &vault_key, NEW_PASSWORD).unwrap();
+
+        // A wrapper that unwraps to nothing useful still lets the payload
+        // authenticate: this API says nothing about the wrapper.
+        let mut broken_wrapper = original.clone();
+        broken_wrapper.wrapped_vault_key.ciphertext[0] ^= 0x01;
+
+        for envelope in [&rewrapped, &broken_wrapper] {
+            assert_eq!(
+                open_payload_with_key(envelope, &vault_key)
+                    .unwrap()
+                    .as_slice(),
+                TEST_PAYLOAD
+            );
+        }
+
+        assert!(open_envelope_with_key(MASTER_PASSWORD, &broken_wrapper).is_err());
     }
 }
