@@ -327,6 +327,11 @@ pub enum PushReconciliation {
 // caller-supplied parser, and the only way to obtain a `RemoteInspection` is
 // through `inspect_remote_candidate`; a caller cannot present deserialized data
 // and call it authenticated.
+//
+// Stage 1U-4 A2a narrows that boundary additively: `inspect_remote_bytes` takes
+// the *raw* envelope bytes, fingerprints and parses those same slices itself,
+// and returns an opaque `BoundInspection`. `inspect_remote_candidate` is
+// unchanged and remains the only authenticated-validation implementation.
 
 /// Why one side of an inspection was rejected.
 ///
@@ -694,6 +699,218 @@ fn relate_wrappers(local: &VaultEnvelope, candidate: &VaultEnvelope) -> WrapperR
     } else {
         WrapperRelation::Different
     }
+}
+
+// ---------------------------------------------------------------------------
+// Byte-bound remote inspection (Stage 1U-4 A2a)
+// ---------------------------------------------------------------------------
+
+/// Largest raw envelope, in bytes, that [`inspect_remote_bytes`] will look at.
+///
+/// Mirrors the desktop vault-file limit (32 MiB). The check is on the length of
+/// the supplied slice and happens before any hashing, parsing or
+/// authentication; a longer input is rejected, never truncated.
+pub const MAX_ENVELOPE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Which input of [`inspect_remote_bytes`] an error refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeInput {
+    /// The caller's own committed local envelope (`local_raw`).
+    LocalReference,
+    /// The remote candidate (`candidate_raw`).
+    Candidate,
+}
+
+impl fmt::Display for EnvelopeInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::LocalReference => "local reference",
+            Self::Candidate => "remote candidate",
+        })
+    }
+}
+
+/// Why [`inspect_remote_bytes`] failed.
+///
+/// Carries only the input that was at fault, lengths and the coarse
+/// [`InspectionError`]; never input bytes, deserializer error text or any
+/// decrypted content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BoundInspectionError {
+    /// The input is longer than [`MAX_ENVELOPE_BYTES`]. Decided from the length
+    /// alone, before anything is hashed, parsed or authenticated.
+    #[error("{input} envelope is {actual} bytes, over the {limit}-byte limit")]
+    InputTooLarge {
+        input: EnvelopeInput,
+        actual: usize,
+        limit: usize,
+    },
+    /// The input is not a parseable `VaultEnvelope` (not JSON, truncated, wrong
+    /// shape or types, trailing data). Header problems in an envelope that does
+    /// parse are reported through [`Inspection`](Self::Inspection) instead.
+    #[error("{input} is not a readable vault envelope")]
+    MalformedEnvelope { input: EnvelopeInput },
+    /// Both inputs parsed; authenticated inspection rejected one of them.
+    #[error(transparent)]
+    Inspection(InspectionError),
+}
+
+/// An authenticated [`RemoteInspection`] together with the SHA-256 fingerprints
+/// of the exact raw bytes it was computed from.
+///
+/// The only way to obtain one is [`inspect_remote_bytes`]: the fields are
+/// private, there is no constructor, no `From`/`Default` and no mutable access,
+/// so fingerprints and inspection cannot be assembled from different file
+/// versions or from caller-supplied values. Later transitions are meant to
+/// accept this type instead of independent fingerprints and inspections.
+///
+/// Byte identity and authenticated identity are separate facts: two different
+/// raw representations of the same envelope have different fingerprints but the
+/// same inspection. A fingerprint here still proves byte identity only.
+///
+/// ```compile_fail,E0451
+/// use localvault_core::sync::{BoundInspection, EnvelopeFingerprint, RemoteInspection};
+///
+/// fn forge(fingerprint: EnvelopeFingerprint, inspection: RemoteInspection) -> BoundInspection {
+///     BoundInspection {
+///         local_fingerprint: fingerprint,
+///         candidate_fingerprint: fingerprint,
+///         inspection,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use localvault_core::sync::{BoundInspection, EnvelopeFingerprint, RemoteInspection};
+///
+/// fn forge(fingerprint: EnvelopeFingerprint, inspection: RemoteInspection) -> BoundInspection {
+///     BoundInspection::new(fingerprint, fingerprint, inspection)
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
+/// use localvault_core::sync::{BoundInspection, EnvelopeFingerprint, RemoteInspection};
+///
+/// fn forge(fingerprint: EnvelopeFingerprint, inspection: RemoteInspection) -> BoundInspection {
+///     BoundInspection::from((fingerprint, fingerprint, inspection))
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use localvault_core::sync::{BoundInspection, EnvelopeFingerprint};
+///
+/// fn tamper(bound: &mut BoundInspection, fingerprint: EnvelopeFingerprint) {
+///     bound.candidate_fingerprint = fingerprint;
+/// }
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BoundInspection {
+    local_fingerprint: EnvelopeFingerprint,
+    candidate_fingerprint: EnvelopeFingerprint,
+    inspection: RemoteInspection,
+}
+
+impl BoundInspection {
+    /// Fingerprint of the exact `local_raw` bytes that were inspected.
+    pub fn local_fingerprint(&self) -> &EnvelopeFingerprint {
+        &self.local_fingerprint
+    }
+
+    /// Fingerprint of the exact `candidate_raw` bytes that were inspected.
+    pub fn candidate_fingerprint(&self) -> &EnvelopeFingerprint {
+        &self.candidate_fingerprint
+    }
+
+    /// The authenticated inspection of those two byte strings.
+    pub fn inspection(&self) -> &RemoteInspection {
+        &self.inspection
+    }
+}
+
+// Fingerprints and relation facts only: no decrypted content is reachable from
+// this type. `Debug` is written out field by field so that a field added later
+// cannot reach the output through a derive.
+impl fmt::Debug for BoundInspection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BoundInspection")
+            .field("local_fingerprint", &self.local_fingerprint)
+            .field("candidate_fingerprint", &self.candidate_fingerprint)
+            .field("inspection", &self.inspection)
+            .finish()
+    }
+}
+
+/// Fingerprint, parse and authenticate two raw envelopes as one operation.
+///
+/// # Same-bytes guarantee
+///
+/// `local_raw` and `candidate_raw` are borrowed once. Each slice is measured,
+/// parsed with `serde_json` into a [`VaultEnvelope`] and hashed with SHA-256
+/// from that same borrow; nothing is re-read, re-serialized or accepted from the
+/// caller. A shared borrow cannot change underneath the call, so the returned
+/// fingerprints describe exactly the bytes whose parsed form was authenticated.
+/// The fingerprints are of the raw bytes, not of the parsed envelope: reformatting
+/// the same JSON changes the fingerprint and nothing else.
+///
+/// # Order of checks
+///
+/// 1. Both lengths against [`MAX_ENVELOPE_BYTES`] (local first). Nothing is
+///    hashed or parsed until both pass.
+/// 2. Parse the local, then the candidate, envelope.
+/// 3. Fingerprint both slices.
+/// 4. [`inspect_remote_candidate`], unchanged, for authentication, payload
+///    validation, vault identity, revision, checkpoint and wrapper relations.
+///
+/// When several inputs are at fault the first applicable error in that order is
+/// returned, so a local-reference problem is never reported as a remote one.
+///
+/// All of the security semantics of [`inspect_remote_candidate`] apply: no
+/// freshness claim without a trusted `high_water`, a candidate behind local is
+/// not by itself a rollback, and a different wrapper is only an observation. The
+/// function is read-only and performs no I/O.
+pub fn inspect_remote_bytes(
+    vault_key: &SecretKey,
+    expected_vault_id: Uuid,
+    local_raw: &[u8],
+    candidate_raw: &[u8],
+    high_water: Option<RemoteHighWater>,
+) -> Result<BoundInspection, BoundInspectionError> {
+    check_envelope_len(EnvelopeInput::LocalReference, local_raw)?;
+    check_envelope_len(EnvelopeInput::Candidate, candidate_raw)?;
+
+    let local = parse_envelope(EnvelopeInput::LocalReference, local_raw)?;
+    let candidate = parse_envelope(EnvelopeInput::Candidate, candidate_raw)?;
+
+    let local_fingerprint = EnvelopeFingerprint::of_bytes(local_raw);
+    let candidate_fingerprint = EnvelopeFingerprint::of_bytes(candidate_raw);
+
+    let inspection =
+        inspect_remote_candidate(vault_key, expected_vault_id, &local, &candidate, high_water)
+            .map_err(BoundInspectionError::Inspection)?;
+
+    Ok(BoundInspection {
+        local_fingerprint,
+        candidate_fingerprint,
+        inspection,
+    })
+}
+
+fn check_envelope_len(input: EnvelopeInput, raw: &[u8]) -> Result<(), BoundInspectionError> {
+    if raw.len() > MAX_ENVELOPE_BYTES {
+        return Err(BoundInspectionError::InputTooLarge {
+            input,
+            actual: raw.len(),
+            limit: MAX_ENVELOPE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn parse_envelope(input: EnvelopeInput, raw: &[u8]) -> Result<VaultEnvelope, BoundInspectionError> {
+    // The deserializer error is discarded on purpose: it can quote positions
+    // and fragments of the input.
+    serde_json::from_slice::<VaultEnvelope>(raw)
+        .map_err(|_| BoundInspectionError::MalformedEnvelope { input })
 }
 
 #[cfg(test)]
@@ -2260,6 +2477,1012 @@ mod inspection_tests {
         for text in [format!("{error}"), format!("{error:?}")] {
             assert!(!text.contains(SECRET));
             assert!(!text.contains(&rig.id().to_string()));
+        }
+    }
+}
+
+/// Stage 1U-4 A2a tests. Kept apart from the accepted 1U-1 and 1U-3 modules,
+/// which are unchanged. Synthetic data only; the committed fixtures are
+/// read-only.
+#[cfg(test)]
+mod bound_inspection_tests {
+    use super::*;
+    use crate::vault::{
+        data::{
+            VaultEntry, LEGACY_VAULT_DATA_SCHEMA_VERSION, PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        },
+        format::{
+            create_envelope_with_key, open_envelope_with_key, reseal_envelope,
+            rewrap_envelope_master_password,
+        },
+    };
+
+    const SCHEMA1_FIXTURE: &[u8] =
+        include_bytes!("../../../src-tauri/tests/fixtures/compat/schema1_baseline.envelope.json");
+    const SCHEMA2_FIXTURE: &[u8] =
+        include_bytes!("../../../src-tauri/tests/fixtures/compat/schema2_baseline.envelope.json");
+    const SCHEMA3_FIXTURE: &[u8] =
+        include_bytes!("../../../src-tauri/tests/fixtures/compat/schema3_baseline.envelope.json");
+
+    // Computed outside this module with `Get-FileHash` on the committed files.
+    const SCHEMA1_SHA256: &str = "17edf060385cca1a778b2236842ecfa44d21aa174d9b70092c1d9cbdd0fcb9a8";
+    const SCHEMA2_SHA256: &str = "f5bf1fcdb11115f0fa39598389a7a8ce3b9c44b78ddfd5295b57845b52155f55";
+    const SCHEMA3_SHA256: &str = "71d2efb0150e7f818cf1acf61ce25f6e1dda06370f8df85056dc671fdc3e81c8";
+
+    const FIXTURE_PASSWORD: &str = "compat-baseline-master-password-test-only";
+    const MASTER: &str = "bound-inspection-test-only-master-password";
+    const NEW_MASTER: &str = "bound-inspection-test-only-new-master-password";
+    const SECRET: &str = "BOUND_INSPECTION_TEST_ONLY_SECRET";
+    const TITLE: &str = "Bound Inspection Entry";
+    const SENTINEL: &str = "RAW_INPUT_SENTINEL_SECRET";
+    const NOW_MS: i64 = 1_700_000_000_000;
+
+    fn bytes_of(data: &VaultData) -> Vec<u8> {
+        serde_json::to_vec(data).unwrap()
+    }
+
+    fn raw(envelope: &VaultEnvelope) -> Vec<u8> {
+        serde_json::to_vec(envelope).unwrap()
+    }
+
+    /// SHA-256 computed directly with the `sha2` crate, independent of
+    /// `EnvelopeFingerprint`.
+    fn independent_sha256(bytes: &[u8]) -> [u8; 32] {
+        Sha256::digest(bytes).into()
+    }
+
+    fn high_water(revision: u64) -> Option<RemoteHighWater> {
+        Some(RemoteHighWater::new(revision))
+    }
+
+    fn candidate_error(reason: PayloadRejection) -> BoundInspectionError {
+        BoundInspectionError::Inspection(InspectionError::Candidate(reason))
+    }
+
+    fn local_error(reason: PayloadRejection) -> BoundInspectionError {
+        BoundInspectionError::Inspection(InspectionError::LocalReference(reason))
+    }
+
+    fn malformed(input: EnvelopeInput) -> BoundInspectionError {
+        BoundInspectionError::MalformedEnvelope { input }
+    }
+
+    /// One vault: its Vault Key, id and a local envelope at revision 3.
+    struct Rig {
+        local: VaultEnvelope,
+        key: SecretKey,
+        base: VaultData,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let mut base = VaultData::new(NOW_MS).unwrap();
+
+            let mut entry = VaultEntry::new(TITLE, NOW_MS).unwrap();
+            entry.password = SECRET.to_owned();
+            base.entries.push(entry);
+
+            base.revision = 3;
+            base.validate().unwrap();
+
+            let (local, key) = create_envelope_with_key(MASTER, &bytes_of(&base)).unwrap();
+
+            Self { local, key, base }
+        }
+
+        fn id(&self) -> Uuid {
+            self.base.vault_id
+        }
+
+        fn data(&self, revision: u64) -> VaultData {
+            let mut data = self.base.clone();
+            data.revision = revision;
+            data
+        }
+
+        fn legacy(&self, schema_version: u16) -> VaultData {
+            let mut data = self.base.clone();
+            data.schema_version = schema_version;
+            data.revision = 0;
+            data
+        }
+
+        fn seal(&self, data: &VaultData) -> VaultEnvelope {
+            self.seal_plaintext(&bytes_of(data))
+        }
+
+        fn seal_plaintext(&self, plaintext: &[u8]) -> VaultEnvelope {
+            reseal_envelope(&self.local, &self.key, plaintext).unwrap()
+        }
+
+        fn at(&self, revision: u64) -> VaultEnvelope {
+            self.seal(&self.data(revision))
+        }
+
+        fn inspect(
+            &self,
+            local_raw: &[u8],
+            candidate_raw: &[u8],
+            high_water: Option<RemoteHighWater>,
+        ) -> Result<BoundInspection, BoundInspectionError> {
+            inspect_remote_bytes(&self.key, self.id(), local_raw, candidate_raw, high_water)
+        }
+
+        /// The unchanged 1U-3 result for the same two envelopes.
+        fn reference(
+            &self,
+            local: &VaultEnvelope,
+            candidate: &VaultEnvelope,
+            high_water: Option<RemoteHighWater>,
+        ) -> Result<RemoteInspection, InspectionError> {
+            inspect_remote_candidate(&self.key, self.id(), local, candidate, high_water)
+        }
+    }
+
+    // ---- 1./2. valid input, exact-byte fingerprints ------------------------
+
+    #[test]
+    fn valid_raw_envelopes_are_inspected_and_bound_to_their_exact_bytes() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+        let candidate_envelope = rig.at(5);
+        let candidate_raw = raw(&candidate_envelope);
+
+        let bound = rig.inspect(&local_raw, &candidate_raw, None).unwrap();
+
+        assert_eq!(
+            bound.inspection().candidate_revision(),
+            AuthenticatedRevision::Counter(5)
+        );
+        assert_eq!(
+            bound.inspection().local_revision(),
+            AuthenticatedRevision::Counter(3)
+        );
+        assert_eq!(
+            bound.inspection().payload(),
+            PayloadRelation::CandidateHigherRevision
+        );
+        assert_eq!(bound.inspection().wrapper(), WrapperRelation::Identical);
+        assert_eq!(
+            bound.inspection().checkpoint(),
+            CheckpointComparison::NoCheckpoint
+        );
+
+        // Independently computed SHA-256 of exactly the supplied slices.
+        assert_eq!(
+            bound.local_fingerprint().as_bytes(),
+            &independent_sha256(&local_raw)
+        );
+        assert_eq!(
+            bound.candidate_fingerprint().as_bytes(),
+            &independent_sha256(&candidate_raw)
+        );
+        assert_ne!(bound.local_fingerprint(), bound.candidate_fingerprint());
+
+        // The inspection is exactly the unchanged 1U-3 result.
+        assert_eq!(
+            Ok(*bound.inspection()),
+            rig.reference(&rig.local, &candidate_envelope, None)
+        );
+    }
+
+    #[test]
+    fn local_and_candidate_fingerprints_are_not_interchangeable() {
+        let rig = Rig::new();
+        let a = raw(&rig.at(4));
+        let b = raw(&rig.at(6));
+
+        let forward = rig.inspect(&a, &b, None).unwrap();
+        let backward = rig.inspect(&b, &a, None).unwrap();
+
+        assert_eq!(
+            forward.local_fingerprint(),
+            backward.candidate_fingerprint()
+        );
+        assert_eq!(
+            forward.candidate_fingerprint(),
+            backward.local_fingerprint()
+        );
+        assert_ne!(forward.local_fingerprint(), forward.candidate_fingerprint());
+        assert_eq!(
+            forward.inspection().payload(),
+            PayloadRelation::CandidateHigherRevision
+        );
+        assert_eq!(
+            backward.inspection().payload(),
+            PayloadRelation::CandidateLowerRevision
+        );
+    }
+
+    // ---- 3. raw representation vs authenticated identity -------------------
+
+    #[test]
+    fn whitespace_changes_the_fingerprint_but_not_the_inspection() {
+        let rig = Rig::new();
+        let compact = raw(&rig.local);
+
+        let pretty = serde_json::to_vec_pretty(&rig.local).unwrap();
+        let mut trailing_newline = compact.clone();
+        trailing_newline.push(b'\n');
+        let mut trailing_crlf = compact.clone();
+        trailing_crlf.extend_from_slice(b"\r\n");
+        let mut leading_space = vec![b' '];
+        leading_space.extend_from_slice(&compact);
+
+        let representations = [
+            compact.clone(),
+            pretty,
+            trailing_newline,
+            trailing_crlf,
+            leading_space,
+        ];
+
+        // Every representation parses to the very same envelope ...
+        for representation in &representations {
+            assert_eq!(
+                serde_json::from_slice::<VaultEnvelope>(representation).unwrap(),
+                rig.local
+            );
+        }
+
+        let baseline = rig.inspect(&compact, &compact, None).unwrap();
+        assert_eq!(
+            baseline.inspection().payload(),
+            PayloadRelation::IdenticalCiphertext
+        );
+        assert_eq!(
+            baseline.local_fingerprint(),
+            baseline.candidate_fingerprint()
+        );
+
+        for (index, representation) in representations.iter().enumerate() {
+            let bound = rig.inspect(&compact, representation, None).unwrap();
+
+            // ... so the authenticated facts never change ...
+            assert_eq!(bound.inspection(), baseline.inspection(), "form {index}");
+
+            // ... while the candidate fingerprint follows the exact bytes.
+            assert_eq!(
+                bound.candidate_fingerprint().as_bytes(),
+                &independent_sha256(representation),
+                "form {index}"
+            );
+            assert_eq!(bound.local_fingerprint(), baseline.local_fingerprint());
+
+            for (other_index, other) in representations.iter().enumerate() {
+                assert_eq!(
+                    bound.candidate_fingerprint() == &EnvelopeFingerprint::of_bytes(other),
+                    representation == other,
+                    "forms {index} and {other_index}"
+                );
+            }
+        }
+    }
+
+    // ---- 4./5. malformed envelopes -----------------------------------------
+
+    fn malformed_samples(valid: &[u8]) -> Vec<Vec<u8>> {
+        let mut trailing_data = valid.to_vec();
+        trailing_data.extend_from_slice(b" trailing");
+
+        vec![
+            Vec::new(),
+            b"not json".to_vec(),
+            b"{}".to_vec(),
+            b"[]".to_vec(),
+            b"null".to_vec(),
+            vec![0xff, 0xfe, 0x00, 0x01],
+            format!(r#"{{"magic":"{SENTINEL}","version":"{SENTINEL}"}}"#).into_bytes(),
+            format!(r#"{{"magic":"LOCALVAULT","version":1,"kdf":"{SENTINEL}"}}"#).into_bytes(),
+            trailing_data,
+        ]
+    }
+
+    #[test]
+    fn malformed_candidate_bytes_are_rejected_as_the_candidate() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+
+        for sample in malformed_samples(&raw(&rig.at(5))) {
+            let error = rig.inspect(&local_raw, &sample, None).unwrap_err();
+
+            assert_eq!(error, malformed(EnvelopeInput::Candidate));
+
+            for text in [format!("{error}"), format!("{error:?}")] {
+                assert!(!text.contains(SENTINEL));
+                assert!(!text.contains("line"));
+                assert!(!text.contains("column"));
+                assert!(!text.contains("EOF"));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_local_bytes_are_rejected_as_the_local_reference() {
+        let rig = Rig::new();
+        let candidate_raw = raw(&rig.at(5));
+
+        for sample in malformed_samples(&raw(&rig.local)) {
+            let error = rig.inspect(&sample, &candidate_raw, None).unwrap_err();
+
+            assert_eq!(error, malformed(EnvelopeInput::LocalReference));
+
+            for text in [format!("{error}"), format!("{error:?}")] {
+                assert!(!text.contains(SENTINEL));
+            }
+        }
+    }
+
+    #[test]
+    fn the_local_reference_is_blamed_first_when_both_inputs_are_malformed() {
+        let rig = Rig::new();
+
+        assert_eq!(
+            rig.inspect(b"{", b"[", None),
+            Err(malformed(EnvelopeInput::LocalReference))
+        );
+    }
+
+    #[test]
+    fn a_parseable_envelope_with_a_bad_header_keeps_its_1u3_classification() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+
+        let mut wrong_magic = rig.at(5);
+        wrong_magic.magic = "NOTVAULT".to_owned();
+
+        let mut wrong_version = rig.at(5);
+        wrong_version.version += 1;
+
+        let mut kdf_too_large = rig.at(5);
+        kdf_too_large.kdf.memory_kib = u32::MAX;
+
+        for candidate in [wrong_magic, wrong_version, kdf_too_large] {
+            assert_eq!(
+                rig.inspect(&local_raw, &raw(&candidate), None),
+                Err(candidate_error(PayloadRejection::UnsupportedFormat))
+            );
+        }
+
+        let mut wrong_magic_local = rig.local.clone();
+        wrong_magic_local.magic = "NOTVAULT".to_owned();
+
+        assert_eq!(
+            rig.inspect(&raw(&wrong_magic_local), &raw(&rig.at(5)), None),
+            Err(local_error(PayloadRejection::UnsupportedFormat))
+        );
+    }
+
+    // ---- 6./7. size limits --------------------------------------------------
+
+    #[test]
+    fn the_limit_is_the_32_mib_desktop_vault_file_limit() {
+        assert_eq!(MAX_ENVELOPE_BYTES, 33_554_432);
+    }
+
+    #[test]
+    fn oversized_local_input_is_rejected_with_its_length() {
+        let rig = Rig::new();
+        let candidate_raw = raw(&rig.at(5));
+
+        let oversized = vec![b' '; MAX_ENVELOPE_BYTES + 1];
+        let error = rig.inspect(&oversized, &candidate_raw, None).unwrap_err();
+
+        assert_eq!(
+            error,
+            BoundInspectionError::InputTooLarge {
+                input: EnvelopeInput::LocalReference,
+                actual: MAX_ENVELOPE_BYTES + 1,
+                limit: MAX_ENVELOPE_BYTES,
+            }
+        );
+        assert!(format!("{error}").contains("local reference"));
+        assert!(format!("{error}").contains("33554433"));
+    }
+
+    #[test]
+    fn oversized_candidate_input_is_rejected_with_its_length() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+
+        let oversized = vec![b' '; MAX_ENVELOPE_BYTES + 1];
+        let error = rig.inspect(&local_raw, &oversized, None).unwrap_err();
+
+        assert_eq!(
+            error,
+            BoundInspectionError::InputTooLarge {
+                input: EnvelopeInput::Candidate,
+                actual: MAX_ENVELOPE_BYTES + 1,
+                limit: MAX_ENVELOPE_BYTES,
+            }
+        );
+        assert!(format!("{error}").contains("remote candidate"));
+    }
+
+    #[test]
+    fn both_lengths_are_checked_before_either_input_is_parsed() {
+        let rig = Rig::new();
+        let oversized = vec![b'x'; MAX_ENVELOPE_BYTES + 1];
+
+        // A malformed (tiny) local reference does not hide an oversized
+        // candidate: the size verdict comes first, and it is the candidate's.
+        assert_eq!(
+            rig.inspect(b"not json", &oversized, None),
+            Err(BoundInspectionError::InputTooLarge {
+                input: EnvelopeInput::Candidate,
+                actual: MAX_ENVELOPE_BYTES + 1,
+                limit: MAX_ENVELOPE_BYTES,
+            })
+        );
+
+        // An oversized input is a size error even though it is also not JSON.
+        assert!(matches!(
+            rig.inspect(&oversized, &raw(&rig.local), None),
+            Err(BoundInspectionError::InputTooLarge {
+                input: EnvelopeInput::LocalReference,
+                ..
+            })
+        ));
+
+        // With both over the limit the local reference is reported first.
+        assert!(matches!(
+            rig.inspect(&oversized, &oversized, None),
+            Err(BoundInspectionError::InputTooLarge {
+                input: EnvelopeInput::LocalReference,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn input_of_exactly_the_limit_is_accepted_and_hashed_in_full() {
+        let rig = Rig::new();
+
+        let pad_to_limit = |envelope: &VaultEnvelope| {
+            let mut bytes = raw(envelope);
+            bytes.resize(MAX_ENVELOPE_BYTES, b' ');
+            bytes
+        };
+
+        let local_raw = pad_to_limit(&rig.local);
+        let candidate_raw = pad_to_limit(&rig.at(5));
+        assert_eq!(local_raw.len(), MAX_ENVELOPE_BYTES);
+        assert_eq!(candidate_raw.len(), MAX_ENVELOPE_BYTES);
+
+        let bound = rig.inspect(&local_raw, &candidate_raw, None).unwrap();
+
+        // Nothing was truncated: the digest covers every padding byte.
+        assert_eq!(
+            bound.local_fingerprint().as_bytes(),
+            &independent_sha256(&local_raw)
+        );
+        assert_eq!(
+            bound.candidate_fingerprint().as_bytes(),
+            &independent_sha256(&candidate_raw)
+        );
+        assert_eq!(
+            bound.inspection().payload(),
+            PayloadRelation::CandidateHigherRevision
+        );
+    }
+
+    // ---- 8. truncation ------------------------------------------------------
+
+    #[test]
+    fn every_truncation_of_a_valid_envelope_is_malformed() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+        let candidate_raw = raw(&rig.at(5));
+
+        assert!(rig.inspect(&local_raw, &candidate_raw, None).is_ok());
+
+        for length in 0..candidate_raw.len() {
+            assert_eq!(
+                rig.inspect(&local_raw, &candidate_raw[..length], None),
+                Err(malformed(EnvelopeInput::Candidate)),
+                "candidate truncated to {length} bytes"
+            );
+        }
+
+        for length in 0..local_raw.len() {
+            assert_eq!(
+                rig.inspect(&local_raw[..length], &candidate_raw, None),
+                Err(malformed(EnvelopeInput::LocalReference)),
+                "local truncated to {length} bytes"
+            );
+        }
+    }
+
+    // ---- 9. wrong key -------------------------------------------------------
+
+    #[test]
+    fn wrong_vault_key_is_an_authentication_failure_of_the_local_reference() {
+        let rig = Rig::new();
+        let other = Rig::new();
+
+        // The local reference is read first, so it is the first to fail to
+        // authenticate under the wrong key.
+        assert_eq!(
+            inspect_remote_bytes(
+                &other.key,
+                rig.id(),
+                &raw(&rig.local),
+                &raw(&rig.at(5)),
+                None
+            ),
+            Err(local_error(PayloadRejection::AuthenticationFailed))
+        );
+    }
+
+    #[test]
+    fn candidate_sealed_under_another_key_is_an_authentication_failure() {
+        let rig = Rig::new();
+        let other = Rig::new();
+
+        assert_eq!(
+            rig.inspect(&raw(&rig.local), &raw(&other.at(5)), None),
+            Err(candidate_error(PayloadRejection::AuthenticationFailed))
+        );
+    }
+
+    #[test]
+    fn tampered_candidate_bytes_fail_authentication_not_parsing() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+
+        let mut flipped_ciphertext = rig.at(5);
+        flipped_ciphertext.payload.ciphertext[0] ^= 0x01;
+
+        let mut flipped_nonce = rig.at(5);
+        flipped_nonce.payload.nonce[0] ^= 0x01;
+
+        for candidate in [flipped_ciphertext, flipped_nonce] {
+            assert_eq!(
+                rig.inspect(&local_raw, &raw(&candidate), None),
+                Err(candidate_error(PayloadRejection::AuthenticationFailed))
+            );
+        }
+    }
+
+    // ---- 10. invalid authenticated payloads ---------------------------------
+
+    #[test]
+    fn authenticated_but_invalid_payloads_stay_distinct_from_authentication_failure() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+
+        // Authentic bytes that are not a vault payload.
+        assert_eq!(
+            rig.inspect(&local_raw, &raw(&rig.seal_plaintext(b"{ not json")), None),
+            Err(candidate_error(PayloadRejection::MalformedPayload))
+        );
+
+        // Authentic, parseable, but fails vault-data validation.
+        let mut empty_title = rig.data(5);
+        empty_title.entries[0].title = String::new();
+
+        assert_eq!(
+            rig.inspect(&local_raw, &raw(&rig.seal(&empty_title)), None),
+            Err(candidate_error(PayloadRejection::InvalidData))
+        );
+
+        // Authentic, parseable, from a schema this build does not know.
+        let mut future_schema = serde_json::to_value(rig.data(5)).unwrap();
+        future_schema["schema_version"] = serde_json::json!(4);
+
+        assert_eq!(
+            rig.inspect(
+                &local_raw,
+                &raw(&rig.seal_plaintext(&serde_json::to_vec(&future_schema).unwrap())),
+                None
+            ),
+            Err(candidate_error(PayloadRejection::UnsupportedSchema))
+        );
+
+        // The same defect on the local side is blamed on the local reference.
+        assert_eq!(
+            rig.inspect(
+                &raw(&rig.seal_plaintext(b"{ not json")),
+                &raw(&rig.at(5)),
+                None
+            ),
+            Err(local_error(PayloadRejection::MalformedPayload))
+        );
+    }
+
+    // ---- 11. vault identity -------------------------------------------------
+
+    #[test]
+    fn a_different_vault_id_is_rejected_after_authentication() {
+        let rig = Rig::new();
+
+        let mut other_vault = rig.data(5);
+        other_vault.vault_id = Uuid::new_v4();
+        assert_ne!(other_vault.vault_id, rig.id());
+
+        assert_eq!(
+            rig.inspect(&raw(&rig.local), &raw(&rig.seal(&other_vault)), None),
+            Err(candidate_error(PayloadRejection::VaultIdMismatch))
+        );
+
+        let mut other_local = rig.data(3);
+        other_local.vault_id = Uuid::new_v4();
+
+        assert_eq!(
+            rig.inspect(&raw(&rig.seal(&other_local)), &raw(&rig.at(5)), None),
+            Err(local_error(PayloadRejection::VaultIdMismatch))
+        );
+
+        // A nil expected id can never match a valid payload.
+        assert_eq!(
+            inspect_remote_bytes(
+                &rig.key,
+                Uuid::nil(),
+                &raw(&rig.local),
+                &raw(&rig.at(5)),
+                None
+            ),
+            Err(local_error(PayloadRejection::VaultIdMismatch))
+        );
+    }
+
+    // ---- 12./13. committed fixtures, byte for byte --------------------------
+
+    #[test]
+    fn committed_fixtures_are_fingerprinted_as_the_exact_file_bytes() {
+        for (fixture, expected_sha256, legacy_schema) in [
+            (
+                SCHEMA1_FIXTURE,
+                SCHEMA1_SHA256,
+                Some(LEGACY_VAULT_DATA_SCHEMA_VERSION),
+            ),
+            (
+                SCHEMA2_FIXTURE,
+                SCHEMA2_SHA256,
+                Some(PRE_REVISION_VAULT_DATA_SCHEMA_VERSION),
+            ),
+            (SCHEMA3_FIXTURE, SCHEMA3_SHA256, None),
+        ] {
+            let envelope: VaultEnvelope = serde_json::from_slice(fixture).unwrap();
+            let (key, plaintext) = open_envelope_with_key(FIXTURE_PASSWORD, &envelope).unwrap();
+            let data: VaultData = serde_json::from_slice(plaintext.as_slice()).unwrap();
+
+            // A local state of the same vault, ahead of the fixture.
+            let mut ahead = data.clone();
+            ahead.schema_version = VAULT_DATA_SCHEMA_VERSION;
+            ahead.revision = data.revision + 5;
+            let local = reseal_envelope(&envelope, &key, &bytes_of(&ahead)).unwrap();
+            let local_raw = raw(&local);
+
+            // The fixture file bytes are passed as they are on disk.
+            let bound =
+                inspect_remote_bytes(&key, data.vault_id, &local_raw, fixture, high_water(0))
+                    .unwrap();
+
+            assert_eq!(
+                bound.candidate_fingerprint().to_hex(),
+                expected_sha256,
+                "fixture fingerprint"
+            );
+            assert_eq!(
+                bound.local_fingerprint().as_bytes(),
+                &independent_sha256(&local_raw)
+            );
+            assert_eq!(
+                bound.inspection().local_revision(),
+                AuthenticatedRevision::Counter(data.revision + 5)
+            );
+            assert_eq!(bound.inspection().wrapper(), WrapperRelation::Identical);
+
+            match legacy_schema {
+                Some(schema_version) => {
+                    assert_eq!(
+                        bound.inspection().candidate_revision(),
+                        AuthenticatedRevision::Unversioned { schema_version }
+                    );
+                    assert_eq!(bound.inspection().payload(), PayloadRelation::Unordered);
+                    assert_eq!(
+                        bound.inspection().checkpoint(),
+                        CheckpointComparison::UnversionedCandidate
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        bound.inspection().candidate_revision(),
+                        AuthenticatedRevision::Counter(data.revision)
+                    );
+                    assert_eq!(
+                        bound.inspection().payload(),
+                        PayloadRelation::CandidateLowerRevision
+                    );
+                }
+            }
+
+            // Same envelopes through the unchanged 1U-3 entry point.
+            assert_eq!(
+                Ok(*bound.inspection()),
+                inspect_remote_candidate(&key, data.vault_id, &local, &envelope, high_water(0))
+            );
+        }
+    }
+
+    // ---- 14. checkpoint -----------------------------------------------------
+
+    #[test]
+    fn known_rollback_is_reported_against_the_supplied_checkpoint_only() {
+        let rig = Rig::new();
+
+        // Candidate (4) is ahead of local (2) but behind what the remote is
+        // known to have reached (6).
+        let regressed = rig
+            .inspect(&raw(&rig.at(2)), &raw(&rig.at(4)), high_water(6))
+            .unwrap();
+        assert_eq!(
+            regressed.inspection().checkpoint(),
+            CheckpointComparison::BelowCheckpoint
+        );
+        assert_eq!(
+            regressed.inspection().payload(),
+            PayloadRelation::CandidateHigherRevision
+        );
+
+        // Behind local without a checkpoint is not a rollback.
+        let behind_local = rig
+            .inspect(&raw(&rig.at(9)), &raw(&rig.at(4)), None)
+            .unwrap();
+        assert_eq!(
+            behind_local.inspection().payload(),
+            PayloadRelation::CandidateLowerRevision
+        );
+        assert_eq!(
+            behind_local.inspection().checkpoint(),
+            CheckpointComparison::NoCheckpoint
+        );
+
+        // Exactly at the checkpoint: consistent, not a regression.
+        let at = rig
+            .inspect(&raw(&rig.at(9)), &raw(&rig.at(4)), high_water(4))
+            .unwrap();
+        assert_eq!(
+            at.inspection().checkpoint(),
+            CheckpointComparison::AtCheckpoint
+        );
+    }
+
+    // ---- 15./16./17. same-revision, wrapper, randomized ciphertext ----------
+
+    #[test]
+    fn same_revision_with_different_content_is_a_conflict_indicator() {
+        let rig = Rig::new();
+
+        let mut diverged = rig.data(3);
+        diverged.entries[0].password = "a-different-password".to_owned();
+
+        let bound = rig
+            .inspect(&raw(&rig.local), &raw(&rig.seal(&diverged)), None)
+            .unwrap();
+
+        assert_eq!(
+            bound.inspection().payload(),
+            PayloadRelation::SameRevisionDifferentContent
+        );
+        assert_ne!(bound.local_fingerprint(), bound.candidate_fingerprint());
+    }
+
+    #[test]
+    fn wrapper_only_change_differs_in_bytes_and_wrapper_but_not_in_payload() {
+        let rig = Rig::new();
+        let rewrapped = rewrap_envelope_master_password(&rig.local, &rig.key, NEW_MASTER).unwrap();
+        assert_eq!(rewrapped.payload, rig.local.payload);
+
+        let local_raw = raw(&rig.local);
+        let rewrapped_raw = raw(&rewrapped);
+
+        let bound = rig.inspect(&local_raw, &rewrapped_raw, None).unwrap();
+
+        assert_ne!(bound.local_fingerprint(), bound.candidate_fingerprint());
+        assert_eq!(
+            bound.candidate_fingerprint().as_bytes(),
+            &independent_sha256(&rewrapped_raw)
+        );
+        assert_eq!(
+            bound.inspection().payload(),
+            PayloadRelation::IdenticalCiphertext
+        );
+        assert_eq!(bound.inspection().wrapper(), WrapperRelation::Different);
+        assert_eq!(
+            bound.inspection().candidate_revision(),
+            bound.inspection().local_revision()
+        );
+    }
+
+    #[test]
+    fn equivalent_content_under_randomized_encryption_is_not_a_fork() {
+        let rig = Rig::new();
+
+        let resealed = rig.at(3);
+        assert_ne!(resealed.payload, rig.local.payload);
+
+        let bound = rig
+            .inspect(&raw(&rig.local), &raw(&resealed), None)
+            .unwrap();
+
+        assert_ne!(bound.local_fingerprint(), bound.candidate_fingerprint());
+        assert_eq!(
+            bound.inspection().payload(),
+            PayloadRelation::EquivalentContentDifferentCiphertext
+        );
+        assert_eq!(bound.inspection().wrapper(), WrapperRelation::Identical);
+    }
+
+    #[test]
+    fn identical_bytes_give_identical_fingerprints_and_identical_payloads() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+
+        let bound = rig.inspect(&local_raw, &local_raw, None).unwrap();
+
+        assert_eq!(bound.local_fingerprint(), bound.candidate_fingerprint());
+        assert_eq!(
+            bound.inspection().payload(),
+            PayloadRelation::IdenticalCiphertext
+        );
+    }
+
+    // ---- 18. nothing sensitive in Debug or errors ---------------------------
+
+    #[test]
+    fn debug_and_error_output_expose_no_contents_or_secrets() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+        let candidate_raw = raw(&rig.at(5));
+
+        let bound = rig
+            .inspect(&local_raw, &candidate_raw, high_water(4))
+            .unwrap();
+
+        let rendered = format!("{bound:?}");
+        assert!(rendered.starts_with("BoundInspection"));
+        assert!(rendered.contains(&bound.local_fingerprint().to_hex()));
+        assert!(rendered.contains(&bound.candidate_fingerprint().to_hex()));
+
+        let mut empty_title = rig.data(5);
+        empty_title.entries[0].title = String::new();
+
+        let errors = [
+            rig.inspect(b"{", &candidate_raw, None).unwrap_err(),
+            rig.inspect(&local_raw, SENTINEL.as_bytes(), None)
+                .unwrap_err(),
+            rig.inspect(&local_raw, &vec![b' '; MAX_ENVELOPE_BYTES + 1], None)
+                .unwrap_err(),
+            rig.inspect(&local_raw, &raw(&rig.seal(&empty_title)), None)
+                .unwrap_err(),
+            inspect_remote_bytes(&Rig::new().key, rig.id(), &local_raw, &candidate_raw, None)
+                .unwrap_err(),
+        ];
+
+        let mut texts = vec![rendered];
+        for error in errors {
+            texts.push(format!("{error}"));
+            texts.push(format!("{error:?}"));
+        }
+
+        for text in texts {
+            for forbidden in [
+                SECRET,
+                TITLE,
+                SENTINEL,
+                MASTER,
+                NEW_MASTER,
+                FIXTURE_PASSWORD,
+                "password",
+            ] {
+                assert!(!text.contains(forbidden), "{forbidden} leaked in {text}");
+            }
+            assert!(!text.contains(&rig.id().to_string()));
+        }
+    }
+
+    // ---- 19. the bound type cannot be assembled by a caller -----------------
+
+    #[test]
+    fn the_only_producer_is_the_byte_taking_entry_point() {
+        // Exactly this signature: raw slices in, no fingerprints and no parsed
+        // envelopes accepted. (The negative construction claims -- no struct
+        // literal, constructor, `From` or field mutation -- are compile_fail
+        // doctests on `BoundInspection`.)
+        type ExactSignature = fn(
+            &SecretKey,
+            Uuid,
+            &[u8],
+            &[u8],
+            Option<RemoteHighWater>,
+        ) -> Result<BoundInspection, BoundInspectionError>;
+
+        let _signature: ExactSignature = inspect_remote_bytes;
+
+        // A bound value is read-only: accessors hand out shared references.
+        let rig = Rig::new();
+        let bound = rig
+            .inspect(&raw(&rig.local), &raw(&rig.at(5)), None)
+            .unwrap();
+        let copy = bound;
+
+        assert_eq!(copy, bound);
+        assert_eq!(copy.local_fingerprint(), bound.local_fingerprint());
+        assert_eq!(copy.inspection(), bound.inspection());
+    }
+
+    // ---- no side effects ----------------------------------------------------
+
+    #[test]
+    fn repeated_inspection_is_deterministic_and_leaves_inputs_untouched() {
+        let rig = Rig::new();
+
+        let local_raw = raw(&rig.local);
+        let candidate_raw = raw(&rig.at(5));
+        let local_before = local_raw.clone();
+        let candidate_before = candidate_raw.clone();
+
+        let first = rig
+            .inspect(&local_raw, &candidate_raw, high_water(4))
+            .unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(
+                rig.inspect(&local_raw, &candidate_raw, high_water(4))
+                    .unwrap(),
+                first
+            );
+        }
+
+        assert_eq!(local_raw, local_before);
+        assert_eq!(candidate_raw, candidate_before);
+
+        // A rejected call leaves nothing behind that affects the next one.
+        assert!(rig.inspect(&local_raw, b"{", high_water(4)).is_err());
+        assert_eq!(
+            rig.inspect(&local_raw, &candidate_raw, high_water(4))
+                .unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn legacy_candidates_are_not_migrated_by_byte_inspection() {
+        let rig = Rig::new();
+
+        for schema in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            let legacy_plaintext = bytes_of(&rig.legacy(schema));
+            let candidate = rig.seal_plaintext(&legacy_plaintext);
+            let candidate_raw = raw(&candidate);
+
+            let bound = rig
+                .inspect(&raw(&rig.local), &candidate_raw, high_water(0))
+                .unwrap();
+
+            assert_eq!(
+                bound.inspection().candidate_revision(),
+                AuthenticatedRevision::Unversioned {
+                    schema_version: schema
+                }
+            );
+            assert_eq!(
+                bound.inspection().checkpoint(),
+                CheckpointComparison::UnversionedCandidate
+            );
+
+            // The supplied bytes (and the payload they carry) are exactly as before.
+            assert_eq!(raw(&candidate), candidate_raw);
+            assert_eq!(
+                open_payload_with_key(&candidate, &rig.key)
+                    .unwrap()
+                    .as_slice(),
+                legacy_plaintext.as_slice()
+            );
         }
     }
 }
