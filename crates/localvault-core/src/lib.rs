@@ -8,5 +8,6 @@
 mod crypto;
 pub mod site;
 pub mod sync;
+pub mod sync_state;
 pub mod totp;
 pub mod vault;
