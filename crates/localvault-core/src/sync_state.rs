@@ -1,12 +1,32 @@
-//! Pure model and codec for a per-vault local synchronization binding
-//! (Stage 1U-4, slice A1).
+//! Pure model, codec and transitions for a per-vault local synchronization
+//! binding (Stage 1U-4, slices A1 and A2b).
 //!
 //! A [`SyncState`] records which local vault file is bound to which remote
 //! target, the last successfully synchronized checkpoint and an optional
-//! interrupted push. This module only *describes and (de)serializes* that
-//! state. It performs no I/O, no network access, no vault cryptography, reads
-//! no clock, generates no randomness, mutates no vault data and orchestrates no
-//! state transition. Persistence belongs to platform storage adapters.
+//! interrupted push. This module *describes, (de)serializes and proposes
+//! transitions of* that state. It performs no I/O, no network access, no vault
+//! cryptography, reads no clock, generates no randomness (binding ids, tag salts
+//! and intent ids are supplied by the caller), mutates no vault data and never
+//! persists anything. Persistence belongs to platform storage adapters.
+//!
+//! # Transitions (slice A2b)
+//!
+//! The functions in the "Pure transitions" section take the current state (or
+//! the load outcome) and authenticated evidence, and return a *proposed* new
+//! [`SyncState`], an explicit outcome, or a typed [`TransitionRefusal`]. Nothing
+//! they return has happened: the input is never mutated, and a proposal is not a
+//! committed checkpoint until a platform adapter has persisted its encoded bytes
+//! atomically and read them back. A failed persistence must therefore leave the
+//! previous durable state as the source of truth. No transition writes to a
+//! remote, retries, or authorizes a pull.
+//!
+//! Evidence comes only from [`crate::sync`]: a [`BoundInspection`] (a remote
+//! envelope authenticated together with the local one, with fingerprints of the
+//! exact raw bytes) or a [`LocalSnapshot`] (the local envelope alone). Both
+//! carry the vault identity they were authenticated against, so a stored
+//! [`VaultBindingTag`] is checked against the evidence itself and never against
+//! a separately supplied id; revisions and fingerprints are never accepted as
+//! loose numbers.
 //!
 //! # What the persisted state does not contain
 //!
@@ -56,7 +76,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::sync::{EnvelopeFingerprint, PushBaseline, PushIntent, RemoteHighWater};
+use crate::sync::{
+    classify, AuthenticatedRevision, BoundInspection, EnvelopeFingerprint, LocalSnapshot,
+    PayloadRelation, PushBaseline, PushIntent, PushReconciliation, RemoteHighWater,
+    RemoteObservation, SyncClassification,
+};
 
 pub const SYNC_STATE_FORMAT: &str = "localvault-sync-state";
 pub const SYNC_STATE_VERSION: u32 = 1;
@@ -584,6 +608,638 @@ impl SyncStateLoad {
             Err(_) => Self::Corrupt,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pure transitions (Stage 1U-4, slice A2b)
+// ---------------------------------------------------------------------------
+//
+// Every function below is pure and deterministic: it reads its arguments, never
+// mutates them, and returns either a proposal or a typed refusal. See the module
+// documentation for what a proposal does and does not mean.
+//
+// What the evidence does and does not establish (applies to every transition):
+//
+// * A fingerprint proves byte identity only. A revision is a write counter, not
+//   a freshness proof, and a revision above the high-water mark does **not**
+//   prove that a version descends from another one; the provider is not assumed
+//   honest. The high-water mark is trusted only relative to this device's own
+//   persisted history and the authenticated observations that fed it.
+// * `RemoteEvidence::Absent`, `RemoteObservation::Absent` and
+//   `SyncStateLoad::NotConfigured` are *assertions of the platform adapter*. The
+//   pure core cannot prove that a file is physically missing: the adapter must
+//   have established it with correct error handling (an I/O failure is
+//   `Unavailable`, never `Absent`) and must create the remote with no-clobber
+//   semantics so that a concurrently created file is never overwritten.
+// * Matching locator strings do not prove that two differently written
+//   paths/URIs name different physical files; adapters check that themselves.
+
+/// Why a transition was refused.
+///
+/// Fixed variants only. A refusal never carries (and its `Display`/`Debug`
+/// never show) a vault id, locator, path, URI, key, password, ciphertext,
+/// plaintext, fingerprint or raw JSON; the nested categories are fixed enums.
+/// A refusal changes nothing and authorizes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TransitionRefusal {
+    #[error("the explicit user approval was withheld")]
+    ApprovalWithheld,
+    #[error("a synchronization binding already exists; it must be reset explicitly")]
+    ExistingBinding,
+    #[error("the prior synchronization state could not be established")]
+    PriorStateUnknown,
+    #[error("the remote exists; it cannot be treated as an initial publication target")]
+    RemoteNotAbsent,
+    #[error("the remote is absent")]
+    RemoteAbsent,
+    #[error("the remote disappeared since the last synchronization")]
+    RemoteDisappeared,
+    #[error("the remote could not be read")]
+    RemoteUnavailable,
+    #[error("the remote is not byte-identical to the local envelope")]
+    RemoteDiffers,
+    #[error("the local payload predates the revision counter")]
+    LocalUnversioned,
+    #[error("the remote payload predates the revision counter")]
+    RemoteUnversioned,
+    #[error("binding mismatch: {0}")]
+    BindingMismatch(BindingMismatch),
+    #[error("the state has no synchronized checkpoint")]
+    NotBased,
+    #[error("the state has no pending push")]
+    NoPendingPush,
+    #[error("a push is already pending and must be reconciled first")]
+    PendingIntentExists,
+    #[error("the local envelope has not changed since the last synchronization")]
+    NoLocalChanges,
+    #[error("the remote changed since the last synchronization")]
+    RemoteAhead,
+    #[error("local and remote both changed since the last synchronization")]
+    Diverged,
+    #[error("local and remote both changed to identical bytes")]
+    Converged,
+    #[error("the local change is only a wrapper or re-encryption change")]
+    WrapperChangeBlocked,
+    #[error("two different histories claim the same revision")]
+    SameRevisionConflict,
+    #[error("the relation between local and remote cannot be established")]
+    AmbiguousChange,
+    #[error("the remote bytes authenticate to a different revision than recorded")]
+    BaselineRevisionMismatch,
+    #[error("the remote is below the trusted high-water revision")]
+    KnownRegression,
+    #[error("the local revision is not strictly above the trusted high-water revision")]
+    NotStrictlyAboveHighWater,
+    #[error("the resulting state is invalid: {0}")]
+    InvalidState(SyncStateError),
+}
+
+/// Whether the user explicitly approved the binding workflow being proposed.
+/// The pure core only checks that the calling workflow obtained it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserApproval {
+    Granted,
+    Withheld,
+}
+
+/// What an adapter established about the remote at one point in time, as input
+/// to a transition. Contrast with [`RemoteObservation`], which carries only a
+/// fingerprint: `Inspected` carries a [`BoundInspection`], i.e. authenticated
+/// evidence bound to the exact raw bytes of both envelopes.
+///
+/// `Absent` and `Unavailable` are adapter assertions (see the section notes); a
+/// read failure must be `Unavailable`, never `Absent`.
+#[derive(Debug, Clone, Copy)]
+pub enum RemoteEvidence<'a> {
+    Absent,
+    Unavailable,
+    Inspected(&'a BoundInspection),
+}
+
+/// Caller-supplied identity material for a **new** binding. Plain parameters,
+/// validated when a state is built from them: a nil binding id or identical
+/// locators is refused as [`TransitionRefusal::InvalidState`].
+///
+/// The salt must be fresh randomness from the adapter. No vault id is accepted
+/// here: the tag is derived from the vault identity carried by the evidence.
+#[derive(Clone)]
+pub struct NewBinding<'a> {
+    pub binding_id: Uuid,
+    pub tag_salt: [u8; BINDING_SALT_LEN],
+    pub local_locator: &'a Locator,
+    pub target_locator: &'a Locator,
+}
+
+// Nothing is printed: the salt and locators are redacted by their own types, and
+// the rest adds nothing worth showing.
+impl fmt::Debug for NewBinding<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NewBinding(<redacted>)")
+    }
+}
+
+/// Result of [`record_remote_observation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HighWaterOutcome {
+    /// A newer authenticated remote revision: a proposed state whose only
+    /// difference is a higher `high_water`. The synchronized fingerprint and
+    /// revision are untouched, and nothing is authorized (no push, no pull).
+    Raised(Box<SyncState>),
+    /// The observation equals the current mark: nothing to change or persist.
+    Unchanged,
+    /// The authenticated remote is below the mark: the remote is known to have
+    /// held something newer (a replayed or restored older copy, or a lost
+    /// write). The mark is **not** lowered and the binding is not reset; this
+    /// needs the user's attention.
+    KnownRegression,
+}
+
+/// Result of [`reconcile_pending_push`]. Every variant is a *proposal or
+/// report*; none is an instruction to upload, retry, discard or adopt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushResolution {
+    /// The remote holds exactly the intended bytes, with the intended
+    /// authenticated revision. One proposed state: the checkpoint advanced to
+    /// the intended fingerprint and revision, the high-water mark raised
+    /// monotonically, and the pending push cleared, all in one replacement. The
+    /// payload revision is not incremented again.
+    Finalize {
+        intent_id: Uuid,
+        state: Box<SyncState>,
+    },
+    /// The remote still holds the original baseline: a proposed state with the
+    /// pending push removed and the checkpoint and high-water mark unchanged.
+    ///
+    /// This is a snapshot. It does not prove that the provider has no earlier
+    /// write still in flight, and it does not authorize a retry: before
+    /// applying it the adapter must establish safe quiescence (nothing can
+    /// still complete the abandoned write).
+    ClearIntent {
+        intent_id: Uuid,
+        state: Box<SyncState>,
+    },
+    /// An initial publication whose remote is still absent: propose deleting
+    /// the unbased record. The same snapshot and quiescence caveats as
+    /// [`ClearIntent`](Self::ClearIntent) apply, and absence must be
+    /// re-established by the adapter, not assumed.
+    DeleteUnbasedRecord { intent_id: Uuid },
+    /// Unreadable, unexpectedly missing, corrupt, a third version, or evidence
+    /// that is inconsistent with the recorded intent. The pending push stays,
+    /// the checkpoint does not move, no new publication may start, and neither
+    /// version is discarded; this needs explicit future user resolution.
+    StillPending { intent_id: Uuid },
+}
+
+/// Propose the initial binding for a **confirmed-absent** remote: an unbased
+/// state holding a pending initial publication from an absent baseline.
+///
+/// Nothing is written. The adapter must persist the returned state and read it
+/// back **before** it attempts the no-clobber creation of the remote, so that a
+/// crash between the two leaves a recorded intent to reconcile.
+///
+/// Requires: explicit approval; `prior` is [`SyncStateLoad::NotConfigured`] (a
+/// loaded binding is [`ExistingBinding`](TransitionRefusal::ExistingBinding) and
+/// is never silently replaced; `Unreadable`, `Corrupt` and `UnsupportedVersion`
+/// are [`PriorStateUnknown`](TransitionRefusal::PriorStateUnknown), never
+/// absence); the adapter's assertion `remote == Absent`; and a
+/// [`LocalSnapshot`] with a schema-3 counter revision. The pending push records
+/// the exact fingerprint and authenticated revision of that snapshot.
+pub fn plan_initial_publication(
+    prior: &SyncStateLoad,
+    approval: UserApproval,
+    remote: RemoteObservation,
+    local: &LocalSnapshot,
+    binding: &NewBinding<'_>,
+    intent_id: Uuid,
+) -> Result<SyncState, TransitionRefusal> {
+    require_approval(approval)?;
+    require_not_configured(prior)?;
+
+    match remote {
+        RemoteObservation::Absent => {}
+        RemoteObservation::Present(_) => return Err(TransitionRefusal::RemoteNotAbsent),
+        RemoteObservation::Unavailable => return Err(TransitionRefusal::RemoteUnavailable),
+    }
+
+    let revision = counter(local.revision()).ok_or(TransitionRefusal::LocalUnversioned)?;
+
+    let intent = PushIntent::new(PushBaseline::Absent, *local.fingerprint())
+        .map_err(|_| invalid(SyncStateError::InvalidPushIntent))?;
+    let pending = PendingPush::new(intent_id, intent, revision).map_err(invalid)?;
+
+    new_state(
+        binding,
+        local.authenticated_vault_id(),
+        SyncBase::Unbased,
+        Some(pending),
+    )
+}
+
+/// Propose the initial binding to an **existing remote that is byte-identical**
+/// to the local envelope: a based state at the authenticated revision, with the
+/// high-water mark starting there and no pending push.
+///
+/// Requires: explicit approval; `prior` is `NotConfigured` (see
+/// [`plan_initial_publication`] for the other load outcomes); inspected
+/// evidence whose raw local and remote fingerprints are equal and whose payloads
+/// authenticated under the current Vault Key and expected vault identity (that is
+/// what a [`BoundInspection`] is); and a schema-3 counter revision. A remote
+/// that differs, is absent or unavailable, or a legacy payload is refused. The
+/// remote cannot be corrupt or foreign here: such bytes never produce a
+/// `BoundInspection`.
+pub fn bind_identical_remote(
+    prior: &SyncStateLoad,
+    approval: UserApproval,
+    remote: RemoteEvidence<'_>,
+    binding: &NewBinding<'_>,
+) -> Result<SyncState, TransitionRefusal> {
+    require_approval(approval)?;
+    require_not_configured(prior)?;
+
+    let bound = match remote {
+        RemoteEvidence::Inspected(bound) => bound,
+        RemoteEvidence::Absent => return Err(TransitionRefusal::RemoteAbsent),
+        RemoteEvidence::Unavailable => return Err(TransitionRefusal::RemoteUnavailable),
+    };
+
+    if bound.local_fingerprint() != bound.candidate_fingerprint() {
+        return Err(TransitionRefusal::RemoteDiffers);
+    }
+
+    let local_revision =
+        counter(bound.inspection().local_revision()).ok_or(TransitionRefusal::LocalUnversioned)?;
+    let remote_revision = counter(bound.inspection().candidate_revision())
+        .ok_or(TransitionRefusal::RemoteUnversioned)?;
+
+    // Identical bytes authenticate to one revision; anything else is not a
+    // state this transition may bind.
+    if local_revision != remote_revision {
+        return Err(TransitionRefusal::RemoteDiffers);
+    }
+
+    let checkpoint = SyncCheckpoint::new(
+        *bound.local_fingerprint(),
+        local_revision,
+        RemoteHighWater::new(local_revision),
+    )
+    .map_err(invalid)?;
+
+    new_state(
+        binding,
+        bound.authenticated_vault_id(),
+        SyncBase::Based(checkpoint),
+        None,
+    )
+}
+
+/// Record a newly authenticated remote revision against the trusted high-water
+/// mark.
+///
+/// Requires a based state without a pending push (a pending push blocks every
+/// observation-based change and is left intact), a verified binding, and a
+/// schema-3 remote revision. The mark only ever rises: a higher revision yields
+/// [`HighWaterOutcome::Raised`], an equal one [`Unchanged`](HighWaterOutcome::Unchanged),
+/// and a lower one reports [`KnownRegression`](HighWaterOutcome::KnownRegression)
+/// without lowering anything or resetting the binding.
+///
+/// Observing a newer remote never moves the synchronized fingerprint or revision
+/// and never authorizes an upload or adopting remote data.
+pub fn record_remote_observation(
+    state: &SyncState,
+    expected_local: &Locator,
+    expected_target: &Locator,
+    observation: &BoundInspection,
+) -> Result<HighWaterOutcome, TransitionRefusal> {
+    check_binding(
+        state,
+        Some(observation.authenticated_vault_id()),
+        expected_local,
+        expected_target,
+    )?;
+
+    let SyncBase::Based(checkpoint) = state.base else {
+        return Err(TransitionRefusal::NotBased);
+    };
+
+    if state.pending_push.is_some() {
+        return Err(TransitionRefusal::PendingIntentExists);
+    }
+
+    let observed = counter(observation.inspection().candidate_revision())
+        .ok_or(TransitionRefusal::RemoteUnversioned)?;
+
+    let current = checkpoint.high_water.revision();
+
+    match observed.cmp(&current) {
+        std::cmp::Ordering::Less => Ok(HighWaterOutcome::KnownRegression),
+        std::cmp::Ordering::Equal => Ok(HighWaterOutcome::Unchanged),
+        std::cmp::Ordering::Greater => {
+            let raised = SyncCheckpoint::new(
+                checkpoint.synced,
+                checkpoint.synced_revision,
+                RemoteHighWater::new(observed.max(current)),
+            )
+            .map_err(invalid)?;
+
+            let proposed = state
+                .with_parts(SyncBase::Based(raised), None)
+                .map_err(invalid)?;
+
+            Ok(HighWaterOutcome::Raised(Box::new(proposed)))
+        }
+    }
+}
+
+/// Evaluate whether a new outgoing publication can be prepared and, if so,
+/// propose the state that records it as a pending push.
+///
+/// The returned state is a *durable intent candidate*. Nothing is uploaded. The
+/// adapter must persist it atomically, read it back and verify it, repeat the
+/// remote stale check, and only then attempt the remote write; any crash leaves
+/// the previous durable state as the source of truth, and a pending push blocks
+/// every further push until it is explicitly reconciled. There is no automatic
+/// retry.
+///
+/// Accepted only when all of these hold: the binding (verified vault identity
+/// from `remote` and both locators) matches; the state is based and has no
+/// pending push; both payloads authenticated with schema-3 counters; the remote
+/// bytes equal the synchronized fingerprint and authenticate to the recorded
+/// synchronized revision; the remote is not below the high-water mark; the local
+/// envelope is the only side that changed ([`SyncClassification::LocalAhead`])
+/// with a genuine payload change (not a wrapper-only or re-encryption change,
+/// not a same-revision conflict); and the authenticated local revision is
+/// strictly above the high-water mark.
+///
+/// A higher revision does **not** prove that the local state descends from the
+/// synchronized one. The caller-supplied `intent_id` must be fresh and non-nil.
+/// The evidence's own `checkpoint()` comparison is deliberately ignored: it
+/// depends on a mark the inspection does not record, so this function compares
+/// revisions against the state's own mark.
+pub fn begin_push(
+    state: &SyncState,
+    expected_local: &Locator,
+    expected_target: &Locator,
+    remote: RemoteEvidence<'_>,
+    intent_id: Uuid,
+) -> Result<SyncState, TransitionRefusal> {
+    let vault_id = match remote {
+        RemoteEvidence::Inspected(bound) => Some(bound.authenticated_vault_id()),
+        RemoteEvidence::Absent | RemoteEvidence::Unavailable => None,
+    };
+    check_binding(state, vault_id, expected_local, expected_target)?;
+
+    let SyncBase::Based(checkpoint) = state.base else {
+        return Err(TransitionRefusal::NotBased);
+    };
+
+    if state.pending_push.is_some() {
+        return Err(TransitionRefusal::PendingIntentExists);
+    }
+
+    let bound = match remote {
+        RemoteEvidence::Inspected(bound) => bound,
+        RemoteEvidence::Absent => return Err(TransitionRefusal::RemoteDisappeared),
+        RemoteEvidence::Unavailable => return Err(TransitionRefusal::RemoteUnavailable),
+    };
+
+    let inspection = bound.inspection();
+    let local_revision =
+        counter(inspection.local_revision()).ok_or(TransitionRefusal::LocalUnversioned)?;
+    let remote_revision =
+        counter(inspection.candidate_revision()).ok_or(TransitionRefusal::RemoteUnversioned)?;
+
+    match classify(
+        Some(&checkpoint.synced),
+        bound.local_fingerprint(),
+        &RemoteObservation::Present(*bound.candidate_fingerprint()),
+    ) {
+        SyncClassification::LocalAhead => {}
+        SyncClassification::InSync => return Err(TransitionRefusal::NoLocalChanges),
+        SyncClassification::RemoteAhead => return Err(TransitionRefusal::RemoteAhead),
+        SyncClassification::Diverged => return Err(TransitionRefusal::Diverged),
+        SyncClassification::Converged => return Err(TransitionRefusal::Converged),
+        // Not reachable for a present remote with a recorded baseline.
+        _ => return Err(TransitionRefusal::AmbiguousChange),
+    }
+
+    // Local differs from the synchronized bytes and the remote still equals
+    // them. Distinguish a real payload change from a wrapper/re-encryption one.
+    match inspection.payload() {
+        PayloadRelation::IdenticalCiphertext
+        | PayloadRelation::EquivalentContentDifferentCiphertext => {
+            return Err(TransitionRefusal::WrapperChangeBlocked);
+        }
+        PayloadRelation::SameRevisionDifferentContent => {
+            return Err(TransitionRefusal::SameRevisionConflict);
+        }
+        PayloadRelation::Unordered => return Err(TransitionRefusal::AmbiguousChange),
+        PayloadRelation::CandidateLowerRevision | PayloadRelation::CandidateHigherRevision => {}
+    }
+
+    if remote_revision != checkpoint.synced_revision {
+        return Err(TransitionRefusal::BaselineRevisionMismatch);
+    }
+
+    if remote_revision < checkpoint.high_water.revision() {
+        return Err(TransitionRefusal::KnownRegression);
+    }
+
+    // Also refuses a local payload that is behind the remote.
+    if local_revision <= checkpoint.high_water.revision() {
+        return Err(TransitionRefusal::NotStrictlyAboveHighWater);
+    }
+
+    // After the checks above the local side must be strictly ahead of the
+    // remote; anything else is not a state this function may act on.
+    if inspection.payload() != PayloadRelation::CandidateLowerRevision {
+        return Err(TransitionRefusal::AmbiguousChange);
+    }
+
+    let intent = PushIntent::new(
+        PushBaseline::Present(checkpoint.synced),
+        *bound.local_fingerprint(),
+    )
+    .map_err(|_| invalid(SyncStateError::InvalidPushIntent))?;
+    let pending = PendingPush::new(intent_id, intent, local_revision).map_err(invalid)?;
+
+    state.with_parts(state.base, Some(pending)).map_err(invalid)
+}
+
+/// Judge a persisted pending push against a fresh remote observation, using the
+/// accepted [`PushIntent::reconcile`] semantics, and propose the matching state
+/// change. Nothing is persisted and nothing is retried.
+///
+/// * **Published**: the remote holds exactly the intended bytes *and* they
+///   authenticate to the intended revision → [`PushResolution::Finalize`].
+/// * **Not published**: the remote is at the original baseline (still absent, for
+///   an initial publication; for a based push, the baseline bytes authenticating
+///   to the recorded synchronized revision) → [`PushResolution::ClearIntent`] or
+///   [`PushResolution::DeleteUnbasedRecord`]. This is a snapshot only; see those
+///   variants for the quiescence the adapter must establish first.
+/// * **Anything else** (unreadable, unexpectedly missing, a third version, or
+///   inconsistent evidence) → [`PushResolution::StillPending`].
+///
+/// A [`NoPendingPush`](TransitionRefusal::NoPendingPush) refusal makes a repeated
+/// reconciliation of an already-finalized state harmless: the revision is never
+/// applied twice. Without inspected evidence (`Absent`/`Unavailable`) only the
+/// locators of the binding can be verified.
+pub fn reconcile_pending_push(
+    state: &SyncState,
+    expected_local: &Locator,
+    expected_target: &Locator,
+    remote: RemoteEvidence<'_>,
+) -> Result<PushResolution, TransitionRefusal> {
+    let vault_id = match remote {
+        RemoteEvidence::Inspected(bound) => Some(bound.authenticated_vault_id()),
+        RemoteEvidence::Absent | RemoteEvidence::Unavailable => None,
+    };
+    check_binding(state, vault_id, expected_local, expected_target)?;
+
+    let pending = state.pending_push.ok_or(TransitionRefusal::NoPendingPush)?;
+    let intent_id = pending.intent_id;
+    let still_pending = Ok(PushResolution::StillPending { intent_id });
+
+    let (observed, revision) = match remote {
+        RemoteEvidence::Absent => (RemoteObservation::Absent, None),
+        RemoteEvidence::Unavailable => (RemoteObservation::Unavailable, None),
+        RemoteEvidence::Inspected(bound) => (
+            RemoteObservation::Present(*bound.candidate_fingerprint()),
+            counter(bound.inspection().candidate_revision()),
+        ),
+    };
+
+    match pending.intent.reconcile(&observed) {
+        PushReconciliation::Published => {
+            if revision != Some(pending.intended_revision) {
+                return still_pending;
+            }
+
+            let previous = match state.base {
+                SyncBase::Based(checkpoint) => checkpoint.high_water.revision(),
+                SyncBase::Unbased => 0,
+            };
+            let checkpoint = SyncCheckpoint::new(
+                *pending.intent.intended(),
+                pending.intended_revision,
+                RemoteHighWater::new(previous.max(pending.intended_revision)),
+            )
+            .map_err(invalid)?;
+            let proposed = state
+                .with_parts(SyncBase::Based(checkpoint), None)
+                .map_err(invalid)?;
+
+            Ok(PushResolution::Finalize {
+                intent_id,
+                state: Box::new(proposed),
+            })
+        }
+        PushReconciliation::NotPublished => match state.base {
+            SyncBase::Unbased => Ok(PushResolution::DeleteUnbasedRecord { intent_id }),
+            SyncBase::Based(checkpoint) => {
+                if revision != Some(checkpoint.synced_revision) {
+                    return still_pending;
+                }
+
+                let proposed = state
+                    .with_parts(SyncBase::Based(checkpoint), None)
+                    .map_err(invalid)?;
+
+                Ok(PushResolution::ClearIntent {
+                    intent_id,
+                    state: Box::new(proposed),
+                })
+            }
+        },
+        PushReconciliation::Unknown => still_pending,
+    }
+}
+
+impl SyncState {
+    /// A copy with a different base and pending push, revalidated by
+    /// [`SyncState::new`]. The binding identity and locators are carried over.
+    fn with_parts(
+        &self,
+        base: SyncBase,
+        pending_push: Option<PendingPush>,
+    ) -> Result<SyncState, SyncStateError> {
+        SyncState::new(
+            self.binding_id,
+            self.vault_tag,
+            self.local_locator.clone(),
+            self.target_locator.clone(),
+            base,
+            pending_push,
+        )
+    }
+}
+
+fn invalid(error: SyncStateError) -> TransitionRefusal {
+    TransitionRefusal::InvalidState(error)
+}
+
+fn counter(revision: AuthenticatedRevision) -> Option<u64> {
+    match revision {
+        AuthenticatedRevision::Counter(value) => Some(value),
+        AuthenticatedRevision::Unversioned { .. } => None,
+    }
+}
+
+fn require_approval(approval: UserApproval) -> Result<(), TransitionRefusal> {
+    match approval {
+        UserApproval::Granted => Ok(()),
+        UserApproval::Withheld => Err(TransitionRefusal::ApprovalWithheld),
+    }
+}
+
+/// Only a confirmed absence of any prior state authorizes an initial binding.
+fn require_not_configured(prior: &SyncStateLoad) -> Result<(), TransitionRefusal> {
+    match prior {
+        SyncStateLoad::NotConfigured => Ok(()),
+        SyncStateLoad::Loaded(_) => Err(TransitionRefusal::ExistingBinding),
+        SyncStateLoad::Unreadable | SyncStateLoad::Corrupt | SyncStateLoad::UnsupportedVersion => {
+            Err(TransitionRefusal::PriorStateUnknown)
+        }
+    }
+}
+
+/// Verify the binding of an existing state. With evidence, the vault tag is
+/// checked against the identity the evidence was authenticated for; without it
+/// (an absent or unavailable remote) only the locators can be checked.
+fn check_binding(
+    state: &SyncState,
+    authenticated_vault_id: Option<Uuid>,
+    expected_local: &Locator,
+    expected_target: &Locator,
+) -> Result<(), TransitionRefusal> {
+    let result = match authenticated_vault_id {
+        Some(vault_id) => state.verify_binding(vault_id, expected_local, expected_target),
+        None if &state.local_locator != expected_local => Err(BindingMismatch::LocalLocator),
+        None if &state.target_locator != expected_target => Err(BindingMismatch::TargetLocator),
+        None => Ok(()),
+    };
+
+    result.map_err(TransitionRefusal::BindingMismatch)
+}
+
+fn new_state(
+    binding: &NewBinding<'_>,
+    authenticated_vault_id: Uuid,
+    base: SyncBase,
+    pending_push: Option<PendingPush>,
+) -> Result<SyncState, TransitionRefusal> {
+    let binding_id = BindingId::new(binding.binding_id).map_err(invalid)?;
+    let vault_tag =
+        VaultBindingTag::derive(binding.tag_salt, authenticated_vault_id).map_err(invalid)?;
+
+    SyncState::new(
+        binding_id,
+        vault_tag,
+        binding.local_locator.clone(),
+        binding.target_locator.clone(),
+        base,
+        pending_push,
+    )
+    .map_err(invalid)
 }
 
 // ---------------------------------------------------------------------------
@@ -2430,5 +3086,1646 @@ mod tests {
                 assert_eq!(left == right, i == j, "{} vs {}", label(left), label(right));
             }
         }
+    }
+}
+
+/// Stage 1U-4 A2b tests for the pure transitions. Evidence comes from real
+/// (synthetic) sealed envelopes through `inspect_remote_bytes` /
+/// `inspect_local_bytes`; no committed fixture is read or modified.
+#[cfg(test)]
+mod transition_tests {
+    use std::sync::OnceLock;
+
+    use super::*;
+    use crate::sync::{inspect_local_bytes, inspect_remote_bytes};
+    use crate::vault::{
+        data::{
+            VaultData, VaultEntry, LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        },
+        format::{create_envelope_with_key, reseal_envelope, SecretKey, VaultEnvelope},
+    };
+
+    const LOCAL: &str = "synthetic/local/LOCAL-MARKER.lvault";
+    const TARGET: &str = "synthetic/remote/TARGET-MARKER.lvault";
+    const OTHER: &str = "synthetic/other/OTHER-MARKER.lvault";
+
+    const VAULT_ID: Uuid = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+    const FOREIGN_VAULT_ID: Uuid = Uuid::from_u128(0x0f0f_0f0f_0f0f_0f0f_0f0f_0f0f_0f0f_0f0f);
+    const BINDING: Uuid = Uuid::from_u128(0x1111_1111_2222_3333_4444_5555_5555_5555);
+    const INTENT: Uuid = Uuid::from_u128(0xaaaa_aaaa_bbbb_4ccc_8ddd_eeee_eeee_eeee);
+
+    const MASTER: &str = "transition-test-only-master-password";
+    const SECRET: &str = "TRANSITION_TEST_ONLY_SECRET";
+    const NOW_MS: i64 = 1_700_000_000_000;
+
+    // ---- evidence rig -------------------------------------------------------
+
+    struct Rig {
+        template: VaultEnvelope,
+        key: SecretKey,
+        base: VaultData,
+    }
+
+    impl Rig {
+        fn build(vault_id: Uuid) -> Self {
+            let mut base = VaultData::new(NOW_MS).unwrap();
+            base.vault_id = vault_id;
+
+            let mut entry = VaultEntry::new("Base Entry", NOW_MS).unwrap();
+            entry.password = SECRET.to_owned();
+            base.entries.push(entry);
+
+            base.revision = 1;
+            base.validate().unwrap();
+
+            let (template, key) =
+                create_envelope_with_key(MASTER, &serde_json::to_vec(&base).unwrap()).unwrap();
+
+            Self {
+                template,
+                key,
+                base,
+            }
+        }
+
+        fn seal(&self, data: &VaultData) -> VaultEnvelope {
+            reseal_envelope(
+                &self.template,
+                &self.key,
+                &serde_json::to_vec(data).unwrap(),
+            )
+            .unwrap()
+        }
+
+        /// Raw bytes of a fresh envelope. Encryption is randomized, so every call
+        /// returns different bytes; tests keep what they need.
+        fn raw_with(&self, revision: u64, title: &str) -> Vec<u8> {
+            let mut data = self.base.clone();
+            data.revision = revision;
+            data.entries[0].title = title.to_owned();
+
+            serde_json::to_vec(&self.seal(&data)).unwrap()
+        }
+
+        fn raw_at(&self, revision: u64) -> Vec<u8> {
+            self.raw_with(revision, "Base Entry")
+        }
+
+        fn legacy_raw(&self, schema: u16) -> Vec<u8> {
+            let mut data = self.base.clone();
+            data.schema_version = schema;
+            data.revision = 0;
+
+            serde_json::to_vec(&self.seal(&data)).unwrap()
+        }
+    }
+
+    fn rig() -> &'static Rig {
+        static RIG: OnceLock<Rig> = OnceLock::new();
+        RIG.get_or_init(|| Rig::build(VAULT_ID))
+    }
+
+    fn foreign() -> &'static Rig {
+        static RIG: OnceLock<Rig> = OnceLock::new();
+        RIG.get_or_init(|| Rig::build(FOREIGN_VAULT_ID))
+    }
+
+    /// Fixed envelope versions shared by every test.
+    struct Versions {
+        s7: Vec<u8>,
+        s7_resealed: Vec<u8>,
+        s7_rewrapped: Vec<u8>,
+        s7_pretty: Vec<u8>,
+        s7_conflict: Vec<u8>,
+        l5: Vec<u8>,
+        l6: Vec<u8>,
+        l8: Vec<u8>,
+        t9: Vec<u8>,
+        l10: Vec<u8>,
+        r12: Vec<u8>,
+        legacy: Vec<u8>,
+    }
+
+    fn v() -> &'static Versions {
+        static VERSIONS: OnceLock<Versions> = OnceLock::new();
+        VERSIONS.get_or_init(|| {
+            let rig = rig();
+            let s7 = rig.raw_at(7);
+
+            let mut rewrapped: VaultEnvelope = serde_json::from_slice(&s7).unwrap();
+            rewrapped.kdf_salt[0] ^= 0x01;
+
+            let parsed: VaultEnvelope = serde_json::from_slice(&s7).unwrap();
+
+            Versions {
+                s7_resealed: rig.raw_at(7),
+                s7_rewrapped: serde_json::to_vec(&rewrapped).unwrap(),
+                s7_pretty: serde_json::to_vec_pretty(&parsed).unwrap(),
+                s7_conflict: rig.raw_with(7, "Conflicting Entry"),
+                l5: rig.raw_at(5),
+                l6: rig.raw_at(6),
+                l8: rig.raw_at(8),
+                t9: rig.raw_at(9),
+                l10: rig.raw_at(10),
+                r12: rig.raw_at(12),
+                legacy: rig.legacy_raw(PRE_REVISION_VAULT_DATA_SCHEMA_VERSION),
+                s7,
+            }
+        })
+    }
+
+    fn fp_of(raw: &[u8]) -> EnvelopeFingerprint {
+        EnvelopeFingerprint::of_bytes(raw)
+    }
+
+    fn bound(local: &[u8], remote: &[u8]) -> BoundInspection {
+        inspect_remote_bytes(&rig().key, VAULT_ID, local, remote, None).unwrap()
+    }
+
+    fn snapshot(local: &[u8]) -> LocalSnapshot {
+        inspect_local_bytes(&rig().key, VAULT_ID, local).unwrap()
+    }
+
+    // ---- state builders -----------------------------------------------------
+
+    fn salt(seed: u8) -> [u8; BINDING_SALT_LEN] {
+        std::array::from_fn(|i| seed.wrapping_add(i as u8))
+    }
+
+    fn loc(value: &str) -> Locator {
+        Locator::new(value).unwrap()
+    }
+
+    fn locs() -> (Locator, Locator) {
+        (loc(LOCAL), loc(TARGET))
+    }
+
+    fn tag() -> VaultBindingTag {
+        VaultBindingTag::derive(salt(0), VAULT_ID).unwrap()
+    }
+
+    fn checkpoint(synced: &[u8], revision: u64, high_water: u64) -> SyncCheckpoint {
+        SyncCheckpoint::new(fp_of(synced), revision, RemoteHighWater::new(high_water)).unwrap()
+    }
+
+    fn pending(baseline: PushBaseline, intended: &[u8], revision: u64) -> PendingPush {
+        PendingPush::new(
+            INTENT,
+            PushIntent::new(baseline, fp_of(intended)).unwrap(),
+            revision,
+        )
+        .unwrap()
+    }
+
+    fn build(base: SyncBase, pending_push: Option<PendingPush>) -> SyncState {
+        SyncState::new(
+            BindingId::new(BINDING).unwrap(),
+            tag(),
+            loc(LOCAL),
+            loc(TARGET),
+            base,
+            pending_push,
+        )
+        .unwrap()
+    }
+
+    /// Synced S (revision 7), high-water 7, nothing pending.
+    fn based() -> SyncState {
+        build(SyncBase::Based(checkpoint(&v().s7, 7, 7)), None)
+    }
+
+    /// As [`based`], with a push of L (revision 8) pending.
+    fn based_pending() -> SyncState {
+        build(
+            SyncBase::Based(checkpoint(&v().s7, 7, 7)),
+            Some(pending(PushBaseline::Present(fp_of(&v().s7)), &v().l8, 8)),
+        )
+    }
+
+    /// An initial publication of L (revision 8) pending.
+    fn unbased_pending() -> SyncState {
+        build(
+            SyncBase::Unbased,
+            Some(pending(PushBaseline::Absent, &v().l8, 8)),
+        )
+    }
+
+    // ---- transition shorthands ---------------------------------------------
+
+    fn push(state: &SyncState, remote: RemoteEvidence<'_>) -> Result<SyncState, TransitionRefusal> {
+        let (l, t) = locs();
+        begin_push(state, &l, &t, remote, INTENT)
+    }
+
+    fn reconcile(
+        state: &SyncState,
+        remote: RemoteEvidence<'_>,
+    ) -> Result<PushResolution, TransitionRefusal> {
+        let (l, t) = locs();
+        reconcile_pending_push(state, &l, &t, remote)
+    }
+
+    fn observe(
+        state: &SyncState,
+        observation: &BoundInspection,
+    ) -> Result<HighWaterOutcome, TransitionRefusal> {
+        let (l, t) = locs();
+        record_remote_observation(state, &l, &t, observation)
+    }
+
+    fn new_binding<'a>(local: &'a Locator, target: &'a Locator) -> NewBinding<'a> {
+        NewBinding {
+            binding_id: BINDING,
+            tag_salt: salt(0),
+            local_locator: local,
+            target_locator: target,
+        }
+    }
+
+    fn publish(
+        prior: &SyncStateLoad,
+        approval: UserApproval,
+        remote: RemoteObservation,
+        local: &LocalSnapshot,
+    ) -> Result<SyncState, TransitionRefusal> {
+        let (l, t) = locs();
+        plan_initial_publication(prior, approval, remote, local, &new_binding(&l, &t), INTENT)
+    }
+
+    fn bind(
+        prior: &SyncStateLoad,
+        approval: UserApproval,
+        remote: RemoteEvidence<'_>,
+    ) -> Result<SyncState, TransitionRefusal> {
+        let (l, t) = locs();
+        bind_identical_remote(prior, approval, remote, &new_binding(&l, &t))
+    }
+
+    fn checkpoint_of(state: &SyncState) -> SyncCheckpoint {
+        match state.base() {
+            SyncBase::Based(checkpoint) => *checkpoint,
+            SyncBase::Unbased => panic!("expected a based state"),
+        }
+    }
+
+    fn assert_round_trips(state: &SyncState) {
+        assert_eq!(&SyncState::decode(&state.encode().unwrap()).unwrap(), state);
+    }
+
+    // ---- initial binding: confirmed absent remote ---------------------------
+
+    #[test]
+    fn a_confirmed_absent_remote_yields_an_unbased_state_with_a_pending_initial_publication() {
+        let local = snapshot(&v().l8);
+        let (l, t) = locs();
+
+        let state = publish(
+            &SyncStateLoad::NotConfigured,
+            UserApproval::Granted,
+            RemoteObservation::Absent,
+            &local,
+        )
+        .unwrap();
+
+        assert_eq!(state.base(), &SyncBase::Unbased);
+        assert_eq!(state.binding_id().uuid(), BINDING);
+        assert_eq!(state.local_locator(), &l);
+        assert_eq!(state.target_locator(), &t);
+
+        let pending = state.pending_push().unwrap();
+        assert_eq!(pending.intent_id(), INTENT);
+        assert_eq!(pending.intent().baseline(), &PushBaseline::Absent);
+        assert_eq!(pending.intent().intended(), &fp_of(&v().l8));
+        assert_eq!(pending.intended_revision(), 8);
+
+        // The tag follows the authenticated identity of the evidence.
+        assert!(state.vault_tag().matches_vault(VAULT_ID));
+        assert!(!state.vault_tag().matches_vault(FOREIGN_VAULT_ID));
+
+        assert_round_trips(&state);
+    }
+
+    #[test]
+    fn the_binding_identity_comes_from_the_evidence_not_from_the_caller() {
+        let foreign_raw = foreign().raw_at(2);
+        let foreign_snapshot =
+            inspect_local_bytes(&foreign().key, FOREIGN_VAULT_ID, &foreign_raw).unwrap();
+
+        let state = publish(
+            &SyncStateLoad::NotConfigured,
+            UserApproval::Granted,
+            RemoteObservation::Absent,
+            &foreign_snapshot,
+        )
+        .unwrap();
+
+        assert!(state.vault_tag().matches_vault(FOREIGN_VAULT_ID));
+        assert!(!state.vault_tag().matches_vault(VAULT_ID));
+    }
+
+    #[test]
+    fn initial_publication_of_revision_zero_is_a_valid_counter() {
+        let raw = rig().raw_at(0);
+
+        let state = publish(
+            &SyncStateLoad::NotConfigured,
+            UserApproval::Granted,
+            RemoteObservation::Absent,
+            &snapshot(&raw),
+        )
+        .unwrap();
+
+        assert_eq!(state.pending_push().unwrap().intended_revision(), 0);
+    }
+
+    #[test]
+    fn initial_publication_refuses_every_other_remote_observation() {
+        let local = snapshot(&v().l8);
+
+        for (remote, expected) in [
+            (
+                RemoteObservation::Present(fp_of(&v().s7)),
+                TransitionRefusal::RemoteNotAbsent,
+            ),
+            (
+                RemoteObservation::Present(fp_of(&v().l8)),
+                TransitionRefusal::RemoteNotAbsent,
+            ),
+            (
+                RemoteObservation::Unavailable,
+                TransitionRefusal::RemoteUnavailable,
+            ),
+        ] {
+            assert_eq!(
+                publish(
+                    &SyncStateLoad::NotConfigured,
+                    UserApproval::Granted,
+                    remote,
+                    &local
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn initial_publication_refuses_a_withheld_approval() {
+        assert_eq!(
+            publish(
+                &SyncStateLoad::NotConfigured,
+                UserApproval::Withheld,
+                RemoteObservation::Absent,
+                &snapshot(&v().l8),
+            ),
+            Err(TransitionRefusal::ApprovalWithheld)
+        );
+    }
+
+    #[test]
+    fn initial_publication_refuses_a_legacy_unversioned_payload() {
+        for schema in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            let raw = rig().legacy_raw(schema);
+
+            assert_eq!(
+                publish(
+                    &SyncStateLoad::NotConfigured,
+                    UserApproval::Granted,
+                    RemoteObservation::Absent,
+                    &snapshot(&raw),
+                ),
+                Err(TransitionRefusal::LocalUnversioned)
+            );
+        }
+    }
+
+    #[test]
+    fn initial_publication_validates_the_caller_supplied_identity_material() {
+        let local = snapshot(&v().l8);
+        let (l, t) = locs();
+
+        let mut nil_binding = new_binding(&l, &t);
+        nil_binding.binding_id = Uuid::nil();
+
+        assert_eq!(
+            plan_initial_publication(
+                &SyncStateLoad::NotConfigured,
+                UserApproval::Granted,
+                RemoteObservation::Absent,
+                &local,
+                &nil_binding,
+                INTENT,
+            ),
+            Err(TransitionRefusal::InvalidState(
+                SyncStateError::NilBindingId
+            ))
+        );
+
+        assert_eq!(
+            plan_initial_publication(
+                &SyncStateLoad::NotConfigured,
+                UserApproval::Granted,
+                RemoteObservation::Absent,
+                &local,
+                &new_binding(&l, &l),
+                INTENT,
+            ),
+            Err(TransitionRefusal::InvalidState(
+                SyncStateError::IdenticalLocators
+            ))
+        );
+
+        assert_eq!(
+            plan_initial_publication(
+                &SyncStateLoad::NotConfigured,
+                UserApproval::Granted,
+                RemoteObservation::Absent,
+                &local,
+                &new_binding(&l, &t),
+                Uuid::nil(),
+            ),
+            Err(TransitionRefusal::InvalidState(SyncStateError::NilIntentId))
+        );
+    }
+
+    // ---- initial binding: identical existing remote -------------------------
+
+    #[test]
+    fn an_identical_authenticated_remote_binds_at_its_revision() {
+        let evidence = bound(&v().s7, &v().s7);
+
+        let state = bind(
+            &SyncStateLoad::NotConfigured,
+            UserApproval::Granted,
+            RemoteEvidence::Inspected(&evidence),
+        )
+        .unwrap();
+
+        let checkpoint = checkpoint_of(&state);
+        assert_eq!(checkpoint.synced(), &fp_of(&v().s7));
+        assert_eq!(checkpoint.synced_revision(), 7);
+        assert_eq!(checkpoint.high_water(), RemoteHighWater::new(7));
+        assert!(state.pending_push().is_none());
+        assert!(state.vault_tag().matches_vault(VAULT_ID));
+        assert!(!state.vault_tag().matches_vault(FOREIGN_VAULT_ID));
+
+        assert_round_trips(&state);
+    }
+
+    #[test]
+    fn identical_binding_requires_byte_identity_not_just_equal_content() {
+        // Same authenticated content, different bytes: refused.
+        for other in [&v().s7_resealed, &v().s7_rewrapped, &v().s7_pretty] {
+            let evidence = bound(&v().s7, other);
+
+            assert_eq!(
+                bind(
+                    &SyncStateLoad::NotConfigured,
+                    UserApproval::Granted,
+                    RemoteEvidence::Inspected(&evidence),
+                ),
+                Err(TransitionRefusal::RemoteDiffers)
+            );
+        }
+
+        // A different version altogether.
+        let evidence = bound(&v().l8, &v().s7);
+
+        assert_eq!(
+            bind(
+                &SyncStateLoad::NotConfigured,
+                UserApproval::Granted,
+                RemoteEvidence::Inspected(&evidence),
+            ),
+            Err(TransitionRefusal::RemoteDiffers)
+        );
+    }
+
+    #[test]
+    fn identical_binding_refuses_absent_and_unavailable_remotes() {
+        assert_eq!(
+            bind(
+                &SyncStateLoad::NotConfigured,
+                UserApproval::Granted,
+                RemoteEvidence::Absent
+            ),
+            Err(TransitionRefusal::RemoteAbsent)
+        );
+        assert_eq!(
+            bind(
+                &SyncStateLoad::NotConfigured,
+                UserApproval::Granted,
+                RemoteEvidence::Unavailable
+            ),
+            Err(TransitionRefusal::RemoteUnavailable)
+        );
+    }
+
+    #[test]
+    fn identical_binding_refuses_a_legacy_payload_and_a_withheld_approval() {
+        for schema in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            let raw = rig().legacy_raw(schema);
+            let evidence = bound(&raw, &raw);
+
+            assert_eq!(
+                bind(
+                    &SyncStateLoad::NotConfigured,
+                    UserApproval::Granted,
+                    RemoteEvidence::Inspected(&evidence),
+                ),
+                Err(TransitionRefusal::LocalUnversioned)
+            );
+        }
+
+        let evidence = bound(&v().s7, &v().s7);
+
+        assert_eq!(
+            bind(
+                &SyncStateLoad::NotConfigured,
+                UserApproval::Withheld,
+                RemoteEvidence::Inspected(&evidence),
+            ),
+            Err(TransitionRefusal::ApprovalWithheld)
+        );
+    }
+
+    #[test]
+    fn a_corrupt_or_foreign_remote_never_yields_evidence_to_bind_with() {
+        let mut corrupt: VaultEnvelope = serde_json::from_slice(&v().s7).unwrap();
+        corrupt.payload.ciphertext[0] ^= 0x01;
+        let corrupt = serde_json::to_vec(&corrupt).unwrap();
+
+        assert!(inspect_remote_bytes(&rig().key, VAULT_ID, &v().s7, &corrupt, None).is_err());
+
+        let foreign_raw = foreign().raw_at(7);
+
+        assert!(inspect_remote_bytes(&rig().key, VAULT_ID, &v().s7, &foreign_raw, None).is_err());
+    }
+
+    // ---- the prior load outcome is never reinterpreted ----------------------
+
+    #[test]
+    fn only_not_configured_authorizes_an_initial_binding() {
+        let local = snapshot(&v().l8);
+        let evidence = bound(&v().s7, &v().s7);
+
+        let priors = [
+            (
+                SyncStateLoad::Loaded(Box::new(based())),
+                TransitionRefusal::ExistingBinding,
+            ),
+            (
+                SyncStateLoad::Loaded(Box::new(unbased_pending())),
+                TransitionRefusal::ExistingBinding,
+            ),
+            (
+                SyncStateLoad::Unreadable,
+                TransitionRefusal::PriorStateUnknown,
+            ),
+            (SyncStateLoad::Corrupt, TransitionRefusal::PriorStateUnknown),
+            (
+                SyncStateLoad::UnsupportedVersion,
+                TransitionRefusal::PriorStateUnknown,
+            ),
+            (
+                SyncStateLoad::from_bytes(b"not a sync state"),
+                TransitionRefusal::PriorStateUnknown,
+            ),
+            (
+                SyncStateLoad::from_bytes(&[]),
+                TransitionRefusal::PriorStateUnknown,
+            ),
+        ];
+
+        for (prior, expected) in priors {
+            assert_eq!(
+                publish(
+                    &prior,
+                    UserApproval::Granted,
+                    RemoteObservation::Absent,
+                    &local
+                ),
+                Err(expected)
+            );
+            assert_eq!(
+                bind(
+                    &prior,
+                    UserApproval::Granted,
+                    RemoteEvidence::Inspected(&evidence)
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    // ---- high-water observations -------------------------------------------
+
+    #[test]
+    fn a_newer_authenticated_observation_raises_only_the_high_water() {
+        let state = based();
+        let before = state.clone();
+
+        let outcome = observe(&state, &bound(&v().s7, &v().r12)).unwrap();
+
+        let HighWaterOutcome::Raised(proposed) = outcome else {
+            panic!("expected a raised high-water");
+        };
+
+        let checkpoint = checkpoint_of(&proposed);
+        assert_eq!(checkpoint.high_water(), RemoteHighWater::new(12));
+        // The synchronized baseline did not move, and nothing was authorized.
+        assert_eq!(checkpoint.synced(), &fp_of(&v().s7));
+        assert_eq!(checkpoint.synced_revision(), 7);
+        assert!(proposed.pending_push().is_none());
+        assert_eq!(proposed.binding_id(), before.binding_id());
+        assert_eq!(proposed.local_locator(), before.local_locator());
+        assert_eq!(proposed.target_locator(), before.target_locator());
+
+        // The input was not mutated: until a proposal is persisted, the old
+        // state is the truth (a failed persistence leaves it so).
+        assert_eq!(state, before);
+        assert_ne!(*proposed, state);
+        assert_eq!(checkpoint_of(&state).high_water(), RemoteHighWater::new(7));
+
+        assert_round_trips(&proposed);
+    }
+
+    #[test]
+    fn an_equal_observation_changes_nothing() {
+        assert_eq!(
+            observe(&based(), &bound(&v().s7, &v().s7_resealed)),
+            Ok(HighWaterOutcome::Unchanged)
+        );
+    }
+
+    #[test]
+    fn an_older_observation_never_lowers_the_high_water_and_reports_a_regression() {
+        let state = based();
+
+        for older in [&v().l5, &v().l6] {
+            assert_eq!(
+                observe(&state, &bound(&v().s7, older)),
+                Ok(HighWaterOutcome::KnownRegression)
+            );
+        }
+
+        assert_eq!(checkpoint_of(&state).high_water(), RemoteHighWater::new(7));
+    }
+
+    #[test]
+    fn the_high_water_never_decreases_across_a_sequence_of_observations() {
+        let mut state = based();
+        let mut seen = checkpoint_of(&state).high_water().revision();
+
+        for remote in [&v().t9, &v().l5, &v().r12, &v().s7, &v().l10, &v().l6] {
+            if let Ok(HighWaterOutcome::Raised(next)) = observe(&state, &bound(&v().s7, remote)) {
+                state = *next;
+            }
+
+            let now = checkpoint_of(&state).high_water().revision();
+            assert!(now >= seen);
+            seen = now;
+        }
+
+        assert_eq!(seen, 12);
+        assert_eq!(checkpoint_of(&state).synced(), &fp_of(&v().s7));
+        assert_eq!(checkpoint_of(&state).synced_revision(), 7);
+    }
+
+    #[test]
+    fn a_pending_push_blocks_observation_based_changes_and_is_left_intact() {
+        let state = based_pending();
+        let before = state.clone();
+
+        assert_eq!(
+            observe(&state, &bound(&v().s7, &v().r12)),
+            Err(TransitionRefusal::PendingIntentExists)
+        );
+        // Not even a regression report is produced while an intent is pending.
+        assert_eq!(
+            observe(&state, &bound(&v().s7, &v().l5)),
+            Err(TransitionRefusal::PendingIntentExists)
+        );
+        assert_eq!(state, before);
+        assert!(state.pending_push().is_some());
+    }
+
+    #[test]
+    fn an_unbased_state_is_not_treated_as_a_checkpoint() {
+        assert_eq!(
+            observe(&unbased_pending(), &bound(&v().s7, &v().r12)),
+            Err(TransitionRefusal::NotBased)
+        );
+    }
+
+    #[test]
+    fn observations_require_a_schema_three_remote_and_the_right_binding() {
+        assert_eq!(
+            observe(&based(), &bound(&v().s7, &v().legacy)),
+            Err(TransitionRefusal::RemoteUnversioned)
+        );
+
+        // Evidence authenticated for another vault.
+        let foreign_evidence = inspect_remote_bytes(
+            &foreign().key,
+            FOREIGN_VAULT_ID,
+            &foreign().raw_at(7),
+            &foreign().raw_at(12),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            observe(&based(), &foreign_evidence),
+            Err(TransitionRefusal::BindingMismatch(
+                BindingMismatch::VaultIdentity
+            ))
+        );
+
+        let (_, t) = locs();
+        let other = loc(OTHER);
+        let evidence = bound(&v().s7, &v().r12);
+
+        assert_eq!(
+            record_remote_observation(&based(), &other, &t, &evidence),
+            Err(TransitionRefusal::BindingMismatch(
+                BindingMismatch::LocalLocator
+            ))
+        );
+
+        let (l, _) = locs();
+
+        assert_eq!(
+            record_remote_observation(&based(), &l, &other, &evidence),
+            Err(TransitionRefusal::BindingMismatch(
+                BindingMismatch::TargetLocator
+            ))
+        );
+    }
+
+    // ---- begin push ---------------------------------------------------------
+
+    #[test]
+    fn a_local_ahead_vault_above_the_high_water_yields_a_pending_push() {
+        let state = based();
+        let before = state.clone();
+        let evidence = bound(&v().l8, &v().s7);
+
+        let proposed = push(&state, RemoteEvidence::Inspected(&evidence)).unwrap();
+
+        let pending = proposed.pending_push().unwrap();
+        assert_eq!(pending.intent_id(), INTENT);
+        assert_eq!(
+            pending.intent().baseline(),
+            &PushBaseline::Present(fp_of(&v().s7))
+        );
+        assert_eq!(pending.intent().intended(), &fp_of(&v().l8));
+        assert_eq!(pending.intended_revision(), 8);
+
+        // The checkpoint is untouched; only the intent was added.
+        assert_eq!(proposed.base(), state.base());
+        assert_eq!(proposed.binding_id(), state.binding_id());
+        assert_eq!(state, before);
+        assert!(state.pending_push().is_none());
+
+        assert_round_trips(&proposed);
+    }
+
+    #[test]
+    fn begin_push_is_deterministic_and_does_not_depend_on_the_evidence_checkpoint() {
+        let state = based();
+        let evidence = bound(&v().l8, &v().s7);
+
+        let first = push(&state, RemoteEvidence::Inspected(&evidence)).unwrap();
+        let second = push(&state, RemoteEvidence::Inspected(&evidence)).unwrap();
+        assert_eq!(first, second);
+
+        // The inspection's own checkpoint comparison depends on a mark the
+        // evidence does not record; whatever it says, the decision uses the
+        // state's own mark.
+        for claimed in [0, 7, 8, 100] {
+            let with_mark = inspect_remote_bytes(
+                &rig().key,
+                VAULT_ID,
+                &v().l8,
+                &v().s7,
+                Some(RemoteHighWater::new(claimed)),
+            )
+            .unwrap();
+
+            assert_eq!(
+                push(&state, RemoteEvidence::Inspected(&with_mark)),
+                Ok(first.clone()),
+                "claimed mark {claimed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_nil_intent_id_is_required() {
+        let evidence = bound(&v().l8, &v().s7);
+        let (l, t) = locs();
+
+        assert_eq!(
+            begin_push(
+                &based(),
+                &l,
+                &t,
+                RemoteEvidence::Inspected(&evidence),
+                Uuid::nil()
+            ),
+            Err(TransitionRefusal::InvalidState(SyncStateError::NilIntentId))
+        );
+    }
+
+    #[test]
+    fn begin_push_refuses_a_vault_that_did_not_change() {
+        let evidence = bound(&v().s7, &v().s7);
+
+        assert_eq!(
+            push(&based(), RemoteEvidence::Inspected(&evidence)),
+            Err(TransitionRefusal::NoLocalChanges)
+        );
+    }
+
+    #[test]
+    fn begin_push_refuses_wrapper_only_and_reencryption_changes() {
+        // Same payload bytes, only the wrapper differs; same content re-sealed
+        // with a fresh nonce; and pure whitespace changes of the same envelope.
+        for local in [&v().s7_rewrapped, &v().s7_resealed, &v().s7_pretty] {
+            let evidence = bound(local, &v().s7);
+
+            assert_ne!(
+                evidence.local_fingerprint(),
+                evidence.candidate_fingerprint()
+            );
+            assert_eq!(
+                push(&based(), RemoteEvidence::Inspected(&evidence)),
+                Err(TransitionRefusal::WrapperChangeBlocked)
+            );
+        }
+    }
+
+    #[test]
+    fn begin_push_refuses_a_same_revision_conflict() {
+        // Local equals the high-water revision but with different content.
+        let evidence = bound(&v().s7_conflict, &v().s7);
+
+        assert_eq!(
+            push(&based(), RemoteEvidence::Inspected(&evidence)),
+            Err(TransitionRefusal::SameRevisionConflict)
+        );
+    }
+
+    #[test]
+    fn begin_push_requires_the_local_revision_strictly_above_the_high_water() {
+        // Below the mark (and behind the remote).
+        let behind = bound(&v().l6, &v().s7);
+
+        assert_eq!(
+            push(&based(), RemoteEvidence::Inspected(&behind)),
+            Err(TransitionRefusal::NotStrictlyAboveHighWater)
+        );
+
+        // Exactly at the mark, with different content, is a conflict, not an
+        // advance.
+        let at_mark = bound(&v().s7_conflict, &v().s7);
+
+        assert!(push(&based(), RemoteEvidence::Inspected(&at_mark)).is_err());
+
+        // One above is the smallest acceptable revision.
+        let one_above = bound(&v().l8, &v().s7);
+
+        assert!(push(&based(), RemoteEvidence::Inspected(&one_above)).is_ok());
+    }
+
+    #[test]
+    fn begin_push_refuses_a_remote_below_the_high_water() {
+        // The mark is 9, but the remote is back at the synchronized revision 7.
+        let state = build(SyncBase::Based(checkpoint(&v().s7, 7, 9)), None);
+
+        for local in [&v().l8, &v().l10] {
+            let evidence = bound(local, &v().s7);
+
+            assert_eq!(
+                push(&state, RemoteEvidence::Inspected(&evidence)),
+                Err(TransitionRefusal::KnownRegression)
+            );
+        }
+    }
+
+    #[test]
+    fn begin_push_refuses_a_remote_that_changed() {
+        let ahead = bound(&v().s7, &v().t9);
+        assert_eq!(
+            push(&based(), RemoteEvidence::Inspected(&ahead)),
+            Err(TransitionRefusal::RemoteAhead)
+        );
+
+        let diverged = bound(&v().l8, &v().t9);
+        assert_eq!(
+            push(&based(), RemoteEvidence::Inspected(&diverged)),
+            Err(TransitionRefusal::Diverged)
+        );
+
+        let converged = bound(&v().l8, &v().l8);
+        assert_eq!(
+            push(&based(), RemoteEvidence::Inspected(&converged)),
+            Err(TransitionRefusal::Converged)
+        );
+    }
+
+    #[test]
+    fn begin_push_refuses_an_absent_or_unavailable_remote() {
+        assert_eq!(
+            push(&based(), RemoteEvidence::Absent),
+            Err(TransitionRefusal::RemoteDisappeared)
+        );
+        assert_eq!(
+            push(&based(), RemoteEvidence::Unavailable),
+            Err(TransitionRefusal::RemoteUnavailable)
+        );
+    }
+
+    #[test]
+    fn begin_push_refuses_unversioned_payloads_on_either_side() {
+        let legacy_local = bound(&v().legacy, &v().s7);
+        assert_eq!(
+            push(&based(), RemoteEvidence::Inspected(&legacy_local)),
+            Err(TransitionRefusal::LocalUnversioned)
+        );
+
+        let legacy_remote = bound(&v().l8, &v().legacy);
+        assert_eq!(
+            push(&based(), RemoteEvidence::Inspected(&legacy_remote)),
+            Err(TransitionRefusal::RemoteUnversioned)
+        );
+    }
+
+    #[test]
+    fn begin_push_refuses_a_remote_whose_revision_disagrees_with_the_record() {
+        // The recorded revision (5) disagrees with what the bytes authenticate
+        // to (7): the state is inconsistent with the evidence.
+        let state = build(SyncBase::Based(checkpoint(&v().s7, 5, 5)), None);
+        let evidence = bound(&v().l8, &v().s7);
+
+        assert_eq!(
+            push(&state, RemoteEvidence::Inspected(&evidence)),
+            Err(TransitionRefusal::BaselineRevisionMismatch)
+        );
+    }
+
+    #[test]
+    fn begin_push_refuses_when_a_push_is_pending_or_the_state_is_unbased() {
+        let evidence = bound(&v().l8, &v().s7);
+
+        assert_eq!(
+            push(&based_pending(), RemoteEvidence::Inspected(&evidence)),
+            Err(TransitionRefusal::PendingIntentExists)
+        );
+        assert_eq!(
+            push(&unbased_pending(), RemoteEvidence::Inspected(&evidence)),
+            Err(TransitionRefusal::NotBased)
+        );
+    }
+
+    #[test]
+    fn begin_push_refuses_every_binding_mismatch() {
+        let evidence = bound(&v().l8, &v().s7);
+        let other = loc(OTHER);
+        let (l, t) = locs();
+
+        assert_eq!(
+            begin_push(
+                &based(),
+                &other,
+                &t,
+                RemoteEvidence::Inspected(&evidence),
+                INTENT
+            ),
+            Err(TransitionRefusal::BindingMismatch(
+                BindingMismatch::LocalLocator
+            ))
+        );
+        assert_eq!(
+            begin_push(
+                &based(),
+                &l,
+                &other,
+                RemoteEvidence::Inspected(&evidence),
+                INTENT
+            ),
+            Err(TransitionRefusal::BindingMismatch(
+                BindingMismatch::TargetLocator
+            ))
+        );
+        // Locators are also checked when there is no inspected evidence.
+        assert_eq!(
+            begin_push(&based(), &other, &t, RemoteEvidence::Absent, INTENT),
+            Err(TransitionRefusal::BindingMismatch(
+                BindingMismatch::LocalLocator
+            ))
+        );
+
+        // Authenticated evidence of a different vault.
+        let foreign_evidence = inspect_remote_bytes(
+            &foreign().key,
+            FOREIGN_VAULT_ID,
+            &foreign().raw_at(8),
+            &foreign().raw_at(7),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            push(&based(), RemoteEvidence::Inspected(&foreign_evidence)),
+            Err(TransitionRefusal::BindingMismatch(
+                BindingMismatch::VaultIdentity
+            ))
+        );
+    }
+
+    #[test]
+    fn every_refused_push_leaves_the_state_untouched() {
+        let state = based();
+        let before = state.clone();
+
+        for local_and_remote in [
+            (&v().s7, &v().s7),
+            (&v().l6, &v().s7),
+            (&v().l8, &v().t9),
+            (&v().s7_conflict, &v().s7),
+            (&v().s7_rewrapped, &v().s7),
+        ] {
+            let evidence = bound(local_and_remote.0, local_and_remote.1);
+
+            assert!(push(&state, RemoteEvidence::Inspected(&evidence)).is_err());
+            assert_eq!(state, before);
+        }
+    }
+
+    // ---- reconciliation -----------------------------------------------------
+
+    #[test]
+    fn a_published_push_advances_the_checkpoint_and_clears_the_intent_in_one_state() {
+        let state = based_pending();
+        let before = state.clone();
+        let evidence = bound(&v().l8, &v().l8);
+
+        let resolution = reconcile(&state, RemoteEvidence::Inspected(&evidence)).unwrap();
+
+        let PushResolution::Finalize {
+            intent_id,
+            state: proposed,
+        } = resolution
+        else {
+            panic!("expected a finalized state");
+        };
+
+        assert_eq!(intent_id, INTENT);
+
+        let checkpoint = checkpoint_of(&proposed);
+        assert_eq!(checkpoint.synced(), &fp_of(&v().l8));
+        assert_eq!(checkpoint.synced_revision(), 8);
+        assert_eq!(checkpoint.high_water(), RemoteHighWater::new(8));
+        assert!(proposed.pending_push().is_none());
+        assert_eq!(proposed.binding_id(), state.binding_id());
+
+        assert_eq!(state, before);
+        assert_round_trips(&proposed);
+    }
+
+    #[test]
+    fn the_high_water_is_raised_monotonically_when_finalizing() {
+        // The recorded mark (8) is already above the previous one; a finalize
+        // may never lower it. Intended revision 9 exceeds a mark of 8.
+        let state = build(
+            SyncBase::Based(checkpoint(&v().s7, 7, 8)),
+            Some(pending(PushBaseline::Present(fp_of(&v().s7)), &v().t9, 9)),
+        );
+        let evidence = bound(&v().t9, &v().t9);
+
+        let PushResolution::Finalize {
+            state: proposed, ..
+        } = reconcile(&state, RemoteEvidence::Inspected(&evidence)).unwrap()
+        else {
+            panic!("expected a finalized state");
+        };
+
+        assert_eq!(
+            checkpoint_of(&proposed).high_water(),
+            RemoteHighWater::new(9)
+        );
+        assert_eq!(checkpoint_of(&proposed).synced_revision(), 9);
+    }
+
+    #[test]
+    fn a_published_initial_publication_becomes_a_based_checkpoint() {
+        let state = unbased_pending();
+        let evidence = bound(&v().l8, &v().l8);
+
+        let PushResolution::Finalize {
+            state: proposed, ..
+        } = reconcile(&state, RemoteEvidence::Inspected(&evidence)).unwrap()
+        else {
+            panic!("expected a finalized state");
+        };
+
+        let checkpoint = checkpoint_of(&proposed);
+        assert_eq!(checkpoint.synced(), &fp_of(&v().l8));
+        assert_eq!(checkpoint.synced_revision(), 8);
+        assert_eq!(checkpoint.high_water(), RemoteHighWater::new(8));
+        assert!(proposed.pending_push().is_none());
+        assert_round_trips(&proposed);
+    }
+
+    #[test]
+    fn reconciliation_is_repeatable_and_never_applies_the_revision_twice() {
+        let state = based_pending();
+        let evidence = bound(&v().l8, &v().l8);
+
+        let first = reconcile(&state, RemoteEvidence::Inspected(&evidence)).unwrap();
+        // An interrupted attempt (the proposal was never persisted) repeats to
+        // exactly the same proposal.
+        let again = reconcile(&state, RemoteEvidence::Inspected(&evidence)).unwrap();
+        assert_eq!(first, again);
+
+        let PushResolution::Finalize { state: applied, .. } = first else {
+            panic!("expected a finalized state");
+        };
+
+        // Once applied, there is nothing left to reconcile: no second advance.
+        assert_eq!(
+            reconcile(&applied, RemoteEvidence::Inspected(&evidence)),
+            Err(TransitionRefusal::NoPendingPush)
+        );
+        assert_eq!(checkpoint_of(&applied).synced_revision(), 8);
+        assert_eq!(
+            checkpoint_of(&applied).high_water(),
+            RemoteHighWater::new(8)
+        );
+    }
+
+    #[test]
+    fn a_published_fingerprint_with_the_wrong_authenticated_revision_is_not_accepted() {
+        // The pending record claims revision 9, but these bytes authenticate to 8.
+        let state = build(
+            SyncBase::Based(checkpoint(&v().s7, 7, 7)),
+            Some(pending(PushBaseline::Present(fp_of(&v().s7)), &v().l8, 9)),
+        );
+        let evidence = bound(&v().l8, &v().l8);
+
+        assert_eq!(
+            reconcile(&state, RemoteEvidence::Inspected(&evidence)),
+            Ok(PushResolution::StillPending { intent_id: INTENT })
+        );
+
+        // A legacy payload carries no counter to compare at all.
+        let legacy_state = build(
+            SyncBase::Based(checkpoint(&v().s7, 7, 7)),
+            Some(pending(
+                PushBaseline::Present(fp_of(&v().s7)),
+                &v().legacy,
+                8,
+            )),
+        );
+        let legacy_evidence = bound(&v().legacy, &v().legacy);
+
+        assert_eq!(
+            reconcile(&legacy_state, RemoteEvidence::Inspected(&legacy_evidence)),
+            Ok(PushResolution::StillPending { intent_id: INTENT })
+        );
+    }
+
+    #[test]
+    fn a_push_still_at_its_baseline_proposes_only_clearing_the_intent() {
+        let state = based_pending();
+        let before = state.clone();
+        let evidence = bound(&v().l8, &v().s7);
+
+        let resolution = reconcile(&state, RemoteEvidence::Inspected(&evidence)).unwrap();
+
+        let PushResolution::ClearIntent {
+            intent_id,
+            state: proposed,
+        } = resolution
+        else {
+            panic!("expected an intent-clear proposal");
+        };
+
+        assert_eq!(intent_id, INTENT);
+        assert!(proposed.pending_push().is_none());
+        // Checkpoint and high-water are exactly as they were.
+        assert_eq!(proposed.base(), state.base());
+        assert_eq!(checkpoint_of(&proposed).synced_revision(), 7);
+        assert_eq!(
+            checkpoint_of(&proposed).high_water(),
+            RemoteHighWater::new(7)
+        );
+
+        assert_eq!(state, before);
+        assert_round_trips(&proposed);
+    }
+
+    #[test]
+    fn not_published_never_authorizes_a_retry() {
+        let state = based_pending();
+        let evidence = bound(&v().l8, &v().s7);
+
+        let PushResolution::ClearIntent { state: cleared, .. } =
+            reconcile(&state, RemoteEvidence::Inspected(&evidence)).unwrap()
+        else {
+            panic!("expected an intent-clear proposal");
+        };
+
+        // The proposal carries no new intent; a retry would be a separate,
+        // explicitly decided `begin_push` on the cleared state ...
+        assert!(cleared.pending_push().is_none());
+
+        // ... and until that proposal is applied, the pending state still
+        // blocks any push, even against a remote at the baseline.
+        assert_eq!(
+            push(&state, RemoteEvidence::Inspected(&evidence)),
+            Err(TransitionRefusal::PendingIntentExists)
+        );
+    }
+
+    #[test]
+    fn an_initial_publication_that_never_happened_proposes_deleting_the_record() {
+        assert_eq!(
+            reconcile(&unbased_pending(), RemoteEvidence::Absent),
+            Ok(PushResolution::DeleteUnbasedRecord { intent_id: INTENT })
+        );
+    }
+
+    #[test]
+    fn a_baseline_with_the_wrong_authenticated_revision_is_not_a_clean_not_published() {
+        // The record says the baseline was revision 6; the bytes say 7.
+        let state = build(
+            SyncBase::Based(checkpoint(&v().s7, 6, 6)),
+            Some(pending(PushBaseline::Present(fp_of(&v().s7)), &v().l8, 8)),
+        );
+        let evidence = bound(&v().l8, &v().s7);
+
+        assert_eq!(
+            reconcile(&state, RemoteEvidence::Inspected(&evidence)),
+            Ok(PushResolution::StillPending { intent_id: INTENT })
+        );
+    }
+
+    #[test]
+    fn an_unexpected_remote_keeps_the_intent_and_decides_nothing() {
+        let third = bound(&v().l8, &v().t9);
+
+        for (state, remote) in [
+            (based_pending(), RemoteEvidence::Inspected(&third)),
+            (based_pending(), RemoteEvidence::Absent),
+            (based_pending(), RemoteEvidence::Unavailable),
+            (unbased_pending(), RemoteEvidence::Inspected(&third)),
+            (unbased_pending(), RemoteEvidence::Unavailable),
+        ] {
+            let before = state.clone();
+
+            assert_eq!(
+                reconcile(&state, remote),
+                Ok(PushResolution::StillPending { intent_id: INTENT })
+            );
+            assert_eq!(state, before);
+        }
+    }
+
+    #[test]
+    fn reconciliation_requires_a_pending_push_and_the_right_binding() {
+        let evidence = bound(&v().l8, &v().l8);
+
+        assert_eq!(
+            reconcile(&based(), RemoteEvidence::Inspected(&evidence)),
+            Err(TransitionRefusal::NoPendingPush)
+        );
+
+        let other = loc(OTHER);
+        let (l, t) = locs();
+
+        assert_eq!(
+            reconcile_pending_push(
+                &based_pending(),
+                &l,
+                &other,
+                RemoteEvidence::Inspected(&evidence)
+            ),
+            Err(TransitionRefusal::BindingMismatch(
+                BindingMismatch::TargetLocator
+            ))
+        );
+        assert_eq!(
+            reconcile_pending_push(&based_pending(), &other, &t, RemoteEvidence::Absent),
+            Err(TransitionRefusal::BindingMismatch(
+                BindingMismatch::LocalLocator
+            ))
+        );
+
+        let foreign_evidence = inspect_remote_bytes(
+            &foreign().key,
+            FOREIGN_VAULT_ID,
+            &foreign().raw_at(8),
+            &foreign().raw_at(8),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reconcile(
+                &based_pending(),
+                RemoteEvidence::Inspected(&foreign_evidence)
+            ),
+            Err(TransitionRefusal::BindingMismatch(
+                BindingMismatch::VaultIdentity
+            ))
+        );
+    }
+
+    // ---- crash-state decision matrix ---------------------------------------
+
+    #[derive(Clone, Copy, Debug)]
+    enum Observed {
+        Baseline,
+        Intended,
+        Third,
+        Missing,
+        Unavailable,
+    }
+
+    const OBSERVATIONS: [Observed; 5] = [
+        Observed::Baseline,
+        Observed::Intended,
+        Observed::Third,
+        Observed::Missing,
+        Observed::Unavailable,
+    ];
+
+    fn evidence_for(observed: Observed) -> Option<BoundInspection> {
+        match observed {
+            Observed::Baseline => Some(bound(&v().l8, &v().s7)),
+            Observed::Intended => Some(bound(&v().l8, &v().l8)),
+            Observed::Third => Some(bound(&v().l8, &v().t9)),
+            Observed::Missing | Observed::Unavailable => None,
+        }
+    }
+
+    fn remote_of<'a>(
+        observed: Observed,
+        evidence: &'a Option<BoundInspection>,
+    ) -> RemoteEvidence<'a> {
+        match (observed, evidence) {
+            (_, Some(inspected)) => RemoteEvidence::Inspected(inspected),
+            (Observed::Missing, None) => RemoteEvidence::Absent,
+            (_, None) => RemoteEvidence::Unavailable,
+        }
+    }
+
+    fn kind(result: &Result<PushResolution, TransitionRefusal>) -> &'static str {
+        match result {
+            Ok(PushResolution::Finalize { .. }) => "finalize",
+            Ok(PushResolution::ClearIntent { .. }) => "clear",
+            Ok(PushResolution::DeleteUnbasedRecord { .. }) => "delete",
+            Ok(PushResolution::StillPending { .. }) => "pending",
+            Err(TransitionRefusal::NoPendingPush) => "no-pending",
+            Err(_) => "refused",
+        }
+    }
+
+    #[test]
+    fn crash_state_matrix_never_authorizes_an_unsafe_publication() {
+        for observed in OBSERVATIONS {
+            let evidence = evidence_for(observed);
+            let remote = remote_of(observed, &evidence);
+
+            // Only a based, nothing-pending state with a remote still at its
+            // baseline may start a new push.
+            for (name, state) in [
+                ("unbased+pending", unbased_pending()),
+                ("based", based()),
+                ("based+pending", based_pending()),
+            ] {
+                let result = push(&state, remote);
+                let allowed = name == "based" && matches!(observed, Observed::Baseline);
+
+                assert_eq!(result.is_ok(), allowed, "{name} / {observed:?}");
+            }
+
+            // Reconciliation, per durable state.
+            let expected_unbased = match observed {
+                Observed::Missing => "delete",
+                Observed::Intended => "finalize",
+                _ => "pending",
+            };
+            let expected_based_pending = match observed {
+                Observed::Baseline => "clear",
+                Observed::Intended => "finalize",
+                _ => "pending",
+            };
+
+            assert_eq!(
+                kind(&reconcile(&unbased_pending(), remote)),
+                expected_unbased,
+                "unbased+pending / {observed:?}"
+            );
+            assert_eq!(
+                kind(&reconcile(&based(), remote)),
+                "no-pending",
+                "based / {observed:?}"
+            );
+            assert_eq!(
+                kind(&reconcile(&based_pending(), remote)),
+                expected_based_pending,
+                "based+pending / {observed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn crash_state_matrix_for_an_unbound_vault_only_allows_the_two_approved_bindings() {
+        let local = snapshot(&v().l8);
+
+        for observed in OBSERVATIONS {
+            let evidence = evidence_for(observed);
+            let remote = remote_of(observed, &evidence);
+
+            let publication = publish(
+                &SyncStateLoad::NotConfigured,
+                UserApproval::Granted,
+                match observed {
+                    Observed::Missing => RemoteObservation::Absent,
+                    Observed::Unavailable => RemoteObservation::Unavailable,
+                    Observed::Baseline => RemoteObservation::Present(fp_of(&v().s7)),
+                    Observed::Intended => RemoteObservation::Present(fp_of(&v().l8)),
+                    Observed::Third => RemoteObservation::Present(fp_of(&v().t9)),
+                },
+                &local,
+            );
+            assert_eq!(
+                publication.is_ok(),
+                matches!(observed, Observed::Missing),
+                "{observed:?}"
+            );
+
+            // Binding to an existing remote needs byte-identical, inspected
+            // evidence: here that is only the pair (L, L).
+            assert_eq!(
+                bind(&SyncStateLoad::NotConfigured, UserApproval::Granted, remote).is_ok(),
+                matches!(observed, Observed::Intended),
+                "{observed:?}"
+            );
+        }
+    }
+
+    // ---- no implicit resets, opacity and redaction --------------------------
+
+    #[test]
+    fn no_transition_resets_or_replaces_an_existing_binding() {
+        let local = snapshot(&v().l8);
+        let evidence = bound(&v().s7, &v().s7);
+
+        for existing in [based(), based_pending(), unbased_pending()] {
+            let prior = SyncStateLoad::Loaded(Box::new(existing));
+
+            assert_eq!(
+                publish(
+                    &prior,
+                    UserApproval::Granted,
+                    RemoteObservation::Absent,
+                    &local
+                ),
+                Err(TransitionRefusal::ExistingBinding)
+            );
+            assert_eq!(
+                bind(
+                    &prior,
+                    UserApproval::Granted,
+                    RemoteEvidence::Inspected(&evidence)
+                ),
+                Err(TransitionRefusal::ExistingBinding)
+            );
+        }
+    }
+
+    fn assert_free_of_content(text: &str) {
+        for forbidden in [
+            "LOCAL-MARKER",
+            "TARGET-MARKER",
+            "OTHER-MARKER",
+            "synthetic",
+            SECRET,
+            "Base Entry",
+            MASTER,
+            &VAULT_ID.to_string(),
+            &VAULT_ID.simple().to_string(),
+            &FOREIGN_VAULT_ID.to_string(),
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden:?} leaked: {text}");
+        }
+    }
+
+    #[test]
+    fn refusals_and_outcomes_never_show_identities_locators_or_content() {
+        let refusals = [
+            TransitionRefusal::ApprovalWithheld,
+            TransitionRefusal::ExistingBinding,
+            TransitionRefusal::PriorStateUnknown,
+            TransitionRefusal::RemoteNotAbsent,
+            TransitionRefusal::RemoteAbsent,
+            TransitionRefusal::RemoteDisappeared,
+            TransitionRefusal::RemoteUnavailable,
+            TransitionRefusal::RemoteDiffers,
+            TransitionRefusal::LocalUnversioned,
+            TransitionRefusal::RemoteUnversioned,
+            TransitionRefusal::BindingMismatch(BindingMismatch::VaultIdentity),
+            TransitionRefusal::BindingMismatch(BindingMismatch::LocalLocator),
+            TransitionRefusal::BindingMismatch(BindingMismatch::TargetLocator),
+            TransitionRefusal::NotBased,
+            TransitionRefusal::NoPendingPush,
+            TransitionRefusal::PendingIntentExists,
+            TransitionRefusal::NoLocalChanges,
+            TransitionRefusal::RemoteAhead,
+            TransitionRefusal::Diverged,
+            TransitionRefusal::Converged,
+            TransitionRefusal::WrapperChangeBlocked,
+            TransitionRefusal::SameRevisionConflict,
+            TransitionRefusal::AmbiguousChange,
+            TransitionRefusal::BaselineRevisionMismatch,
+            TransitionRefusal::KnownRegression,
+            TransitionRefusal::NotStrictlyAboveHighWater,
+            TransitionRefusal::InvalidState(SyncStateError::NilIntentId),
+        ];
+
+        for refusal in refusals {
+            assert_free_of_content(&format!("{refusal} | {refusal:?}"));
+        }
+
+        // Real outcomes, including full proposed states.
+        let evidence = bound(&v().l8, &v().l8);
+        let local = snapshot(&v().l8);
+        let (l, t) = locs();
+
+        let rendered = [
+            format!("{:?}", new_binding(&l, &t)),
+            format!("{:?}", RemoteEvidence::Inspected(&evidence)),
+            format!(
+                "{:?}",
+                reconcile(&based_pending(), RemoteEvidence::Inspected(&evidence))
+            ),
+            format!(
+                "{:?}",
+                reconcile(&unbased_pending(), RemoteEvidence::Absent)
+            ),
+            format!("{:?}", observe(&based(), &bound(&v().s7, &v().r12))),
+            format!(
+                "{:?}",
+                push(
+                    &based(),
+                    RemoteEvidence::Inspected(&bound(&v().l8, &v().s7))
+                )
+            ),
+            format!(
+                "{:?}",
+                publish(
+                    &SyncStateLoad::NotConfigured,
+                    UserApproval::Granted,
+                    RemoteObservation::Absent,
+                    &local
+                )
+            ),
+        ];
+
+        for text in rendered {
+            assert_free_of_content(&text);
+        }
+    }
+
+    #[test]
+    fn transitions_accept_only_core_produced_evidence() {
+        // The only values that carry revisions and fingerprints into a
+        // transition are `BoundInspection` and `LocalSnapshot`; both come from
+        // authenticated raw bytes. A byte string that does not authenticate
+        // yields no evidence at all, so no revision can be injected.
+        let forged = serde_json::to_vec(&{
+            let mut envelope: VaultEnvelope = serde_json::from_slice(&v().l8).unwrap();
+            envelope.payload.ciphertext[0] ^= 0x01;
+            envelope
+        })
+        .unwrap();
+
+        assert!(inspect_local_bytes(&rig().key, VAULT_ID, &forged).is_err());
+        assert!(inspect_remote_bytes(&rig().key, VAULT_ID, &v().l8, &forged, None).is_err());
+        assert!(inspect_remote_bytes(&rig().key, VAULT_ID, &forged, &v().s7, None).is_err());
+
+        // And the vault key of another vault authenticates neither side.
+        assert!(inspect_local_bytes(&foreign().key, VAULT_ID, &v().l8).is_err());
     }
 }

@@ -803,14 +803,40 @@ pub enum BoundInspectionError {
 ///     bound.candidate_fingerprint = fingerprint;
 /// }
 /// ```
+///
+/// # Verified vault identity (Stage 1U-4 A2b)
+///
+/// A `BoundInspection` also remembers the `vault_id` that **both** payloads
+/// were authenticated against. It is set only by [`inspect_remote_bytes`], from
+/// the `expected_vault_id` that call has just checked against the authenticated,
+/// validated local and candidate payloads (a mismatch fails before any value
+/// exists). It is readable only inside this crate, so that
+/// [`sync_state`](crate::sync_state) transitions can check a stored vault tag
+/// against the evidence itself instead of trusting a separate caller-supplied
+/// id. It is never exposed publicly and never printed.
+///
+/// ```compile_fail,E0624
+/// use localvault_core::sync::BoundInspection;
+///
+/// fn leak(bound: &BoundInspection) {
+///     let _ = bound.authenticated_vault_id();
+/// }
+/// ```
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct BoundInspection {
     local_fingerprint: EnvelopeFingerprint,
     candidate_fingerprint: EnvelopeFingerprint,
     inspection: RemoteInspection,
+    vault_id: Uuid,
 }
 
 impl BoundInspection {
+    /// The vault identity both inspected payloads were authenticated against.
+    /// Crate-private on purpose: see the type documentation.
+    pub(crate) fn authenticated_vault_id(&self) -> Uuid {
+        self.vault_id
+    }
+
     /// Fingerprint of the exact `local_raw` bytes that were inspected.
     pub fn local_fingerprint(&self) -> &EnvelopeFingerprint {
         &self.local_fingerprint
@@ -888,10 +914,167 @@ pub fn inspect_remote_bytes(
         inspect_remote_candidate(vault_key, expected_vault_id, &local, &candidate, high_water)
             .map_err(BoundInspectionError::Inspection)?;
 
+    // `inspect_remote_candidate` has authenticated, validated and compared the
+    // `vault_id` of both payloads with `expected_vault_id`; reaching this point
+    // means that identity is verified, not merely claimed.
     Ok(BoundInspection {
         local_fingerprint,
         candidate_fingerprint,
         inspection,
+        vault_id: expected_vault_id,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Local-only authenticated snapshot (Stage 1U-4 A2b)
+// ---------------------------------------------------------------------------
+
+/// An authenticated view of the **local** envelope alone, for the case where no
+/// remote candidate exists (an initial publication to a remote that is absent).
+///
+/// It carries exactly three facts, all derived from the same borrowed byte slice
+/// by [`inspect_local_bytes`]: the SHA-256 fingerprint of those exact raw bytes,
+/// the authenticated [`AuthenticatedRevision`] of the decrypted payload, and the
+/// verified vault identity. There is no constructor, no `Default`, no `From`
+/// and no mutable access, so a snapshot cannot be fabricated from caller-chosen
+/// values, and a revision cannot be paired with a fingerprint of other bytes.
+///
+/// Like [`BoundInspection`], the vault identity is readable only inside this
+/// crate and `Debug` never shows it. A fingerprint here still proves byte
+/// identity only.
+///
+/// ```compile_fail,E0451
+/// use localvault_core::sync::{AuthenticatedRevision, EnvelopeFingerprint, LocalSnapshot};
+///
+/// fn forge(fingerprint: EnvelopeFingerprint) -> LocalSnapshot {
+///     LocalSnapshot {
+///         fingerprint,
+///         revision: AuthenticatedRevision::Counter(1),
+///         vault_id: uuid::Uuid::nil(),
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use localvault_core::sync::{AuthenticatedRevision, EnvelopeFingerprint, LocalSnapshot};
+///
+/// fn forge(fingerprint: EnvelopeFingerprint) -> LocalSnapshot {
+///     LocalSnapshot::new(fingerprint, AuthenticatedRevision::Counter(1))
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use localvault_core::sync::LocalSnapshot;
+///
+/// fn forge() -> LocalSnapshot {
+///     LocalSnapshot::default()
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
+/// use localvault_core::sync::{AuthenticatedRevision, EnvelopeFingerprint, LocalSnapshot};
+///
+/// fn forge(fingerprint: EnvelopeFingerprint) -> LocalSnapshot {
+///     LocalSnapshot::from((fingerprint, AuthenticatedRevision::Counter(1)))
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use localvault_core::sync::{AuthenticatedRevision, LocalSnapshot};
+///
+/// fn tamper(snapshot: &mut LocalSnapshot) {
+///     snapshot.revision = AuthenticatedRevision::Counter(u64::MAX);
+/// }
+/// ```
+///
+/// ```compile_fail,E0624
+/// use localvault_core::sync::LocalSnapshot;
+///
+/// fn leak(snapshot: &LocalSnapshot) {
+///     let _ = snapshot.authenticated_vault_id();
+/// }
+/// ```
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct LocalSnapshot {
+    fingerprint: EnvelopeFingerprint,
+    revision: AuthenticatedRevision,
+    vault_id: Uuid,
+}
+
+impl LocalSnapshot {
+    /// Fingerprint of the exact `local_raw` bytes that were authenticated.
+    pub fn fingerprint(&self) -> &EnvelopeFingerprint {
+        &self.fingerprint
+    }
+
+    /// The authenticated revision of the local payload: a schema-3 counter, or
+    /// an explicit [`AuthenticatedRevision::Unversioned`] for a legacy payload.
+    pub fn revision(&self) -> AuthenticatedRevision {
+        self.revision
+    }
+
+    /// The vault identity the payload was authenticated against. Crate-private
+    /// on purpose: see the type documentation.
+    pub(crate) fn authenticated_vault_id(&self) -> Uuid {
+        self.vault_id
+    }
+}
+
+// Fingerprint and revision only; the vault identity is deliberately absent, and
+// written out field by field so that a field added later cannot reach the output
+// through a derive.
+impl fmt::Debug for LocalSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalSnapshot")
+            .field("fingerprint", &self.fingerprint)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Fingerprint, parse and authenticate one raw **local** envelope.
+///
+/// The counterpart of [`inspect_remote_bytes`] for when no candidate exists. It
+/// takes the same borrow once and derives everything from it:
+///
+/// 1. the length against [`MAX_ENVELOPE_BYTES`], before anything is hashed,
+///    parsed or decrypted;
+/// 2. the `VaultEnvelope` parse (a failure is
+///    [`MalformedEnvelope`](BoundInspectionError::MalformedEnvelope) of the
+///    [`LocalReference`](EnvelopeInput::LocalReference) input);
+/// 3. the SHA-256 fingerprint of the same slice;
+/// 4. the existing private `authenticate_vault_data`, unchanged: payload AEAD
+///    under `vault_key`, deserialization of only the authenticated bytes,
+///    `VaultData::validate` (supported schema, well-formed revision) and the
+///    `vault_id` comparison with `expected_vault_id`;
+/// 5. the [`AuthenticatedRevision`] of the validated payload.
+///
+/// Every failure is attributed to the local reference, never to a remote
+/// candidate, and carries no input bytes, parser text or decrypted content. The
+/// decrypted buffer is zeroized as soon as it is parsed and `VaultData`
+/// zeroizes itself on drop. No payload is migrated and
+/// `VaultData::prepare_for_write` is never called. The function is read-only and
+/// performs no I/O.
+pub fn inspect_local_bytes(
+    vault_key: &SecretKey,
+    expected_vault_id: Uuid,
+    local_raw: &[u8],
+) -> Result<LocalSnapshot, BoundInspectionError> {
+    check_envelope_len(EnvelopeInput::LocalReference, local_raw)?;
+
+    let local = parse_envelope(EnvelopeInput::LocalReference, local_raw)?;
+
+    let fingerprint = EnvelopeFingerprint::of_bytes(local_raw);
+
+    let data = authenticate_vault_data(&local, vault_key, expected_vault_id).map_err(|reason| {
+        BoundInspectionError::Inspection(InspectionError::LocalReference(reason))
+    })?;
+
+    Ok(LocalSnapshot {
+        fingerprint,
+        revision: AuthenticatedRevision::of(&data),
+        // Authenticated and compared with `expected_vault_id` just above.
+        vault_id: data.vault_id,
     })
 }
 
@@ -3484,5 +3667,405 @@ mod bound_inspection_tests {
                 legacy_plaintext.as_slice()
             );
         }
+    }
+}
+
+/// Stage 1U-4 A2b tests: [`LocalSnapshot`] and the verified vault identity of
+/// [`BoundInspection`]. Synthetic data only; no committed fixture is touched.
+#[cfg(test)]
+mod local_snapshot_tests {
+    use super::*;
+    use crate::vault::{
+        data::{
+            VaultEntry, LEGACY_VAULT_DATA_SCHEMA_VERSION, PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+            VAULT_DATA_SCHEMA_VERSION,
+        },
+        format::{create_envelope_with_key, reseal_envelope},
+    };
+
+    const MASTER: &str = "local-snapshot-test-only-master-password";
+    const SECRET: &str = "LOCAL_SNAPSHOT_TEST_ONLY_SECRET";
+    const TITLE: &str = "Local Snapshot Entry";
+    const SENTINEL: &str = "LOCAL_RAW_INPUT_SENTINEL";
+    const NOW_MS: i64 = 1_700_000_000_000;
+
+    fn bytes_of(data: &VaultData) -> Vec<u8> {
+        serde_json::to_vec(data).unwrap()
+    }
+
+    fn raw(envelope: &VaultEnvelope) -> Vec<u8> {
+        serde_json::to_vec(envelope).unwrap()
+    }
+
+    fn local_error(reason: PayloadRejection) -> BoundInspectionError {
+        BoundInspectionError::Inspection(InspectionError::LocalReference(reason))
+    }
+
+    fn candidate_error(reason: PayloadRejection) -> BoundInspectionError {
+        BoundInspectionError::Inspection(InspectionError::Candidate(reason))
+    }
+
+    /// One vault: its Vault Key, id and a local envelope at revision 3.
+    struct Rig {
+        local: VaultEnvelope,
+        key: SecretKey,
+        base: VaultData,
+    }
+
+    impl Rig {
+        fn new() -> Self {
+            let mut base = VaultData::new(NOW_MS).unwrap();
+
+            let mut entry = VaultEntry::new(TITLE, NOW_MS).unwrap();
+            entry.password = SECRET.to_owned();
+            base.entries.push(entry);
+
+            base.revision = 3;
+            base.validate().unwrap();
+
+            let (local, key) = create_envelope_with_key(MASTER, &bytes_of(&base)).unwrap();
+
+            Self { local, key, base }
+        }
+
+        fn id(&self) -> Uuid {
+            self.base.vault_id
+        }
+
+        fn data(&self, revision: u64) -> VaultData {
+            let mut data = self.base.clone();
+            data.revision = revision;
+            data
+        }
+
+        fn seal_plaintext(&self, plaintext: &[u8]) -> VaultEnvelope {
+            reseal_envelope(&self.local, &self.key, plaintext).unwrap()
+        }
+
+        fn raw_at(&self, revision: u64) -> Vec<u8> {
+            raw(&self.seal_plaintext(&bytes_of(&self.data(revision))))
+        }
+
+        fn raw_of(&self, data: &VaultData) -> Vec<u8> {
+            raw(&self.seal_plaintext(&bytes_of(data)))
+        }
+
+        fn snapshot(&self, local_raw: &[u8]) -> Result<LocalSnapshot, BoundInspectionError> {
+            inspect_local_bytes(&self.key, self.id(), local_raw)
+        }
+    }
+
+    #[test]
+    fn a_valid_schema_three_envelope_yields_a_bound_snapshot_without_any_remote() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+
+        let snapshot = rig.snapshot(&local_raw).unwrap();
+
+        assert_eq!(snapshot.revision(), AuthenticatedRevision::Counter(3));
+        assert_eq!(snapshot.authenticated_vault_id(), rig.id());
+
+        // Independently computed SHA-256 of exactly the supplied slice.
+        let independent: [u8; 32] = Sha256::digest(&local_raw).into();
+        assert_eq!(snapshot.fingerprint().as_bytes(), &independent);
+
+        // It is the very same authenticated evidence a two-sided inspection
+        // reports for its local side.
+        let candidate_raw = rig.raw_at(5);
+        let bound =
+            inspect_remote_bytes(&rig.key, rig.id(), &local_raw, &candidate_raw, None).unwrap();
+
+        assert_eq!(snapshot.fingerprint(), bound.local_fingerprint());
+        assert_eq!(snapshot.revision(), bound.inspection().local_revision());
+        assert_eq!(
+            snapshot.authenticated_vault_id(),
+            bound.authenticated_vault_id()
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_follows_the_exact_raw_bytes_not_the_parsed_envelope() {
+        let rig = Rig::new();
+        let compact = raw(&rig.local);
+        let pretty = serde_json::to_vec_pretty(&rig.local).unwrap();
+
+        let from_compact = rig.snapshot(&compact).unwrap();
+        let from_pretty = rig.snapshot(&pretty).unwrap();
+
+        assert_ne!(from_compact.fingerprint(), from_pretty.fingerprint());
+        assert_eq!(
+            from_pretty.fingerprint(),
+            &EnvelopeFingerprint::of_bytes(&pretty)
+        );
+        assert_eq!(from_compact.revision(), from_pretty.revision());
+    }
+
+    #[test]
+    fn revision_zero_is_a_counter_and_legacy_schemas_are_unversioned() {
+        let rig = Rig::new();
+
+        assert_eq!(
+            rig.snapshot(&rig.raw_at(0)).unwrap().revision(),
+            AuthenticatedRevision::Counter(0)
+        );
+
+        for schema in [
+            LEGACY_VAULT_DATA_SCHEMA_VERSION,
+            PRE_REVISION_VAULT_DATA_SCHEMA_VERSION,
+        ] {
+            let mut legacy = rig.data(0);
+            legacy.schema_version = schema;
+
+            let snapshot = rig.snapshot(&rig.raw_of(&legacy)).unwrap();
+
+            // Never mistaken for a schema-3 vault at revision 0, and not migrated.
+            assert_eq!(
+                snapshot.revision(),
+                AuthenticatedRevision::Unversioned {
+                    schema_version: schema
+                }
+            );
+            assert_ne!(snapshot.revision(), AuthenticatedRevision::Counter(0));
+        }
+    }
+
+    #[test]
+    fn a_wrong_vault_key_is_an_authentication_failure_of_the_local_reference() {
+        let rig = Rig::new();
+        let other = Rig::new();
+
+        assert_eq!(
+            inspect_local_bytes(&other.key, rig.id(), &raw(&rig.local)),
+            Err(local_error(PayloadRejection::AuthenticationFailed))
+        );
+
+        // An envelope of another vault, sealed under another key.
+        assert_eq!(
+            rig.snapshot(&raw(&other.local)),
+            Err(local_error(PayloadRejection::AuthenticationFailed))
+        );
+    }
+
+    #[test]
+    fn corruption_is_indistinguishable_from_a_wrong_key() {
+        let rig = Rig::new();
+
+        let mut ciphertext = rig.local.clone();
+        ciphertext.payload.ciphertext[0] ^= 0x01;
+
+        let mut nonce = rig.local.clone();
+        nonce.payload.nonce[0] ^= 0x01;
+
+        for tampered in [ciphertext, nonce] {
+            assert_eq!(
+                rig.snapshot(&raw(&tampered)),
+                Err(local_error(PayloadRejection::AuthenticationFailed))
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_expected_vault_id_is_rejected_after_authentication() {
+        let rig = Rig::new();
+        let wrong = Uuid::new_v4();
+
+        assert_ne!(wrong, rig.id());
+        assert_eq!(
+            inspect_local_bytes(&rig.key, wrong, &raw(&rig.local)),
+            Err(local_error(PayloadRejection::VaultIdMismatch))
+        );
+
+        // A payload that authenticates but carries another vault_id.
+        let mut foreign = rig.data(4);
+        foreign.vault_id = Uuid::new_v4();
+
+        assert_eq!(
+            rig.snapshot(&rig.raw_of(&foreign)),
+            Err(local_error(PayloadRejection::VaultIdMismatch))
+        );
+    }
+
+    #[test]
+    fn malformed_local_bytes_are_a_local_failure_and_echo_nothing() {
+        let rig = Rig::new();
+        let valid = raw(&rig.local);
+
+        let mut trailing = valid.clone();
+        trailing.extend_from_slice(b" trailing");
+
+        let samples: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"not json".to_vec(),
+            b"{}".to_vec(),
+            b"null".to_vec(),
+            vec![0xff, 0xfe, 0x00, 0x01],
+            format!(r#"{{"magic":"{SENTINEL}","version":"{SENTINEL}"}}"#).into_bytes(),
+            trailing,
+        ];
+
+        for sample in samples {
+            let error = rig.snapshot(&sample).unwrap_err();
+
+            assert_eq!(
+                error,
+                BoundInspectionError::MalformedEnvelope {
+                    input: EnvelopeInput::LocalReference
+                }
+            );
+
+            for text in [format!("{error}"), format!("{error:?}")] {
+                assert!(!text.contains(SENTINEL));
+                assert!(!text.contains("line"));
+                assert!(!text.contains("column"));
+                assert!(!text.contains("EOF"));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_local_input_is_rejected_by_length_before_any_parsing() {
+        let rig = Rig::new();
+
+        // Not even JSON: only the length can have decided this.
+        let oversized = vec![b'x'; MAX_ENVELOPE_BYTES + 1];
+
+        assert_eq!(
+            rig.snapshot(&oversized),
+            Err(BoundInspectionError::InputTooLarge {
+                input: EnvelopeInput::LocalReference,
+                actual: MAX_ENVELOPE_BYTES + 1,
+                limit: MAX_ENVELOPE_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_authenticated_payloads_are_rejected_with_the_existing_reasons() {
+        let rig = Rig::new();
+
+        // Authentic, but not a vault payload.
+        assert_eq!(
+            rig.snapshot(&raw(&rig.seal_plaintext(b"this is not json"))),
+            Err(local_error(PayloadRejection::MalformedPayload))
+        );
+
+        // Authentic and well-formed, but an unsupported (future) schema.
+        let mut future = rig.data(4);
+        future.schema_version = VAULT_DATA_SCHEMA_VERSION + 1;
+
+        assert_eq!(
+            rig.snapshot(&rig.raw_of(&future)),
+            Err(local_error(PayloadRejection::UnsupportedSchema))
+        );
+
+        // Authentic and well-formed, but failing `VaultData::validate`.
+        let mut invalid = rig.data(4);
+        invalid.entries[0].title = String::new();
+
+        assert_eq!(
+            rig.snapshot(&rig.raw_of(&invalid)),
+            Err(local_error(PayloadRejection::InvalidData))
+        );
+
+        // An unsupported envelope header is decided before any decryption.
+        let mut wrong_magic = rig.local.clone();
+        wrong_magic.magic = "NOTVAULT".to_owned();
+
+        assert_eq!(
+            rig.snapshot(&raw(&wrong_magic)),
+            Err(local_error(PayloadRejection::UnsupportedFormat))
+        );
+    }
+
+    #[test]
+    fn the_snapshot_debug_output_is_redacted() {
+        let rig = Rig::new();
+        let snapshot = rig.snapshot(&raw(&rig.local)).unwrap();
+
+        let rendered = format!("{snapshot:?}");
+
+        assert!(rendered.contains(&snapshot.fingerprint().to_hex()));
+        assert!(!rendered.contains(&rig.id().to_string()));
+        assert!(!rendered.contains(&rig.id().simple().to_string()));
+        assert!(!rendered.contains(SECRET));
+        assert!(!rendered.contains(TITLE));
+
+        // Error values are equally free of content.
+        let error = rig.snapshot(b"{").unwrap_err();
+        let text = format!("{error} {error:?}");
+        assert!(!text.contains(&rig.id().to_string()));
+        assert!(!text.contains(SECRET));
+    }
+
+    #[test]
+    fn inspecting_is_read_only_and_repeatable() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+        let before = local_raw.clone();
+
+        let first = rig.snapshot(&local_raw).unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(rig.snapshot(&local_raw).unwrap(), first);
+        }
+
+        assert_eq!(local_raw, before);
+        assert!(rig.snapshot(b"{").is_err());
+        assert_eq!(rig.snapshot(&local_raw).unwrap(), first);
+    }
+
+    // ---- BoundInspection verified vault identity --------------------------
+
+    #[test]
+    fn a_bound_inspection_carries_the_vault_id_both_payloads_were_checked_against() {
+        let rig = Rig::new();
+
+        let bound =
+            inspect_remote_bytes(&rig.key, rig.id(), &raw(&rig.local), &rig.raw_at(5), None)
+                .unwrap();
+
+        assert_eq!(bound.authenticated_vault_id(), rig.id());
+
+        let rendered = format!("{bound:?}");
+        assert!(!rendered.contains(&rig.id().to_string()));
+        assert!(!rendered.contains(&rig.id().simple().to_string()));
+    }
+
+    #[test]
+    fn identity_mismatches_are_rejected_before_any_bound_inspection_exists() {
+        let rig = Rig::new();
+        let local_raw = raw(&rig.local);
+        let candidate_raw = rig.raw_at(5);
+
+        // A wrong expected id fails against the local payload first.
+        assert_eq!(
+            inspect_remote_bytes(&rig.key, Uuid::new_v4(), &local_raw, &candidate_raw, None),
+            Err(local_error(PayloadRejection::VaultIdMismatch))
+        );
+
+        // A candidate that authenticates but belongs to another vault_id.
+        let mut other_vault = rig.data(5);
+        other_vault.vault_id = Uuid::new_v4();
+        let other_vault_raw = rig.raw_of(&other_vault);
+
+        assert_eq!(
+            inspect_remote_bytes(&rig.key, rig.id(), &local_raw, &other_vault_raw, None),
+            Err(candidate_error(PayloadRejection::VaultIdMismatch))
+        );
+
+        // A local payload that authenticates but belongs to another vault_id is
+        // a local-reference failure, never blamed on the remote.
+        assert_eq!(
+            inspect_remote_bytes(&rig.key, rig.id(), &other_vault_raw, &candidate_raw, None),
+            Err(local_error(PayloadRejection::VaultIdMismatch))
+        );
+
+        // A candidate sealed under another vault's key.
+        let other = Rig::new();
+
+        assert_eq!(
+            inspect_remote_bytes(&rig.key, rig.id(), &local_raw, &raw(&other.local), None),
+            Err(candidate_error(PayloadRejection::AuthenticationFailed))
+        );
     }
 }
