@@ -1,0 +1,2582 @@
+//! Device-local, crash-conscious file store for the accepted
+//! [`SyncState`] model (Stage 1U-4, slice B1a).
+//!
+//! Storage only. Nothing here is connected to vault unlock/save/delete, to a
+//! Tauri command, to the recent-vault list, to a remote or to the network; the
+//! pure transitions in `localvault_core::sync_state` decide *what* to persist,
+//! this module only persists, reads back and removes it.
+//!
+//! # Location (integration boundary)
+//!
+//! [`SyncStateStore::new`] takes the **device-local application-data root**
+//! supplied by the future caller (the approved source is Tauri's
+//! `app_local_data_dir()`, which resolves under the per-user *local*
+//! application-data directory) and always uses its `sync-state` subdirectory.
+//! It must never be the roaming `app_config_dir()` used by the recent-vault list,
+//! and never the directory holding `.lvault` files. This module cannot verify
+//! which directory it was given beyond requiring an absolute path.
+//!
+//! # Record identity
+//!
+//! One record per local vault *location*, never per `vault_id`:
+//!
+//! * key = lowercase hex SHA-256 of the ASCII-lowercased bytes of the local
+//!   locator string; record file = `<key>.json`.
+//! * ASCII-lowercasing mirrors `recent_vaults::path_strings_equal`
+//!   (`eq_ignore_ascii_case` on Windows), the existing path-identity rule. That
+//!   function and `normalize_existing_vault_path` are private to
+//!   `recent_vaults`, so the rule is repeated in [`path_identity_eq`] and
+//!   pinned by tests; the store does **not** canonicalize. The caller must pass
+//!   the locator produced by that existing normalization (the canonical path
+//!   string). Two spellings of one file that the existing normalization would
+//!   not unify get different records.
+//! * The decoded state carries its own `local_locator`; a record whose locator
+//!   does not agree with the requested one is reported as corrupt
+//!   ([`CorruptReason::LocatorMismatch`]) and is never treated as a binding.
+//! * The store cannot authenticate which *vault* a record belongs to. A path
+//!   later reused by a different encrypted vault loads the old record unchanged;
+//!   the unlocked-session integration **must** call `SyncState::verify_binding`
+//!   with the authenticated `vault_id` before trusting any loaded state.
+//!
+//! # Outcomes are never conflated
+//!
+//! [`StateLoad::NotConfigured`] is returned only when the `sync-state`
+//! directory is confirmed absent, or it exists as a real directory and neither
+//! the record nor any recognized recovery artifact is present. Every I/O
+//! failure, unexpected object (directory, symlink, junction or other reparse
+//! point), unresolved recovery artifact, undecodable or oversized record and
+//! unsupported version is something else.
+//!
+//! Windows reports a missing path component and "a component is a regular
+//! file" alike as "not found". So when the `sync-state` directory is not found,
+//! the nearest existing ancestor must be shown to be a plain directory
+//! (missing intermediate directories are normal first use); a regular file,
+//! reparse point, I/O error or a path with no existing ancestor at all is
+//! `Unreadable`, never `NotConfigured`.
+//!
+//! # Recovery artifacts
+//!
+//! Temporary files are `<key>.<32 lowercase hex>.tmp` in the same directory.
+//! Exactly that pattern, for the record's own key, is a *recovery artifact*:
+//! it blocks [`SyncStateStore::create`], makes a missing record
+//! [`UnreadableReason::UnresolvedArtifacts`] rather than absent, and is removed
+//! by an explicit [`SyncStateStore::delete`]. Nothing else is ever deleted, and
+//! nothing is deleted automatically: files that merely share the prefix are
+//! unrelated and ignored. A primary record is authoritative regardless of
+//! leftover artifacts (an unpublished temp can never be adopted), so `load` and
+//! `replace` tolerate them.
+//!
+//! # Guarantees and limits
+//!
+//! * **Create** is no-clobber because publication is `hard_link(temp, record)`,
+//!   which fails if the name exists (verified: `ERROR_ALREADY_EXISTS` on NTFS).
+//!   `fs::rename` is *not* used for creation: on Windows it replaces an existing
+//!   destination, so check-then-rename would be a race. A filesystem without
+//!   hard links yields [`StoreError::NoClobberUnsupported`]; there is no
+//!   fallback to an overwriting rename.
+//! * **Replace** is a re-read, compare, temp-write, re-read, rename sequence. It
+//!   is **not** compare-and-swap against an arbitrary competing process: another
+//!   writer can still slip in between the last read and the rename. It is safe
+//!   only under the exclusive per-vault session lock, which the future
+//!   integration must hold for every state operation. This module adds no
+//!   cross-process locking.
+//! * Temp contents are flushed (`sync_all`) before publication and every write is
+//!   verified by reading the record back and decoding it. Directory entries are
+//!   not flushed (std offers no portable way on Windows); physical power-loss
+//!   consistency is **not** proven here and relies on NTFS journaling.
+//! * Unexpected reparse points are never followed: the directory and record are
+//!   inspected with `symlink_metadata`, the record is opened with
+//!   `FILE_FLAG_OPEN_REPARSE_POINT` and re-checked on the handle. Ancestors above
+//!   the supplied root are not inspected while `sync-state` exists; when it
+//!   does not, the nearest existing ancestor is checked (see above).
+//! * Physical file-symlink rejection is covered by the shared reparse check and
+//!   by junction tests, but the file-symlink test could not create a symlink
+//!   under this account's privileges and is an unverified residual.
+//! * Errors and `Debug` output carry fixed categories and `io::ErrorKind` only:
+//!   never a path, locator, vault id, binding id or record body.
+
+use std::{
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Write},
+    path::{Path, PathBuf},
+};
+
+use localvault_core::{
+    sync::EnvelopeFingerprint,
+    sync_state::{
+        Locator, SyncBase, SyncState, SyncStateEncodeError, SyncStateLoad, MAX_SYNC_STATE_BYTES,
+    },
+};
+use thiserror::Error;
+use uuid::Uuid;
+
+/// Subdirectory of the supplied application-data root that holds all records.
+pub const SYNC_STATE_DIRECTORY: &str = "sync-state";
+
+const RECORD_EXTENSION: &str = "json";
+const ARTIFACT_EXTENSION: &str = "tmp";
+const ARTIFACT_TOKEN_LEN: usize = 32;
+const MAX_SCANNED_ENTRIES: usize = 10_000;
+const TEMP_ALLOCATION_ATTEMPTS: usize = 16;
+
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Why a record that exists was not accepted as corrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CorruptReason {
+    /// Zero bytes.
+    Empty,
+    /// Larger than `MAX_SYNC_STATE_BYTES`; rejected from metadata, or after a
+    /// bounded read if it grew.
+    TooLarge,
+    /// Not decodable by the core codec (bad JSON, truncation, checksum,
+    /// malformed or inconsistent fields).
+    Undecodable,
+    /// Decodes, but its own `local_locator` is not the requested location
+    /// (for example a record copied under another key).
+    LocatorMismatch,
+}
+
+/// Why the state could not be read, or its absence could not be established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadableReason {
+    /// An I/O or permission failure.
+    Io(io::ErrorKind),
+    /// A directory, symlink, junction or other reparse point where a plain
+    /// file or directory was required.
+    UnexpectedObject,
+    /// No record, but a recovery artifact of an interrupted write exists.
+    UnresolvedArtifacts,
+    /// The directory holds too many entries to scan for artifacts.
+    EntryLimit,
+}
+
+/// Typed result of [`SyncStateStore::load`]. A superset of the core
+/// [`SyncStateLoad`]; see [`StateLoad::into_sync_state_load`].
+#[derive(Clone, PartialEq, Eq)]
+pub enum StateLoad {
+    /// Confirmed absent, including recovery artifacts.
+    NotConfigured,
+    /// A valid record for exactly the requested local location. The vault
+    /// binding tag is **not** verified here.
+    Loaded(Box<SyncState>),
+    Corrupt(CorruptReason),
+    UnsupportedVersion,
+    Unreadable(UnreadableReason),
+}
+
+impl StateLoad {
+    /// The accepted core outcome, for the pure transitions. Every reason is
+    /// folded into `Corrupt` or `Unreadable`; neither is ever `NotConfigured`.
+    pub fn into_sync_state_load(self) -> SyncStateLoad {
+        match self {
+            Self::NotConfigured => SyncStateLoad::NotConfigured,
+            Self::Loaded(state) => SyncStateLoad::Loaded(state),
+            Self::Corrupt(_) => SyncStateLoad::Corrupt,
+            Self::UnsupportedVersion => SyncStateLoad::UnsupportedVersion,
+            Self::Unreadable(_) => SyncStateLoad::Unreadable,
+        }
+    }
+}
+
+// The state is not printed: its own Debug would show binding ids, fingerprints
+// and revisions, none of which belong in a log line.
+impl fmt::Debug for StateLoad {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotConfigured => f.write_str("NotConfigured"),
+            Self::Loaded(_) => f.write_str("Loaded(<state>)"),
+            Self::Corrupt(reason) => write!(f, "Corrupt({reason:?})"),
+            Self::UnsupportedVersion => f.write_str("UnsupportedVersion"),
+            Self::Unreadable(reason) => write!(f, "Unreadable({reason:?})"),
+        }
+    }
+}
+
+/// Which filesystem step failed. A category only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoStage {
+    Directory,
+    Inspect,
+    Scan,
+    Open,
+    Write,
+    Sync,
+    Replace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum StoreError {
+    #[error("the sync-state root must be an absolute path")]
+    RootNotAbsolute,
+    #[error("a sync-state record already exists")]
+    AlreadyExists,
+    #[error("the sync-state record is missing")]
+    Missing,
+    #[error("unresolved sync-state recovery artifacts exist")]
+    UnresolvedArtifacts,
+    #[error("a sync-state path is not a regular file or directory")]
+    UnexpectedObject,
+    #[error("the current sync-state record could not be read")]
+    CurrentUnreadable,
+    #[error("the current sync-state record is corrupt")]
+    CurrentCorrupt,
+    #[error("the current sync-state record has an unsupported version")]
+    CurrentUnsupportedVersion,
+    #[error("the current sync-state record belongs to a different local location")]
+    CurrentLocatorMismatch,
+    #[error("the sync-state record changed since it was observed")]
+    Changed,
+    #[error("the replacement is for a different local location")]
+    LocatorMismatch,
+    #[error("a replacement must keep the binding identity")]
+    BindingIdentityChanged,
+    #[error("a replacement must not lower or drop the trusted checkpoint")]
+    TrustedHistoryRegression,
+    #[error("the filesystem cannot publish a new record without overwriting")]
+    NoClobberUnsupported,
+    #[error("the written sync-state record could not be verified")]
+    VerificationFailed,
+    #[error("sync-state deletion is incomplete")]
+    IncompleteDeletion,
+    #[error("sync state could not be encoded: {0}")]
+    Encode(SyncStateEncodeError),
+    #[error("a sync-state filesystem operation failed ({stage:?}, {kind:?})")]
+    Io { stage: IoStage, kind: io::ErrorKind },
+}
+
+/// Outcome of a successful [`SyncStateStore::delete`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOutcome {
+    /// Something was removed and the removal was verified.
+    Removed,
+    /// There was nothing to remove (verified).
+    AlreadyAbsent,
+}
+
+/// Internal filesystem failure, before it is mapped to a public type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fault {
+    Io(io::ErrorKind),
+    Unexpected,
+    EntryLimit,
+}
+
+impl From<Fault> for UnreadableReason {
+    fn from(fault: Fault) -> Self {
+        match fault {
+            Fault::Io(kind) => Self::Io(kind),
+            Fault::Unexpected => Self::UnexpectedObject,
+            Fault::EntryLimit => Self::EntryLimit,
+        }
+    }
+}
+
+impl Fault {
+    fn into_store_error(self, stage: IoStage) -> StoreError {
+        match self {
+            Self::Io(kind) => StoreError::Io { stage, kind },
+            Self::Unexpected => StoreError::UnexpectedObject,
+            Self::EntryLimit => StoreError::Io {
+                stage: IoStage::Scan,
+                kind: io::ErrorKind::Other,
+            },
+        }
+    }
+}
+
+enum DirState {
+    Absent,
+    Present,
+}
+
+enum Primary {
+    Absent,
+    Empty,
+    TooLarge,
+    Bytes(Vec<u8>),
+}
+
+/// Fault-injection points (tests only act on them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Point {
+    TempSync,
+    Publish,
+    BeforeReplace,
+    Replace,
+    Verify,
+    RemoveArtifact,
+    RemovePrimary,
+}
+
+#[cfg(test)]
+enum Action {
+    Fail(io::ErrorKind),
+    Run(Box<dyn Fn() + Send>),
+}
+
+pub struct SyncStateStore {
+    directory: PathBuf,
+    #[cfg(test)]
+    faults: std::sync::Mutex<Vec<(Point, Action)>>,
+}
+
+impl fmt::Debug for SyncStateStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SyncStateStore(<redacted>)")
+    }
+}
+
+impl SyncStateStore {
+    /// `app_local_data_root` is the caller-supplied device-local
+    /// application-data directory; records live in its `sync-state`
+    /// subdirectory, which is created on first [`create`](Self::create).
+    pub fn new(app_local_data_root: &Path) -> Result<Self, StoreError> {
+        if !app_local_data_root.is_absolute() {
+            return Err(StoreError::RootNotAbsolute);
+        }
+
+        Ok(Self {
+            directory: app_local_data_root.join(SYNC_STATE_DIRECTORY),
+            #[cfg(test)]
+            faults: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Strictly read the record of `local_locator`.
+    ///
+    /// Never creates, repairs, deletes or resets anything.
+    pub fn load(&self, local_locator: &Locator) -> StateLoad {
+        let key = record_key(local_locator);
+
+        match self.inspect_directory() {
+            Ok(DirState::Absent) => return StateLoad::NotConfigured,
+            Ok(DirState::Present) => {}
+            Err(fault) => return StateLoad::Unreadable(fault.into()),
+        }
+
+        match self.read_primary(&self.record_path(&key)) {
+            Err(fault) => StateLoad::Unreadable(fault.into()),
+            Ok(Primary::Empty) => StateLoad::Corrupt(CorruptReason::Empty),
+            Ok(Primary::TooLarge) => StateLoad::Corrupt(CorruptReason::TooLarge),
+            Ok(Primary::Bytes(bytes)) => classify(local_locator, &bytes),
+            Ok(Primary::Absent) => match self.scan_artifacts(&key) {
+                Err(fault) => StateLoad::Unreadable(fault.into()),
+                Ok(artifacts) if !artifacts.is_empty() => {
+                    StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts)
+                }
+                Ok(_) => StateLoad::NotConfigured,
+            },
+        }
+    }
+
+    /// Publish a new record. Succeeds only if the record is definitely absent,
+    /// no recovery artifact exists, publication is no-clobber, and the record
+    /// reads back byte-identical and decodes to `state`.
+    ///
+    /// After `VerificationFailed` or an `Io` error the record may or may not
+    /// exist: call [`load`](Self::load) before deciding anything.
+    pub fn create(&self, state: &SyncState) -> Result<(), StoreError> {
+        let bytes = state.encode().map_err(StoreError::Encode)?;
+        let key = record_key(state.local_locator());
+
+        self.ensure_directory()?;
+
+        let record = self.record_path(&key);
+
+        match fs::symlink_metadata(&record) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(metadata) if is_plain_file(&metadata) => return Err(StoreError::AlreadyExists),
+            Ok(_) => return Err(StoreError::UnexpectedObject),
+            Err(error) => {
+                return Err(StoreError::Io {
+                    stage: IoStage::Inspect,
+                    kind: error.kind(),
+                })
+            }
+        }
+
+        let artifacts = self
+            .scan_artifacts(&key)
+            .map_err(|fault| fault.into_store_error(IoStage::Scan))?;
+        if !artifacts.is_empty() {
+            return Err(StoreError::UnresolvedArtifacts);
+        }
+
+        let temp = self.write_temp(&key, &bytes)?;
+
+        let published = self
+            .hook(Point::Publish)
+            .and_then(|()| fs::hard_link(&temp, &record));
+
+        // The temp name is only a staging name; the record is now (or never
+        // will be) a second name for the same synced file.
+        let _ = fs::remove_file(&temp);
+
+        if let Err(error) = published {
+            return Err(map_publish_error(&error));
+        }
+
+        self.verify(&record, &bytes, state)
+    }
+
+    /// Replace the record that currently holds `expected` with `proposed`.
+    ///
+    /// See the module documentation: this is read-compare-write, not
+    /// compare-and-swap, and requires the caller to hold the exclusive vault
+    /// session lock. The replacement must keep the binding identity (binding id,
+    /// vault tag, both locators) and must not lower the trusted high-water mark
+    /// or drop the checkpoint; resetting a binding is [`delete`](Self::delete)
+    /// followed by a new binding.
+    pub fn replace(&self, expected: &SyncState, proposed: &SyncState) -> Result<(), StoreError> {
+        check_replacement(expected, proposed)?;
+
+        let bytes = proposed.encode().map_err(StoreError::Encode)?;
+        let key = record_key(expected.local_locator());
+
+        match self
+            .inspect_directory()
+            .map_err(|fault| fault.into_store_error(IoStage::Inspect))?
+        {
+            DirState::Absent => return Err(StoreError::Missing),
+            DirState::Present => {}
+        }
+
+        let record = self.record_path(&key);
+
+        let observed = match self.read_primary(&record) {
+            Err(_) => return Err(StoreError::CurrentUnreadable),
+            Ok(Primary::Absent) => return Err(StoreError::Missing),
+            Ok(Primary::Empty) | Ok(Primary::TooLarge) => return Err(StoreError::CurrentCorrupt),
+            Ok(Primary::Bytes(observed)) => observed,
+        };
+
+        match classify(expected.local_locator(), &observed) {
+            StateLoad::Loaded(current) if *current == *expected => {}
+            StateLoad::Loaded(_) => return Err(StoreError::Changed),
+            StateLoad::Corrupt(CorruptReason::LocatorMismatch) => {
+                return Err(StoreError::CurrentLocatorMismatch)
+            }
+            StateLoad::UnsupportedVersion => return Err(StoreError::CurrentUnsupportedVersion),
+            _ => return Err(StoreError::CurrentCorrupt),
+        }
+
+        let temp = self.write_temp(&key, &bytes)?;
+
+        let swapped = (|| {
+            self.hook(Point::BeforeReplace)
+                .map_err(|error| StoreError::Io {
+                    stage: IoStage::Inspect,
+                    kind: error.kind(),
+                })?;
+
+            // Narrow the window: the record must still be byte-identical to
+            // what was compared above. This does not close it.
+            match self.read_primary(&record) {
+                Ok(Primary::Bytes(again)) if again == observed => {}
+                Ok(_) => return Err(StoreError::Changed),
+                Err(_) => return Err(StoreError::CurrentUnreadable),
+            }
+
+            self.hook(Point::Replace)
+                .and_then(|()| fs::rename(&temp, &record))
+                .map_err(|error| StoreError::Io {
+                    stage: IoStage::Replace,
+                    kind: error.kind(),
+                })
+        })();
+
+        if let Err(error) = swapped {
+            // The record was never replaced; only our own staging file goes.
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+
+        self.verify(&record, &bytes, proposed)
+    }
+
+    /// Explicitly remove the record of `local_locator` and its recognized
+    /// recovery artifacts. Works on a corrupt or unsupported record too; it is
+    /// the only operation that removes anything, and must only be called for an
+    /// explicit user-approved reset, unbind or vault deletion.
+    ///
+    /// Artifacts go first and the record last. A crash before the record is
+    /// removed leaves the intact binding. A crash after the last file was
+    /// removed but before success is reported leaves a fully absent record
+    /// (`NotConfigured`): that is the intended, user-authorized loss of trust
+    /// history, not an error. Partial cleanup that leaves artifacts is
+    /// `Unreadable`, never absent. Anything that cannot be removed or verified
+    /// gone is [`StoreError::IncompleteDeletion`]. Nothing else ever deletes.
+    pub fn delete(&self, local_locator: &Locator) -> Result<DeleteOutcome, StoreError> {
+        let key = record_key(local_locator);
+
+        match self
+            .inspect_directory()
+            .map_err(|fault| fault.into_store_error(IoStage::Inspect))?
+        {
+            DirState::Absent => return Ok(DeleteOutcome::AlreadyAbsent),
+            DirState::Present => {}
+        }
+
+        let record = self.record_path(&key);
+
+        let artifacts = self
+            .scan_artifacts(&key)
+            .map_err(|fault| fault.into_store_error(IoStage::Scan))?;
+
+        // Refuse before removing anything if any target is not a plain file.
+        for artifact in &artifacts {
+            match fs::symlink_metadata(artifact) {
+                Ok(metadata) if is_plain_file(&metadata) => {}
+                Ok(_) => return Err(StoreError::UnexpectedObject),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(StoreError::Io {
+                        stage: IoStage::Inspect,
+                        kind: error.kind(),
+                    })
+                }
+            }
+        }
+
+        let record_present = match fs::symlink_metadata(&record) {
+            Ok(metadata) if is_plain_file(&metadata) => true,
+            Ok(_) => return Err(StoreError::UnexpectedObject),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(StoreError::Io {
+                    stage: IoStage::Inspect,
+                    kind: error.kind(),
+                })
+            }
+        };
+
+        if artifacts.is_empty() && !record_present {
+            return Ok(DeleteOutcome::AlreadyAbsent);
+        }
+
+        for artifact in &artifacts {
+            self.remove(Point::RemoveArtifact, artifact)?;
+        }
+        if record_present {
+            self.remove(Point::RemovePrimary, &record)?;
+        }
+
+        // Verify, treating "cannot tell" as incomplete.
+        match fs::symlink_metadata(&record) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            _ => return Err(StoreError::IncompleteDeletion),
+        }
+        match self.scan_artifacts(&key) {
+            Ok(remaining) if remaining.is_empty() => Ok(DeleteOutcome::Removed),
+            _ => Err(StoreError::IncompleteDeletion),
+        }
+    }
+
+    // ---- internals ---------------------------------------------------------
+
+    fn record_path(&self, key: &str) -> PathBuf {
+        self.directory.join(format!("{key}.{RECORD_EXTENSION}"))
+    }
+
+    fn inspect_directory(&self) -> Result<DirState, Fault> {
+        match fs::symlink_metadata(&self.directory) {
+            Ok(metadata) if is_plain_directory(&metadata) => Ok(DirState::Present),
+            Ok(_) => Err(Fault::Unexpected),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => self.confirm_parent_chain(),
+            Err(error) => Err(Fault::Io(error.kind())),
+        }
+    }
+
+    /// Windows reports "not found" both for a genuinely missing path and when a
+    /// component is a regular file. So absence of the `sync-state` directory
+    /// only counts once the nearest *existing* ancestor is shown to be a plain
+    /// directory; a file, reparse point, unreadable or nonexistent-to-the-top
+    /// path is a fault. Missing intermediate directories (first use) are fine.
+    fn confirm_parent_chain(&self) -> Result<DirState, Fault> {
+        let mut ancestor = self.directory.parent();
+
+        while let Some(path) = ancestor {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if is_plain_directory(&metadata) => return Ok(DirState::Absent),
+                Ok(_) => return Err(Fault::Unexpected),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    ancestor = path.parent();
+                }
+                Err(error) => return Err(Fault::Io(error.kind())),
+            }
+        }
+
+        // Not even a drive/root exists: absence cannot be established.
+        Err(Fault::Io(io::ErrorKind::NotFound))
+    }
+
+    fn ensure_directory(&self) -> Result<(), StoreError> {
+        // Establish the surrounding filesystem first: never create through a
+        // junction, a file ancestor or an unreadable path.
+        self.inspect_directory()
+            .map_err(|fault| fault.into_store_error(IoStage::Directory))?;
+
+        // `create_dir_all` returns Ok without creating anything when the path
+        // is already a directory, including a junction; the inspection below
+        // is what rejects that.
+        fs::create_dir_all(&self.directory).map_err(|error| StoreError::Io {
+            stage: IoStage::Directory,
+            kind: error.kind(),
+        })?;
+
+        match self
+            .inspect_directory()
+            .map_err(|fault| fault.into_store_error(IoStage::Directory))?
+        {
+            DirState::Present => Ok(()),
+            DirState::Absent => Err(StoreError::Io {
+                stage: IoStage::Directory,
+                kind: io::ErrorKind::NotFound,
+            }),
+        }
+    }
+
+    /// Bounded, reparse-safe read. `Absent` only when the *first* metadata call
+    /// says not found; a record that vanishes afterwards is an I/O fault.
+    fn read_primary(&self, path: &Path) -> Result<Primary, Fault> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Primary::Absent),
+            Err(error) => return Err(Fault::Io(error.kind())),
+        };
+
+        if !is_plain_file(&metadata) {
+            return Err(Fault::Unexpected);
+        }
+        if let Some(early) = size_verdict(metadata.len()) {
+            return Ok(early);
+        }
+
+        let file = open_no_follow(path).map_err(|error| Fault::Io(error.kind()))?;
+
+        // Judge the opened handle, not the path that may have been swapped.
+        let opened = file.metadata().map_err(|error| Fault::Io(error.kind()))?;
+        if !is_plain_file(&opened) {
+            return Err(Fault::Unexpected);
+        }
+        if let Some(early) = size_verdict(opened.len()) {
+            return Ok(early);
+        }
+
+        let mut bytes = Vec::new();
+        file.take(MAX_SYNC_STATE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| Fault::Io(error.kind()))?;
+
+        match size_verdict(bytes.len() as u64) {
+            Some(verdict) => Ok(verdict),
+            None => Ok(Primary::Bytes(bytes)),
+        }
+    }
+
+    fn scan_artifacts(&self, key: &str) -> Result<Vec<PathBuf>, Fault> {
+        let entries = fs::read_dir(&self.directory).map_err(|error| Fault::Io(error.kind()))?;
+
+        let mut found = Vec::new();
+        for (index, entry) in entries.enumerate() {
+            if index >= MAX_SCANNED_ENTRIES {
+                return Err(Fault::EntryLimit);
+            }
+            let entry = entry.map_err(|error| Fault::Io(error.kind()))?;
+
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| is_artifact_name(name, key))
+            {
+                found.push(entry.path());
+            }
+        }
+
+        Ok(found)
+    }
+
+    /// Create, fill, flush and close a staging file; remove it on any failure.
+    fn write_temp(&self, key: &str, bytes: &[u8]) -> Result<PathBuf, StoreError> {
+        let (path, mut file) = self.create_temp(key)?;
+
+        let written = (|| {
+            file.write_all(bytes).map_err(|error| StoreError::Io {
+                stage: IoStage::Write,
+                kind: error.kind(),
+            })?;
+            file.flush().map_err(|error| StoreError::Io {
+                stage: IoStage::Write,
+                kind: error.kind(),
+            })?;
+            self.hook(Point::TempSync)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| StoreError::Io {
+                    stage: IoStage::Sync,
+                    kind: error.kind(),
+                })
+        })();
+
+        // Close before publication; Windows will not link or rename an open
+        // file that was opened without delete sharing by someone else, and we
+        // want our own handle gone regardless.
+        drop(file);
+
+        match written {
+            Ok(()) => Ok(path),
+            Err(error) => {
+                let _ = fs::remove_file(&path);
+                Err(error)
+            }
+        }
+    }
+
+    fn create_temp(&self, key: &str) -> Result<(PathBuf, File), StoreError> {
+        for _ in 0..TEMP_ALLOCATION_ATTEMPTS {
+            let name = format!("{key}.{}.{ARTIFACT_EXTENSION}", Uuid::new_v4().simple());
+            let path = self.directory.join(name);
+
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(StoreError::Io {
+                        stage: IoStage::Open,
+                        kind: error.kind(),
+                    })
+                }
+            }
+        }
+
+        Err(StoreError::Io {
+            stage: IoStage::Open,
+            kind: io::ErrorKind::AlreadyExists,
+        })
+    }
+
+    /// Read the record back; it must be byte-identical to what was written and
+    /// decode to the intended state.
+    fn verify(
+        &self,
+        record: &Path,
+        written: &[u8],
+        intended: &SyncState,
+    ) -> Result<(), StoreError> {
+        if self.hook(Point::Verify).is_err() {
+            return Err(StoreError::VerificationFailed);
+        }
+
+        match self.read_primary(record) {
+            Ok(Primary::Bytes(read_back))
+                if read_back == written
+                    && SyncState::decode(&read_back).is_ok_and(|decoded| decoded == *intended) =>
+            {
+                Ok(())
+            }
+            _ => Err(StoreError::VerificationFailed),
+        }
+    }
+
+    fn remove(&self, point: Point, path: &Path) -> Result<(), StoreError> {
+        match self.hook(point).and_then(|()| fs::remove_file(path)) {
+            Ok(()) => Ok(()),
+            // Already gone is the goal; the final verification decides.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(StoreError::IncompleteDeletion),
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn hook(&self, _point: Point) -> io::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn hook(&self, point: Point) -> io::Result<()> {
+        let faults = self.faults.lock().unwrap();
+        for (at, action) in faults.iter() {
+            if *at == point {
+                match action {
+                    Action::Fail(kind) => return Err(io::Error::from(*kind)),
+                    Action::Run(run) => run(),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---- free helpers -----------------------------------------------------------
+
+/// The existing Windows path-identity rule (`recent_vaults::path_strings_equal`,
+/// which is private there): ASCII case-insensitive. Non-ASCII letters are
+/// compared exactly, exactly as `eq_ignore_ascii_case` does.
+fn path_identity_eq(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+/// Record key: hex SHA-256 of the ASCII-lowercased locator bytes. The core
+/// fingerprint type is used purely as its existing SHA-256 helper (no new
+/// dependency); the value is not an envelope fingerprint.
+fn record_key(locator: &Locator) -> String {
+    EnvelopeFingerprint::of_bytes(locator.as_str().to_ascii_lowercase().as_bytes()).to_hex()
+}
+
+fn is_artifact_name(name: &str, key: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+
+    lowered
+        .strip_prefix(key)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(|rest| rest.strip_suffix(ARTIFACT_EXTENSION))
+        .and_then(|rest| rest.strip_suffix('.'))
+        .is_some_and(|token| {
+            token.len() == ARTIFACT_TOKEN_LEN
+                && token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+fn size_verdict(len: u64) -> Option<Primary> {
+    if len == 0 {
+        Some(Primary::Empty)
+    } else if len > MAX_SYNC_STATE_BYTES as u64 {
+        Some(Primary::TooLarge)
+    } else {
+        None
+    }
+}
+
+/// Decode with the accepted core mapping, then require the record to be for the
+/// requested location.
+fn classify(requested: &Locator, bytes: &[u8]) -> StateLoad {
+    match SyncStateLoad::from_bytes(bytes) {
+        SyncStateLoad::Loaded(state) => {
+            if path_identity_eq(state.local_locator().as_str(), requested.as_str()) {
+                StateLoad::Loaded(state)
+            } else {
+                StateLoad::Corrupt(CorruptReason::LocatorMismatch)
+            }
+        }
+        SyncStateLoad::UnsupportedVersion => StateLoad::UnsupportedVersion,
+        // `from_bytes` yields nothing else; anything unexpected fails closed.
+        _ => StateLoad::Corrupt(CorruptReason::Undecodable),
+    }
+}
+
+fn check_replacement(expected: &SyncState, proposed: &SyncState) -> Result<(), StoreError> {
+    if !path_identity_eq(
+        expected.local_locator().as_str(),
+        proposed.local_locator().as_str(),
+    ) {
+        return Err(StoreError::LocatorMismatch);
+    }
+
+    if expected.binding_id() != proposed.binding_id()
+        || expected.vault_tag() != proposed.vault_tag()
+        || expected.local_locator() != proposed.local_locator()
+        || expected.target_locator() != proposed.target_locator()
+    {
+        return Err(StoreError::BindingIdentityChanged);
+    }
+
+    // Defense in depth only: the core transitions never produce these.
+    match (expected.base(), proposed.base()) {
+        (SyncBase::Based(_), SyncBase::Unbased) => Err(StoreError::TrustedHistoryRegression),
+        (SyncBase::Based(old), SyncBase::Based(new))
+            if new.high_water().revision() < old.high_water().revision() =>
+        {
+            Err(StoreError::TrustedHistoryRegression)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn map_publish_error(error: &io::Error) -> StoreError {
+    // ERROR_INVALID_FUNCTION (1) / ERROR_NOT_SUPPORTED (50): no hard links.
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        StoreError::AlreadyExists
+    } else if error.kind() == io::ErrorKind::Unsupported
+        || matches!(error.raw_os_error(), Some(1) | Some(50))
+    {
+        StoreError::NoClobberUnsupported
+    } else {
+        StoreError::Io {
+            stage: IoStage::Replace,
+            kind: error.kind(),
+        }
+    }
+}
+
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || metadata.file_type().is_symlink()
+    }
+
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+fn is_plain_file(metadata: &fs::Metadata) -> bool {
+    !is_reparse_point(metadata) && metadata.is_file()
+}
+
+fn is_plain_directory(metadata: &fs::Metadata) -> bool {
+    !is_reparse_point(metadata) && metadata.is_dir()
+}
+
+fn open_no_follow(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+
+    options.open(path)
+}
+
+/// Windows storage tests. Synthetic states only; no vault fixture is read or
+/// modified. Every test owns a uniquely named scratch directory under the
+/// git-ignored `<repo>/.qa-local/sync-state-b1-tests/` (never `%TEMP%`) and
+/// removes only that directory.
+///
+/// Not proven here: physical power-loss behavior, Windows filesystem crash
+/// consistency, and behavior on a filesystem without hard links. Crash states
+/// are produced by constructing the files an interruption would leave, and
+/// unreproducible I/O failures by the test-only fault seam (`Point`).
+#[cfg(test)]
+mod tests {
+    use std::{fs, io, path::PathBuf};
+
+    use localvault_core::{
+        sync::{PushBaseline, PushIntent, RemoteHighWater},
+        sync_state::{BindingId, PendingPush, SyncCheckpoint, VaultBindingTag, BINDING_SALT_LEN},
+    };
+    use zeroize::Zeroizing;
+
+    use super::*;
+    use crate::vault::session::UnlockedVaultSession;
+
+    const LOCAL: &str = r"\\?\C:\Synthetic\Vaults\LOCAL-MARKER.lvault";
+    const OTHER_LOCAL: &str = r"\\?\C:\Synthetic\Vaults\OTHER-MARKER.lvault";
+    const TARGET: &str = r"\\?\D:\Synthetic\Remote\TARGET-MARKER.lvault";
+
+    const VAULT_ID: Uuid = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+    const OTHER_VAULT_ID: Uuid = Uuid::from_u128(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210);
+    const BINDING: Uuid = Uuid::from_u128(0x1111_1111_2222_3333_4444_5555_5555_5555);
+    const INTENT: Uuid = Uuid::from_u128(0xaaaa_aaaa_bbbb_4ccc_8ddd_eeee_eeee_eeee);
+
+    const STALE_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    // ---- scratch and builders ---------------------------------------------
+
+    struct Scratch {
+        dir: tempfile::TempDir,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(".qa-local")
+                .join("sync-state-b1-tests");
+            fs::create_dir_all(&base).unwrap();
+
+            // `.qa-local` is ignored by its own `.gitignore`; only supply it if
+            // the directory was just created without one.
+            let ignore = base.parent().unwrap().join(".gitignore");
+            if !ignore.exists() {
+                fs::write(&ignore, "*\n").unwrap();
+            }
+
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("{name}-"))
+                .tempdir_in(&base)
+                .unwrap();
+
+            Self { dir }
+        }
+
+        fn root(&self) -> PathBuf {
+            self.dir.path().to_path_buf()
+        }
+
+        fn state_dir(&self) -> PathBuf {
+            self.root().join(SYNC_STATE_DIRECTORY)
+        }
+
+        fn store(&self) -> SyncStateStore {
+            SyncStateStore::new(&self.root()).unwrap()
+        }
+
+        fn record(&self, local: &str) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.json", record_key(&loc(local))))
+        }
+
+        fn artifact(&self, local: &str, token: &str) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.{token}.tmp", record_key(&loc(local))))
+        }
+
+        fn put(&self, path: &Path, bytes: &[u8]) {
+            fs::create_dir_all(self.state_dir()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut found: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn fp(tag: u8) -> EnvelopeFingerprint {
+        EnvelopeFingerprint::of_bytes(&[tag])
+    }
+
+    fn loc(value: &str) -> Locator {
+        Locator::new(value).unwrap()
+    }
+
+    fn tag_for(vault_id: Uuid) -> VaultBindingTag {
+        let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+        VaultBindingTag::derive(salt, vault_id).unwrap()
+    }
+
+    fn build(
+        local: &str,
+        vault_id: Uuid,
+        base: SyncBase,
+        pending: Option<PendingPush>,
+    ) -> SyncState {
+        SyncState::new(
+            BindingId::new(BINDING).unwrap(),
+            tag_for(vault_id),
+            loc(local),
+            loc(TARGET),
+            base,
+            pending,
+        )
+        .unwrap()
+    }
+
+    /// Unbased, with a pending initial publication from an absent remote.
+    fn unbased(local: &str) -> SyncState {
+        let intent = PushIntent::new(PushBaseline::Absent, fp(2)).unwrap();
+        build(
+            local,
+            VAULT_ID,
+            SyncBase::Unbased,
+            Some(PendingPush::new(INTENT, intent, 1).unwrap()),
+        )
+    }
+
+    fn checkpoint(high_water: u64) -> SyncBase {
+        SyncBase::Based(SyncCheckpoint::new(fp(1), 1, RemoteHighWater::new(high_water)).unwrap())
+    }
+
+    fn based(local: &str, high_water: u64) -> SyncState {
+        build(local, VAULT_ID, checkpoint(high_water), None)
+    }
+
+    /// Same binding as `old`, different base and pending push.
+    fn rebuilt(old: &SyncState, base: SyncBase, pending: Option<PendingPush>) -> SyncState {
+        SyncState::new(
+            old.binding_id(),
+            *old.vault_tag(),
+            old.local_locator().clone(),
+            old.target_locator().clone(),
+            base,
+            pending,
+        )
+        .unwrap()
+    }
+
+    fn pending_push(revision: u64) -> PendingPush {
+        let intent = PushIntent::new(PushBaseline::Present(fp(1)), fp(3)).unwrap();
+        PendingPush::new(INTENT, intent, revision).unwrap()
+    }
+
+    fn tampered(state: &SyncState, edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&state.encode().unwrap()).unwrap();
+        edit(&mut value);
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    fn loaded(load: StateLoad) -> SyncState {
+        match load {
+            StateLoad::Loaded(state) => *state,
+            other => panic!("expected a loaded state, got {other:?}"),
+        }
+    }
+
+    fn fail_at(store: &SyncStateStore, point: Point, kind: io::ErrorKind) {
+        store
+            .faults
+            .lock()
+            .unwrap()
+            .push((point, Action::Fail(kind)));
+    }
+
+    fn run_at(store: &SyncStateStore, point: Point, run: impl Fn() + Send + 'static) {
+        store
+            .faults
+            .lock()
+            .unwrap()
+            .push((point, Action::Run(Box::new(run))));
+    }
+
+    /// Open without delete/write sharing: later opens for data or delete fail.
+    #[cfg(windows)]
+    fn hold_exclusively(path: &Path) -> fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap()
+    }
+
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(status.status.success(), "could not create a test junction");
+    }
+
+    // ---- 1. create / load round trip ---------------------------------------
+
+    #[test]
+    fn valid_state_create_load_round_trip() {
+        let scratch = Scratch::new("roundtrip");
+        let store = scratch.store();
+        let state = unbased(LOCAL);
+
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+
+        store.create(&state).unwrap();
+
+        assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+        assert_eq!(
+            fs::read(scratch.record(LOCAL)).unwrap(),
+            state.encode().unwrap()
+        );
+        // Only the record: the staging name was removed.
+        assert_eq!(names(&scratch.state_dir()).len(), 1);
+
+        assert!(matches!(
+            store.load(&loc(LOCAL)).into_sync_state_load(),
+            SyncStateLoad::Loaded(_)
+        ));
+    }
+
+    // ---- 2. replacement ------------------------------------------------------
+
+    #[test]
+    fn replacement_is_atomic_and_verified_by_read_back() {
+        let scratch = Scratch::new("replace");
+        let store = scratch.store();
+
+        let first = based(LOCAL, 9);
+        store.create(&first).unwrap();
+
+        let raised = rebuilt(&first, checkpoint(12), None);
+        store.replace(&first, &raised).unwrap();
+        assert_eq!(loaded(store.load(&loc(LOCAL))), raised);
+        assert_eq!(
+            fs::read(scratch.record(LOCAL)).unwrap(),
+            raised.encode().unwrap()
+        );
+        assert_eq!(names(&scratch.state_dir()).len(), 1);
+
+        let pending = rebuilt(&raised, checkpoint(12), Some(pending_push(13)));
+        store.replace(&raised, &pending).unwrap();
+        assert_eq!(loaded(store.load(&loc(LOCAL))), pending);
+
+        // Unbased -> Based is a legitimate (finalize) replacement.
+        let other = Scratch::new("replace-unbased");
+        let other_store = other.store();
+        let initial = unbased(LOCAL);
+        other_store.create(&initial).unwrap();
+        let finalized = rebuilt(&initial, checkpoint(1), None);
+        other_store.replace(&initial, &finalized).unwrap();
+        assert_eq!(loaded(other_store.load(&loc(LOCAL))), finalized);
+    }
+
+    // ---- 3. create refuses existing -----------------------------------------
+
+    #[test]
+    fn create_refuses_an_existing_state_without_modifying_it() {
+        let scratch = Scratch::new("create-exists");
+        let store = scratch.store();
+        let original = unbased(LOCAL);
+        store.create(&original).unwrap();
+        let before = fs::read(scratch.record(LOCAL)).unwrap();
+
+        assert_eq!(store.create(&original), Err(StoreError::AlreadyExists));
+        assert_eq!(
+            store.create(&based(LOCAL, 3)),
+            Err(StoreError::AlreadyExists)
+        );
+
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), before);
+        assert_eq!(names(&scratch.state_dir()).len(), 1);
+    }
+
+    // ---- 4. replacement refuses a changed expectation -----------------------
+
+    #[test]
+    fn replacement_refuses_a_changed_expected_state() {
+        let scratch = Scratch::new("replace-changed");
+        let store = scratch.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        let before = fs::read(scratch.record(LOCAL)).unwrap();
+
+        let stale_expectation = based(LOCAL, 8);
+        let proposed = rebuilt(&stale_expectation, checkpoint(10), None);
+
+        assert_eq!(
+            store.replace(&stale_expectation, &proposed),
+            Err(StoreError::Changed)
+        );
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), before);
+        assert_eq!(names(&scratch.state_dir()).len(), 1);
+    }
+
+    #[test]
+    fn replacement_detects_a_record_swapped_between_the_two_reads() {
+        let scratch = Scratch::new("replace-swapped");
+        let store = scratch.store();
+        let expected = based(LOCAL, 9);
+        store.create(&expected).unwrap();
+
+        // Another valid state is written after the compare, before the rename.
+        let intruder = rebuilt(&expected, checkpoint(50), None);
+        let record = scratch.record(LOCAL);
+        let intruder_bytes = intruder.encode().unwrap();
+        let swap_bytes = intruder_bytes.clone();
+        run_at(&store, Point::BeforeReplace, move || {
+            fs::write(&record, &swap_bytes).unwrap();
+        });
+
+        let proposed = rebuilt(&expected, checkpoint(10), None);
+        assert_eq!(
+            store.replace(&expected, &proposed),
+            Err(StoreError::Changed)
+        );
+
+        // The intruder's record is untouched and our staging file is gone.
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), intruder_bytes);
+        assert_eq!(names(&scratch.state_dir()).len(), 1);
+    }
+
+    // ---- 5. replacement refuses a missing state -----------------------------
+
+    #[test]
+    fn replacement_refuses_a_missing_state_and_creates_nothing() {
+        let scratch = Scratch::new("replace-missing");
+        let store = scratch.store();
+        let expected = based(LOCAL, 9);
+        let proposed = rebuilt(&expected, checkpoint(10), None);
+
+        assert_eq!(
+            store.replace(&expected, &proposed),
+            Err(StoreError::Missing)
+        );
+        assert!(!scratch.state_dir().exists());
+
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+        assert_eq!(
+            store.replace(&expected, &proposed),
+            Err(StoreError::Missing)
+        );
+        assert!(names(&scratch.state_dir()).is_empty());
+    }
+
+    #[test]
+    fn replacement_guards_binding_identity_and_trusted_history() {
+        let scratch = Scratch::new("replace-guards");
+        let store = scratch.store();
+        let current = based(LOCAL, 9);
+        store.create(&current).unwrap();
+        let before = fs::read(scratch.record(LOCAL)).unwrap();
+
+        // Different record.
+        assert_eq!(
+            store.replace(&current, &based(OTHER_LOCAL, 9)),
+            Err(StoreError::LocatorMismatch)
+        );
+
+        // Different vault tag, same locators.
+        let retagged = build(LOCAL, OTHER_VAULT_ID, checkpoint(9), None);
+        assert_eq!(
+            store.replace(&current, &retagged),
+            Err(StoreError::BindingIdentityChanged)
+        );
+
+        // Same locator up to ASCII case is the same record but not the same
+        // binding identity.
+        let recased = based(&LOCAL.to_ascii_uppercase(), 9);
+        assert_eq!(
+            store.replace(&current, &recased),
+            Err(StoreError::BindingIdentityChanged)
+        );
+
+        // The trusted high-water mark never goes down, and a checkpoint is
+        // never dropped.
+        let lowered = rebuilt(&current, checkpoint(8), None);
+        assert_eq!(
+            store.replace(&current, &lowered),
+            Err(StoreError::TrustedHistoryRegression)
+        );
+        let dropped = rebuilt(
+            &current,
+            SyncBase::Unbased,
+            Some(
+                PendingPush::new(
+                    INTENT,
+                    PushIntent::new(PushBaseline::Absent, fp(2)).unwrap(),
+                    1,
+                )
+                .unwrap(),
+            ),
+        );
+        assert_eq!(
+            store.replace(&current, &dropped),
+            Err(StoreError::TrustedHistoryRegression)
+        );
+
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), before);
+    }
+
+    // ---- 6-10. load classification ------------------------------------------
+
+    #[test]
+    fn corrupt_json_is_corrupt_and_left_in_place() {
+        let scratch = Scratch::new("corrupt-json");
+        let store = scratch.store();
+        scratch.put(&scratch.record(LOCAL), b"{ definitely not json");
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Corrupt(CorruptReason::Undecodable)
+        );
+        assert_eq!(
+            store.load(&loc(LOCAL)).into_sync_state_load(),
+            SyncStateLoad::Corrupt
+        );
+        assert_eq!(
+            fs::read(scratch.record(LOCAL)).unwrap(),
+            b"{ definitely not json"
+        );
+
+        // A corrupt record is never replaced by a new binding or a replacement.
+        assert_eq!(
+            store.create(&unbased(LOCAL)),
+            Err(StoreError::AlreadyExists)
+        );
+        let expected = based(LOCAL, 9);
+        assert_eq!(
+            store.replace(&expected, &rebuilt(&expected, checkpoint(10), None)),
+            Err(StoreError::CurrentCorrupt)
+        );
+        assert_eq!(
+            fs::read(scratch.record(LOCAL)).unwrap(),
+            b"{ definitely not json"
+        );
+    }
+
+    #[test]
+    fn bad_checksum_is_corrupt() {
+        let scratch = Scratch::new("bad-checksum");
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+
+        let flipped_digest = tampered(&state, |value| {
+            let mut digest = value["body_sha256"].as_str().unwrap().to_owned();
+            let first = if digest.starts_with('0') { "1" } else { "0" };
+            digest.replace_range(0..1, first);
+            value["body_sha256"] = serde_json::Value::String(digest);
+        });
+        scratch.put(&scratch.record(LOCAL), &flipped_digest);
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Corrupt(CorruptReason::Undecodable)
+        );
+
+        // A changed body under the old checksum is equally rejected.
+        let edited_body = tampered(&state, |value| {
+            let body = value["body"]
+                .as_str()
+                .unwrap()
+                .replace("\"high_water\":9", "\"high_water\":8");
+            value["body"] = serde_json::Value::String(body);
+        });
+        fs::write(scratch.record(LOCAL), &edited_body).unwrap();
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Corrupt(CorruptReason::Undecodable)
+        );
+    }
+
+    #[test]
+    fn unsupported_future_version_stays_blocked() {
+        let scratch = Scratch::new("future-version");
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+
+        let future = tampered(&state, |value| {
+            value["version"] = serde_json::json!(2);
+            value["added_in_v2"] = serde_json::json!(true);
+        });
+        scratch.put(&scratch.record(LOCAL), &future);
+
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::UnsupportedVersion);
+        assert_eq!(
+            store.load(&loc(LOCAL)).into_sync_state_load(),
+            SyncStateLoad::UnsupportedVersion
+        );
+
+        // Not reset, not replaced, not overwritten by a fresh binding.
+        assert_eq!(
+            store.create(&unbased(LOCAL)),
+            Err(StoreError::AlreadyExists)
+        );
+        assert_eq!(
+            store.replace(&state, &rebuilt(&state, checkpoint(10), None)),
+            Err(StoreError::CurrentUnsupportedVersion)
+        );
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), future);
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::UnsupportedVersion);
+    }
+
+    #[test]
+    fn oversized_file_is_rejected_without_reading_it() {
+        let scratch = Scratch::new("oversized");
+        let store = scratch.store();
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+
+        // A sparse 512 MiB file: reading it would be slow and large; the
+        // metadata length alone must decide.
+        let file = File::create(scratch.record(LOCAL)).unwrap();
+        file.set_len(512 * 1024 * 1024).unwrap();
+        drop(file);
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Corrupt(CorruptReason::TooLarge)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        // One byte over the limit.
+        let file = OpenOptions::new()
+            .write(true)
+            .open(scratch.record(LOCAL))
+            .unwrap();
+        file.set_len(MAX_SYNC_STATE_BYTES as u64 + 1).unwrap();
+        drop(file);
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Corrupt(CorruptReason::TooLarge)
+        );
+        assert_eq!(
+            store.create(&unbased(LOCAL)),
+            Err(StoreError::AlreadyExists)
+        );
+
+        // Exactly the limit is read (bounded) and then fails to decode.
+        fs::write(scratch.record(LOCAL), vec![b'x'; MAX_SYNC_STATE_BYTES]).unwrap();
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Corrupt(CorruptReason::Undecodable)
+        );
+
+        assert!(matches!(size_verdict(0), Some(Primary::Empty)));
+        assert!(size_verdict(MAX_SYNC_STATE_BYTES as u64).is_none());
+        assert!(matches!(
+            size_verdict(MAX_SYNC_STATE_BYTES as u64 + 1),
+            Some(Primary::TooLarge)
+        ));
+    }
+
+    #[test]
+    fn truncated_state_is_never_not_configured() {
+        let scratch = Scratch::new("truncated");
+        let store = scratch.store();
+        let full = based(LOCAL, 9).encode().unwrap();
+
+        scratch.put(&scratch.record(LOCAL), b"");
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Corrupt(CorruptReason::Empty)
+        );
+
+        for cut in (1..full.len()).step_by(7) {
+            fs::write(scratch.record(LOCAL), &full[..cut]).unwrap();
+            assert_eq!(
+                store.load(&loc(LOCAL)),
+                StateLoad::Corrupt(CorruptReason::Undecodable),
+                "cut at {cut}"
+            );
+        }
+
+        // Loading never repairs or removes it.
+        assert!(scratch.record(LOCAL).exists());
+    }
+
+    // ---- 11. I/O errors are not absence --------------------------------------
+
+    #[cfg(windows)]
+    #[test]
+    fn io_and_permission_errors_are_never_not_configured() {
+        let scratch = Scratch::new("io-errors");
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+        store.create(&state).unwrap();
+
+        {
+            // The record exists but cannot be opened for reading.
+            let _guard = hold_exclusively(&scratch.record(LOCAL));
+
+            let outcome = store.load(&loc(LOCAL));
+            assert!(
+                matches!(outcome, StateLoad::Unreadable(UnreadableReason::Io(_))),
+                "got {outcome:?}"
+            );
+            assert_eq!(
+                store.load(&loc(LOCAL)).into_sync_state_load(),
+                SyncStateLoad::Unreadable
+            );
+            assert_eq!(
+                store.replace(&state, &rebuilt(&state, checkpoint(10), None)),
+                Err(StoreError::CurrentUnreadable)
+            );
+            assert_eq!(store.create(&state), Err(StoreError::AlreadyExists));
+        }
+
+        // Released: the record was never harmed.
+        assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+
+        // The sync-state "directory" being a regular file is not absence.
+        let blocked = Scratch::new("io-errors-file-dir");
+        fs::write(blocked.state_dir(), b"not a directory").unwrap();
+        assert_eq!(
+            blocked.store().load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnexpectedObject)
+        );
+        assert_eq!(
+            blocked.store().create(&state),
+            Err(StoreError::UnexpectedObject)
+        );
+
+        // A genuinely missing root (first run) is the one case of absence.
+        let pristine = Scratch::new("io-errors-pristine");
+        let missing_root = pristine.root().join("not-created-yet");
+        let pristine_store = SyncStateStore::new(&missing_root).unwrap();
+        assert_eq!(pristine_store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+        assert!(!missing_root.exists());
+    }
+
+    // ---- 12-14. record identity ----------------------------------------------
+
+    #[test]
+    fn a_record_copied_under_the_wrong_key_is_rejected() {
+        let scratch = Scratch::new("wrong-key");
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+        store.create(&state).unwrap();
+
+        fs::copy(scratch.record(LOCAL), scratch.record(OTHER_LOCAL)).unwrap();
+
+        assert_eq!(
+            store.load(&loc(OTHER_LOCAL)),
+            StateLoad::Corrupt(CorruptReason::LocatorMismatch)
+        );
+        assert_eq!(
+            store.load(&loc(OTHER_LOCAL)).into_sync_state_load(),
+            SyncStateLoad::Corrupt
+        );
+
+        let wrong = based(OTHER_LOCAL, 9);
+        assert_eq!(
+            store.replace(&wrong, &rebuilt(&wrong, checkpoint(10), None)),
+            Err(StoreError::CurrentLocatorMismatch)
+        );
+
+        // The genuine record is still valid.
+        assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+    }
+
+    #[test]
+    fn different_local_paths_have_different_keys_and_agree_with_path_identity() {
+        let key = record_key(&loc(LOCAL));
+        assert_eq!(key.len(), 64);
+        assert!(key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_ne!(key, record_key(&loc(OTHER_LOCAL)));
+
+        // Key equality is exactly the existing Windows path-identity rule
+        // (ASCII case-insensitive; non-ASCII compared exactly).
+        let spellings = [
+            LOCAL,
+            r"\\?\c:\synthetic\vaults\local-marker.LVAULT",
+            OTHER_LOCAL,
+            r"\\?\C:\Synthetic\Vaults\Ä.lvault",
+            r"\\?\C:\Synthetic\Vaults\ä.lvault",
+            r"C:\Synthetic\Vaults\LOCAL-MARKER.lvault",
+        ];
+        for left in spellings {
+            for right in spellings {
+                assert_eq!(
+                    record_key(&loc(left)) == record_key(&loc(right)),
+                    path_identity_eq(left, right),
+                    "{left} vs {right}"
+                );
+            }
+        }
+        assert!(!path_identity_eq("Ä", "ä"));
+        assert!(path_identity_eq("A", "a"));
+
+        let scratch = Scratch::new("two-records");
+        let store = scratch.store();
+        let first = based(LOCAL, 9);
+        let second = based(OTHER_LOCAL, 4);
+        store.create(&first).unwrap();
+        store.create(&second).unwrap();
+        assert_eq!(loaded(store.load(&loc(LOCAL))), first);
+        assert_eq!(loaded(store.load(&loc(OTHER_LOCAL))), second);
+        assert_eq!(names(&scratch.state_dir()).len(), 2);
+    }
+
+    #[test]
+    fn a_case_variant_request_finds_the_record_but_core_still_compares_exactly() {
+        let scratch = Scratch::new("case-variant");
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+        store.create(&state).unwrap();
+
+        let variant = loc(&LOCAL.to_ascii_uppercase());
+        let found = loaded(store.load(&variant));
+        assert_eq!(found, state);
+
+        // The store keys on path identity; the core's binding check remains an
+        // exact comparison and refuses the differently spelled locator.
+        assert_eq!(
+            found
+                .verify_binding(VAULT_ID, &variant, &loc(TARGET))
+                .unwrap_err(),
+            localvault_core::sync_state::BindingMismatch::LocalLocator
+        );
+    }
+
+    #[test]
+    fn a_reused_path_loads_the_old_record_so_the_caller_must_verify_the_vault_tag() {
+        let scratch = Scratch::new("reused-path");
+        let store = scratch.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+
+        // Later a different encrypted vault sits at the same path. The store
+        // cannot tell: it returns the old record unchanged...
+        let inherited = loaded(store.load(&loc(LOCAL)));
+
+        // ...and only the authenticated-vault-id check rejects it.
+        assert!(inherited
+            .verify_binding(VAULT_ID, &loc(LOCAL), &loc(TARGET))
+            .is_ok());
+        assert_eq!(
+            inherited
+                .verify_binding(OTHER_VAULT_ID, &loc(LOCAL), &loc(TARGET))
+                .unwrap_err(),
+            localvault_core::sync_state::BindingMismatch::VaultIdentity
+        );
+    }
+
+    // ---- 15-16. recovery artifacts and interruption ---------------------------
+
+    #[test]
+    fn stale_recovery_artifacts_fail_closed_and_are_never_auto_deleted() {
+        let scratch = Scratch::new("stale-artifacts");
+        let store = scratch.store();
+        let artifact = scratch.artifact(LOCAL, STALE_TOKEN);
+        scratch.put(&artifact, b"{\"half written");
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts)
+        );
+        assert_eq!(
+            store.load(&loc(LOCAL)).into_sync_state_load(),
+            SyncStateLoad::Unreadable
+        );
+        assert_eq!(
+            store.create(&unbased(LOCAL)),
+            Err(StoreError::UnresolvedArtifacts)
+        );
+        assert!(artifact.exists());
+        assert!(!scratch.record(LOCAL).exists());
+
+        // Files that only look related, and other records' artifacts, are not
+        // this record's artifacts: they neither block nor get touched.
+        fs::remove_file(&artifact).unwrap();
+        let key = record_key(&loc(LOCAL));
+        let unrelated = [
+            scratch.state_dir().join(format!("{key}.notes.txt")),
+            scratch.state_dir().join(format!("{key}.json.bak")),
+            scratch
+                .state_dir()
+                .join(format!("{key}.{STALE_TOKEN}.tmp.old")),
+            scratch.state_dir().join(format!("{key}.short.tmp")),
+            scratch.artifact(OTHER_LOCAL, STALE_TOKEN),
+        ];
+        for path in &unrelated {
+            fs::write(path, b"unrelated").unwrap();
+        }
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+        store.create(&unbased(LOCAL)).unwrap();
+        for path in &unrelated {
+            assert_eq!(fs::read(path).unwrap(), b"unrelated");
+        }
+    }
+
+    #[test]
+    fn artifact_name_pattern_is_exact() {
+        let key = record_key(&loc(LOCAL));
+        let other = record_key(&loc(OTHER_LOCAL));
+
+        assert!(is_artifact_name(&format!("{key}.{STALE_TOKEN}.tmp"), &key));
+        // NTFS names are case-insensitive.
+        assert!(is_artifact_name(
+            &format!("{key}.{STALE_TOKEN}.tmp").to_ascii_uppercase(),
+            &key
+        ));
+        assert!(!is_artifact_name(
+            &format!("{other}.{STALE_TOKEN}.tmp"),
+            &key
+        ));
+        assert!(!is_artifact_name(&format!("{key}.json"), &key));
+        assert!(!is_artifact_name(
+            &format!("{key}.{STALE_TOKEN}.tmp.x"),
+            &key
+        ));
+        assert!(!is_artifact_name(
+            &format!("{key}.{STALE_TOKEN}0.tmp"),
+            &key
+        ));
+        assert!(!is_artifact_name(
+            &format!("{key}.{}.tmp", "g".repeat(32)),
+            &key
+        ));
+        assert!(!is_artifact_name(&format!("{key}{STALE_TOKEN}.tmp"), &key));
+    }
+
+    #[test]
+    fn an_interrupted_write_never_authorizes_an_initial_binding() {
+        // Crash after the staging file was written, before publication.
+        let scratch = Scratch::new("interrupted-before-publish");
+        let store = scratch.store();
+        let state = unbased(LOCAL);
+        scratch.put(
+            &scratch.artifact(LOCAL, STALE_TOKEN),
+            &state.encode().unwrap(),
+        );
+        assert_ne!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+        assert_eq!(store.create(&state), Err(StoreError::UnresolvedArtifacts));
+
+        // A non-atomic writer died halfway through the record itself.
+        let torn = Scratch::new("interrupted-torn-record");
+        let torn_store = torn.store();
+        let bytes = state.encode().unwrap();
+        torn.put(&torn.record(LOCAL), &bytes[..bytes.len() / 2]);
+        assert_eq!(
+            torn_store.load(&loc(LOCAL)),
+            StateLoad::Corrupt(CorruptReason::Undecodable)
+        );
+        assert_eq!(torn_store.create(&state), Err(StoreError::AlreadyExists));
+
+        // Crash after publication, before the staging name was removed: the
+        // record is complete and authoritative, the leftover is only debris.
+        let linked = Scratch::new("interrupted-after-publish");
+        let linked_store = linked.store();
+        linked.put(&linked.record(LOCAL), &bytes);
+        linked.put(&linked.artifact(LOCAL, STALE_TOKEN), &bytes);
+        assert_eq!(loaded(linked_store.load(&loc(LOCAL))), state);
+        assert_eq!(linked_store.create(&state), Err(StoreError::AlreadyExists));
+
+        // Crash during a replacement: old record intact, partial staging file.
+        let replacing = Scratch::new("interrupted-during-replace");
+        let replacing_store = replacing.store();
+        let old = based(LOCAL, 9);
+        replacing_store.create(&old).unwrap();
+        let next = rebuilt(&old, checkpoint(12), None);
+        let next_bytes = next.encode().unwrap();
+        replacing.put(
+            &replacing.artifact(LOCAL, STALE_TOKEN),
+            &next_bytes[..next_bytes.len() / 3],
+        );
+        assert_eq!(loaded(replacing_store.load(&loc(LOCAL))), old);
+        replacing_store.replace(&old, &next).unwrap();
+        assert_eq!(loaded(replacing_store.load(&loc(LOCAL))), next);
+        assert!(replacing.artifact(LOCAL, STALE_TOKEN).exists());
+    }
+
+    #[test]
+    fn failed_publication_leaves_no_record_and_no_staging_file() {
+        let scratch = Scratch::new("fault-publish");
+        let store = scratch.store();
+        let state = unbased(LOCAL);
+
+        fail_at(&store, Point::Publish, io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            store.create(&state),
+            Err(StoreError::Io {
+                stage: IoStage::Replace,
+                kind: io::ErrorKind::PermissionDenied
+            })
+        ));
+        assert!(names(&scratch.state_dir()).is_empty());
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+
+        // A filesystem without hard links is reported, never worked around.
+        let unsupported = Scratch::new("fault-no-hard-links");
+        let unsupported_store = unsupported.store();
+        fail_at(
+            &unsupported_store,
+            Point::Publish,
+            io::ErrorKind::Unsupported,
+        );
+        assert_eq!(
+            unsupported_store.create(&state),
+            Err(StoreError::NoClobberUnsupported)
+        );
+        assert!(names(&unsupported.state_dir()).is_empty());
+
+        // A failed flush of the staging file.
+        let unflushed = Scratch::new("fault-sync");
+        let unflushed_store = unflushed.store();
+        fail_at(&unflushed_store, Point::TempSync, io::ErrorKind::Other);
+        assert!(matches!(
+            unflushed_store.create(&state),
+            Err(StoreError::Io {
+                stage: IoStage::Sync,
+                ..
+            })
+        ));
+        assert!(names(&unflushed.state_dir()).is_empty());
+    }
+
+    #[test]
+    fn publication_never_clobbers_a_record_that_appears_after_the_existence_check() {
+        let scratch = Scratch::new("no-clobber-race");
+        let store = scratch.store();
+
+        // A competing writer publishes a different valid record in the window
+        // between the existence check and our publication.
+        let intruder = based(LOCAL, 40);
+        let intruder_bytes = intruder.encode().unwrap();
+        let record = scratch.record(LOCAL);
+        let planted = intruder_bytes.clone();
+        run_at(&store, Point::Publish, move || {
+            fs::write(&record, &planted).unwrap();
+        });
+
+        assert_eq!(
+            store.create(&unbased(LOCAL)),
+            Err(StoreError::AlreadyExists)
+        );
+
+        // The competing record survived untouched and our staging file is gone.
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), intruder_bytes);
+        assert_eq!(names(&scratch.state_dir()).len(), 1);
+        assert_eq!(loaded(store.load(&loc(LOCAL))), intruder);
+    }
+
+    #[test]
+    fn a_failed_read_back_is_not_reported_as_success() {
+        let scratch = Scratch::new("fault-verify-create");
+        let store = scratch.store();
+        let state = unbased(LOCAL);
+
+        fail_at(&store, Point::Verify, io::ErrorKind::Other);
+        assert_eq!(store.create(&state), Err(StoreError::VerificationFailed));
+        // The caller is told to reload; the record that was published is not
+        // silently removed.
+        assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+
+        let replacing = Scratch::new("fault-verify-replace");
+        let replacing_store = replacing.store();
+        let old = based(LOCAL, 9);
+        replacing_store.create(&old).unwrap();
+        let next = rebuilt(&old, checkpoint(10), None);
+        fail_at(&replacing_store, Point::Verify, io::ErrorKind::Other);
+        assert_eq!(
+            replacing_store.replace(&old, &next),
+            Err(StoreError::VerificationFailed)
+        );
+        assert_eq!(loaded(replacing_store.load(&loc(LOCAL))), next);
+    }
+
+    #[test]
+    fn a_failed_replacement_leaves_the_trusted_record_untouched() {
+        let scratch = Scratch::new("fault-replace");
+        let store = scratch.store();
+        let old = based(LOCAL, 9);
+        store.create(&old).unwrap();
+        let before = fs::read(scratch.record(LOCAL)).unwrap();
+        let next = rebuilt(&old, checkpoint(10), None);
+
+        fail_at(&store, Point::Replace, io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            store.replace(&old, &next),
+            Err(StoreError::Io {
+                stage: IoStage::Replace,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), before);
+        assert_eq!(names(&scratch.state_dir()).len(), 1);
+
+        // A failed flush of the replacement's staging file.
+        let flush = Scratch::new("fault-replace-sync");
+        let flush_store = flush.store();
+        flush_store.create(&old).unwrap();
+        fail_at(&flush_store, Point::TempSync, io::ErrorKind::Other);
+        assert!(matches!(
+            flush_store.replace(&old, &next),
+            Err(StoreError::Io {
+                stage: IoStage::Sync,
+                ..
+            })
+        ));
+        assert_eq!(loaded(flush_store.load(&loc(LOCAL))), old);
+        assert_eq!(names(&flush.state_dir()).len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_real_rename_failure_leaves_the_trusted_record_untouched() {
+        let scratch = Scratch::new("real-replace-failure");
+        let store = scratch.store();
+        let old = based(LOCAL, 9);
+        store.create(&old).unwrap();
+        let next = rebuilt(&old, checkpoint(10), None);
+
+        // Hold the record so Windows refuses to replace it. The pre-replace
+        // read fails first, which is equally fail-closed.
+        let guard = hold_exclusively(&scratch.record(LOCAL));
+        let result = store.replace(&old, &next);
+        assert!(result.is_err(), "replacement over a held record succeeded");
+        drop(guard);
+
+        assert_eq!(loaded(store.load(&loc(LOCAL))), old);
+        assert_eq!(names(&scratch.state_dir()).len(), 1);
+    }
+
+    // ---- 17-18. deletion --------------------------------------------------------
+
+    #[test]
+    fn verified_deletion_removes_only_this_records_files() {
+        let scratch = Scratch::new("delete");
+        let store = scratch.store();
+
+        let doomed = based(LOCAL, 9);
+        let survivor = based(OTHER_LOCAL, 4);
+        store.create(&doomed).unwrap();
+        store.create(&survivor).unwrap();
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+        let key = record_key(&loc(LOCAL));
+        let unrelated = scratch.state_dir().join(format!("{key}.notes.txt"));
+        fs::write(&unrelated, b"unrelated").unwrap();
+
+        assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
+
+        assert!(!scratch.record(LOCAL).exists());
+        assert!(!scratch.artifact(LOCAL, STALE_TOKEN).exists());
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+        assert_eq!(loaded(store.load(&loc(OTHER_LOCAL))), survivor);
+
+        assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::AlreadyAbsent));
+
+        // A missing directory is verified absence too.
+        let empty = Scratch::new("delete-nothing");
+        assert_eq!(
+            empty.store().delete(&loc(LOCAL)),
+            Ok(DeleteOutcome::AlreadyAbsent)
+        );
+        assert!(!empty.state_dir().exists());
+    }
+
+    #[test]
+    fn loading_never_deletes_and_explicit_delete_clears_unusable_records() {
+        let scratch = Scratch::new("delete-unusable");
+        let store = scratch.store();
+        scratch.put(&scratch.record(LOCAL), b"garbage");
+
+        for _ in 0..3 {
+            assert!(matches!(store.load(&loc(LOCAL)), StateLoad::Corrupt(_)));
+        }
+        assert!(scratch.record(LOCAL).exists());
+
+        // Only the explicit operation removes it, after which a binding can be
+        // created deliberately.
+        assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+        store.create(&unbased(LOCAL)).unwrap();
+    }
+
+    #[test]
+    fn interrupted_or_failed_deletion_is_reported_and_never_absence() {
+        // Artifact removal fails: the record is untouched (artifacts go first).
+        let scratch = Scratch::new("delete-fail-artifact");
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+        store.create(&state).unwrap();
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+        fail_at(
+            &store,
+            Point::RemoveArtifact,
+            io::ErrorKind::PermissionDenied,
+        );
+        assert_eq!(
+            store.delete(&loc(LOCAL)),
+            Err(StoreError::IncompleteDeletion)
+        );
+        assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+
+        // Record removal fails after the artifacts were removed: the binding is
+        // intact, which is not "unbound".
+        let second = Scratch::new("delete-fail-record");
+        let second_store = second.store();
+        second_store.create(&state).unwrap();
+        second.put(&second.artifact(LOCAL, STALE_TOKEN), b"debris");
+        fail_at(
+            &second_store,
+            Point::RemovePrimary,
+            io::ErrorKind::PermissionDenied,
+        );
+        assert_eq!(
+            second_store.delete(&loc(LOCAL)),
+            Err(StoreError::IncompleteDeletion)
+        );
+        assert!(!second.artifact(LOCAL, STALE_TOKEN).exists());
+        assert_eq!(loaded(second_store.load(&loc(LOCAL))), state);
+
+        // A deletion interrupted with the record gone and an artifact left:
+        // that is unresolved, never NotConfigured, and a second delete finishes.
+        let third = Scratch::new("delete-interrupted");
+        let third_store = third.store();
+        third.put(&third.artifact(LOCAL, STALE_TOKEN), b"debris");
+        assert_eq!(
+            third_store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts)
+        );
+        assert_eq!(third_store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
+        assert_eq!(third_store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_windows_deletion_failure_is_reported_as_incomplete() {
+        let scratch = Scratch::new("delete-real-failure");
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+        store.create(&state).unwrap();
+
+        {
+            let _guard = hold_exclusively(&scratch.record(LOCAL));
+            assert_eq!(
+                store.delete(&loc(LOCAL)),
+                Err(StoreError::IncompleteDeletion)
+            );
+            assert!(scratch.record(LOCAL).exists());
+        }
+        assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+
+        // With an artifact held instead, the record must survive.
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+        {
+            let _guard = hold_exclusively(&scratch.artifact(LOCAL, STALE_TOKEN));
+            assert_eq!(
+                store.delete(&loc(LOCAL)),
+                Err(StoreError::IncompleteDeletion)
+            );
+            assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+        }
+        assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
+    }
+
+    // ---- 19. unexpected objects and reparse points -------------------------------
+
+    #[test]
+    fn a_directory_in_place_of_a_record_is_unexpected_and_untouched() {
+        let scratch = Scratch::new("directory-record");
+        let store = scratch.store();
+        fs::create_dir_all(scratch.record(LOCAL)).unwrap();
+        fs::write(scratch.record(LOCAL).join("inner.txt"), b"keep").unwrap();
+        let state = based(LOCAL, 9);
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnexpectedObject)
+        );
+        assert_eq!(store.create(&state), Err(StoreError::UnexpectedObject));
+        assert_eq!(
+            store.replace(&state, &rebuilt(&state, checkpoint(10), None)),
+            Err(StoreError::CurrentUnreadable)
+        );
+        assert_eq!(store.delete(&loc(LOCAL)), Err(StoreError::UnexpectedObject));
+        assert_eq!(
+            fs::read(scratch.record(LOCAL).join("inner.txt")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn a_directory_named_like_an_artifact_blocks_and_is_never_deleted() {
+        let scratch = Scratch::new("directory-artifact");
+        let store = scratch.store();
+        fs::create_dir_all(scratch.artifact(LOCAL, STALE_TOKEN)).unwrap();
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts)
+        );
+        assert_eq!(
+            store.create(&unbased(LOCAL)),
+            Err(StoreError::UnresolvedArtifacts)
+        );
+        assert_eq!(store.delete(&loc(LOCAL)), Err(StoreError::UnexpectedObject));
+        assert!(scratch.artifact(LOCAL, STALE_TOKEN).is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_are_never_followed() {
+        let state = based(LOCAL, 9);
+
+        // The sync-state directory itself is a junction.
+        let scratch = Scratch::new("junction-directory");
+        let elsewhere = scratch.root().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        make_junction(&scratch.state_dir(), &elsewhere);
+        let store = scratch.store();
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnexpectedObject)
+        );
+        assert_eq!(store.create(&state), Err(StoreError::UnexpectedObject));
+        assert_eq!(
+            store.replace(&state, &rebuilt(&state, checkpoint(10), None)),
+            Err(StoreError::UnexpectedObject)
+        );
+        assert_eq!(store.delete(&loc(LOCAL)), Err(StoreError::UnexpectedObject));
+        assert!(names(&elsewhere).is_empty());
+        fs::remove_dir(scratch.state_dir()).unwrap();
+
+        // The record path is a junction to a directory holding a valid state
+        // file under the very same record name.
+        let second = Scratch::new("junction-record");
+        let second_store = second.store();
+        let target = second.root().join("target-dir");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(second.state_dir()).unwrap();
+        make_junction(&second.record(LOCAL), &target);
+        assert_eq!(
+            second_store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnexpectedObject)
+        );
+        assert_eq!(
+            second_store.create(&state),
+            Err(StoreError::UnexpectedObject)
+        );
+        assert_eq!(
+            second_store.delete(&loc(LOCAL)),
+            Err(StoreError::UnexpectedObject)
+        );
+        assert!(names(&target).is_empty());
+        fs::remove_dir(second.record(LOCAL)).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_symlink_record_is_not_followed_when_the_platform_allows_creating_one() {
+        use std::os::windows::fs::symlink_file;
+
+        let scratch = Scratch::new("symlink-record");
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+
+        // A valid state under another name, linked at the record path.
+        let genuine = scratch.root().join("genuine.json");
+        fs::write(&genuine, state.encode().unwrap()).unwrap();
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+
+        if let Err(error) = symlink_file(&genuine, scratch.record(LOCAL)) {
+            // File symlinks need a privilege this account may not hold. The
+            // junction test above still covers reparse rejection.
+            eprintln!(
+                "SKIPPED symlink assertions: cannot create a file symlink here ({:?})",
+                error.kind()
+            );
+            return;
+        }
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnexpectedObject)
+        );
+        assert_eq!(store.create(&state), Err(StoreError::UnexpectedObject));
+        assert_eq!(store.delete(&loc(LOCAL)), Err(StoreError::UnexpectedObject));
+        assert_eq!(fs::read(&genuine).unwrap(), state.encode().unwrap());
+    }
+
+    // ---- absence classification regressions (A-H) ----------------------------
+
+    #[test]
+    fn a_normal_missing_root_sync_dir_or_record_is_not_configured() {
+        // A. root (and several of its parents) do not exist yet: first use.
+        let scratch = Scratch::new("absent-root");
+        let deep = scratch.root().join("a").join("b").join("app-data");
+        let store = SyncStateStore::new(&deep).unwrap();
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+        assert!(!scratch.root().join("a").exists());
+
+        // B. root exists, `sync-state` does not.
+        let second = Scratch::new("absent-sync-dir");
+        assert_eq!(second.store().load(&loc(LOCAL)), StateLoad::NotConfigured);
+
+        // C. directory exists, record does not.
+        fs::create_dir_all(second.state_dir()).unwrap();
+        assert_eq!(second.store().load(&loc(LOCAL)), StateLoad::NotConfigured);
+
+        // First use still works end to end from the deep missing root.
+        store.create(&unbased(LOCAL)).unwrap();
+        assert!(matches!(store.load(&loc(LOCAL)), StateLoad::Loaded(_)));
+    }
+
+    #[test]
+    fn a_regular_file_ancestor_is_unreadable_and_blocks_creation() {
+        // D. the injected root has a regular-file ancestor.
+        let scratch = Scratch::new("file-ancestor");
+        let blocker = scratch.root().join("afile");
+        fs::write(&blocker, b"plain file").unwrap();
+        let state = unbased(LOCAL);
+
+        let beneath = SyncStateStore::new(&blocker.join("deep").join("app-data")).unwrap();
+        assert_eq!(
+            beneath.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnexpectedObject)
+        );
+        assert_eq!(
+            beneath.load(&loc(LOCAL)).into_sync_state_load(),
+            SyncStateLoad::Unreadable
+        );
+
+        // The root itself is a regular file.
+        let as_root = SyncStateStore::new(&blocker).unwrap();
+        assert_eq!(
+            as_root.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnexpectedObject)
+        );
+
+        // H. neither failed load authorizes a new record.
+        assert!(beneath.create(&state).is_err());
+        assert!(as_root.create(&state).is_err());
+        assert_eq!(fs::read(&blocker).unwrap(), b"plain file");
+        assert!(beneath.delete(&loc(LOCAL)).is_err());
+    }
+
+    #[test]
+    fn sync_state_being_a_regular_file_is_unreadable_for_every_operation() {
+        // E.
+        let scratch = Scratch::new("sync-state-is-file");
+        fs::write(scratch.state_dir(), b"plain file").unwrap();
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnexpectedObject)
+        );
+        assert!(store.create(&state).is_err());
+        assert!(store
+            .replace(&state, &rebuilt(&state, checkpoint(10), None))
+            .is_err());
+        assert!(store.delete(&loc(LOCAL)).is_err());
+        assert_eq!(fs::read(scratch.state_dir()).unwrap(), b"plain file");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_ancestor_of_a_missing_sync_dir_is_never_trusted() {
+        // F. the nearest existing ancestor of the absent `sync-state` is a
+        // junction; absence behind it is not established.
+        let scratch = Scratch::new("junction-ancestor");
+        let target = scratch.root().join("target-dir");
+        fs::create_dir_all(&target).unwrap();
+        let link = scratch.root().join("link");
+        make_junction(&link, &target);
+
+        let store = SyncStateStore::new(&link.join("app-data")).unwrap();
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnexpectedObject)
+        );
+        assert!(store.create(&unbased(LOCAL)).is_err());
+        assert!(names(&target).is_empty());
+
+        // Root itself a junction, `sync-state` not yet present.
+        let direct = SyncStateStore::new(&link).unwrap();
+        assert_eq!(
+            direct.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnexpectedObject)
+        );
+        assert!(names(&target).is_empty());
+        fs::remove_dir(&link).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn io_errors_stay_unreadable_and_a_failed_load_cannot_authorize_creation() {
+        // G + H. A held record cannot be read; the unreadable outcome is not
+        // absence and creation is refused.
+        let scratch = Scratch::new("io-no-authorize");
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+        store.create(&state).unwrap();
+        let guard = hold_exclusively(&scratch.record(LOCAL));
+
+        let load = store.load(&loc(LOCAL));
+        assert!(matches!(
+            load,
+            StateLoad::Unreadable(UnreadableReason::Io(_))
+        ));
+        assert_ne!(load.into_sync_state_load(), SyncStateLoad::NotConfigured);
+        assert_eq!(store.create(&state), Err(StoreError::AlreadyExists));
+        drop(guard);
+        assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+    }
+
+    #[test]
+    fn deletion_that_removed_the_last_file_is_a_fully_absent_record() {
+        // A process that dies after the last removal but before reporting
+        // success leaves exactly this disk state: absent, by explicit
+        // user-authorized deletion. It is not an error state.
+        let scratch = Scratch::new("delete-crash-after-last");
+        let store = scratch.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        fs::remove_file(scratch.record(LOCAL)).unwrap();
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+
+        // Partial cleanup (an artifact remains) is not absence.
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts)
+        );
+    }
+
+    #[test]
+    fn the_store_root_must_be_absolute() {
+        assert_eq!(
+            SyncStateStore::new(Path::new("relative\\app-data")).unwrap_err(),
+            StoreError::RootNotAbsolute
+        );
+        assert_eq!(
+            SyncStateStore::new(Path::new("")).unwrap_err(),
+            StoreError::RootNotAbsolute
+        );
+    }
+
+    // ---- 20. sanitized output -----------------------------------------------------
+
+    #[test]
+    fn errors_and_debug_output_carry_no_paths_locators_or_identifiers() {
+        let scratch = Scratch::new("sanitized");
+        let store = scratch.store();
+        let state = based(LOCAL, 9);
+        store.create(&state).unwrap();
+
+        let mut outputs: Vec<String> = Vec::new();
+        let mut note = |text: String| outputs.push(text);
+
+        note(format!("{store:?}"));
+        note(format!("{:?}", store.load(&loc(LOCAL))));
+        note(format!("{:?}", store.load(&loc(OTHER_LOCAL))));
+
+        let results = [
+            store.create(&state),
+            store.replace(&based(LOCAL, 8), &based(LOCAL, 10)),
+            store.replace(&based(OTHER_LOCAL, 1), &based(OTHER_LOCAL, 2)),
+            store.replace(&state, &based(OTHER_LOCAL, 9)),
+            store.delete(&loc(OTHER_LOCAL)).map(|_| ()),
+        ];
+        for result in results {
+            if let Err(error) = result {
+                note(format!("{error} | {error:?}"));
+            }
+        }
+
+        scratch.put(&scratch.artifact(OTHER_LOCAL, STALE_TOKEN), b"x");
+        note(format!("{:?}", store.load(&loc(OTHER_LOCAL))));
+        if let Err(error) = store.create(&based(OTHER_LOCAL, 1)) {
+            note(format!("{error} | {error:?}"));
+        }
+
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::Other,
+        ] {
+            let error = StoreError::Io {
+                stage: IoStage::Open,
+                kind,
+            };
+            note(format!("{error} | {error:?}"));
+            note(format!(
+                "{:?}",
+                StateLoad::Unreadable(UnreadableReason::Io(kind))
+            ));
+        }
+        for error in [
+            StoreError::RootNotAbsolute,
+            StoreError::AlreadyExists,
+            StoreError::Missing,
+            StoreError::UnresolvedArtifacts,
+            StoreError::UnexpectedObject,
+            StoreError::CurrentUnreadable,
+            StoreError::CurrentCorrupt,
+            StoreError::CurrentUnsupportedVersion,
+            StoreError::CurrentLocatorMismatch,
+            StoreError::Changed,
+            StoreError::LocatorMismatch,
+            StoreError::BindingIdentityChanged,
+            StoreError::TrustedHistoryRegression,
+            StoreError::NoClobberUnsupported,
+            StoreError::VerificationFailed,
+            StoreError::IncompleteDeletion,
+            StoreError::Encode(SyncStateEncodeError::TooLarge),
+        ] {
+            note(format!("{error} | {error:?}"));
+        }
+
+        let root = scratch.root().to_string_lossy().into_owned();
+        let key = record_key(&loc(LOCAL));
+        let other_key = record_key(&loc(OTHER_LOCAL));
+        let needles = [
+            "LOCAL-MARKER",
+            "TARGET-MARKER",
+            "OTHER-MARKER",
+            "Synthetic",
+            ".qa-local",
+            "sanitized-",
+            root.as_str(),
+            key.as_str(),
+            other_key.as_str(),
+            "11111111-2222-3333-4444-555555555555",
+            "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        ];
+        for output in &outputs {
+            for needle in needles {
+                assert!(
+                    !output.contains(needle),
+                    "output leaks {needle:?}: {output}"
+                );
+            }
+        }
+        assert!(!outputs.is_empty());
+    }
+
+    // ---- 21. local-only vault behavior is unchanged -----------------------------------
+
+    #[test]
+    fn local_only_vault_files_and_sessions_are_unaffected() {
+        const NOW_MS: i64 = 1_700_000_000_000;
+        const PASSWORD: &str = "sync-state-store-test-only-password";
+
+        let scratch = Scratch::new("local-only");
+        let vault_dir = scratch.root().join("vaults");
+        fs::create_dir_all(&vault_dir).unwrap();
+        let vault_path = vault_dir.join("vault.lvault");
+
+        let session =
+            UnlockedVaultSession::create(&vault_path, Zeroizing::new(PASSWORD.to_owned()), NOW_MS)
+                .unwrap();
+        let vault_id = session.data().vault_id;
+
+        let vault_bytes = fs::read(&vault_path).unwrap();
+        let vault_dir_listing = names(&vault_dir);
+
+        // Exercise every store operation while the exclusive session lock is
+        // held, as the future integration will.
+        let locator = loc(&vault_path.to_string_lossy());
+        let store = scratch.store();
+        assert_eq!(store.load(&locator), StateLoad::NotConfigured);
+        let initial = build(
+            &vault_path.to_string_lossy(),
+            vault_id,
+            SyncBase::Unbased,
+            Some(
+                PendingPush::new(
+                    INTENT,
+                    PushIntent::new(PushBaseline::Absent, fp(2)).unwrap(),
+                    1,
+                )
+                .unwrap(),
+            ),
+        );
+        store.create(&initial).unwrap();
+        let based_state = rebuilt(&initial, checkpoint(1), None);
+        store.replace(&initial, &based_state).unwrap();
+        assert!(loaded(store.load(&locator))
+            .verify_binding(vault_id, &locator, &loc(TARGET))
+            .is_ok());
+        assert_eq!(store.delete(&locator), Ok(DeleteOutcome::Removed));
+
+        // The vault, its directory and its lock/backup siblings are untouched,
+        // and the sync-state directory is not inside the vault directory.
+        assert_eq!(fs::read(&vault_path).unwrap(), vault_bytes);
+        assert_eq!(names(&vault_dir), vault_dir_listing);
+        assert!(!scratch.state_dir().starts_with(&vault_dir));
+
+        session.lock();
+        let reopened =
+            UnlockedVaultSession::unlock(&vault_path, Zeroizing::new(PASSWORD.to_owned())).unwrap();
+        assert_eq!(reopened.data().vault_id, vault_id);
+        assert_eq!(fs::read(&vault_path).unwrap(), vault_bytes);
+    }
+}
