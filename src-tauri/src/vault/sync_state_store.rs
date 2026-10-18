@@ -24,12 +24,14 @@
 //!   locator string; record file = `<key>.json`.
 //! * ASCII-lowercasing mirrors `recent_vaults::path_strings_equal`
 //!   (`eq_ignore_ascii_case` on Windows), the existing path-identity rule. That
-//!   function and `normalize_existing_vault_path` are private to
-//!   `recent_vaults`, so the rule is repeated in [`path_identity_eq`] and
-//!   pinned by tests; the store does **not** canonicalize. The caller must pass
-//!   the locator produced by that existing normalization (the canonical path
-//!   string). Two spellings of one file that the existing normalization would
-//!   not unify get different records.
+//!   function is private to `recent_vaults`, so the rule is repeated in
+//!   [`path_identity_eq`] and pinned by tests; the store does **not**
+//!   canonicalize. The caller must pass the locator produced by the existing
+//!   `recent_vaults::normalize_existing_vault_path` (the canonical path string);
+//!   the session integration (`UnlockedVaultSession::load_sync_state`) does
+//!   exactly that. Two spellings of one file that the existing normalization
+//!   would not unify get different records. Path-string equality does not prove
+//!   the identity of the filesystem object behind it.
 //! * The decoded state carries its own `local_locator`; a record whose locator
 //!   does not agree with the requested one is reported as corrupt
 //!   ([`CorruptReason::LocatorMismatch`]) and is never treated as a binding.
@@ -86,9 +88,14 @@
 //!   consistency is **not** proven here and relies on NTFS journaling.
 //! * Unexpected reparse points are never followed: the directory and record are
 //!   inspected with `symlink_metadata`, the record is opened with
-//!   `FILE_FLAG_OPEN_REPARSE_POINT` and re-checked on the handle. Ancestors above
-//!   the supplied root are not inspected while `sync-state` exists; when it
-//!   does not, the nearest existing ancestor is checked (see above).
+//!   `FILE_FLAG_OPEN_REPARSE_POINT` and re-checked on the handle. Every
+//!   *existing* ancestor of the `sync-state` directory, up to the filesystem
+//!   root, must also be a plain directory (Stage 1U-4 B1b); a junction, symlink
+//!   or other reparse point anywhere in that chain is `Unreadable`, never
+//!   trusted as ordinary device-local storage, and never created through. This
+//!   is a check-then-use inspection: it does not stop a redirection that is
+//!   installed *after* the check, and the later opens still traverse ancestors
+//!   normally.
 //! * Physical file-symlink rejection is covered by the shared reparse check and
 //!   by junction tests, but the file-symlink test could not create a symlink
 //!   under this account's privileges and is an unverified residual.
@@ -113,6 +120,61 @@ use uuid::Uuid;
 
 /// Subdirectory of the supplied application-data root that holds all records.
 pub const SYNC_STATE_DIRECTORY: &str = "sync-state";
+
+/// Why a [`SyncStateRoot`] could not be established. Categories only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RootError {
+    #[error("the device-local application-data directory is unavailable")]
+    Unavailable,
+    #[error("the device-local application-data directory is not an absolute path")]
+    NotAbsolute,
+}
+
+/// The device-local application-data root that sync-state records live under.
+///
+/// The only production constructor is [`SyncStateRoot::from_app`], which asks
+/// the trusted Tauri application context for `app_local_data_dir()`. No
+/// command, UI value or user-supplied string can produce one, so a caller of
+/// the session integration cannot redirect the store to an arbitrary directory
+/// (such as the vault's folder, the roaming config directory or the working
+/// directory). Tests build one from an explicit scratch path.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SyncStateRoot(PathBuf);
+
+impl SyncStateRoot {
+    /// Resolve Tauri's `app_local_data_dir()` (the per-user *local*, non-roaming
+    /// application-data directory). Never `app_config_dir()`.
+    pub fn from_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Self, RootError> {
+        use tauri::Manager;
+
+        Self::from_resolved(app.path().app_local_data_dir())
+    }
+
+    fn from_resolved<E>(resolved: Result<PathBuf, E>) -> Result<Self, RootError> {
+        let path = resolved.map_err(|_| RootError::Unavailable)?;
+
+        if !path.is_absolute() {
+            return Err(RootError::NotAbsolute);
+        }
+
+        Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(path: PathBuf) -> Self {
+        Self::from_resolved::<()>(Ok(path)).unwrap()
+    }
+}
+
+impl fmt::Debug for SyncStateRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SyncStateRoot(<redacted>)")
+    }
+}
 
 const RECORD_EXTENSION: &str = "json";
 const ARTIFACT_EXTENSION: &str = "tmp";
@@ -584,12 +646,37 @@ impl SyncStateStore {
     }
 
     fn inspect_directory(&self) -> Result<DirState, Fault> {
+        self.confirm_ancestors()?;
+
         match fs::symlink_metadata(&self.directory) {
             Ok(metadata) if is_plain_directory(&metadata) => Ok(DirState::Present),
             Ok(_) => Err(Fault::Unexpected),
             Err(error) if error.kind() == io::ErrorKind::NotFound => self.confirm_parent_chain(),
             Err(error) => Err(Fault::Io(error.kind())),
         }
+    }
+
+    /// Every existing ancestor of the `sync-state` directory (the supplied
+    /// root and everything above it) must be a plain directory: a junction,
+    /// symlink or other reparse point, a regular file or an unreadable
+    /// component is a fault. Missing components are normal first use. Runs
+    /// before every other inspection so no operation trusts or creates through
+    /// a redirected path.
+    fn confirm_ancestors(&self) -> Result<(), Fault> {
+        for ancestor in self.directory.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                continue;
+            }
+
+            match fs::symlink_metadata(ancestor) {
+                Ok(metadata) if is_plain_directory(&metadata) => {}
+                Ok(_) => return Err(Fault::Unexpected),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Fault::Io(error.kind())),
+            }
+        }
+
+        Ok(())
     }
 
     /// Windows reports "not found" both for a genuinely missing path and when a
@@ -817,7 +904,7 @@ impl SyncStateStore {
 /// The existing Windows path-identity rule (`recent_vaults::path_strings_equal`,
 /// which is private there): ASCII case-insensitive. Non-ASCII letters are
 /// compared exactly, exactly as `eq_ignore_ascii_case` does.
-fn path_identity_eq(left: &str, right: &str) -> bool {
+pub(crate) fn path_identity_eq(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
@@ -2578,5 +2665,676 @@ mod tests {
             UnlockedVaultSession::unlock(&vault_path, Zeroizing::new(PASSWORD.to_owned())).unwrap();
         assert_eq!(reopened.data().vault_id, vault_id);
         assert_eq!(fs::read(&vault_path).unwrap(), vault_bytes);
+    }
+
+    // ---- Stage 1U-4 B1b: session-bound, read-only load ----------------------------
+    //
+    // Real `UnlockedVaultSession`s over synthetic vaults and synthetic state
+    // records, all beneath the git-ignored `.qa-local/sync-state-b1-tests/`.
+    // Not covered here (and not claimed): a live remote or target adapter (none
+    // exists), UI, Tauri command wiring, and `SyncStateRoot::from_app` itself
+    // (it needs a running Tauri app; its path validation is tested through
+    // `from_resolved`).
+
+    use crate::{
+        recent_vaults::normalize_existing_vault_path,
+        vault::{
+            session::{CategoryInput, SessionSyncState, SyncStateUnavailable},
+            storage::save_envelope_atomic,
+        },
+    };
+    use localvault_core::{sync_state::BindingMismatch, vault::format::create_envelope};
+
+    const B1B_PASSWORD: &str = "sync-state-b1b-test-only-password";
+    const B1B_NOW_MS: i64 = 1_700_000_000_000;
+
+    fn b1b_password() -> Zeroizing<String> {
+        Zeroizing::new(B1B_PASSWORD.to_owned())
+    }
+
+    /// A scratch directory with a `vaults` folder and a separate, initially
+    /// absent `app-local` root (first use).
+    struct Fixture {
+        scratch: Scratch,
+        vaults: PathBuf,
+        vault: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let scratch = Scratch::new(name);
+            let vaults = scratch.root().join("vaults");
+            fs::create_dir_all(&vaults).unwrap();
+            let vault = vaults.join("vault.lvault");
+
+            Self {
+                scratch,
+                vaults,
+                vault,
+            }
+        }
+
+        fn app_root(&self) -> PathBuf {
+            self.scratch.root().join("app-local")
+        }
+
+        fn root(&self) -> SyncStateRoot {
+            SyncStateRoot::for_test(self.app_root())
+        }
+    }
+
+    fn create_session(path: &Path) -> UnlockedVaultSession {
+        UnlockedVaultSession::create(path, b1b_password(), B1B_NOW_MS).unwrap()
+    }
+
+    fn open_session(path: &Path) -> UnlockedVaultSession {
+        UnlockedVaultSession::unlock(path, b1b_password()).unwrap()
+    }
+
+    fn canonical(path: &Path) -> String {
+        normalize_existing_vault_path(path).unwrap()
+    }
+
+    fn state_for(local: &str, vault_id: Uuid, target: &str) -> SyncState {
+        SyncState::new(
+            BindingId::new(BINDING).unwrap(),
+            tag_for(vault_id),
+            loc(local),
+            loc(target),
+            checkpoint(5),
+            None,
+        )
+        .unwrap()
+    }
+
+    fn record_in(root: &SyncStateRoot, locator: &str) -> PathBuf {
+        root.path()
+            .join(SYNC_STATE_DIRECTORY)
+            .join(format!("{}.json", record_key(&loc(locator))))
+    }
+
+    fn publish(root: &SyncStateRoot, state: &SyncState) {
+        SyncStateStore::new(root.path())
+            .unwrap()
+            .create(state)
+            .unwrap();
+    }
+
+    fn put_at(path: &Path, bytes: &[u8]) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn bound(result: SessionSyncState) -> SyncState {
+        match result {
+            SessionSyncState::Bound(bound) => bound.state().clone(),
+            other => panic!("expected a bound state, got {other:?}"),
+        }
+    }
+
+    /// Everything beneath `dir`, without following reparse points: kind, name,
+    /// and for files the modification time and content hash.
+    fn snapshot(dir: &Path) -> Vec<String> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+            let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+            entries.sort_by_key(|entry| entry.file_name());
+
+            for entry in entries {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let relative = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+
+                if is_plain_directory(&metadata) {
+                    out.push(format!("D {relative}"));
+                    walk(&path, base, out);
+                } else if relative.ends_with(".lock") {
+                    // The session's own exclusively locked lock file: name only.
+                    out.push(format!("L {relative}"));
+                } else if is_plain_file(&metadata) {
+                    let hash = EnvelopeFingerprint::of_bytes(&fs::read(&path).unwrap()).to_hex();
+                    out.push(format!(
+                        "F {relative} {:?} {hash}",
+                        metadata.modified().unwrap()
+                    ));
+                } else {
+                    out.push(format!("O {relative}"));
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_session_loads_its_matching_record_and_changes_nothing() {
+        let fx = Fixture::new("b1b-bound");
+        let session = create_session(&fx.vault);
+        let vault_id = session.data().vault_id;
+        let root = fx.root();
+        let locator = canonical(&fx.vault);
+
+        // The stored locator is the existing normalization (canonical, verbatim
+        // on Windows), and the record file is keyed from exactly that string.
+        #[cfg(windows)]
+        assert!(locator.starts_with(r"\\?\"));
+        let state = state_for(&locator, vault_id, TARGET);
+        publish(&root, &state);
+        assert!(record_in(&root, &locator).is_file());
+
+        let before = snapshot(&fx.scratch.root());
+
+        let loaded = bound(session.load_sync_state(&root));
+
+        assert_eq!(loaded, state);
+        // Read-only: not created, not changed (content and modification time).
+        assert_eq!(snapshot(&fx.scratch.root()), before);
+
+        // The loaded record is not authorization for any other target.
+        assert_eq!(
+            loaded.verify_binding(vault_id, &loc(&locator), &loc(OTHER_LOCAL)),
+            Err(BindingMismatch::TargetLocator)
+        );
+        assert!(loaded
+            .verify_binding(vault_id, &loc(&locator), &loc(TARGET))
+            .is_ok());
+    }
+
+    #[test]
+    fn no_record_is_not_configured_and_nothing_is_created() {
+        let fx = Fixture::new("b1b-absent");
+        let session = create_session(&fx.vault);
+        let root = fx.root();
+        let before = snapshot(&fx.scratch.root());
+
+        // First use: the app-local root does not even exist yet.
+        assert_eq!(
+            session.load_sync_state(&root),
+            SessionSyncState::NotConfigured
+        );
+        assert!(!root.path().exists());
+
+        // The directory exists but holds no record.
+        fs::create_dir_all(root.path().join(SYNC_STATE_DIRECTORY)).unwrap();
+        let with_dir = snapshot(&fx.scratch.root());
+        assert_eq!(
+            session.load_sync_state(&root),
+            SessionSyncState::NotConfigured
+        );
+        assert_eq!(snapshot(&fx.scratch.root()), with_dir);
+        assert_ne!(with_dir, before);
+    }
+
+    #[test]
+    fn every_failure_outcome_stays_distinct_and_leaves_the_record_alone() {
+        let fx = Fixture::new("b1b-outcomes");
+        let session = create_session(&fx.vault);
+        let vault_id = session.data().vault_id;
+        let root = fx.root();
+        let locator = canonical(&fx.vault);
+        let record = record_in(&root, &locator);
+        let valid = state_for(&locator, vault_id, TARGET);
+
+        let check = |bytes: &[u8], expected: SessionSyncState| {
+            put_at(&record, bytes);
+            let result = session.load_sync_state(&root);
+            assert_eq!(result, expected);
+            assert_ne!(result, SessionSyncState::NotConfigured);
+            assert_eq!(fs::read(&record).unwrap(), bytes);
+        };
+
+        check(
+            b"this is not a sync state",
+            SessionSyncState::Corrupt(CorruptReason::Undecodable),
+        );
+        check(b"", SessionSyncState::Corrupt(CorruptReason::Empty));
+        check(
+            &tampered(&valid, |value| {
+                value["version"] = serde_json::json!(2);
+                value["added_in_v2"] = serde_json::json!(true);
+            }),
+            SessionSyncState::UnsupportedVersion,
+        );
+
+        // A record for another location copied under this key.
+        check(
+            &state_for(OTHER_LOCAL, vault_id, TARGET).encode().unwrap(),
+            SessionSyncState::Corrupt(CorruptReason::LocatorMismatch),
+        );
+
+        // No record, but an interrupted-write artifact.
+        fs::remove_file(&record).unwrap();
+        let artifact = record
+            .parent()
+            .unwrap()
+            .join(format!("{}.{STALE_TOKEN}.tmp", record_key(&loc(&locator))));
+        put_at(&artifact, b"debris");
+        assert_eq!(
+            session.load_sync_state(&root),
+            SessionSyncState::Unreadable(UnreadableReason::UnresolvedArtifacts)
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), b"debris");
+        fs::remove_file(&artifact).unwrap();
+
+        // A valid record that cannot be opened: unreadable, not absent.
+        #[cfg(windows)]
+        {
+            put_at(&record, &valid.encode().unwrap());
+            let guard = hold_exclusively(&record);
+            let result = session.load_sync_state(&root);
+            assert!(
+                matches!(
+                    result,
+                    SessionSyncState::Unreadable(UnreadableReason::Io(_))
+                ),
+                "got {result:?}"
+            );
+            drop(guard);
+            assert_eq!(bound(session.load_sync_state(&root)), valid);
+        }
+    }
+
+    #[test]
+    fn a_record_for_another_vault_id_is_a_mismatch_and_is_not_reset() {
+        let fx = Fixture::new("b1b-wrong-id");
+        let session = create_session(&fx.vault);
+        let root = fx.root();
+        let locator = canonical(&fx.vault);
+
+        assert_ne!(session.data().vault_id, OTHER_VAULT_ID);
+        let foreign = state_for(&locator, OTHER_VAULT_ID, TARGET);
+        publish(&root, &foreign);
+        let before = snapshot(&fx.scratch.root());
+
+        assert_eq!(
+            session.load_sync_state(&root),
+            SessionSyncState::BindingMismatch(BindingMismatch::VaultIdentity)
+        );
+        assert_eq!(snapshot(&fx.scratch.root()), before);
+        assert_eq!(
+            fs::read(record_in(&root, &locator)).unwrap(),
+            foreign.encode().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_different_vault_created_at_a_reused_path_is_a_mismatch() {
+        let fx = Fixture::new("b1b-reused-path");
+        let first = create_session(&fx.vault);
+        let first_id = first.data().vault_id;
+        let root = fx.root();
+        let locator = canonical(&fx.vault);
+        let original = state_for(&locator, first_id, TARGET);
+        publish(&root, &original);
+        assert_eq!(bound(first.load_sync_state(&root)), original);
+        first.lock();
+
+        // The vault is deleted and a different one is created at the same path.
+        fs::remove_file(&fx.vault).unwrap();
+        let _ = fs::remove_file(format!("{}.backup", fx.vault.display()));
+        let second = create_session(&fx.vault);
+        assert_ne!(second.data().vault_id, first_id);
+        assert_eq!(canonical(&fx.vault), locator);
+
+        assert_eq!(
+            second.load_sync_state(&root),
+            SessionSyncState::BindingMismatch(BindingMismatch::VaultIdentity)
+        );
+        assert_eq!(
+            fs::read(record_in(&root, &locator)).unwrap(),
+            original.encode().unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn equivalent_windows_path_spellings_reach_the_same_record() {
+        let fx = Fixture::new("b1b-spellings");
+        let first = create_session(&fx.vault);
+        let vault_id = first.data().vault_id;
+        let root = fx.root();
+        let locator = canonical(&fx.vault);
+        let state = state_for(&locator, vault_id, TARGET);
+        publish(&root, &state);
+        first.lock();
+
+        fs::create_dir_all(fx.vaults.join("sub")).unwrap();
+        let vault_dir_listing = names(&fx.vaults);
+        let plain = fx.vault.to_string_lossy().into_owned();
+
+        let spellings = [
+            fx.vault.clone(),
+            fx.vaults.join(".").join("vault.lvault"),
+            fx.vaults.join("sub").join("..").join("vault.lvault"),
+            PathBuf::from(plain.to_ascii_uppercase()),
+            PathBuf::from(plain.to_ascii_lowercase()),
+            PathBuf::from(plain.replace('\\', "/")),
+            PathBuf::from(format!(r"\\?\{plain}")),
+        ];
+
+        for spelling in spellings {
+            let session = open_session(&spelling);
+
+            assert_eq!(canonical(&spelling), locator, "{}", spelling.display());
+            assert_eq!(bound(session.load_sync_state(&root)), state);
+            session.lock();
+        }
+
+        assert_eq!(names(&fx.vaults), vault_dir_listing);
+    }
+
+    #[test]
+    fn a_record_for_a_different_vault_path_is_not_this_sessions() {
+        let fx = Fixture::new("b1b-other-path");
+        let first = create_session(&fx.vault);
+        let first_id = first.data().vault_id;
+        let second_path = fx.vaults.join("other.lvault");
+        let second = create_session(&second_path);
+        let root = fx.root();
+        let first_locator = canonical(&fx.vault);
+        let second_locator = canonical(&second_path);
+        assert_ne!(first_locator, second_locator);
+
+        let first_state = state_for(&first_locator, first_id, TARGET);
+        publish(&root, &first_state);
+
+        // The other vault has no record of its own.
+        assert_eq!(
+            second.load_sync_state(&root),
+            SessionSyncState::NotConfigured
+        );
+        assert_eq!(bound(first.load_sync_state(&root)), first_state);
+
+        // A record for the first location copied under the second one's key is
+        // a wrong local locator: rejected, never bound.
+        let copied = record_in(&root, &second_locator);
+        put_at(&copied, &first_state.encode().unwrap());
+        assert_eq!(
+            second.load_sync_state(&root),
+            SessionSyncState::Corrupt(CorruptReason::LocatorMismatch)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_redirected_root_or_ancestor_fails_closed() {
+        let fx = Fixture::new("b1b-reparse");
+        let session = create_session(&fx.vault);
+        let vault_id = session.data().vault_id;
+        let locator = canonical(&fx.vault);
+        let state = state_for(&locator, vault_id, TARGET);
+
+        // Control: the genuine root loads.
+        let real = fx.scratch.root().join("real-app-local");
+        let real_root = SyncStateRoot::for_test(real.clone());
+        publish(&real_root, &state);
+        assert_eq!(bound(session.load_sync_state(&real_root)), state);
+        let before = snapshot(&real);
+
+        // 1. The root itself is a junction to a directory that holds a record.
+        let link_root = fx.scratch.root().join("link-root");
+        make_junction(&link_root, &real);
+        let via_root = SyncStateRoot::for_test(link_root.clone());
+
+        // 2. An ancestor of the root is a junction; the record exists behind it.
+        let holder = fx.scratch.root().join("holder");
+        let holder_root = SyncStateRoot::for_test(holder.join("app-local"));
+        publish(&holder_root, &state);
+        let link_ancestor = fx.scratch.root().join("link-ancestor");
+        make_junction(&link_ancestor, &holder);
+        let via_ancestor = SyncStateRoot::for_test(link_ancestor.join("app-local"));
+        let holder_before = snapshot(&holder);
+
+        // 3. The sync-state directory itself is a junction.
+        let third = fx.scratch.root().join("third-app-local");
+        fs::create_dir_all(&third).unwrap();
+        let link_dir = third.join(SYNC_STATE_DIRECTORY);
+        make_junction(&link_dir, &real.join(SYNC_STATE_DIRECTORY));
+        let via_dir = SyncStateRoot::for_test(third.clone());
+
+        for root in [&via_root, &via_ancestor, &via_dir] {
+            assert_eq!(
+                session.load_sync_state(root),
+                SessionSyncState::Unreadable(UnreadableReason::UnexpectedObject)
+            );
+
+            // No store operation trusts or creates through the redirection.
+            let store = SyncStateStore::new(root.path()).unwrap();
+            assert!(store.create(&unbased(&locator)).is_err());
+            assert!(store
+                .replace(&state, &rebuilt(&state, checkpoint(6), None))
+                .is_err());
+            assert!(store.delete(&loc(&locator)).is_err());
+        }
+
+        assert_eq!(snapshot(&real), before);
+        assert_eq!(snapshot(&holder), holder_before);
+
+        fs::remove_dir(&link_root).unwrap();
+        fs::remove_dir(&link_ancestor).unwrap();
+        fs::remove_dir(&link_dir).unwrap();
+    }
+
+    #[test]
+    fn loading_leaves_local_vault_save_and_unlock_behavior_unchanged() {
+        let fx = Fixture::new("b1b-local-unchanged");
+        let mut session = create_session(&fx.vault);
+        let vault_id = session.data().vault_id;
+        let root = fx.root();
+        let locator = canonical(&fx.vault);
+
+        let vault_bytes = fs::read(&fx.vault).unwrap();
+        let listing = names(&fx.vaults);
+
+        assert_eq!(
+            session.load_sync_state(&root),
+            SessionSyncState::NotConfigured
+        );
+        assert_eq!(fs::read(&fx.vault).unwrap(), vault_bytes);
+        assert_eq!(names(&fx.vaults), listing);
+        assert!(!session.is_dirty());
+        assert!(!session.save().unwrap());
+
+        // Ordinary local use continues, and a vault rewritten by this very
+        // session is still this session's vault for the next load.
+        session
+            .create_category(
+                CategoryInput {
+                    name: "One".to_owned(),
+                },
+                B1B_NOW_MS + 1,
+            )
+            .unwrap();
+        assert_eq!(session.data().revision, 1);
+        let state = state_for(&locator, vault_id, TARGET);
+        publish(&root, &state);
+        assert_eq!(bound(session.load_sync_state(&root)), state);
+        assert_eq!(session.data().revision, 1);
+
+        // A sync-state failure never blocks the vault.
+        put_at(&record_in(&root, &locator), b"garbage");
+        assert!(matches!(
+            session.load_sync_state(&root),
+            SessionSyncState::Corrupt(_)
+        ));
+        session
+            .create_category(
+                CategoryInput {
+                    name: "Two".to_owned(),
+                },
+                B1B_NOW_MS + 2,
+            )
+            .unwrap();
+        session.lock();
+
+        let reopened = open_session(&fx.vault);
+        assert_eq!(reopened.data().vault_id, vault_id);
+        assert_eq!(reopened.data().revision, 2);
+        assert_eq!(reopened.data().categories.len(), 2);
+    }
+
+    #[test]
+    fn a_session_whose_vault_file_is_not_the_unlocked_one_has_no_locator() {
+        let fx = Fixture::new("b1b-unavailable");
+        let session = create_session(&fx.vault);
+        let root = fx.root();
+
+        // Replaced by a non-cooperating writer.
+        let replacement = create_envelope(B1B_PASSWORD, b"external replacement").unwrap();
+        save_envelope_atomic(&fx.vault, &replacement).unwrap();
+        assert_eq!(
+            session.load_sync_state(&root),
+            SessionSyncState::Unavailable(SyncStateUnavailable::LocalVaultChanged)
+        );
+
+        // Deleted.
+        fs::remove_file(&fx.vault).unwrap();
+        assert_eq!(
+            session.load_sync_state(&root),
+            SessionSyncState::Unavailable(SyncStateUnavailable::LocalVaultChanged)
+        );
+        assert!(!root.path().exists());
+
+        // A vault whose name has no `.lvault` extension has no normalized
+        // locator at all. It is reported, not given an invented one.
+        let odd = fx.vaults.join("vault.bin");
+        let odd_session = create_session(&odd);
+        assert_eq!(
+            odd_session.load_sync_state(&root),
+            SessionSyncState::Unavailable(SyncStateUnavailable::LocalLocator)
+        );
+        assert!(!root.path().exists());
+    }
+
+    #[test]
+    fn the_exclusive_session_lock_is_held_across_and_after_the_load() {
+        // The method is `&self` on `UnlockedVaultSession`: there is no way to
+        // call it without a live session, and the borrow keeps `_lock_file`
+        // (the OS lock) alive for the whole call. A closed session no longer
+        // exists to call it on. This checks the observable side: the lock is
+        // still exclusively held afterwards and released only by dropping.
+        let fx = Fixture::new("b1b-lock");
+        let session = create_session(&fx.vault);
+        let root = fx.root();
+
+        assert_eq!(
+            session.load_sync_state(&root),
+            SessionSyncState::NotConfigured
+        );
+        assert!(matches!(
+            UnlockedVaultSession::unlock(&fx.vault, b1b_password()),
+            Err(crate::vault::session::SessionError::InUse)
+        ));
+
+        session.lock();
+        assert_eq!(
+            open_session(&fx.vault).load_sync_state(&root),
+            SessionSyncState::NotConfigured
+        );
+    }
+
+    #[test]
+    fn a_retained_target_is_never_opened_or_created() {
+        let fx = Fixture::new("b1b-no-remote");
+        let session = create_session(&fx.vault);
+        let vault_id = session.data().vault_id;
+        let root = fx.root();
+        let locator = canonical(&fx.vault);
+
+        let remote = fx.scratch.root().join("remote");
+        fs::create_dir_all(&remote).unwrap();
+        fs::write(remote.join("sentinel.lvault"), b"remote bytes").unwrap();
+        let target = remote.join("target.lvault");
+        let target_text = target.to_string_lossy().into_owned();
+
+        publish(&root, &state_for(&locator, vault_id, &target_text));
+        let before = snapshot(&remote);
+
+        let loaded = bound(session.load_sync_state(&root));
+
+        assert_eq!(loaded.target_locator().as_str(), target_text);
+        assert!(!target.exists());
+        assert_eq!(snapshot(&remote), before);
+        // By construction nothing in the call has a target adapter: the retained
+        // target is carried as a string and compared with itself only.
+    }
+
+    #[test]
+    fn outcomes_for_a_real_session_leak_no_identifier_path_or_locator() {
+        let fx = Fixture::new("b1b-no-leak");
+        let session = create_session(&fx.vault);
+        let vault_id = session.data().vault_id;
+        let root = fx.root();
+        let locator = canonical(&fx.vault);
+        let key = record_key(&loc(&locator));
+
+        let mut shown = vec![format!("{root:?}")];
+        shown.push(format!("{:?}", session.load_sync_state(&root)));
+
+        publish(&root, &state_for(&locator, vault_id, TARGET));
+        shown.push(format!("{:?}", session.load_sync_state(&root)));
+
+        fs::write(record_in(&root, &locator), b"garbage").unwrap();
+        shown.push(format!("{:?}", session.load_sync_state(&root)));
+
+        fs::write(
+            record_in(&root, &locator),
+            state_for(&locator, OTHER_VAULT_ID, TARGET)
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+        shown.push(format!("{:?}", session.load_sync_state(&root)));
+
+        let scratch_root = fx.scratch.root().to_string_lossy().into_owned();
+        let needles = [
+            vault_id.to_string(),
+            vault_id.simple().to_string(),
+            OTHER_VAULT_ID.to_string(),
+            BINDING.to_string(),
+            scratch_root,
+            key,
+            locator,
+            "TARGET-MARKER".to_owned(),
+            "vault.lvault".to_owned(),
+            ".qa-local".to_owned(),
+        ];
+
+        for output in &shown {
+            for needle in &needles {
+                assert!(
+                    !output.contains(needle.as_str()),
+                    "leaks {needle:?}: {output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_app_local_root_must_be_resolved_absolute_and_is_redacted() {
+        assert!(SyncStateRoot::from_resolved::<()>(Ok(PathBuf::from(
+            r"C:\Users\x\AppData\Local\app"
+        )))
+        .is_ok());
+
+        assert_eq!(
+            SyncStateRoot::from_resolved::<()>(Err(())).unwrap_err(),
+            RootError::Unavailable
+        );
+        for relative in ["", "app-data", r"..\app-data", r"sub\dir"] {
+            assert_eq!(
+                SyncStateRoot::from_resolved::<()>(Ok(PathBuf::from(relative))).unwrap_err(),
+                RootError::NotAbsolute
+            );
+        }
+
+        let root = SyncStateRoot::for_test(PathBuf::from(r"C:\Users\x\AppData\Local\app"));
+        let shown = format!("{root:?}");
+        assert!(!shown.contains("AppData") && !shown.contains("Users"));
     }
 }

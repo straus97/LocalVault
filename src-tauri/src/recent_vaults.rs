@@ -62,7 +62,7 @@ fn path_strings_equal(left: &str, right: &str) -> bool {
     }
 }
 
-fn normalize_existing_vault_path(path: &Path) -> Result<String, RecentVaultError> {
+pub(crate) fn normalize_existing_vault_path(path: &Path) -> Result<String, RecentVaultError> {
     let has_vault_extension = path
         .extension()
         .and_then(|extension| extension.to_str())

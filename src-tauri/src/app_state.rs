@@ -24,7 +24,8 @@ use zeroize::Zeroizing;
 use crate::vault::{
     backup::BackupError,
     lifecycle::VaultLifecycleError,
-    session::{SessionError, UnlockedVaultSession},
+    session::{SessionError, SessionSyncState, UnlockedVaultSession},
+    sync_state_store::SyncStateRoot,
 };
 
 const DEFAULT_AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -235,6 +236,28 @@ impl AppState {
 
         Ok(false)
     }
+
+    /// Read-only load of the unlocked vault's device-local sync-state record
+    /// (Stage 1U-4 B1b). Internal: no command, event or UI is attached.
+    ///
+    /// Fails with `VaultLocked`/`SessionExpired` unless a session is live, and
+    /// holds the application-state mutex (and therefore the session and its
+    /// exclusive OS lock) for the whole read. It observes expiry but, like
+    /// `status`, does not count as user activity: an internal check must never
+    /// keep a vault unlocked. The root comes from the trusted application
+    /// context via `SyncStateRoot::from_app`; this method takes no path.
+    pub fn load_sync_state(&self, root: &SyncStateRoot) -> Result<SessionSyncState, AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        if self.expire_if_needed(&mut guard, Instant::now()) {
+            return Err(AppStateError::SessionExpired);
+        }
+
+        let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.load_sync_state(root))
+    }
+
     fn active_session_guard(&self) -> Result<MutexGuard<'_, AppStateInner>, AppStateError> {
         let mut guard = self.inner_guard()?;
 
@@ -676,5 +699,99 @@ mod tests {
         assert_eq!(parse_dev_auto_lock_timeout("901"), None);
 
         assert_eq!(parse_dev_auto_lock_timeout("not-a-number"), None);
+    }
+
+    // -- Stage 1U-4 B1b: sync-state load through the application state --------
+    //
+    // Scratch lives under the git-ignored `.qa-local/sync-state-b1-tests/`,
+    // never `%TEMP%`.
+
+    fn qa_scratch(name: &str) -> tempfile::TempDir {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".qa-local")
+            .join("sync-state-b1-tests");
+
+        std::fs::create_dir_all(&base).unwrap();
+
+        tempfile::Builder::new()
+            .prefix(&format!("{name}-"))
+            .tempdir_in(&base)
+            .unwrap()
+    }
+
+    #[test]
+    fn sync_state_load_requires_a_live_session_and_touches_nothing_otherwise() {
+        let scratch = qa_scratch("b1b-appstate-locked");
+
+        let app_local = scratch.path().join("app-local");
+
+        let root = SyncStateRoot::for_test(app_local.clone());
+
+        let state = AppState::default();
+
+        assert!(matches!(
+            state.load_sync_state(&root),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        let path = scratch.path().join("vault.lvault");
+
+        state.create_vault(path, password()).unwrap();
+
+        assert_eq!(
+            state.load_sync_state(&root).unwrap(),
+            SessionSyncState::NotConfigured
+        );
+
+        state.lock_vault().unwrap();
+
+        assert!(matches!(
+            state.load_sync_state(&root),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        assert!(!app_local.exists());
+    }
+
+    #[test]
+    fn sync_state_load_does_not_count_as_activity_and_fails_after_expiry() {
+        let scratch = qa_scratch("b1b-appstate-expiry");
+
+        let root = SyncStateRoot::for_test(scratch.path().join("app-local"));
+
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        state
+            .create_vault(scratch.path().join("vault.lvault"), password())
+            .unwrap();
+
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let before = state.last_activity_for_test();
+
+        assert_eq!(
+            state.load_sync_state(&root).unwrap(),
+            SessionSyncState::NotConfigured
+        );
+
+        assert_eq!(state.last_activity_for_test(), before);
+
+        state.age_session_for_test(Duration::from_secs(31));
+
+        assert!(matches!(
+            state.load_sync_state(&root),
+            Err(AppStateError::SessionExpired)
+        ));
+
+        assert!(!state.status().unwrap().unlocked);
+
+        assert!(matches!(
+            state.load_sync_state(&root),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        assert!(!root.path().exists());
     }
 }

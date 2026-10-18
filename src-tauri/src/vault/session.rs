@@ -12,17 +12,27 @@ use std::{
 };
 
 use thiserror::Error;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use localvault_core::vault::{
-    data::{VaultData, VaultDataError},
-    format::{
-        create_envelope_with_key, open_envelope_with_key, reseal_envelope, SecretKey,
-        VaultEnvelope, VaultError,
+use localvault_core::{
+    sync_state::{BindingMismatch, Locator, SyncState},
+    vault::{
+        data::{VaultData, VaultDataError},
+        format::{
+            create_envelope_with_key, open_envelope_with_key, reseal_envelope, SecretKey,
+            VaultEnvelope, VaultError,
+        },
     },
 };
 
-use super::storage::{load_envelope, save_envelope_atomic_with_backup, StorageError};
+use super::{
+    storage::{load_envelope, save_envelope_atomic_with_backup, StorageError},
+    sync_state_store::{
+        path_identity_eq, CorruptReason, StateLoad, SyncStateRoot, SyncStateStore, UnreadableReason,
+    },
+};
+use crate::recent_vaults::normalize_existing_vault_path;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -82,6 +92,67 @@ pub enum SessionError {
 
     #[error("vault storage operation failed")]
     Storage(#[from] StorageError),
+}
+
+/// A saved sync-state record that passed the session-bound checks of
+/// [`UnlockedVaultSession::load_sync_state`]: it is bound to this session's
+/// authenticated `vault_id` and to this session's normalized local location.
+///
+/// **It says nothing about any remote target.** There is no selected target in
+/// this slice, so the record's target locator was only compared with itself.
+/// A future synchronization operation must separately compare the target it was
+/// asked to use with [`SyncState::target_locator`] before touching anything. A
+/// bound record is neither authorization to publish nor to adopt remote data,
+/// and its absence of mismatch is not proof of freshness. The state is shown
+/// by neither `Debug` nor any error.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SessionBoundSyncState {
+    state: SyncState,
+}
+
+impl SessionBoundSyncState {
+    pub fn state(&self) -> &SyncState {
+        &self.state
+    }
+}
+
+impl std::fmt::Debug for SessionBoundSyncState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionBoundSyncState(<redacted>)")
+    }
+}
+
+/// Why no sync-state outcome could be produced for this session at all.
+/// Categories only: no path, locator or identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncStateUnavailable {
+    /// The vault file has no usable normalized locator (it is missing, is not a
+    /// regular `.lvault` file, or its path cannot be represented).
+    LocalLocator,
+    /// The vault file at the session's path is not the envelope this session
+    /// unlocked (replaced, changed or unreadable), so the path cannot be
+    /// treated as the location of this session's vault.
+    LocalVaultChanged,
+    /// The device-local application-data root cannot be used.
+    Root,
+}
+
+/// Result of [`UnlockedVaultSession::load_sync_state`]. Every variant is
+/// distinct and none is a healthy binding except [`Self::Bound`]; in particular
+/// `NotConfigured` is not a trusted checkpoint and does not authorize
+/// publishing over an existing remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionSyncState {
+    /// Confirmed no record. Not a trusted prior checkpoint.
+    NotConfigured,
+    Bound(Box<SessionBoundSyncState>),
+    Corrupt(CorruptReason),
+    UnsupportedVersion,
+    Unreadable(UnreadableReason),
+    /// A readable record that belongs to a different vault, or to a different
+    /// local location, than this session. The record is left untouched.
+    BindingMismatch(BindingMismatch),
+    Unavailable(SyncStateUnavailable),
 }
 
 pub struct UnlockedVaultSession {
@@ -268,6 +339,82 @@ impl UnlockedVaultSession {
 
     pub fn lock(self) {
         drop(self);
+    }
+
+    /// Strictly read-only load of this vault's device-local sync-state record
+    /// (Stage 1U-4 B1b).
+    ///
+    /// * **Session-bound.** Only an unlocked session can call this. It takes
+    ///   `&self`, so the session — and with it the exclusive OS lock held by
+    ///   `_lock_file` — outlives the whole read; a closed or expired session
+    ///   does not exist to call it on.
+    /// * **Authenticated identity.** The vault id comes from this session's
+    ///   decrypted data, never from a caller, filename or the record. It is
+    ///   used only inside `verify_binding` and is never returned or logged.
+    /// * **Locator.** The local locator is the existing
+    ///   `normalize_existing_vault_path` result for the session's path, after
+    ///   confirming the file there still holds the envelope this session
+    ///   unlocked. Path-string equality does not prove the identity of every
+    ///   filesystem object behind it.
+    /// * **Root.** [`SyncStateRoot`] comes from the trusted application context
+    ///   (`app_local_data_dir()`), not from the UI.
+    /// * **Read-only.** Nothing is created, repaired, replaced or deleted, and
+    ///   no remote or network is touched. The local vault is only read.
+    ///
+    /// Failure to read the state never prevents ordinary local use of the
+    /// session; it is reported, never swallowed into a healthy binding.
+    pub fn load_sync_state(&self, root: &SyncStateRoot) -> SessionSyncState {
+        match load_envelope(&self.path) {
+            Ok(on_disk) if on_disk == self.envelope => {}
+            _ => return SessionSyncState::Unavailable(SyncStateUnavailable::LocalVaultChanged),
+        }
+
+        let Some(local_locator) = normalize_existing_vault_path(&self.path)
+            .ok()
+            .and_then(|normalized| Locator::new(&normalized).ok())
+        else {
+            return SessionSyncState::Unavailable(SyncStateUnavailable::LocalLocator);
+        };
+
+        let Ok(store) = SyncStateStore::new(root.path()) else {
+            return SessionSyncState::Unavailable(SyncStateUnavailable::Root);
+        };
+
+        match store.load(&local_locator) {
+            StateLoad::NotConfigured => SessionSyncState::NotConfigured,
+            StateLoad::Loaded(state) => bind_loaded(*state, self.data.vault_id, &local_locator),
+            StateLoad::Corrupt(reason) => SessionSyncState::Corrupt(reason),
+            StateLoad::UnsupportedVersion => SessionSyncState::UnsupportedVersion,
+            StateLoad::Unreadable(reason) => SessionSyncState::Unreadable(reason),
+        }
+    }
+}
+
+/// Verify a loaded record against the authenticated vault id and the session's
+/// normalized local locator.
+///
+/// The store already found the record through the existing ASCII
+/// case-insensitive path identity, so that same rule is applied to the locator
+/// here (a case-only spelling difference is the same location); anything else
+/// that differs is a mismatch. `verify_binding` also needs a target locator;
+/// with no selected target in this slice the record's own is passed, which makes
+/// the target comparison vacuous by construction. See [`SessionBoundSyncState`].
+fn bind_loaded(
+    state: SyncState,
+    authenticated_vault_id: Uuid,
+    local_locator: &Locator,
+) -> SessionSyncState {
+    let expected_local = if path_identity_eq(state.local_locator().as_str(), local_locator.as_str())
+    {
+        state.local_locator().clone()
+    } else {
+        local_locator.clone()
+    };
+    let retained_target = state.target_locator().clone();
+
+    match state.verify_binding(authenticated_vault_id, &expected_local, &retained_target) {
+        Ok(()) => SessionSyncState::Bound(Box::new(SessionBoundSyncState { state })),
+        Err(mismatch) => SessionSyncState::BindingMismatch(mismatch),
     }
 }
 
@@ -865,5 +1012,163 @@ mod tests {
         let result = UnlockedVaultSession::unlock(&path, test_password());
 
         assert!(matches!(result, Err(SessionError::Deserialization(_))));
+    }
+
+    // -- Stage 1U-4 B1b: binding verification (pure; no filesystem) --------
+    //
+    // The filesystem-backed, real-session tests live beside the store's scratch
+    // helper in `sync_state_store::tests` (they must not use `%TEMP%`).
+
+    mod sync_binding {
+        use localvault_core::{
+            sync::{EnvelopeFingerprint, RemoteHighWater},
+            sync_state::{BindingId, SyncBase, SyncCheckpoint, VaultBindingTag, BINDING_SALT_LEN},
+        };
+
+        use super::*;
+
+        const LOCAL: &str = r"\\?\C:\Synthetic\Vaults\Mine.lvault";
+        const TARGET: &str = r"\\?\D:\Synthetic\Remote\target.lvault";
+        const VAULT_ID: Uuid = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+        const OTHER_ID: Uuid = Uuid::from_u128(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210);
+
+        fn loc(value: &str) -> Locator {
+            Locator::new(value).unwrap()
+        }
+
+        fn state(local: &str, vault_id: Uuid, target: &str) -> SyncState {
+            let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+            let checkpoint = SyncCheckpoint::new(
+                EnvelopeFingerprint::of_bytes(&[1]),
+                1,
+                RemoteHighWater::new(1),
+            )
+            .unwrap();
+
+            SyncState::new(
+                BindingId::new(Uuid::from_u128(7)).unwrap(),
+                VaultBindingTag::derive(salt, vault_id).unwrap(),
+                loc(local),
+                loc(target),
+                SyncBase::Based(checkpoint),
+                None,
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn matching_vault_and_locator_are_bound() {
+            let record = state(LOCAL, VAULT_ID, TARGET);
+
+            let result = bind_loaded(record.clone(), VAULT_ID, &loc(LOCAL));
+
+            assert_eq!(
+                result,
+                SessionSyncState::Bound(Box::new(SessionBoundSyncState { state: record }))
+            );
+        }
+
+        #[test]
+        fn a_case_only_locator_difference_is_the_same_location() {
+            // The existing Windows path identity is ASCII case-insensitive.
+            let record = state(LOCAL, VAULT_ID, TARGET);
+
+            let result = bind_loaded(record, VAULT_ID, &loc(&LOCAL.to_ascii_uppercase()));
+
+            assert!(matches!(result, SessionSyncState::Bound(_)));
+        }
+
+        #[test]
+        fn a_different_local_path_is_a_mismatch() {
+            let record = state(LOCAL, VAULT_ID, TARGET);
+
+            let other = r"\\?\C:\Synthetic\Vaults\Other.lvault";
+
+            assert_eq!(
+                bind_loaded(record, VAULT_ID, &loc(other)),
+                SessionSyncState::BindingMismatch(BindingMismatch::LocalLocator)
+            );
+        }
+
+        #[test]
+        fn a_different_vault_at_the_same_path_is_a_mismatch() {
+            let record = state(LOCAL, VAULT_ID, TARGET);
+
+            assert_eq!(
+                bind_loaded(record.clone(), OTHER_ID, &loc(LOCAL)),
+                SessionSyncState::BindingMismatch(BindingMismatch::VaultIdentity)
+            );
+            assert_eq!(
+                bind_loaded(record, Uuid::nil(), &loc(LOCAL)),
+                SessionSyncState::BindingMismatch(BindingMismatch::VaultIdentity)
+            );
+        }
+
+        #[test]
+        fn a_bound_record_does_not_authorize_a_different_target() {
+            let record = state(LOCAL, VAULT_ID, TARGET);
+
+            let SessionSyncState::Bound(bound) = bind_loaded(record, VAULT_ID, &loc(LOCAL)) else {
+                panic!("expected a bound state");
+            };
+
+            // `Bound` carries the retained target; choosing a target is a
+            // separate, later comparison that must still fail for any other.
+            assert_eq!(bound.state().target_locator().as_str(), TARGET);
+            assert_eq!(
+                bound.state().verify_binding(
+                    VAULT_ID,
+                    &loc(LOCAL),
+                    &loc(r"\\?\D:\Synthetic\Remote\someone-elses.lvault"),
+                ),
+                Err(BindingMismatch::TargetLocator)
+            );
+            assert!(bound
+                .state()
+                .verify_binding(VAULT_ID, &loc(LOCAL), &loc(TARGET))
+                .is_ok());
+        }
+
+        #[test]
+        fn outcomes_show_no_identifier_locator_or_state() {
+            let record = state(LOCAL, VAULT_ID, TARGET);
+
+            let mut outcomes = vec![
+                bind_loaded(record.clone(), VAULT_ID, &loc(LOCAL)),
+                bind_loaded(record.clone(), OTHER_ID, &loc(LOCAL)),
+                bind_loaded(record, VAULT_ID, &loc(r"\\?\C:\Synthetic\Other.lvault")),
+                SessionSyncState::NotConfigured,
+                SessionSyncState::UnsupportedVersion,
+            ];
+            outcomes.push(SessionSyncState::Corrupt(CorruptReason::Undecodable));
+            outcomes.push(SessionSyncState::Unreadable(UnreadableReason::Io(
+                io::ErrorKind::PermissionDenied,
+            )));
+            for reason in [
+                SyncStateUnavailable::LocalLocator,
+                SyncStateUnavailable::LocalVaultChanged,
+                SyncStateUnavailable::Root,
+            ] {
+                outcomes.push(SessionSyncState::Unavailable(reason));
+            }
+
+            let needles = [
+                "Synthetic",
+                "Mine.lvault",
+                "target.lvault",
+                "0123456789abcdef",
+                "01234567-89ab-cdef",
+                "fedcba98",
+                "00000000-0000-0000-0000-000000000007",
+            ];
+
+            for outcome in &outcomes {
+                let shown = format!("{outcome:?}");
+
+                for needle in needles {
+                    assert!(!shown.contains(needle), "leaks {needle:?}: {shown}");
+                }
+            }
+        }
     }
 }
