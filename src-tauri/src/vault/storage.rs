@@ -237,26 +237,51 @@ fn create_atomic_temp_file(destination: &Path) -> Result<(PathBuf, File), Storag
     )))
 }
 
-#[cfg(windows)]
+/// Publishes a fully written temporary file under `destination` without ever
+/// replacing an existing destination.
+///
+/// The no-clobber guarantee comes from the publication primitive itself:
+/// `fs::hard_link` (`link(2)` / `CreateHardLinkW`) fails with `AlreadyExists`
+/// if `destination` exists at the moment of the call, so a file created by
+/// another actor after any earlier existence check is never overwritten.
+///
+/// `fs::rename` must NOT be used here: on Windows it replaces an existing
+/// destination (and on POSIX it always does).
+///
+/// There is deliberately no fallback. If the filesystem does not support hard
+/// links (for example FAT/exFAT), publication fails closed with an error and
+/// `destination` is left untouched.
+///
+/// On `Ok` the destination is published. Removing the temporary name afterwards
+/// is best effort: if it fails, the vault is still correctly published and an
+/// extra encrypted-bytes-only name for the same file may remain. It is never
+/// reported as a failed create, and `destination` is never rolled back.
 fn commit_new_temp_file(temp_path: &Path, destination: &Path) -> io::Result<()> {
-    /*
-     * On Windows rename does not replace an existing target.
-     * The operation stays inside one directory/filesystem.
-     */
-    fs::rename(temp_path, destination)
-}
-
-#[cfg(not(windows))]
-fn commit_new_temp_file(temp_path: &Path, destination: &Path) -> io::Result<()> {
-    /*
-     * hard_link is an atomic no-clobber publication step:
-     * it fails if destination already exists.
-     */
     fs::hard_link(temp_path, destination)?;
 
     let _ = fs::remove_file(temp_path);
 
     Ok(())
+}
+
+#[cfg(test)]
+type BeforePublishHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only seam: runs once, on the calling thread, between the staged
+    /// file being complete and its publication. Compiled out of release builds.
+    static BEFORE_PUBLISH_HOOK: std::cell::RefCell<Option<BeforePublishHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_before_publish_hook(destination: &Path) {
+    let hook = BEFORE_PUBLISH_HOOK.with(|cell| cell.borrow_mut().take());
+
+    if let Some(hook) = hook {
+        hook(destination);
+    }
 }
 
 fn map_new_destination_commit_error(destination: &Path, original: io::Error) -> StorageError {
@@ -290,6 +315,9 @@ fn write_bytes_atomic_new(path: &Path, bytes: &[u8]) -> Result<(), StorageError>
 
     fs::create_dir_all(parent).map_err(StorageError::Io)?;
 
+    // Early, best-effort check that gives precise errors (symlink, directory,
+    // already exists). It is NOT the safety guarantee: the destination may
+    // appear after this point, and commit_new_temp_file refuses that case.
     reject_existing_new_destination(path)?;
 
     let (temp_path, mut temp_file) = create_atomic_temp_file(path)?;
@@ -302,10 +330,13 @@ fn write_bytes_atomic_new(path: &Path, bytes: &[u8]) -> Result<(), StorageError>
         temp_file.sync_all().map_err(StorageError::Io)?;
 
         /*
-         * Close the temporary file before publication,
-         * which is important for Windows rename semantics.
+         * Close the temporary file before publication so no handle
+         * to it is held open while it is linked.
          */
         drop(temp_file);
+
+        #[cfg(test)]
+        run_before_publish_hook(path);
 
         commit_new_temp_file(&temp_path, path)
             .map_err(|error| map_new_destination_commit_error(path, error))?;
@@ -313,6 +344,9 @@ fn write_bytes_atomic_new(path: &Path, bytes: &[u8]) -> Result<(), StorageError>
         Ok(())
     })();
 
+    // Only the temporary file owned by this call is removed, and only when
+    // publication did not happen. `destination` is never touched here, so a
+    // competing file is never deleted and a published vault is never rolled back.
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
@@ -633,5 +667,370 @@ mod tests {
         assert!(matches!(result, Err(StorageError::BackupPathMatchesVault)));
 
         assert!(load_envelope(&path).is_ok());
+    }
+
+    // -- No-clobber publication of NEW vault files --------------------------
+
+    const COMPETING_BYTES: &[u8] = b"competing-actor-synthetic-bytes-not-a-vault";
+
+    /// Unique, test-owned scratch directory under the repository's
+    /// `.qa-local\vault-create-noclobber-tests\`. Dropping the returned guard
+    /// removes only that directory.
+    fn scratch_dir() -> tempfile::TempDir {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".qa-local")
+            .join("vault-create-noclobber-tests");
+
+        fs::create_dir_all(&base).unwrap();
+
+        tempfile::Builder::new()
+            .prefix("case-")
+            .tempdir_in(&base)
+            .unwrap()
+    }
+
+    fn set_before_publish_hook(hook: impl FnOnce(&Path) + 'static) {
+        BEFORE_PUBLISH_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    fn leftover_temp_files(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".tmp"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plain_rename_replaces_existing_destination_which_is_why_it_is_not_used() {
+        let dir = scratch_dir();
+        let staged = dir.path().join("staged.tmp");
+        let destination = dir.path().join("vault.lvault");
+
+        fs::write(&staged, b"new-bytes").unwrap();
+        fs::write(&destination, COMPETING_BYTES).unwrap();
+
+        // The root cause: rename silently clobbers an existing destination.
+        fs::rename(&staged, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new-bytes");
+    }
+
+    #[test]
+    fn hard_link_refuses_existing_destination_and_leaves_it_untouched() {
+        let dir = scratch_dir();
+        let staged = dir.path().join("staged.tmp");
+        let destination = dir.path().join("vault.lvault");
+
+        fs::write(&staged, b"new-bytes").unwrap();
+        fs::write(&destination, COMPETING_BYTES).unwrap();
+
+        let error = fs::hard_link(&staged, &destination).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&destination).unwrap(), COMPETING_BYTES);
+    }
+
+    #[test]
+    fn commit_new_temp_file_publishes_and_removes_only_the_temp_name() {
+        let dir = scratch_dir();
+        let staged = dir.path().join(".staged.tmp");
+        let destination = dir.path().join("vault.lvault");
+
+        fs::write(&staged, b"new-bytes").unwrap();
+
+        commit_new_temp_file(&staged, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new-bytes");
+        assert!(!staged.exists());
+    }
+
+    #[test]
+    fn commit_new_temp_file_refuses_existing_destination() {
+        let dir = scratch_dir();
+        let staged = dir.path().join(".staged.tmp");
+        let destination = dir.path().join("vault.lvault");
+
+        fs::write(&staged, b"new-bytes").unwrap();
+        fs::write(&destination, COMPETING_BYTES).unwrap();
+
+        let error = commit_new_temp_file(&staged, &destination).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&destination).unwrap(), COMPETING_BYTES);
+
+        // Cleanup of the staged file is the caller's job on failure.
+        assert_eq!(fs::read(&staged).unwrap(), b"new-bytes");
+    }
+
+    #[test]
+    fn new_vault_creation_publishes_valid_encrypted_bytes() {
+        let dir = scratch_dir();
+        let path = dir.path().join("vault.lvault");
+
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        save_envelope_atomic_new(&path, &envelope).unwrap();
+
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            serde_json::to_vec(&envelope).unwrap()
+        );
+
+        let loaded = load_envelope(&path).unwrap();
+        let plaintext = open_envelope(MASTER_PASSWORD, &loaded).unwrap();
+
+        assert_eq!(plaintext.as_slice(), TEST_PAYLOAD);
+        assert!(leftover_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn new_vault_creation_creates_missing_parent_directories() {
+        let dir = scratch_dir();
+        let path = dir.path().join("nested").join("vault.lvault");
+
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        save_envelope_atomic_new(&path, &envelope).unwrap();
+
+        assert!(load_envelope(&path).is_ok());
+    }
+
+    #[test]
+    fn destination_existing_before_staging_is_refused_and_unchanged() {
+        let dir = scratch_dir();
+        let path = dir.path().join("vault.lvault");
+
+        fs::write(&path, COMPETING_BYTES).unwrap();
+
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        let result = save_envelope_atomic_new(&path, &envelope);
+
+        assert!(matches!(result, Err(StorageError::DestinationExists)));
+        assert_eq!(fs::read(&path).unwrap(), COMPETING_BYTES);
+        assert!(leftover_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn destination_created_between_check_and_publish_is_not_clobbered() {
+        let dir = scratch_dir();
+        let path = dir.path().join("vault.lvault");
+
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        // Another actor creates the destination after the existence check and
+        // after the new vault has been fully staged, immediately before publish.
+        set_before_publish_hook(|destination| {
+            assert!(!destination.exists());
+            fs::write(destination, COMPETING_BYTES).unwrap();
+        });
+
+        let result = save_envelope_atomic_new(&path, &envelope);
+
+        assert!(matches!(result, Err(StorageError::DestinationExists)));
+
+        // Byte-for-byte unchanged, not deleted, and our temp file is cleaned up.
+        assert_eq!(fs::read(&path).unwrap(), COMPETING_BYTES);
+        assert!(leftover_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn competing_file_survives_refused_publish_with_backup_untouched() {
+        let dir = scratch_dir();
+        let path = dir.path().join("vault.lvault");
+        let backup_path = dir.path().join("vault.lvault.backup");
+
+        fs::write(&backup_path, b"unrelated-backup-bytes").unwrap();
+
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        set_before_publish_hook(|destination| {
+            fs::write(destination, COMPETING_BYTES).unwrap();
+        });
+
+        let result = save_envelope_atomic_new(&path, &envelope);
+
+        assert!(matches!(result, Err(StorageError::DestinationExists)));
+        assert_eq!(fs::read(&path).unwrap(), COMPETING_BYTES);
+        assert_eq!(fs::read(&backup_path).unwrap(), b"unrelated-backup-bytes");
+    }
+
+    #[test]
+    fn competing_non_file_destination_is_refused_and_preserved() {
+        let dir = scratch_dir();
+        let path = dir.path().join("vault.lvault");
+
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        set_before_publish_hook(|destination| {
+            fs::create_dir(destination).unwrap();
+        });
+
+        let result = save_envelope_atomic_new(&path, &envelope);
+
+        assert!(matches!(result, Err(StorageError::NotRegularFile)));
+        assert!(path.is_dir());
+        assert!(leftover_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn failed_publish_reports_error_leaves_no_destination_and_cleans_up() {
+        let dir = scratch_dir();
+        let path = dir.path().join("vault.lvault");
+
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        // Make publication fail for a reason other than an existing destination:
+        // the staged file disappears before it can be linked.
+        set_before_publish_hook(|destination| {
+            for staged in leftover_temp_files(destination.parent().unwrap()) {
+                fs::remove_file(staged).unwrap();
+            }
+        });
+
+        let result = save_envelope_atomic_new(&path, &envelope);
+
+        assert!(matches!(result, Err(StorageError::Io(_))));
+
+        // A failed create must never leave a destination behind that could be
+        // mistaken for a successful create.
+        assert!(!path.exists());
+        assert!(leftover_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn independent_creations_in_one_directory_all_succeed_without_leftovers() {
+        let dir = scratch_dir();
+
+        let mut expected = Vec::new();
+
+        for index in 0..3 {
+            let path = dir.path().join(format!("vault-{index}.lvault"));
+            let payload = format!("payload-{index}");
+
+            let envelope = create_envelope(MASTER_PASSWORD, payload.as_bytes()).unwrap();
+
+            save_envelope_atomic_new(&path, &envelope).unwrap();
+
+            expected.push((path, payload));
+        }
+
+        for (path, payload) in expected {
+            let loaded = load_envelope(&path).unwrap();
+            let plaintext = open_envelope(MASTER_PASSWORD, &loaded).unwrap();
+
+            assert_eq!(plaintext.as_slice(), payload.as_bytes());
+        }
+
+        assert!(leftover_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn second_creation_attempt_for_same_path_is_refused_and_first_is_unchanged() {
+        let dir = scratch_dir();
+        let path = dir.path().join("vault.lvault");
+
+        let first = create_envelope(MASTER_PASSWORD, b"first-creation").unwrap();
+        let second = create_envelope(MASTER_PASSWORD, b"second-creation").unwrap();
+
+        save_envelope_atomic_new(&path, &first).unwrap();
+
+        let result = save_envelope_atomic_new(&path, &second);
+
+        assert!(matches!(result, Err(StorageError::DestinationExists)));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            serde_json::to_vec(&first).unwrap()
+        );
+        assert!(leftover_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn concurrent_creations_for_same_path_have_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        const ATTEMPTS: usize = 4;
+
+        let dir = scratch_dir();
+        let path = dir.path().join("vault.lvault");
+
+        let barrier = Arc::new(Barrier::new(ATTEMPTS));
+
+        let handles: Vec<_> = (0..ATTEMPTS)
+            .map(|index| {
+                let path = path.clone();
+                let barrier = Arc::clone(&barrier);
+
+                std::thread::spawn(move || {
+                    let envelope =
+                        create_envelope(MASTER_PASSWORD, format!("attempt-{index}").as_bytes())
+                            .unwrap();
+
+                    let bytes = serde_json::to_vec(&envelope).unwrap();
+
+                    barrier.wait();
+
+                    (save_envelope_atomic_new(&path, &envelope), bytes)
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let winners: Vec<_> = outcomes.iter().filter(|(r, _)| r.is_ok()).collect();
+
+        assert_eq!(winners.len(), 1);
+
+        for (result, _) in outcomes.iter().filter(|(r, _)| r.is_err()) {
+            assert!(matches!(result, Err(StorageError::DestinationExists)));
+        }
+
+        // The published file is exactly the winner's bytes, never a mix.
+        assert_eq!(fs::read(&path).unwrap(), winners[0].1);
+        assert!(load_envelope(&path).is_ok());
+        assert!(leftover_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn no_clobber_errors_do_not_leak_paths_or_secrets() {
+        let dir = scratch_dir();
+        let path = dir.path().join("vault.lvault");
+
+        fs::write(&path, COMPETING_BYTES).unwrap();
+
+        let envelope = create_envelope(MASTER_PASSWORD, TEST_PAYLOAD).unwrap();
+
+        let error = save_envelope_atomic_new(&path, &envelope).unwrap_err();
+
+        let rendered = format!("{error} {error:?}");
+
+        assert!(!rendered.contains(MASTER_PASSWORD));
+        assert!(!rendered.contains("STORAGE_TEST_ONLY_SECRET"));
+        assert!(!rendered.contains("vault.lvault"));
+        assert!(!rendered.contains(&*dir.path().to_string_lossy()));
+    }
+
+    #[test]
+    fn save_with_backup_still_replaces_existing_vault_and_keeps_previous_as_backup() {
+        let dir = scratch_dir();
+        let path = dir.path().join("vault.lvault");
+        let backup_path = dir.path().join("vault.lvault.backup");
+
+        let first = create_envelope(MASTER_PASSWORD, b"first-version").unwrap();
+        let second = create_envelope(MASTER_PASSWORD, b"second-version").unwrap();
+
+        save_envelope_atomic_new(&path, &first).unwrap();
+        save_envelope_atomic_with_backup(&path, &backup_path, &second).unwrap();
+
+        // Intentional replacement semantics are unchanged.
+        assert_eq!(load_envelope(&path).unwrap(), second);
+        assert_eq!(load_envelope(&backup_path).unwrap(), first);
     }
 }
