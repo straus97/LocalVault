@@ -3337,4 +3337,932 @@ mod tests {
         let shown = format!("{root:?}");
         assert!(!shown.contains("AppData") && !shown.contains("Users"));
     }
+
+    // ---- Stage 1U-4 B1c: session-bound high-water observation ---------------------
+    //
+    // Real unlocked sessions over synthetic vaults. Candidate "remote" envelopes
+    // are genuine envelopes of the same vault, produced by unlocking a copy of
+    // the vault file and committing real writes, so their revisions are
+    // authenticated counters. Not covered here (and not claimed): any remote or
+    // target adapter (none exists), cross-process compare-and-swap, power-loss
+    // durability, or Tauri command wiring (there is none).
+
+    use crate::{
+        app_state::{AppState, AppStateError},
+        vault::session::{RemoteObservationOutcome, RemoteObservationRefusal, SessionError},
+    };
+    use localvault_core::{
+        sync::{
+            BoundInspectionError, EnvelopeInput, InspectionError, PayloadRejection,
+            MAX_ENVELOPE_BYTES,
+        },
+        sync_state::TransitionRefusal,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    type Outcome = RemoteObservationOutcome;
+    type Refusal = RemoteObservationRefusal;
+
+    /// Genuine envelope bytes of the vault at `vault`, advanced to `revision` by
+    /// real committed writes on a copy (the original is never touched).
+    fn candidate_from(vault: &Path, scratch_root: &Path, name: &str, revision: u64) -> Vec<u8> {
+        let dir = scratch_root.join("candidates");
+        fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join(format!("{name}.lvault"));
+        fs::copy(vault, &path).unwrap();
+
+        let mut copy = open_session(&path);
+        let mut n: i64 = 0;
+        while copy.data().revision < revision {
+            n += 1;
+            copy.create_category(
+                CategoryInput {
+                    name: format!("candidate-{n}"),
+                },
+                B1B_NOW_MS + n,
+            )
+            .unwrap();
+        }
+        assert_eq!(copy.data().revision, revision);
+        copy.lock();
+
+        fs::read(&path).unwrap()
+    }
+
+    /// An unlocked session with a published binding. `session` is declared first
+    /// so that it (and its exclusive lock file) drops before the scratch
+    /// directory is removed.
+    struct Observed {
+        session: UnlockedVaultSession,
+        root: SyncStateRoot,
+        locator: String,
+        vault_id: Uuid,
+        state: SyncState,
+        fx: Fixture,
+    }
+
+    impl Observed {
+        /// Based at high-water 5 (synced revision 1), no pending push.
+        fn new(name: &str) -> Self {
+            Self::with(name, |locator, vault_id| {
+                build(locator, vault_id, checkpoint(5), None)
+            })
+        }
+
+        fn with(name: &str, make: impl FnOnce(&str, Uuid) -> SyncState) -> Self {
+            let fx = Fixture::new(name);
+            let session = create_session(&fx.vault);
+            let vault_id = session.data().vault_id;
+            let root = fx.root();
+            let locator = canonical(&fx.vault);
+            let state = make(&locator, vault_id);
+            publish(&root, &state);
+
+            Self {
+                session,
+                root,
+                locator,
+                vault_id,
+                state,
+                fx,
+            }
+        }
+
+        fn record(&self) -> PathBuf {
+            record_in(&self.root, &self.locator)
+        }
+
+        fn state_dir(&self) -> PathBuf {
+            self.root.path().join(SYNC_STATE_DIRECTORY)
+        }
+
+        fn store(&self) -> SyncStateStore {
+            SyncStateStore::new(self.root.path()).unwrap()
+        }
+
+        fn record_bytes(&self) -> Vec<u8> {
+            fs::read(self.record()).unwrap()
+        }
+
+        fn candidates_dir(&self) -> PathBuf {
+            self.fx.scratch.root().join("candidates")
+        }
+
+        fn candidate(&self, name: &str, revision: u64) -> Vec<u8> {
+            candidate_from(&self.fx.vault, &self.fx.scratch.root(), name, revision)
+        }
+
+        fn observe(&self, candidate: &[u8]) -> Result<Outcome, Refusal> {
+            self.session
+                .record_remote_observation(&self.root, &loc(TARGET), candidate)
+        }
+
+        fn observe_in(&self, store: &SyncStateStore, candidate: &[u8]) -> Result<Outcome, Refusal> {
+            self.session
+                .record_remote_observation_in(store, &loc(TARGET), candidate)
+        }
+    }
+
+    #[test]
+    fn a_higher_authenticated_revision_raises_and_retains_only_the_high_water() {
+        let o = Observed::new("b1c-raised");
+        let candidate = o.candidate("rev9", 9);
+        let vault_before = snapshot(&o.fx.vaults);
+        let candidates_before = snapshot(&o.candidates_dir());
+
+        assert_eq!(o.observe(&candidate), Ok(Outcome::HighWaterRaised));
+
+        let expected = rebuilt(&o.state, checkpoint(9), None);
+        assert_eq!(o.record_bytes(), expected.encode().unwrap());
+        assert_eq!(names(&o.state_dir()).len(), 1, "no staging file is left");
+
+        // A fresh, independent load sees the retained mark.
+        let reloaded = bound(o.session.load_sync_state(&o.root));
+        assert_eq!(reloaded, expected);
+
+        // Only the mark moved: the synchronized baseline did not.
+        let (SyncBase::Based(old), SyncBase::Based(new)) = (o.state.base(), reloaded.base()) else {
+            panic!("expected based states");
+        };
+        assert_eq!(new.high_water().revision(), 9);
+        assert_eq!(new.synced(), old.synced());
+        assert_eq!(new.synced_revision(), old.synced_revision());
+        assert!(reloaded.pending_push().is_none());
+
+        // No vault, backup, lock or candidate write.
+        assert_eq!(snapshot(&o.fx.vaults), vault_before);
+        assert_eq!(snapshot(&o.candidates_dir()), candidates_before);
+
+        // A later, fresh operation starts from the retained value.
+        assert_eq!(
+            o.observe(&o.candidate("rev7", 7)),
+            Err(Refusal::KnownRegression)
+        );
+        assert_eq!(o.observe(&candidate), Ok(Outcome::Unchanged));
+        assert_eq!(o.record_bytes(), expected.encode().unwrap());
+    }
+
+    #[test]
+    fn the_raised_mark_survives_closing_and_reopening_the_session() {
+        let o = Observed::new("b1c-reopen");
+        let candidate = o.candidate("rev9", 9);
+        assert_eq!(o.observe(&candidate), Ok(Outcome::HighWaterRaised));
+
+        let Observed {
+            session, root, fx, ..
+        } = o;
+        session.lock();
+
+        let reopened = open_session(&fx.vault);
+        let loaded = bound(reopened.load_sync_state(&root));
+        let SyncBase::Based(checkpoint) = loaded.base() else {
+            panic!("expected a based state");
+        };
+        assert_eq!(checkpoint.high_water().revision(), 9);
+
+        // And a new operation in the new session honours it.
+        assert_eq!(
+            reopened.record_remote_observation(&root, &loc(TARGET), &candidate),
+            Ok(Outcome::Unchanged)
+        );
+    }
+
+    #[test]
+    fn an_equal_revision_is_unchanged_and_rewrites_nothing() {
+        let o = Observed::new("b1c-equal");
+        let candidate = o.candidate("rev5", 5);
+        let before = snapshot(&o.state_dir());
+
+        assert_eq!(o.observe(&candidate), Ok(Outcome::Unchanged));
+
+        // Same bytes and same modification time: not even rewritten identically.
+        assert_eq!(snapshot(&o.state_dir()), before);
+        assert_eq!(o.record_bytes(), o.state.encode().unwrap());
+    }
+
+    #[test]
+    fn a_lower_revision_is_a_known_regression_that_changes_nothing() {
+        let o = Observed::new("b1c-regression");
+        let candidate = o.candidate("rev3", 3);
+        let before = snapshot(&o.state_dir());
+
+        assert_eq!(o.observe(&candidate), Err(Refusal::KnownRegression));
+
+        assert_eq!(snapshot(&o.state_dir()), before);
+        assert_eq!(bound(o.session.load_sync_state(&o.root)), o.state);
+    }
+
+    #[test]
+    fn a_pending_push_or_an_unbased_state_blocks_every_observation() {
+        let pending = Observed::with("b1c-pending", |locator, vault_id| {
+            build(locator, vault_id, checkpoint(5), Some(pending_push(6)))
+        });
+        let candidate = pending.candidate("rev9", 9);
+        let before = snapshot(&pending.state_dir());
+        assert_eq!(
+            pending.observe(&candidate),
+            Err(Refusal::Transition(TransitionRefusal::PendingIntentExists))
+        );
+        assert_eq!(snapshot(&pending.state_dir()), before);
+        // The pending push is still there, untouched.
+        assert!(bound(pending.session.load_sync_state(&pending.root))
+            .pending_push()
+            .is_some());
+
+        let unbased = Observed::with("b1c-unbased", |locator, vault_id| {
+            build(
+                locator,
+                vault_id,
+                SyncBase::Unbased,
+                Some(
+                    PendingPush::new(
+                        INTENT,
+                        PushIntent::new(PushBaseline::Absent, fp(2)).unwrap(),
+                        1,
+                    )
+                    .unwrap(),
+                ),
+            )
+        });
+        let before = snapshot(&unbased.state_dir());
+        assert_eq!(
+            unbased.observe(&unbased.candidate("rev9", 9)),
+            Err(Refusal::Transition(TransitionRefusal::NotBased))
+        );
+        assert_eq!(snapshot(&unbased.state_dir()), before);
+    }
+
+    #[test]
+    fn a_record_for_another_vault_is_refused_and_left_alone() {
+        let o = Observed::with("b1c-wrong-vault", |locator, _| {
+            build(locator, OTHER_VAULT_ID, checkpoint(5), None)
+        });
+        assert_ne!(o.vault_id, OTHER_VAULT_ID);
+        let before = snapshot(&o.state_dir());
+
+        assert_eq!(
+            o.observe(&o.candidate("rev9", 9)),
+            Err(Refusal::BindingMismatch(BindingMismatch::VaultIdentity))
+        );
+        assert_eq!(snapshot(&o.state_dir()), before);
+    }
+
+    #[test]
+    fn only_the_retained_target_is_accepted_and_it_is_compared_exactly() {
+        let o = Observed::new("b1c-target");
+        let candidate = o.candidate("rev9", 9);
+        let before = snapshot(&o.state_dir());
+
+        for other in [
+            OTHER_LOCAL.to_owned(),
+            TARGET.to_ascii_lowercase(),
+            format!("{TARGET}x"),
+        ] {
+            assert_eq!(
+                o.session
+                    .record_remote_observation(&o.root, &loc(&other), &candidate),
+                Err(Refusal::BindingMismatch(BindingMismatch::TargetLocator)),
+                "{other}"
+            );
+            assert_eq!(snapshot(&o.state_dir()), before);
+        }
+
+        // Control: the retained target itself is accepted.
+        assert_eq!(o.observe(&candidate), Ok(Outcome::HighWaterRaised));
+    }
+
+    #[test]
+    fn a_missing_record_is_refused_and_nothing_is_created() {
+        let o = Observed::new("b1c-missing");
+        let candidate = o.candidate("rev9", 9);
+
+        // The sync-state directory exists but holds no record.
+        fs::remove_file(o.record()).unwrap();
+        assert_eq!(o.observe(&candidate), Err(Refusal::NotConfigured));
+        assert!(names(&o.state_dir()).is_empty());
+
+        // First use: not even the application-data root exists.
+        fs::remove_dir_all(o.root.path()).unwrap();
+        assert_eq!(o.observe(&candidate), Err(Refusal::NotConfigured));
+        assert!(!o.root.path().exists());
+    }
+
+    #[test]
+    fn corrupt_and_unsupported_records_are_refused_and_left_in_place() {
+        let o = Observed::new("b1c-unusable");
+        let candidate = o.candidate("rev9", 9);
+        let record = o.record();
+
+        let check = |bytes: &[u8], expected: Refusal| {
+            put_at(&record, bytes);
+            assert_eq!(o.observe(&candidate), Err(expected));
+            assert_eq!(fs::read(&record).unwrap(), bytes);
+            assert_eq!(names(&o.state_dir()).len(), 1);
+        };
+
+        check(
+            b"this is not a sync state",
+            Refusal::Corrupt(CorruptReason::Undecodable),
+        );
+        check(b"", Refusal::Corrupt(CorruptReason::Empty));
+        check(
+            &state_for(OTHER_LOCAL, o.vault_id, TARGET).encode().unwrap(),
+            Refusal::Corrupt(CorruptReason::LocatorMismatch),
+        );
+        check(
+            &tampered(&o.state, |value| {
+                value["version"] = serde_json::json!(2);
+                value["added_in_v2"] = serde_json::json!(true);
+            }),
+            Refusal::UnsupportedVersion,
+        );
+    }
+
+    #[test]
+    fn an_unreadable_state_is_refused_and_never_treated_as_absent() {
+        let o = Observed::new("b1c-unreadable");
+        let candidate = o.candidate("rev9", 9);
+
+        #[cfg(windows)]
+        {
+            let original = o.record_bytes();
+            let guard = hold_exclusively(&o.record());
+            let result = o.observe(&candidate);
+            assert!(
+                matches!(result, Err(Refusal::Unreadable(UnreadableReason::Io(_)))),
+                "got {result:?}"
+            );
+            drop(guard);
+            assert_eq!(o.record_bytes(), original);
+        }
+
+        // An interrupted-write artifact without a record.
+        let artifact = o.state_dir().join(format!(
+            "{}.{STALE_TOKEN}.tmp",
+            record_key(&loc(&o.locator))
+        ));
+        fs::remove_file(o.record()).unwrap();
+        put_at(&artifact, b"debris");
+        assert_eq!(
+            o.observe(&candidate),
+            Err(Refusal::Unreadable(UnreadableReason::UnresolvedArtifacts))
+        );
+        assert_eq!(fs::read(&artifact).unwrap(), b"debris");
+        assert!(!o.record().exists());
+    }
+
+    #[test]
+    fn a_vault_file_that_is_not_the_unlocked_one_is_refused() {
+        let o = Observed::new("b1c-vault-changed");
+        let candidate = o.candidate("rev9", 9);
+        let before = snapshot(&o.state_dir());
+        let unavailable = Err(Refusal::Unavailable(
+            SyncStateUnavailable::LocalVaultChanged,
+        ));
+
+        // Replaced by a non-cooperating writer.
+        let replacement = create_envelope(B1B_PASSWORD, b"external replacement").unwrap();
+        save_envelope_atomic(&o.fx.vault, &replacement).unwrap();
+        assert_eq!(o.observe(&candidate), unavailable);
+        assert_eq!(snapshot(&o.state_dir()), before);
+
+        // Deleted.
+        fs::remove_file(&o.fx.vault).unwrap();
+        assert_eq!(o.observe(&candidate), unavailable);
+        assert_eq!(snapshot(&o.state_dir()), before);
+    }
+
+    #[test]
+    fn a_candidate_that_does_not_authenticate_as_this_vault_is_refused() {
+        let o = Observed::new("b1c-bad-candidate");
+        let genuine = o.candidate("rev9", 9);
+        let before = snapshot(&o.state_dir());
+        let malformed = Err(Refusal::Inspection(
+            BoundInspectionError::MalformedEnvelope {
+                input: EnvelopeInput::Candidate,
+            },
+        ));
+        let unauthenticated = Err(Refusal::Inspection(BoundInspectionError::Inspection(
+            InspectionError::Candidate(PayloadRejection::AuthenticationFailed),
+        )));
+
+        assert_eq!(o.observe(b"{\"revision\": 99}"), malformed);
+        assert_eq!(o.observe(&genuine[..genuine.len() / 2]), malformed);
+        assert_eq!(
+            o.observe(&vec![0u8; MAX_ENVELOPE_BYTES + 1]),
+            Err(Refusal::Inspection(BoundInspectionError::InputTooLarge {
+                input: EnvelopeInput::Candidate,
+                actual: MAX_ENVELOPE_BYTES + 1,
+                limit: MAX_ENVELOPE_BYTES,
+            }))
+        );
+
+        // A genuine envelope whose ciphertext was altered: the revision inside
+        // it cannot be forged without the key.
+        let mut value: serde_json::Value = serde_json::from_slice(&genuine).unwrap();
+        let first = value["payload"]["ciphertext"][0].as_u64().unwrap();
+        value["payload"]["ciphertext"][0] = serde_json::json!((first + 1) % 256);
+        assert_eq!(
+            o.observe(&serde_json::to_vec(&value).unwrap()),
+            unauthenticated
+        );
+
+        // Another vault, with another key.
+        let foreign_path = o.fx.scratch.root().join("foreign").join("other.lvault");
+        let foreign = UnlockedVaultSession::create(
+            &foreign_path,
+            Zeroizing::new("another-password-entirely".to_owned()),
+            B1B_NOW_MS,
+        )
+        .unwrap();
+        assert_eq!(
+            o.observe(&fs::read(&foreign_path).unwrap()),
+            unauthenticated
+        );
+        drop(foreign);
+
+        assert_eq!(snapshot(&o.state_dir()), before);
+        assert_eq!(bound(o.session.load_sync_state(&o.root)), o.state);
+    }
+
+    #[test]
+    fn the_session_lock_is_held_for_the_whole_operation() {
+        let o = Observed::new("b1c-lock");
+        let candidate = o.candidate("rev9", 9);
+        let store = o.store();
+
+        // Probe from inside the operation, between the compare and the swap.
+        let probe = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&probe);
+        let vault = o.fx.vault.clone();
+        run_at(&store, Point::BeforeReplace, move || {
+            let attempt = UnlockedVaultSession::unlock(&vault, b1b_password());
+            seen.store(
+                if matches!(attempt, Err(SessionError::InUse)) {
+                    1
+                } else {
+                    2
+                },
+                Ordering::SeqCst,
+            );
+        });
+
+        assert_eq!(
+            o.observe_in(&store, &candidate),
+            Ok(Outcome::HighWaterRaised)
+        );
+        assert_eq!(probe.load(Ordering::SeqCst), 1, "lock was not held");
+
+        // Still held afterwards, released only by dropping the session.
+        assert!(matches!(
+            UnlockedVaultSession::unlock(&o.fx.vault, b1b_password()),
+            Err(SessionError::InUse)
+        ));
+    }
+
+    #[test]
+    fn a_failed_state_write_is_not_reported_as_success() {
+        let o = Observed::new("b1c-write-fails");
+        let candidate = o.candidate("rev9", 9);
+        let original = o.record_bytes();
+
+        let cases = [
+            (
+                Point::TempSync,
+                io::ErrorKind::PermissionDenied,
+                IoStage::Sync,
+            ),
+            (
+                Point::BeforeReplace,
+                io::ErrorKind::TimedOut,
+                IoStage::Inspect,
+            ),
+        ];
+
+        for (point, kind, stage) in cases {
+            let store = o.store();
+            fail_at(&store, point, kind);
+
+            assert_eq!(
+                o.observe_in(&store, &candidate),
+                Err(Refusal::NotPersisted(StoreError::Io { stage, kind })),
+                "{point:?}"
+            );
+            // The trusted record is untouched and no staging file is left.
+            assert_eq!(o.record_bytes(), original, "{point:?}");
+            assert_eq!(names(&o.state_dir()).len(), 1, "{point:?}");
+        }
+
+        // Nothing was lost: a fresh, unfaulted operation succeeds.
+        assert_eq!(o.observe(&candidate), Ok(Outcome::HighWaterRaised));
+    }
+
+    /// Counts attempts at the publication step (the rename).
+    fn count_publications(store: &SyncStateStore) -> Arc<AtomicUsize> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&counter);
+        run_at(store, Point::Replace, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+        counter
+    }
+
+    #[test]
+    fn replace_errors_are_classified_by_whether_publication_could_have_happened() {
+        use crate::vault::session::replace_error_may_follow_publication as ambiguous;
+
+        let io = |stage| StoreError::Io {
+            stage,
+            kind: io::ErrorKind::Other,
+        };
+
+        // Fail before the rename: the store never replaced the record.
+        for definite in [
+            io(IoStage::Inspect),
+            io(IoStage::Open),
+            io(IoStage::Write),
+            io(IoStage::Sync),
+            StoreError::Missing,
+            StoreError::UnexpectedObject,
+            StoreError::CurrentUnreadable,
+            StoreError::CurrentCorrupt,
+            StoreError::CurrentUnsupportedVersion,
+            StoreError::CurrentLocatorMismatch,
+            StoreError::Changed,
+            StoreError::LocatorMismatch,
+            StoreError::BindingIdentityChanged,
+            StoreError::TrustedHistoryRegression,
+            StoreError::Encode(SyncStateEncodeError::TooLarge),
+            StoreError::RootNotAbsolute,
+        ] {
+            assert!(!ambiguous(definite), "{definite:?}");
+        }
+
+        // The publication step itself, anything after it, and everything this
+        // sequence does not produce (fail closed).
+        for uncertain in [
+            io(IoStage::Replace),
+            io(IoStage::Directory),
+            io(IoStage::Scan),
+            StoreError::VerificationFailed,
+            StoreError::AlreadyExists,
+            StoreError::UnresolvedArtifacts,
+            StoreError::NoClobberUnsupported,
+            StoreError::IncompleteDeletion,
+        ] {
+            assert!(ambiguous(uncertain), "{uncertain:?}");
+        }
+    }
+
+    #[test]
+    fn a_publication_error_is_ambiguous_with_the_original_still_present_and_never_retried() {
+        let o = Observed::new("b1c-publish-fails");
+        let candidate = o.candidate("rev9", 9);
+        let original = o.record_bytes();
+        let store = o.store();
+
+        // The rename reports failure (before the real rename runs).
+        let attempts = count_publications(&store);
+        fail_at(&store, Point::Replace, io::ErrorKind::PermissionDenied);
+
+        assert_eq!(
+            o.observe_in(&store, &candidate),
+            Err(Refusal::PersistenceUnverified)
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "no retry");
+
+        // D: the original is what a fresh load finds, mark not changed.
+        assert_eq!(o.record_bytes(), original);
+        assert_eq!(bound(o.session.load_sync_state(&o.root)), o.state);
+        assert_eq!(names(&o.state_dir()).len(), 1);
+
+        // F: only a fresh operation decides, and it still raises exactly once.
+        assert_eq!(o.observe(&candidate), Ok(Outcome::HighWaterRaised));
+        assert_eq!(o.observe(&candidate), Ok(Outcome::Unchanged));
+    }
+
+    #[test]
+    fn a_verification_failure_after_publication_leaves_the_proposed_state_and_is_not_success() {
+        let o = Observed::new("b1c-verify-fails");
+        let candidate = o.candidate("rev9", 9);
+        let store = o.store();
+        let attempts = count_publications(&store);
+        fail_at(&store, Point::Verify, io::ErrorKind::Other);
+
+        assert_eq!(
+            o.observe_in(&store, &candidate),
+            Err(Refusal::PersistenceUnverified)
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "no retry");
+
+        // E: the proposed state has in fact reached disk.
+        let proposed = rebuilt(&o.state, checkpoint(9), None);
+        assert_eq!(o.record_bytes(), proposed.encode().unwrap());
+
+        // F: a fresh operation sees it as the current mark and writes nothing.
+        let before = snapshot(&o.state_dir());
+        assert_eq!(o.observe(&candidate), Ok(Outcome::Unchanged));
+        assert_eq!(snapshot(&o.state_dir()), before);
+        assert_eq!(
+            o.observe(&o.candidate("rev7", 7)),
+            Err(Refusal::KnownRegression)
+        );
+    }
+
+    #[test]
+    fn a_record_swapped_during_verification_is_unverified_and_the_mark_never_drops() {
+        let o = Observed::new("b1c-verify-swapped");
+        let candidate = o.candidate("rev9", 9);
+        let store = o.store();
+
+        // Another writer puts a different valid state (mark 12) in place after
+        // the publication but before the readback.
+        let other = rebuilt(&o.state, checkpoint(12), None).encode().unwrap();
+        let record = o.record();
+        let written = other.clone();
+        run_at(&store, Point::Verify, move || {
+            fs::write(&record, &written).unwrap();
+        });
+
+        assert_eq!(
+            o.observe_in(&store, &candidate),
+            Err(Refusal::PersistenceUnverified)
+        );
+
+        // Not reported as success, and the higher mark is not lowered to 9.
+        assert_eq!(o.record_bytes(), other);
+        assert_eq!(
+            o.observe(&candidate),
+            Err(Refusal::KnownRegression),
+            "a fresh load sees the retained 12, above the candidate's 9"
+        );
+        assert_eq!(o.record_bytes(), other);
+    }
+
+    #[test]
+    fn a_failure_before_publication_is_definite_and_publishes_nothing() {
+        let o = Observed::new("b1c-pre-publication");
+        let candidate = o.candidate("rev9", 9);
+        let original = o.record_bytes();
+
+        for (point, stage) in [
+            (Point::TempSync, IoStage::Sync),
+            (Point::BeforeReplace, IoStage::Inspect),
+        ] {
+            let store = o.store();
+            let attempts = count_publications(&store);
+            fail_at(&store, point, io::ErrorKind::PermissionDenied);
+
+            assert_eq!(
+                o.observe_in(&store, &candidate),
+                Err(Refusal::NotPersisted(StoreError::Io {
+                    stage,
+                    kind: io::ErrorKind::PermissionDenied
+                })),
+                "{point:?}"
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 0, "{point:?}: no rename");
+            assert_eq!(o.record_bytes(), original, "{point:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_readback_is_not_reported_as_success_and_is_not_retried() {
+        let o = Observed::new("b1c-readback-fails");
+        let candidate = o.candidate("rev9", 9);
+        let store = o.store();
+
+        fail_at(&store, Point::Verify, io::ErrorKind::Other);
+        let replacements = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&replacements);
+        run_at(&store, Point::Replace, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        });
+
+        assert_eq!(
+            o.observe_in(&store, &candidate),
+            Err(Refusal::PersistenceUnverified)
+        );
+        assert_eq!(replacements.load(Ordering::SeqCst), 1, "no retry");
+
+        // The ambiguity is real: the replacement was in fact published, which
+        // is exactly why only a fresh load may decide what happens next.
+        let expected = rebuilt(&o.state, checkpoint(9), None);
+        assert_eq!(o.record_bytes(), expected.encode().unwrap());
+        assert_eq!(bound(o.session.load_sync_state(&o.root)), expected);
+        assert_eq!(names(&o.state_dir()).len(), 1);
+    }
+
+    #[test]
+    fn an_unexpected_concurrent_state_change_is_refused_and_not_overwritten() {
+        let o = Observed::new("b1c-concurrent");
+        let candidate = o.candidate("rev9", 9);
+        let store = o.store();
+
+        // Another writer changes the record while the replacement is staged.
+        let concurrent = rebuilt(&o.state, checkpoint(6), None).encode().unwrap();
+        let record = o.record();
+        let written = concurrent.clone();
+        run_at(&store, Point::TempSync, move || {
+            fs::write(&record, &written).unwrap();
+        });
+
+        assert_eq!(
+            o.observe_in(&store, &candidate),
+            Err(Refusal::NotPersisted(StoreError::Changed))
+        );
+        assert_eq!(o.record_bytes(), concurrent);
+        assert_eq!(names(&o.state_dir()).len(), 1);
+    }
+
+    #[test]
+    fn no_outcome_writes_the_vault_its_backup_or_a_candidate() {
+        let o = Observed::new("b1c-no-other-writes");
+        let low = o.candidate("rev3", 3);
+        let same = o.candidate("rev5", 5);
+        let high = o.candidate("rev8", 8);
+        let vault_before = snapshot(&o.fx.vaults);
+        let candidates_before = snapshot(&o.candidates_dir());
+        let backup = PathBuf::from(format!("{}.backup", o.fx.vault.display()));
+        assert!(!backup.exists());
+
+        assert_eq!(o.observe(&low), Err(Refusal::KnownRegression));
+        assert_eq!(o.observe(&same), Ok(Outcome::Unchanged));
+        assert_eq!(o.observe(&high), Ok(Outcome::HighWaterRaised));
+        // The mark is monotone: the previously acceptable values are now
+        // behind it, and nothing resets the binding.
+        assert_eq!(o.observe(&same), Err(Refusal::KnownRegression));
+        assert_eq!(o.observe(&high), Ok(Outcome::Unchanged));
+        assert!(o.observe(b"garbage").is_err());
+
+        assert_eq!(snapshot(&o.fx.vaults), vault_before);
+        assert_eq!(snapshot(&o.candidates_dir()), candidates_before);
+        assert!(!backup.exists());
+        assert!(!o.session.is_dirty());
+
+        // The binding is intact: same identity, checkpoint kept, mark at 8.
+        assert_eq!(
+            bound(o.session.load_sync_state(&o.root)),
+            rebuilt(&o.state, checkpoint(8), None)
+        );
+    }
+
+    #[test]
+    fn local_vault_use_is_unaffected_before_and_after_a_recorded_observation() {
+        let o = Observed::new("b1c-local-use");
+        let candidate = o.candidate("rev9", 9);
+        assert_eq!(o.observe(&candidate), Ok(Outcome::HighWaterRaised));
+
+        let Observed {
+            mut session,
+            root,
+            fx,
+            ..
+        } = o;
+
+        // Ordinary local writes continue, and the next observation reads the
+        // vault file as this session just rewrote it (its current bytes), not a
+        // stale or re-serialized copy.
+        session
+            .create_category(
+                CategoryInput {
+                    name: "Local".to_owned(),
+                },
+                B1B_NOW_MS + 100,
+            )
+            .unwrap();
+        assert_eq!(session.data().revision, 1);
+        let later = candidate_from(&fx.vault, &fx.scratch.root(), "rev12", 12);
+        assert_eq!(
+            session.record_remote_observation(&root, &loc(TARGET), &later),
+            Ok(Outcome::HighWaterRaised)
+        );
+
+        session.lock();
+
+        let reopened = open_session(&fx.vault);
+        assert_eq!(reopened.data().revision, 1);
+        assert_eq!(reopened.data().categories.len(), 1);
+        let loaded = bound(reopened.load_sync_state(&root));
+        let SyncBase::Based(checkpoint) = loaded.base() else {
+            panic!("expected a based state");
+        };
+        assert_eq!(checkpoint.high_water().revision(), 12);
+    }
+
+    #[test]
+    fn the_application_state_needs_a_live_session_and_changes_only_the_record() {
+        let fx = Fixture::new("b1c-appstate");
+        let first = create_session(&fx.vault);
+        let vault_id = first.data().vault_id;
+        let root = fx.root();
+        let locator = canonical(&fx.vault);
+        let original = build(&locator, vault_id, checkpoint(5), None);
+        publish(&root, &original);
+        first.lock();
+
+        let candidate = candidate_from(&fx.vault, &fx.scratch.root(), "rev9", 9);
+        let vault_bytes = fs::read(&fx.vault).unwrap();
+        let target = loc(TARGET);
+
+        let app = AppState::default();
+        assert!(matches!(
+            app.record_remote_observation(&root, &target, &candidate),
+            Err(AppStateError::VaultLocked)
+        ));
+        assert_eq!(
+            fs::read(record_in(&root, &locator)).unwrap(),
+            original.encode().unwrap()
+        );
+
+        app.unlock_vault(fx.vault.clone(), b1b_password()).unwrap();
+        assert_eq!(
+            app.record_remote_observation(&root, &target, &candidate)
+                .unwrap(),
+            Ok(Outcome::HighWaterRaised)
+        );
+        match app.load_sync_state(&root).unwrap() {
+            SessionSyncState::Bound(bound) => {
+                assert_eq!(bound.state(), &rebuilt(&original, checkpoint(9), None))
+            }
+            other => panic!("expected a bound state, got {other:?}"),
+        }
+        assert_eq!(fs::read(&fx.vault).unwrap(), vault_bytes);
+
+        app.lock_vault().unwrap();
+        assert!(matches!(
+            app.record_remote_observation(&root, &target, &candidate),
+            Err(AppStateError::VaultLocked)
+        ));
+    }
+
+    #[test]
+    fn outcomes_and_errors_reveal_no_identifier_path_locator_or_fingerprint() {
+        let o = Observed::new("b1c-no-leak");
+        let down = o.candidate("rev3", 3);
+        let up = o.candidate("rev9", 9);
+        let higher = o.candidate("rev12", 12);
+
+        let mut shown: Vec<String> = Vec::new();
+        let mut note = |result: Result<Outcome, Refusal>| {
+            shown.push(format!("{result:?}"));
+            if let Err(error) = result {
+                shown.push(error.to_string());
+            }
+        };
+
+        note(o.observe(&down));
+        note(o.observe(&up));
+        note(o.observe(&up));
+        note(o.observe(b"garbage"));
+        note(
+            o.session
+                .record_remote_observation(&o.root, &loc(OTHER_LOCAL), &up),
+        );
+
+        let faulted = o.store();
+        fail_at(&faulted, Point::Replace, io::ErrorKind::PermissionDenied);
+        note(o.observe_in(&faulted, &higher));
+
+        let unverified = o.store();
+        fail_at(&unverified, Point::Verify, io::ErrorKind::Other);
+        note(o.observe_in(&unverified, &higher));
+
+        fs::write(o.record(), b"garbage").unwrap();
+        note(o.observe(&up));
+
+        let fingerprint = |bytes: &[u8]| EnvelopeFingerprint::of_bytes(bytes).to_hex();
+        let needles = [
+            o.vault_id.to_string(),
+            o.vault_id.simple().to_string(),
+            OTHER_VAULT_ID.to_string(),
+            BINDING.to_string(),
+            o.fx.scratch.root().to_string_lossy().into_owned(),
+            record_key(&loc(&o.locator)),
+            o.locator.clone(),
+            "TARGET-MARKER".to_owned(),
+            "OTHER-MARKER".to_owned(),
+            "vault.lvault".to_owned(),
+            ".qa-local".to_owned(),
+            B1B_PASSWORD.to_owned(),
+            fingerprint(&down),
+            fingerprint(&up),
+            fingerprint(&higher),
+            fingerprint(&fs::read(&o.fx.vault).unwrap()),
+        ];
+
+        assert!(shown.len() > 8);
+        for output in &shown {
+            for needle in &needles {
+                assert!(
+                    !output.contains(needle.as_str()),
+                    "leaks {needle:?}: {output}"
+                );
+            }
+        }
+    }
 }

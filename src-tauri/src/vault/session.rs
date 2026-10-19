@@ -7,7 +7,7 @@ pub use entries::{EntryDetails, EntryInput, EntrySummary, TotpUpdate};
 
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
-    io,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -16,7 +16,11 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use localvault_core::{
-    sync_state::{BindingMismatch, Locator, SyncState},
+    sync::{inspect_remote_bytes, BoundInspectionError},
+    sync_state::{
+        record_remote_observation, BindingMismatch, HighWaterOutcome, Locator, SyncBase, SyncState,
+        TransitionRefusal,
+    },
     vault::{
         data::{VaultData, VaultDataError},
         format::{
@@ -27,9 +31,12 @@ use localvault_core::{
 };
 
 use super::{
-    storage::{load_envelope, save_envelope_atomic_with_backup, StorageError},
+    storage::{
+        load_envelope, save_envelope_atomic_with_backup, StorageError, MAX_VAULT_FILE_BYTES,
+    },
     sync_state_store::{
-        path_identity_eq, CorruptReason, StateLoad, SyncStateRoot, SyncStateStore, UnreadableReason,
+        path_identity_eq, CorruptReason, StateLoad, StoreError, SyncStateRoot, SyncStateStore,
+        UnreadableReason,
     },
 };
 use crate::recent_vaults::normalize_existing_vault_path;
@@ -153,6 +160,76 @@ pub enum SessionSyncState {
     /// local location, than this session. The record is left untouched.
     BindingMismatch(BindingMismatch),
     Unavailable(SyncStateUnavailable),
+}
+
+/// What a successful [`UnlockedVaultSession::record_remote_observation`]
+/// established. Fieldless on purpose: no revision, fingerprint or identifier.
+///
+/// Neither variant moves the synchronized baseline and neither authorizes a
+/// push or a pull.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum RemoteObservationOutcome {
+    /// The authenticated remote revision was above the trusted high-water mark.
+    /// The raised record was published by guarded replacement, read back
+    /// byte-identically by the store, and then loaded again by a fresh read
+    /// that agreed with it.
+    HighWaterRaised,
+    /// The authenticated remote revision equals the trusted high-water mark.
+    /// Nothing was written.
+    Unchanged,
+}
+
+/// Why no observation was recorded. Fixed categories only: no path, locator,
+/// identifier, fingerprint or revision, in `Debug` or `Display`.
+///
+/// Every variant except [`PersistenceUnverified`](Self::PersistenceUnverified)
+/// leaves the stored record as it was, and none of them lowers the high-water
+/// mark, clears a pending push or resets the binding. After
+/// `PersistenceUnverified` (and after [`NotPersisted`](Self::NotPersisted)) any
+/// later decision must start with a fresh load; nothing is retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RemoteObservationRefusal {
+    /// The session's own vault or location cannot serve as the binding anchor.
+    #[error("the session's vault or sync-state location is unavailable")]
+    Unavailable(SyncStateUnavailable),
+    /// No record exists. An observation never creates a binding.
+    #[error("no synchronization binding exists")]
+    NotConfigured,
+    #[error("the synchronization binding record is corrupt")]
+    Corrupt(CorruptReason),
+    #[error("the synchronization binding record has an unsupported version")]
+    UnsupportedVersion,
+    #[error("the synchronization binding record could not be read")]
+    Unreadable(UnreadableReason),
+    /// The record belongs to another vault, or the supplied target is not the
+    /// retained one (the target comparison is exact).
+    #[error("the synchronization binding does not match this vault or target")]
+    BindingMismatch(BindingMismatch),
+    /// The candidate bytes (or the local reference) did not authenticate as
+    /// this vault's envelope. Names the input at fault; carries no content.
+    #[error("the envelope inspection was rejected")]
+    Inspection(BoundInspectionError),
+    /// The accepted core transition refused (for example a pending push, an
+    /// unbased state, or a legacy candidate with no revision counter).
+    #[error("the high-water transition was refused")]
+    Transition(TransitionRefusal),
+    /// The authenticated remote is below the trusted high-water mark. The mark
+    /// is not lowered, the record is not touched and the binding is not reset.
+    #[error("the remote is below the trusted high-water revision")]
+    KnownRegression,
+    /// The store failed at a step that precedes publication of the replacement
+    /// (a precondition, the comparisons, or staging the temporary file), so the
+    /// previous record was never replaced. Only errors for which
+    /// `replace_error_may_follow_publication` is false land here.
+    #[error("the raised high-water state was not persisted")]
+    NotPersisted(StoreError),
+    /// The replacement may or may not have been published: the failure was the
+    /// publication step itself (the store reports only that the rename failed)
+    /// or the readback after it, or a fresh reload disagreed. The persisted
+    /// state is unknown until freshly loaded; nothing is retried.
+    #[error("the raised high-water state could not be verified after writing")]
+    PersistenceUnverified,
 }
 
 pub struct UnlockedVaultSession {
@@ -369,10 +446,7 @@ impl UnlockedVaultSession {
             _ => return SessionSyncState::Unavailable(SyncStateUnavailable::LocalVaultChanged),
         }
 
-        let Some(local_locator) = normalize_existing_vault_path(&self.path)
-            .ok()
-            .and_then(|normalized| Locator::new(&normalized).ok())
-        else {
+        let Some(local_locator) = self.local_locator() else {
             return SessionSyncState::Unavailable(SyncStateUnavailable::LocalLocator);
         };
 
@@ -387,6 +461,255 @@ impl UnlockedVaultSession {
             StateLoad::UnsupportedVersion => SessionSyncState::UnsupportedVersion,
             StateLoad::Unreadable(reason) => SessionSyncState::Unreadable(reason),
         }
+    }
+
+    /// Record a newly authenticated remote observation against this vault's
+    /// **existing** synchronization binding (Stage 1U-4 B1c). Internal: no
+    /// command, event or UI is attached, and no user-facing synchronization
+    /// operation is enabled by it.
+    ///
+    /// What it does, in order, all inside one `&self` borrow of the unlocked
+    /// session (so the exclusive OS lock held by `_lock_file` is held for the
+    /// whole call, and a closed session has nothing to call it on):
+    ///
+    /// 1. reads the vault file's **exact current bytes** and requires that they
+    ///    parse to precisely the envelope this session unlocked (otherwise the
+    ///    vault changed on disk: [`SyncStateUnavailable::LocalVaultChanged`]);
+    ///    the same raw bytes, never a re-serialization, are the local reference
+    ///    of the inspection;
+    /// 2. loads the saved record through [`SyncStateStore`] and refuses a
+    ///    missing, corrupt, unsupported, unreadable or foreign one, never
+    ///    creating or repairing anything;
+    /// 3. verifies it against the authenticated `vault_id` of this session, the
+    ///    session's normalized local location and the supplied `target`;
+    /// 4. authenticates `candidate_raw` with `inspect_remote_bytes` under this
+    ///    session's Vault Key, producing the only evidence the core transition
+    ///    accepts (a `BoundInspection` of those exact bytes);
+    /// 5. applies the core `record_remote_observation` transition and writes
+    ///    only a `Raised` result, by [`SyncStateStore::replace`] (guarded
+    ///    replacement with readback), then loads the record afresh and requires
+    ///    it to equal the proposed state.
+    ///
+    /// Nothing else changes: the encrypted vault, its `.backup` and its lock
+    /// file are not written, nothing is sent to any remote, the synchronized
+    /// checkpoint and any pending push are left as they are, and the high-water
+    /// mark can only rise. There is no retry.
+    ///
+    /// # The target boundary (read this before calling)
+    ///
+    /// **`target` and `candidate_raw` are caller assertions; this method cannot
+    /// verify that the bytes were read from that target.** There is no remote
+    /// target adapter yet. The only thing proven here is that the bytes are a
+    /// genuine envelope of this very vault (authenticated under its Vault Key),
+    /// and that `target` is, by exact string comparison, the target retained in
+    /// the binding. A future adapter must itself:
+    ///
+    /// * resolve the target the user chose and verify it is the retained one;
+    /// * read the encrypted bytes from exactly that target and pass exactly
+    ///   those bytes here;
+    /// * re-verify the target's identity if its provider can change it between
+    ///   operations.
+    ///
+    /// Bytes taken from anywhere else (an older copy, a backup, another
+    /// location) that are still authentic envelopes of this vault could only
+    /// raise the mark to a revision the vault really reached: that is the
+    /// stricter direction, but it can later make the true remote look like a
+    /// regression. This is why the method must never be reachable from the
+    /// frontend or from an unvetted caller.
+    ///
+    /// # Concurrency
+    ///
+    /// The store's replacement is read-compare-write, not compare-and-swap
+    /// against an arbitrary process. It is safe only because this session holds
+    /// the exclusive per-vault lock; a non-cooperating external writer of the
+    /// state file can still win a race, which the store detects only
+    /// opportunistically. Power-loss durability is not claimed.
+    pub fn record_remote_observation(
+        &self,
+        root: &SyncStateRoot,
+        target: &Locator,
+        candidate_raw: &[u8],
+    ) -> Result<RemoteObservationOutcome, RemoteObservationRefusal> {
+        let store = SyncStateStore::new(root.path())
+            .map_err(|_| RemoteObservationRefusal::Unavailable(SyncStateUnavailable::Root))?;
+
+        self.record_remote_observation_in(&store, target, candidate_raw)
+    }
+
+    /// [`record_remote_observation`](Self::record_remote_observation) over an
+    /// explicit store. Split out only so tests can inject store faults.
+    pub(crate) fn record_remote_observation_in(
+        &self,
+        store: &SyncStateStore,
+        target: &Locator,
+        candidate_raw: &[u8],
+    ) -> Result<RemoteObservationOutcome, RemoteObservationRefusal> {
+        use RemoteObservationRefusal as Refusal;
+
+        let local_raw = self.current_local_raw().ok_or(Refusal::Unavailable(
+            SyncStateUnavailable::LocalVaultChanged,
+        ))?;
+
+        let local_locator = self
+            .local_locator()
+            .ok_or(Refusal::Unavailable(SyncStateUnavailable::LocalLocator))?;
+
+        let state = match store.load(&local_locator) {
+            StateLoad::Loaded(state) => *state,
+            StateLoad::NotConfigured => return Err(Refusal::NotConfigured),
+            StateLoad::Corrupt(reason) => return Err(Refusal::Corrupt(reason)),
+            StateLoad::UnsupportedVersion => return Err(Refusal::UnsupportedVersion),
+            StateLoad::Unreadable(reason) => return Err(Refusal::Unreadable(reason)),
+        };
+
+        let expected_local = effective_local_locator(&state, &local_locator);
+
+        state
+            .verify_binding(self.data.vault_id, &expected_local, target)
+            .map_err(Refusal::BindingMismatch)?;
+
+        // The state's own mark is the trusted high-water; an unbased state has
+        // none, and the transition refuses it below.
+        let high_water = match state.base() {
+            SyncBase::Based(checkpoint) => Some(checkpoint.high_water()),
+            SyncBase::Unbased => None,
+        };
+
+        let observation = inspect_remote_bytes(
+            &self.vault_key,
+            self.data.vault_id,
+            &local_raw,
+            candidate_raw,
+            high_water,
+        )
+        .map_err(Refusal::Inspection)?;
+
+        match record_remote_observation(&state, &expected_local, target, &observation) {
+            Ok(HighWaterOutcome::Unchanged) => Ok(RemoteObservationOutcome::Unchanged),
+            Ok(HighWaterOutcome::KnownRegression) => Err(Refusal::KnownRegression),
+            Ok(HighWaterOutcome::Raised(proposed)) => {
+                match store.replace(&state, &proposed) {
+                    Ok(()) => {}
+                    Err(error) if replace_error_may_follow_publication(error) => {
+                        return Err(Refusal::PersistenceUnverified)
+                    }
+                    Err(error) => return Err(Refusal::NotPersisted(error)),
+                }
+
+                if persisted_matches(store.load(&local_locator), &proposed) {
+                    Ok(RemoteObservationOutcome::HighWaterRaised)
+                } else {
+                    Err(Refusal::PersistenceUnverified)
+                }
+            }
+            Err(refusal) => Err(Refusal::Transition(refusal)),
+        }
+    }
+
+    /// The session's normalized local location (the existing
+    /// `normalize_existing_vault_path` result), if it has one.
+    fn local_locator(&self) -> Option<Locator> {
+        normalize_existing_vault_path(&self.path)
+            .ok()
+            .and_then(|normalized| Locator::new(&normalized).ok())
+    }
+
+    /// The exact bytes now in the vault file, only if they parse to precisely
+    /// the envelope this session unlocked or last wrote. These raw bytes (not a
+    /// re-serialization of `self.envelope`, which can differ byte for byte from
+    /// what is on disk) are what the core fingerprints and authenticates.
+    fn current_local_raw(&self) -> Option<Vec<u8>> {
+        let raw = read_vault_file_bytes(&self.path)?;
+
+        let parsed: VaultEnvelope = serde_json::from_slice(&raw).ok()?;
+
+        parsed.validate_header().ok()?;
+
+        (parsed == self.envelope).then_some(raw)
+    }
+}
+
+/// Bounded read of a regular, non-symlink, non-empty vault file, with the same
+/// limits as `storage::load_envelope` (whose raw reader is private to that
+/// module).
+fn read_vault_file_bytes(path: &Path) -> Option<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_VAULT_FILE_BYTES
+    {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+
+    File::open(path)
+        .ok()?
+        .take(MAX_VAULT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+
+    (!bytes.is_empty() && bytes.len() as u64 <= MAX_VAULT_FILE_BYTES).then_some(bytes)
+}
+
+/// Whether a `SyncStateStore::replace` error could have happened at or after
+/// publication. Derived from the store's own sequence: preconditions, the two
+/// comparisons and temp staging (`Inspect`, `Open`, `Write`, `Sync`) all fail
+/// before the rename and leave the record untouched. The rename itself
+/// (`Replace`) reports only that it failed, not that nothing was published, and
+/// `VerificationFailed` is by construction post-publication. The match is
+/// exhaustive on purpose; anything `replace` does not produce, or that is not
+/// understood, fails closed as ambiguous.
+pub(crate) fn replace_error_may_follow_publication(error: StoreError) -> bool {
+    use super::sync_state_store::IoStage;
+
+    match error {
+        StoreError::Io {
+            stage: IoStage::Inspect | IoStage::Open | IoStage::Write | IoStage::Sync,
+            ..
+        }
+        | StoreError::Missing
+        | StoreError::UnexpectedObject
+        | StoreError::CurrentUnreadable
+        | StoreError::CurrentCorrupt
+        | StoreError::CurrentUnsupportedVersion
+        | StoreError::CurrentLocatorMismatch
+        | StoreError::Changed
+        | StoreError::LocatorMismatch
+        | StoreError::BindingIdentityChanged
+        | StoreError::TrustedHistoryRegression
+        | StoreError::Encode(_)
+        | StoreError::RootNotAbsolute => false,
+
+        StoreError::Io {
+            stage: IoStage::Replace | IoStage::Directory | IoStage::Scan,
+            ..
+        }
+        | StoreError::VerificationFailed
+        | StoreError::AlreadyExists
+        | StoreError::UnresolvedArtifacts
+        | StoreError::NoClobberUnsupported
+        | StoreError::IncompleteDeletion => true,
+    }
+}
+
+/// A freshly loaded record is the persisted state only if it is exactly the
+/// proposed one.
+fn persisted_matches(load: StateLoad, proposed: &SyncState) -> bool {
+    matches!(load, StateLoad::Loaded(current) if *current == *proposed)
+}
+
+/// The store found the record through the existing ASCII case-insensitive path
+/// identity, so a case-only spelling difference is the same location and the
+/// record's own spelling is used for the exact core comparison; anything else
+/// is passed through and fails as a mismatch.
+fn effective_local_locator(state: &SyncState, session_locator: &Locator) -> Locator {
+    if path_identity_eq(state.local_locator().as_str(), session_locator.as_str()) {
+        state.local_locator().clone()
+    } else {
+        session_locator.clone()
     }
 }
 
@@ -404,12 +727,7 @@ fn bind_loaded(
     authenticated_vault_id: Uuid,
     local_locator: &Locator,
 ) -> SessionSyncState {
-    let expected_local = if path_identity_eq(state.local_locator().as_str(), local_locator.as_str())
-    {
-        state.local_locator().clone()
-    } else {
-        local_locator.clone()
-    };
+    let expected_local = effective_local_locator(&state, local_locator);
     let retained_target = state.target_locator().clone();
 
     match state.verify_binding(authenticated_vault_id, &expected_local, &retained_target) {
@@ -1127,6 +1445,45 @@ mod tests {
                 .state()
                 .verify_binding(VAULT_ID, &loc(LOCAL), &loc(TARGET))
                 .is_ok());
+        }
+
+        #[test]
+        fn only_an_identical_fresh_load_confirms_a_persisted_state() {
+            let proposed = state(LOCAL, VAULT_ID, TARGET);
+            let mut other = proposed.clone();
+
+            // Same binding, different mark.
+            let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+            other = SyncState::new(
+                other.binding_id(),
+                VaultBindingTag::derive(salt, VAULT_ID).unwrap(),
+                loc(LOCAL),
+                loc(TARGET),
+                SyncBase::Based(
+                    SyncCheckpoint::new(
+                        EnvelopeFingerprint::of_bytes(&[1]),
+                        1,
+                        RemoteHighWater::new(2),
+                    )
+                    .unwrap(),
+                ),
+                None,
+            )
+            .unwrap();
+
+            assert!(persisted_matches(
+                StateLoad::Loaded(Box::new(proposed.clone())),
+                &proposed
+            ));
+            for load in [
+                StateLoad::Loaded(Box::new(other)),
+                StateLoad::NotConfigured,
+                StateLoad::UnsupportedVersion,
+                StateLoad::Corrupt(CorruptReason::Undecodable),
+                StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts),
+            ] {
+                assert!(!persisted_matches(load, &proposed));
+            }
         }
 
         #[test]

@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use localvault_core::sync_state::Locator;
 use serde::Serialize;
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -24,7 +25,10 @@ use zeroize::Zeroizing;
 use crate::vault::{
     backup::BackupError,
     lifecycle::VaultLifecycleError,
-    session::{SessionError, SessionSyncState, UnlockedVaultSession},
+    session::{
+        RemoteObservationOutcome, RemoteObservationRefusal, SessionError, SessionSyncState,
+        UnlockedVaultSession,
+    },
     sync_state_store::SyncStateRoot,
 };
 
@@ -256,6 +260,37 @@ impl AppState {
         let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
 
         Ok(session.load_sync_state(root))
+    }
+
+    /// Record a newly authenticated remote observation against the unlocked
+    /// vault's existing synchronization binding (Stage 1U-4 B1c). Internal: no
+    /// command, event or UI is attached, so the frontend cannot reach it.
+    ///
+    /// The outer error is "no live session" (`VaultLocked`/`SessionExpired`).
+    /// The inner result is the session's own: see
+    /// [`UnlockedVaultSession::record_remote_observation`] for what is checked,
+    /// what is written and, in particular, why `target` and `candidate_raw` are
+    /// caller assertions that a future target adapter must back (it must read
+    /// the bytes from exactly the retained target).
+    ///
+    /// The application-state mutex, and with it the session and its exclusive
+    /// OS lock, is held for the whole operation. Like `load_sync_state`, it
+    /// observes expiry but does not count as user activity.
+    pub fn record_remote_observation(
+        &self,
+        root: &SyncStateRoot,
+        target: &Locator,
+        candidate_raw: &[u8],
+    ) -> Result<Result<RemoteObservationOutcome, RemoteObservationRefusal>, AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        if self.expire_if_needed(&mut guard, Instant::now()) {
+            return Err(AppStateError::SessionExpired);
+        }
+
+        let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.record_remote_observation(root, target, candidate_raw))
     }
 
     fn active_session_guard(&self) -> Result<MutexGuard<'_, AppStateInner>, AppStateError> {
@@ -789,6 +824,93 @@ mod tests {
 
         assert!(matches!(
             state.load_sync_state(&root),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        assert!(!root.path().exists());
+    }
+
+    // -- Stage 1U-4 B1c: recording a remote observation through the state -------
+    //
+    // The success path (a real binding, real candidate envelopes, store fault
+    // injection) is tested in `sync_state_store::tests`, next to the scratch and
+    // fault helpers. Here: the live-session and activity rules only.
+
+    fn observation_target() -> Locator {
+        Locator::new(r"\\?\D:\Synthetic\Remote\target.lvault").unwrap()
+    }
+
+    #[test]
+    fn recording_an_observation_requires_a_live_session_and_touches_nothing_otherwise() {
+        let scratch = qa_scratch("b1c-appstate-locked");
+
+        let app_local = scratch.path().join("app-local");
+
+        let root = SyncStateRoot::for_test(app_local.clone());
+
+        let state = AppState::default();
+
+        assert!(matches!(
+            state.record_remote_observation(&root, &observation_target(), b"candidate"),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        state
+            .create_vault(scratch.path().join("vault.lvault"), password())
+            .unwrap();
+
+        // A live session with no binding: refused, and nothing is created.
+        assert_eq!(
+            state
+                .record_remote_observation(&root, &observation_target(), b"candidate")
+                .unwrap(),
+            Err(RemoteObservationRefusal::NotConfigured)
+        );
+
+        state.lock_vault().unwrap();
+
+        assert!(matches!(
+            state.record_remote_observation(&root, &observation_target(), b"candidate"),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        assert!(!app_local.exists());
+    }
+
+    #[test]
+    fn recording_an_observation_does_not_count_as_activity_and_fails_after_expiry() {
+        let scratch = qa_scratch("b1c-appstate-expiry");
+
+        let root = SyncStateRoot::for_test(scratch.path().join("app-local"));
+
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        state
+            .create_vault(scratch.path().join("vault.lvault"), password())
+            .unwrap();
+
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let before = state.last_activity_for_test();
+
+        assert_eq!(
+            state
+                .record_remote_observation(&root, &observation_target(), b"candidate")
+                .unwrap(),
+            Err(RemoteObservationRefusal::NotConfigured)
+        );
+
+        assert_eq!(state.last_activity_for_test(), before);
+
+        state.age_session_for_test(Duration::from_secs(31));
+
+        assert!(matches!(
+            state.record_remote_observation(&root, &observation_target(), b"candidate"),
+            Err(AppStateError::SessionExpired)
+        ));
+
+        assert!(matches!(
+            state.record_remote_observation(&root, &observation_target(), b"candidate"),
             Err(AppStateError::VaultLocked)
         ));
 
