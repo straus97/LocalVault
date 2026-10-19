@@ -26,9 +26,10 @@ use crate::vault::{
     backup::BackupError,
     lifecycle::VaultLifecycleError,
     session::{
-        RemoteObservationOutcome, RemoteObservationRefusal, SessionError, SessionSyncState,
-        UnlockedVaultSession,
+        RemoteObservationOutcome, RemoteObservationRefusal, RemoteTargetRefusal, SessionError,
+        SessionSyncState, UnlockedVaultSession,
     },
+    sync_file_adapter::SyncFileTarget,
     sync_state_store::SyncStateRoot,
 };
 
@@ -291,6 +292,38 @@ impl AppState {
         let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
 
         Ok(session.record_remote_observation(root, target, candidate_raw))
+    }
+
+    /// Read the selected local file target and record the authenticated
+    /// observation against the unlocked vault's existing binding (Stage 1U-4
+    /// B1e). Internal: no command, event or UI is attached, nothing calls it on
+    /// startup or unlock, and no user-facing synchronization is enabled by it.
+    ///
+    /// The outer error is "no live session" (`VaultLocked`/`SessionExpired`), and
+    /// in that case the target is never opened. The inner result is the
+    /// session's own: see [`UnlockedVaultSession::observe_remote_target`] for the
+    /// order of checks (the binding's target is compared **before** the file is
+    /// read) and for what a result does not prove.
+    ///
+    /// The application-state mutex, and with it the session and its exclusive OS
+    /// lock, is held across the whole filesystem read and state update, so a
+    /// concurrent lock, expiry or save cannot interleave. Like `load_sync_state`
+    /// and `record_remote_observation`, it observes expiry but does not count as
+    /// user activity: an internal check must never keep a vault unlocked.
+    pub fn observe_remote_target(
+        &self,
+        root: &SyncStateRoot,
+        target: &SyncFileTarget,
+    ) -> Result<Result<RemoteObservationOutcome, RemoteTargetRefusal>, AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        if self.expire_if_needed(&mut guard, Instant::now()) {
+            return Err(AppStateError::SessionExpired);
+        }
+
+        let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.observe_remote_target(root, target))
     }
 
     fn active_session_guard(&self) -> Result<MutexGuard<'_, AppStateInner>, AppStateError> {
@@ -915,5 +948,303 @@ mod tests {
         ));
 
         assert!(!root.path().exists());
+    }
+
+    // -- Stage 1U-4 B1e: observing a local file target through the state --------
+    //
+    // The ordering of the checks inside a session (the binding's target is
+    // compared before the file is read) and every outcome are tested next to the
+    // session. Here: the live-session, lock and activity rules, plus one real
+    // end-to-end observation. Limit: a test cannot observe a read that never
+    // happened; "the target was not opened without a live session" is shown by
+    // the result being `VaultLocked`/`SessionExpired` instead of the
+    // `AbsentOnDisk`/`TargetUnavailable` classification only a read can produce,
+    // and by the session-level read counter.
+
+    use crate::vault::{
+        session::CategoryInput,
+        sync_file_adapter::UnavailableReason,
+        sync_state_store::{SyncStateStore, SYNC_STATE_DIRECTORY},
+    };
+    use localvault_core::{
+        sync::{EnvelopeFingerprint, RemoteHighWater},
+        sync_state::{
+            BindingId, SyncBase, SyncCheckpoint, SyncState, VaultBindingTag, BINDING_SALT_LEN,
+        },
+    };
+
+    struct Bound {
+        scratch: tempfile::TempDir,
+        vault: PathBuf,
+        root: SyncStateRoot,
+        target: SyncFileTarget,
+        remote: PathBuf,
+        original: SyncState,
+        candidate: Vec<u8>,
+    }
+
+    fn checkpoint(high_water: u64) -> SyncBase {
+        SyncBase::Based(
+            SyncCheckpoint::new(
+                EnvelopeFingerprint::of_bytes(&[1]),
+                1,
+                RemoteHighWater::new(high_water),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn state_with_high_water(
+        local: &str,
+        vault_id: uuid::Uuid,
+        target: &str,
+        high_water: u64,
+    ) -> SyncState {
+        let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+
+        SyncState::new(
+            BindingId::new(uuid::Uuid::from_u128(0x1111_2222_3333_4444)).unwrap(),
+            VaultBindingTag::derive(salt, vault_id).unwrap(),
+            Locator::new(local).unwrap(),
+            Locator::new(target).unwrap(),
+            checkpoint(high_water),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A vault with a published binding (high-water 5) whose target file is
+    /// absent, and a genuine revision-9 candidate envelope of the same vault.
+    /// The vault is locked again before this returns.
+    fn bound_vault(name: &str) -> Bound {
+        let scratch = qa_scratch(name);
+        let vaults = scratch.path().join("vaults");
+        let remote_dir = scratch.path().join("remote");
+
+        std::fs::create_dir_all(&vaults).unwrap();
+        std::fs::create_dir_all(&remote_dir).unwrap();
+
+        let vault = vaults.join("vault.lvault");
+        let remote = remote_dir.join("target.lvault");
+        let root = SyncStateRoot::for_test(scratch.path().join("app-local"));
+
+        let session = UnlockedVaultSession::create(&vault, password(), 1_700_000_000_000).unwrap();
+        let local = crate::recent_vaults::normalize_existing_vault_path(&vault).unwrap();
+        let target = SyncFileTarget::from_path(&remote).unwrap();
+        let original = state_with_high_water(
+            &local,
+            session.data().vault_id,
+            target.locator().as_str(),
+            5,
+        );
+
+        SyncStateStore::new(root.path())
+            .unwrap()
+            .create(&original)
+            .unwrap();
+
+        session.lock();
+
+        let copy_path = scratch.path().join("candidates").join("rev9.lvault");
+
+        std::fs::create_dir_all(copy_path.parent().unwrap()).unwrap();
+        std::fs::copy(&vault, &copy_path).unwrap();
+
+        let mut copy = UnlockedVaultSession::unlock(&copy_path, password()).unwrap();
+
+        for n in 0..9 {
+            copy.create_category(
+                CategoryInput {
+                    name: format!("candidate-{n}"),
+                },
+                1_700_000_000_000 + n,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(copy.data().revision, 9);
+        copy.lock();
+
+        let candidate = std::fs::read(&copy_path).unwrap();
+
+        Bound {
+            scratch,
+            vault,
+            root,
+            target,
+            remote,
+            original,
+            candidate,
+        }
+    }
+
+    fn record_of(bound: &Bound) -> Vec<u8> {
+        std::fs::read(
+            bound
+                .root
+                .path()
+                .join(SYNC_STATE_DIRECTORY)
+                .read_dir()
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn observing_a_target_requires_a_live_session_and_does_not_classify_the_file_otherwise() {
+        let bound = bound_vault("b1e-appstate-locked");
+        let state = AppState::default();
+        let original = record_of(&bound);
+
+        // The target file does not exist: a read would say `AbsentOnDisk`.
+        assert!(!bound.remote.exists());
+        assert!(matches!(
+            state.observe_remote_target(&bound.root, &bound.target),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+
+        assert_eq!(
+            state
+                .observe_remote_target(&bound.root, &bound.target)
+                .unwrap(),
+            Err(RemoteTargetRefusal::AbsentOnDisk)
+        );
+        assert_eq!(record_of(&bound), original);
+        assert!(!bound.remote.exists(), "the observation created the target");
+
+        state.lock_vault().unwrap();
+
+        assert!(matches!(
+            state.observe_remote_target(&bound.root, &bound.target),
+            Err(AppStateError::VaultLocked)
+        ));
+        assert_eq!(record_of(&bound), original);
+
+        drop(bound.scratch);
+    }
+
+    #[test]
+    fn observing_a_target_through_the_state_changes_only_the_record() {
+        let bound = bound_vault("b1e-appstate-success");
+
+        std::fs::write(&bound.remote, &bound.candidate).unwrap();
+
+        let vault_bytes = std::fs::read(&bound.vault).unwrap();
+        let remote_bytes = std::fs::read(&bound.remote).unwrap();
+        let state = AppState::default();
+
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+
+        assert_eq!(
+            state
+                .observe_remote_target(&bound.root, &bound.target)
+                .unwrap(),
+            Ok(RemoteObservationOutcome::HighWaterRaised)
+        );
+
+        let SyncBase::Based(old) = bound.original.base() else {
+            panic!("expected a based state");
+        };
+        let expected = SyncState::new(
+            bound.original.binding_id(),
+            *bound.original.vault_tag(),
+            bound.original.local_locator().clone(),
+            bound.original.target_locator().clone(),
+            SyncBase::Based(
+                SyncCheckpoint::new(
+                    *old.synced(),
+                    old.synced_revision(),
+                    RemoteHighWater::new(9),
+                )
+                .unwrap(),
+            ),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(record_of(&bound), expected.encode().unwrap());
+
+        // A second observation is a no-op, and the lock is still held by the
+        // state's session.
+        assert_eq!(
+            state
+                .observe_remote_target(&bound.root, &bound.target)
+                .unwrap(),
+            Ok(RemoteObservationOutcome::Unchanged)
+        );
+        assert!(matches!(
+            UnlockedVaultSession::unlock(&bound.vault, password()),
+            Err(crate::vault::session::SessionError::InUse)
+        ));
+
+        assert_eq!(std::fs::read(&bound.vault).unwrap(), vault_bytes);
+        assert_eq!(std::fs::read(&bound.remote).unwrap(), remote_bytes);
+
+        state.lock_vault().unwrap();
+
+        assert!(matches!(
+            state.observe_remote_target(&bound.root, &bound.target),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        drop(bound.scratch);
+    }
+
+    #[test]
+    fn observing_a_target_does_not_count_as_activity_and_fails_after_expiry() {
+        let bound = bound_vault("b1e-appstate-expiry");
+
+        std::fs::write(&bound.remote, &bound.candidate).unwrap();
+
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let before = state.last_activity_for_test();
+
+        assert_eq!(
+            state
+                .observe_remote_target(&bound.root, &bound.target)
+                .unwrap(),
+            Ok(RemoteObservationOutcome::HighWaterRaised)
+        );
+        assert_eq!(state.last_activity_for_test(), before);
+
+        // An unavailable target is reported, not retried, and is not activity.
+        std::fs::remove_file(&bound.remote).unwrap();
+        std::fs::create_dir(&bound.remote).unwrap();
+
+        assert_eq!(
+            state
+                .observe_remote_target(&bound.root, &bound.target)
+                .unwrap(),
+            Err(RemoteTargetRefusal::TargetUnavailable(
+                UnavailableReason::UnexpectedObject
+            ))
+        );
+        assert_eq!(state.last_activity_for_test(), before);
+
+        let record_before_expiry = record_of(&bound);
+
+        state.age_session_for_test(Duration::from_secs(31));
+
+        assert!(matches!(
+            state.observe_remote_target(&bound.root, &bound.target),
+            Err(AppStateError::SessionExpired)
+        ));
+        assert!(!state.status().unwrap().unlocked);
+        assert!(matches!(
+            state.observe_remote_target(&bound.root, &bound.target),
+            Err(AppStateError::VaultLocked)
+        ));
+        assert_eq!(record_of(&bound), record_before_expiry);
+
+        drop(bound.scratch);
     }
 }

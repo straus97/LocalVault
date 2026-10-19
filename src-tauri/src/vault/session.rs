@@ -34,6 +34,7 @@ use super::{
     storage::{
         load_envelope, save_envelope_atomic_with_backup, StorageError, MAX_VAULT_FILE_BYTES,
     },
+    sync_file_adapter::{SyncFileRead, SyncFileTarget, UnavailableReason},
     sync_state_store::{
         path_identity_eq, CorruptReason, StateLoad, StoreError, SyncStateRoot, SyncStateStore,
         UnreadableReason,
@@ -230,6 +231,34 @@ pub enum RemoteObservationRefusal {
     /// state is unknown until freshly loaded; nothing is retried.
     #[error("the raised high-water state could not be verified after writing")]
     PersistenceUnverified,
+}
+
+/// Why [`UnlockedVaultSession::observe_remote_target`] recorded nothing. Fixed
+/// categories only: no path, locator, identifier, fingerprint, revision or file
+/// content, in `Debug` or `Display`.
+///
+/// Every variant leaves the sync-state record as it was, except the
+/// persistence classifications carried inside [`Self::Observation`]
+/// ([`RemoteObservationRefusal::PersistenceUnverified`] and
+/// [`RemoteObservationRefusal::NotPersisted`]), whose meaning is unchanged from
+/// B1c. Nothing is retried, and none of these lowers the high-water mark,
+/// clears a pending push or creates a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RemoteTargetRefusal {
+    /// Refused by the binding check made **before** the target was read, or by
+    /// the B1c observation (authentication, transition, persistence) after it.
+    #[error("the remote observation was refused")]
+    Observation(#[from] RemoteObservationRefusal),
+    /// The target was not found in a valid, readable local parent chain. This is
+    /// a fact about this machine's folder at this instant. It is **not** remote
+    /// absence, not an authorization to publish, and creates no state.
+    #[error("the target file was not found in the local folder")]
+    AbsentOnDisk,
+    /// Nothing may be concluded about the target (unreadable, a directory or
+    /// reparse point, empty, oversized, changed during the read, ...). Never
+    /// absence, never retried.
+    #[error("the target file could not be read")]
+    TargetUnavailable(UnavailableReason),
 }
 
 pub struct UnlockedVaultSession {
@@ -603,6 +632,104 @@ impl UnlockedVaultSession {
                 }
             }
             Err(refusal) => Err(Refusal::Transition(refusal)),
+        }
+    }
+
+    /// Read the user-selected local file `target` and record what it proves
+    /// against this vault's **existing** synchronization binding (Stage 1U-4
+    /// B1e). Internal: no command, event, UI or automatic caller exists, and no
+    /// user-facing synchronization is enabled by it.
+    ///
+    /// This joins the read-only filesystem adapter (B1d) to the authenticated
+    /// high-water observation (B1c) without re-implementing either. In order,
+    /// all inside one `&self` borrow of the unlocked session (so the exclusive OS
+    /// lock held by `_lock_file` is held across the whole read and the state
+    /// update, and a closed session has nothing to call it on):
+    ///
+    /// 1. [`load_sync_state`](Self::load_sync_state) must yield a **bound**
+    ///    record (this session's authenticated `vault_id`, this session's local
+    ///    location, the local vault file still the unlocked envelope). Every
+    ///    other outcome is refused;
+    /// 2. the record's retained target locator must equal `target`'s locator
+    ///    exactly (core `verify_binding`), **before any byte of the target is
+    ///    opened**: a mismatch never touches the selected file;
+    /// 3. only then [`SyncFileTarget::read`] runs;
+    /// 4. a `Present` read hands its own paired `target()` and `candidate_raw()`
+    ///    — the very values the adapter produced, never re-derived or
+    ///    re-serialized — to [`record_remote_observation`](Self::record_remote_observation),
+    ///    which reloads and re-verifies the binding and the local vault, then
+    ///    authenticates the bytes and applies the single accepted transition and
+    ///    persistence path. That repeated verification is deliberate.
+    ///
+    /// `AbsentOnDisk` and `Unavailable` are returned as distinct refusals and
+    /// change nothing: no record is created, no pending push is cleared and no
+    /// mark moves. Neither is ever treated as remote absence, and nothing here
+    /// retries.
+    ///
+    /// # What a success does and does not mean
+    ///
+    /// * Matching the locator to the stored binding does **not** prove a cloud
+    ///   provider's authority over the file; it is a local filesystem path.
+    /// * `Present` proves only that bounded bytes were read through the adapter's
+    ///   local-file checks; authentication proves only that they are a genuine
+    ///   envelope of **this vault**. Neither proves freshness, provider
+    ///   consistency or global ancestry, and a file absent here says nothing
+    ///   about a remote artifact.
+    /// * Nothing is written to the target, the vault, its `.backup` or its lock
+    ///   file; the synchronized baseline never moves; nothing is uploaded; and
+    ///   no completed provider upload is asserted.
+    pub fn observe_remote_target(
+        &self,
+        root: &SyncStateRoot,
+        target: &SyncFileTarget,
+    ) -> Result<RemoteObservationOutcome, RemoteTargetRefusal> {
+        self.observe_remote_target_with(root, target, SyncFileTarget::read)
+    }
+
+    /// [`observe_remote_target`](Self::observe_remote_target) with the read step
+    /// injectable. Private, so no caller outside this module (and its tests) can
+    /// substitute the read: tests use it to prove the read does not happen before
+    /// the binding check, happens exactly once afterwards, and runs under the
+    /// session lock.
+    fn observe_remote_target_with(
+        &self,
+        root: &SyncStateRoot,
+        target: &SyncFileTarget,
+        read: impl FnOnce(&SyncFileTarget) -> SyncFileRead,
+    ) -> Result<RemoteObservationOutcome, RemoteTargetRefusal> {
+        use RemoteObservationRefusal as Refusal;
+
+        let bound = match self.load_sync_state(root) {
+            SessionSyncState::Bound(bound) => bound,
+            SessionSyncState::NotConfigured => return Err(Refusal::NotConfigured.into()),
+            SessionSyncState::Corrupt(reason) => return Err(Refusal::Corrupt(reason).into()),
+            SessionSyncState::UnsupportedVersion => return Err(Refusal::UnsupportedVersion.into()),
+            SessionSyncState::Unreadable(reason) => return Err(Refusal::Unreadable(reason).into()),
+            SessionSyncState::BindingMismatch(mismatch) => {
+                return Err(Refusal::BindingMismatch(mismatch).into())
+            }
+            SessionSyncState::Unavailable(reason) => {
+                return Err(Refusal::Unavailable(reason).into())
+            }
+        };
+
+        // `load_sync_state` already proved the record's vault and local location,
+        // so its own local locator is the exact expectation here; the only new
+        // fact checked is the selected target, by the core's exact comparison.
+        let state = bound.state();
+
+        state
+            .verify_binding(self.data.vault_id, state.local_locator(), target.locator())
+            .map_err(Refusal::BindingMismatch)?;
+
+        match read(target) {
+            SyncFileRead::Present(present) => self
+                .record_remote_observation(root, present.target(), present.candidate_raw())
+                .map_err(RemoteTargetRefusal::Observation),
+            SyncFileRead::AbsentOnDisk => Err(RemoteTargetRefusal::AbsentOnDisk),
+            SyncFileRead::Unavailable(reason) => {
+                Err(RemoteTargetRefusal::TargetUnavailable(reason))
+            }
         }
     }
 
@@ -1526,6 +1653,1168 @@ mod tests {
                     assert!(!shown.contains(needle), "leaks {needle:?}: {shown}");
                 }
             }
+        }
+    }
+
+    // -- Stage 1U-4 B1e: observing a local file target through the session ----
+    //
+    // Real unlocked sessions, real synthetic vaults, real synthetic target files
+    // and a real sync-state store, all beneath the git-ignored
+    // `.qa-local/sync-state-b1-tests/` (never `%TEMP%`). Candidate "remote"
+    // envelopes are genuine envelopes of the same vault, produced by committing
+    // real writes on a copy, so their revisions are authenticated counters.
+    //
+    // Not covered here (and not claimed): any provider, network or cloud
+    // behavior (none exists and none is called; this cannot be asserted by a
+    // test, only by the absence of such code in the diff), store fault injection
+    // (the store's hooks are private to its module; the B1c classifications of
+    // `NotPersisted` and `PersistenceUnverified` are tested there and are reached
+    // here only through the unchanged B1c call), and cross-process races.
+    mod remote_target {
+        use std::{cell::Cell, error::Error as _, time::SystemTime};
+
+        use localvault_core::sync::{
+            BoundInspectionError, EnvelopeFingerprint, EnvelopeInput, InspectionError,
+            PayloadRejection, PushBaseline, PushIntent, RemoteHighWater, MAX_ENVELOPE_BYTES,
+        };
+        use localvault_core::sync_state::{
+            BindingId, PendingPush, SyncCheckpoint, VaultBindingTag, BINDING_SALT_LEN,
+        };
+
+        use super::*;
+        use crate::vault::sync_state_store::SYNC_STATE_DIRECTORY;
+
+        type Outcome = RemoteObservationOutcome;
+        type Obs = RemoteObservationRefusal;
+
+        const PASSWORD: &str = "b1e-target-observation-test-only-password";
+        const OTHER_LOCAL: &str = r"\\?\C:\Synthetic\Vaults\OTHER-MARKER.lvault";
+        const OTHER_VAULT_ID: Uuid = Uuid::from_u128(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210);
+        const BINDING: Uuid = Uuid::from_u128(0x1111_1111_2222_3333_4444_5555_5555_5555);
+        const INTENT: Uuid = Uuid::from_u128(0xaaaa_aaaa_bbbb_4ccc_8ddd_eeee_eeee_eeee);
+        const STALE_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+        fn password() -> Zeroizing<String> {
+            Zeroizing::new(PASSWORD.to_owned())
+        }
+
+        fn loc(value: &str) -> Locator {
+            Locator::new(value).unwrap()
+        }
+
+        fn fp(tag: u8) -> EnvelopeFingerprint {
+            EnvelopeFingerprint::of_bytes(&[tag])
+        }
+
+        fn checkpoint(high_water: u64) -> SyncBase {
+            SyncBase::Based(
+                SyncCheckpoint::new(fp(1), 1, RemoteHighWater::new(high_water)).unwrap(),
+            )
+        }
+
+        fn pending_push(revision: u64) -> PendingPush {
+            let intent = PushIntent::new(PushBaseline::Present(fp(1)), fp(3)).unwrap();
+
+            PendingPush::new(INTENT, intent, revision).unwrap()
+        }
+
+        fn state_with(
+            local: &str,
+            vault_id: Uuid,
+            target: &str,
+            base: SyncBase,
+            pending: Option<PendingPush>,
+        ) -> SyncState {
+            let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+
+            SyncState::new(
+                BindingId::new(BINDING).unwrap(),
+                VaultBindingTag::derive(salt, vault_id).unwrap(),
+                loc(local),
+                loc(target),
+                base,
+                pending,
+            )
+            .unwrap()
+        }
+
+        /// Same binding as `old`, different base and pending push.
+        fn rebuilt(old: &SyncState, base: SyncBase, pending: Option<PendingPush>) -> SyncState {
+            SyncState::new(
+                old.binding_id(),
+                *old.vault_tag(),
+                old.local_locator().clone(),
+                old.target_locator().clone(),
+                base,
+                pending,
+            )
+            .unwrap()
+        }
+
+        fn tampered(state: &SyncState, edit: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&state.encode().unwrap()).unwrap();
+
+            edit(&mut value);
+
+            serde_json::to_vec(&value).unwrap()
+        }
+
+        fn refused(refusal: Obs) -> Result<Outcome, RemoteTargetRefusal> {
+            Err(RemoteTargetRefusal::Observation(refusal))
+        }
+
+        fn scratch(name: &str) -> tempfile::TempDir {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(".qa-local")
+                .join("sync-state-b1-tests");
+
+            fs::create_dir_all(&base).unwrap();
+
+            tempfile::Builder::new()
+                .prefix(&format!("{name}-"))
+                .tempdir_in(&base)
+                .unwrap()
+        }
+
+        fn names(dir: &Path) -> Vec<String> {
+            let mut found: Vec<String> = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+
+            found.sort();
+
+            found
+        }
+
+        /// Everything beneath `dir` without following reparse points: kind, name
+        /// and, for plain files, length, modification time and content hash. The
+        /// session's own exclusively locked `.lock` file is recorded by name only.
+        fn snapshot(dir: &Path) -> Vec<String> {
+            fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+                let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+
+                entries.sort_by_key(|entry| entry.file_name());
+
+                for entry in entries {
+                    let path = entry.path();
+                    let metadata = fs::symlink_metadata(&path).unwrap();
+                    let relative = path
+                        .strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    let kind = metadata.file_type();
+
+                    if kind.is_symlink() {
+                        out.push(format!("L {relative}"));
+                    } else if kind.is_dir() {
+                        out.push(format!("D {relative}"));
+                        walk(&path, base, out);
+                    } else if relative.ends_with(".lock") {
+                        out.push(format!("K {relative}"));
+                    } else {
+                        let modified: SystemTime = metadata.modified().unwrap();
+                        let hash = EnvelopeFingerprint::of_bytes(&fs::read(&path).unwrap());
+
+                        out.push(format!(
+                            "F {relative} {} {modified:?} {}",
+                            metadata.len(),
+                            hash.to_hex()
+                        ));
+                    }
+                }
+            }
+
+            let mut out = Vec::new();
+
+            walk(dir, dir, &mut out);
+
+            out
+        }
+
+        /// Open without sharing: later opens for data fail with a sharing
+        /// violation.
+        #[cfg(windows)]
+        fn hold_exclusively(path: &Path) -> fs::File {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(path)
+                .unwrap()
+        }
+
+        #[cfg(windows)]
+        fn make_junction(link: &Path, destination: &Path) {
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(destination)
+                .output()
+                .unwrap();
+
+            assert!(status.status.success(), "could not create a test junction");
+        }
+
+        /// An unlocked session with a published binding and an (initially
+        /// absent) target file. `session` is declared first so that it (and its
+        /// exclusive lock file) drops before the scratch directory is removed.
+        struct Fx {
+            session: UnlockedVaultSession,
+            root: SyncStateRoot,
+            target: SyncFileTarget,
+            vault: PathBuf,
+            remote: PathBuf,
+            local: String,
+            vault_id: Uuid,
+            state: SyncState,
+            dir: tempfile::TempDir,
+        }
+
+        impl Fx {
+            /// Based at high-water 5 (synced revision 1), no pending push.
+            fn new(name: &str) -> Self {
+                Self::with(name, |local, vault_id, target| {
+                    state_with(local, vault_id, target, checkpoint(5), None)
+                })
+            }
+
+            fn with(name: &str, make: impl FnOnce(&str, Uuid, &str) -> SyncState) -> Self {
+                let dir = scratch(name);
+                let vaults = dir.path().join("vaults");
+                let remote_dir = dir.path().join("remote");
+
+                fs::create_dir_all(&vaults).unwrap();
+                fs::create_dir_all(&remote_dir).unwrap();
+
+                let vault = vaults.join("vault.lvault");
+                let remote = remote_dir.join("target.lvault");
+
+                let session = UnlockedVaultSession::create(&vault, password(), NOW_MS).unwrap();
+                let vault_id = session.data().vault_id;
+                let local = normalize_existing_vault_path(&vault).unwrap();
+                let target = SyncFileTarget::from_path(&remote).unwrap();
+                let state = make(&local, vault_id, target.locator().as_str());
+                let root = SyncStateRoot::for_test(dir.path().join("app-local"));
+
+                SyncStateStore::new(root.path())
+                    .unwrap()
+                    .create(&state)
+                    .unwrap();
+
+                Self {
+                    session,
+                    root,
+                    target,
+                    vault,
+                    remote,
+                    local,
+                    vault_id,
+                    state,
+                    dir,
+                }
+            }
+
+            fn vaults_dir(&self) -> PathBuf {
+                self.vault.parent().unwrap().to_path_buf()
+            }
+
+            fn remote_dir(&self) -> PathBuf {
+                self.remote.parent().unwrap().to_path_buf()
+            }
+
+            fn candidates_dir(&self) -> PathBuf {
+                self.dir.path().join("candidates")
+            }
+
+            fn state_dir(&self) -> PathBuf {
+                self.root.path().join(SYNC_STATE_DIRECTORY)
+            }
+
+            /// The single state record file.
+            fn record(&self) -> PathBuf {
+                let found: Vec<PathBuf> = fs::read_dir(self.state_dir())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                    .collect();
+
+                assert_eq!(found.len(), 1);
+
+                found.into_iter().next().unwrap()
+            }
+
+            fn record_bytes(&self) -> Vec<u8> {
+                fs::read(self.record()).unwrap()
+            }
+
+            fn put_remote(&self, bytes: &[u8]) {
+                fs::write(&self.remote, bytes).unwrap();
+            }
+
+            fn loaded(&self) -> SyncState {
+                match self.session.load_sync_state(&self.root) {
+                    SessionSyncState::Bound(bound) => bound.state().clone(),
+                    other => panic!("expected a bound state, got {other:?}"),
+                }
+            }
+
+            /// Genuine envelope bytes of this vault advanced to `revision` by real
+            /// committed writes on a copy (the original is never touched). The
+            /// copy's plaintext carries a marker no output may show.
+            fn candidate(&self, name: &str, revision: u64) -> Vec<u8> {
+                let candidates = self.candidates_dir();
+
+                fs::create_dir_all(&candidates).unwrap();
+
+                let path = candidates.join(format!("{name}.lvault"));
+
+                fs::copy(&self.vault, &path).unwrap();
+
+                let mut copy = UnlockedVaultSession::unlock(&path, password()).unwrap();
+                let mut n: i64 = 0;
+
+                while copy.data().revision < revision {
+                    n += 1;
+
+                    copy.create_category(
+                        CategoryInput {
+                            name: format!("LEAKMARK-PLAINTEXT-{n}"),
+                        },
+                        NOW_MS + n,
+                    )
+                    .unwrap();
+                }
+
+                assert_eq!(copy.data().revision, revision);
+
+                copy.lock();
+
+                fs::read(&path).unwrap()
+            }
+
+            fn observe(&self) -> Result<Outcome, RemoteTargetRefusal> {
+                self.session.observe_remote_target(&self.root, &self.target)
+            }
+
+            /// Observe `target` and count how many times the read step ran.
+            fn observe_counting(
+                &self,
+                target: &SyncFileTarget,
+            ) -> (Result<Outcome, RemoteTargetRefusal>, usize) {
+                let reads = Cell::new(0usize);
+
+                let result = self
+                    .session
+                    .observe_remote_target_with(&self.root, target, |t| {
+                        reads.set(reads.get() + 1);
+
+                        t.read()
+                    });
+
+                (result, reads.get())
+            }
+
+            /// Assert the refusal happened before the target was read and left the
+            /// state directory exactly as it was.
+            fn assert_refused_unread(&self, expected: Obs) {
+                let before = snapshot(&self.state_dir());
+
+                let (result, reads) = self.observe_counting(&self.target);
+
+                assert_eq!(result, refused(expected));
+                assert_eq!(reads, 0, "the target was read before the check");
+                assert_eq!(snapshot(&self.state_dir()), before);
+            }
+        }
+
+        // 1, 2. A higher authenticated file raises the mark; a fresh read keeps it.
+        #[test]
+        fn a_higher_authenticated_file_raises_the_mark_and_a_fresh_read_keeps_it() {
+            let fx = Fx::new("b1e-raised");
+            let candidate = fx.candidate("rev9", 9);
+
+            fx.put_remote(&candidate);
+
+            let vaults_before = snapshot(&fx.vaults_dir());
+            let remote_before = snapshot(&fx.remote_dir());
+            let candidates_before = snapshot(&fx.candidates_dir());
+
+            assert_eq!(fx.observe(), Ok(Outcome::HighWaterRaised));
+
+            let expected = rebuilt(&fx.state, checkpoint(9), None);
+
+            assert_eq!(fx.record_bytes(), expected.encode().unwrap());
+            assert_eq!(names(&fx.state_dir()).len(), 1, "no staging file is left");
+
+            // A fresh, independent load sees the retained mark.
+            let reloaded = fx.loaded();
+
+            assert_eq!(reloaded, expected);
+
+            // Only the mark moved: the synchronized baseline did not.
+            let (SyncBase::Based(old), SyncBase::Based(new)) = (fx.state.base(), reloaded.base())
+            else {
+                panic!("expected based states");
+            };
+
+            assert_eq!(new.high_water().revision(), 9);
+            assert_eq!(new.synced(), old.synced());
+            assert_eq!(new.synced_revision(), old.synced_revision());
+            assert!(reloaded.pending_push().is_none());
+
+            // The file, the vault and the candidates were only read.
+            assert_eq!(snapshot(&fx.vaults_dir()), vaults_before);
+            assert_eq!(snapshot(&fx.remote_dir()), remote_before);
+            assert_eq!(snapshot(&fx.candidates_dir()), candidates_before);
+
+            // A later, fresh operation starts from the retained value.
+            let state_before = snapshot(&fx.state_dir());
+
+            assert_eq!(fx.observe(), Ok(Outcome::Unchanged));
+            assert_eq!(snapshot(&fx.state_dir()), state_before);
+
+            fx.put_remote(&fx.candidate("rev7", 7));
+
+            assert_eq!(
+                fx.observe(),
+                refused(Obs::KnownRegression),
+                "the mark never goes down"
+            );
+        }
+
+        #[test]
+        fn the_raised_mark_survives_closing_and_reopening_the_session() {
+            let fx = Fx::new("b1e-reopen");
+
+            fx.put_remote(&fx.candidate("rev9", 9));
+
+            assert_eq!(fx.observe(), Ok(Outcome::HighWaterRaised));
+
+            let Fx {
+                session,
+                root,
+                target,
+                vault,
+                dir,
+                ..
+            } = fx;
+
+            session.lock();
+
+            let reopened = UnlockedVaultSession::unlock(&vault, password()).unwrap();
+
+            assert_eq!(
+                reopened.observe_remote_target(&root, &target),
+                Ok(Outcome::Unchanged)
+            );
+
+            drop(reopened);
+            drop(dir);
+        }
+
+        // 3, 4. Equal and lower authenticated revisions rewrite nothing.
+        #[test]
+        fn an_equal_revision_is_unchanged_and_rewrites_nothing() {
+            let fx = Fx::new("b1e-equal");
+
+            fx.put_remote(&fx.candidate("rev5", 5));
+
+            let before = snapshot(&fx.state_dir());
+
+            assert_eq!(fx.observe(), Ok(Outcome::Unchanged));
+
+            // Same bytes and same modification time: not even rewritten
+            // identically.
+            assert_eq!(snapshot(&fx.state_dir()), before);
+            assert_eq!(fx.record_bytes(), fx.state.encode().unwrap());
+        }
+
+        #[test]
+        fn a_lower_revision_is_a_known_regression_that_changes_nothing() {
+            let fx = Fx::new("b1e-regression");
+
+            fx.put_remote(&fx.candidate("rev3", 3));
+
+            let before = snapshot(&fx.state_dir());
+
+            assert_eq!(fx.observe(), refused(Obs::KnownRegression));
+            assert_eq!(snapshot(&fx.state_dir()), before);
+            assert_eq!(fx.loaded(), fx.state);
+        }
+
+        // 5. A target other than the retained one is refused before it is read.
+        #[test]
+        fn a_target_other_than_the_retained_one_is_refused_before_it_is_read() {
+            let fx = Fx::new("b1e-wrong-target");
+            let candidate = fx.candidate("rev9", 9);
+
+            // The retained target holds a genuine higher candidate too; so does a
+            // second, unbound file. Only the bound locator may ever be read.
+            fx.put_remote(&candidate);
+
+            let other = fx.remote_dir().join("other.lvault");
+
+            fs::write(&other, &candidate).unwrap();
+
+            let remote_text = fx.remote.to_str().unwrap().to_owned();
+            let lowered = remote_text.to_ascii_lowercase();
+
+            assert_ne!(lowered, remote_text, "the case variant must differ");
+
+            let before = snapshot(&fx.state_dir());
+            let remote_before = snapshot(&fx.remote_dir());
+
+            for wrong in [
+                other,
+                PathBuf::from(lowered),
+                PathBuf::from(remote_text + "x"),
+            ] {
+                let wrong = SyncFileTarget::from_path(&wrong).unwrap();
+                let (result, reads) = fx.observe_counting(&wrong);
+
+                assert_eq!(
+                    result,
+                    refused(Obs::BindingMismatch(BindingMismatch::TargetLocator))
+                );
+                assert_eq!(reads, 0, "an unbound target was read");
+                assert_eq!(snapshot(&fx.state_dir()), before);
+            }
+
+            assert_eq!(snapshot(&fx.remote_dir()), remote_before);
+
+            // Control: the retained target itself is read once and accepted.
+            let (result, reads) = fx.observe_counting(&fx.target);
+
+            assert_eq!(result, Ok(Outcome::HighWaterRaised));
+            assert_eq!(reads, 1);
+        }
+
+        // 6. A record for another vault identity is refused before the read.
+        #[test]
+        fn a_record_for_another_vault_identity_is_refused_before_the_read() {
+            let fx = Fx::with("b1e-wrong-vault", |local, _, target| {
+                state_with(local, OTHER_VAULT_ID, target, checkpoint(5), None)
+            });
+
+            assert_ne!(fx.vault_id, OTHER_VAULT_ID);
+
+            fx.put_remote(&fx.candidate("rev9", 9));
+            fx.assert_refused_unread(Obs::BindingMismatch(BindingMismatch::VaultIdentity));
+        }
+
+        // 7. No record: refused, no read, nothing created.
+        #[test]
+        fn a_missing_record_is_refused_before_the_read_and_nothing_is_created() {
+            let fx = Fx::new("b1e-missing-record");
+
+            fx.put_remote(&fx.candidate("rev9", 9));
+
+            // The state directory exists but holds no record.
+            fs::remove_file(fx.record()).unwrap();
+            fx.assert_refused_unread(Obs::NotConfigured);
+            assert!(names(&fx.state_dir()).is_empty());
+
+            // First use: not even the application-data root exists.
+            fs::remove_dir_all(fx.root.path()).unwrap();
+
+            let (result, reads) = fx.observe_counting(&fx.target);
+
+            assert_eq!(result, refused(Obs::NotConfigured));
+            assert_eq!(reads, 0);
+            assert!(!fx.root.path().exists());
+        }
+
+        // 8, 9. Corrupt and unsupported records are refused before the read.
+        #[test]
+        fn corrupt_and_unsupported_records_are_refused_before_the_read() {
+            let fx = Fx::new("b1e-unusable-record");
+            let record = fx.record();
+
+            fx.put_remote(&fx.candidate("rev9", 9));
+
+            let check = |bytes: &[u8], expected: Obs| {
+                fs::write(&record, bytes).unwrap();
+                fx.assert_refused_unread(expected);
+                assert_eq!(fs::read(&record).unwrap(), bytes);
+                assert_eq!(names(&fx.state_dir()).len(), 1);
+            };
+
+            check(
+                b"this is not a sync state",
+                Obs::Corrupt(CorruptReason::Undecodable),
+            );
+            check(b"", Obs::Corrupt(CorruptReason::Empty));
+            check(
+                &state_with(
+                    OTHER_LOCAL,
+                    fx.vault_id,
+                    fx.target.locator().as_str(),
+                    checkpoint(5),
+                    None,
+                )
+                .encode()
+                .unwrap(),
+                Obs::Corrupt(CorruptReason::LocatorMismatch),
+            );
+            check(
+                &tampered(&fx.state, |value| {
+                    value["version"] = serde_json::json!(2);
+                    value["added_in_v2"] = serde_json::json!(true);
+                }),
+                Obs::UnsupportedVersion,
+            );
+        }
+
+        // 10. An unreadable state is refused before the read, never as absent.
+        #[test]
+        fn an_unreadable_state_is_refused_before_the_read() {
+            let fx = Fx::new("b1e-unreadable-record");
+
+            fx.put_remote(&fx.candidate("rev9", 9));
+
+            #[cfg(windows)]
+            {
+                let original = fx.record_bytes();
+                let before = snapshot(&fx.state_dir());
+                let guard = hold_exclusively(&fx.record());
+                let (result, reads) = fx.observe_counting(&fx.target);
+
+                assert!(
+                    matches!(
+                        result,
+                        Err(RemoteTargetRefusal::Observation(Obs::Unreadable(
+                            UnreadableReason::Io(_)
+                        )))
+                    ),
+                    "got {result:?}"
+                );
+                assert_eq!(reads, 0);
+
+                drop(guard);
+
+                assert_eq!(snapshot(&fx.state_dir()), before);
+                assert_eq!(fx.record_bytes(), original);
+            }
+
+            // An interrupted-write artifact without a record.
+            let record = fx.record();
+            let stem = record.file_stem().unwrap().to_str().unwrap().to_owned();
+            let artifact = fx.state_dir().join(format!("{stem}.{STALE_TOKEN}.tmp"));
+
+            fs::remove_file(&record).unwrap();
+            fs::write(&artifact, b"debris").unwrap();
+
+            fx.assert_refused_unread(Obs::Unreadable(UnreadableReason::UnresolvedArtifacts));
+
+            assert_eq!(fs::read(&artifact).unwrap(), b"debris");
+            assert!(!record.exists());
+        }
+
+        // 11, 21. A local miss is distinct, changes nothing and creates no state.
+        #[test]
+        fn a_missing_target_in_a_valid_directory_is_absent_on_disk_and_changes_nothing() {
+            let fx = Fx::new("b1e-absent");
+            let before = snapshot(&fx.state_dir());
+            let vaults_before = snapshot(&fx.vaults_dir());
+
+            assert!(!fx.remote.exists());
+            assert_eq!(fx.observe(), Err(RemoteTargetRefusal::AbsentOnDisk));
+
+            assert_eq!(snapshot(&fx.state_dir()), before);
+            assert_eq!(fx.record_bytes(), fx.state.encode().unwrap());
+            assert_eq!(snapshot(&fx.vaults_dir()), vaults_before);
+            assert!(!fx.remote.exists(), "the observation created the target");
+
+            // Not even a pending push or the mark is touched: it is simply not a
+            // result, and a later retry is the caller's explicit decision.
+            assert_eq!(fx.loaded(), fx.state);
+        }
+
+        #[test]
+        fn a_local_miss_never_creates_a_record() {
+            let fx = Fx::new("b1e-absent-no-record");
+
+            // No record at all and no root: refused before the target is even
+            // consulted, and nothing is created for the absent file.
+            fs::remove_dir_all(fx.root.path()).unwrap();
+
+            let (result, reads) = fx.observe_counting(&fx.target);
+
+            assert_eq!(result, refused(Obs::NotConfigured));
+            assert_eq!(reads, 0);
+            assert!(!fx.root.path().exists());
+            assert!(!fx.remote.exists());
+        }
+
+        // 12. An inaccessible target is unavailable, not absent.
+        #[cfg(windows)]
+        #[test]
+        fn an_inaccessible_target_is_unavailable_and_changes_nothing() {
+            let fx = Fx::new("b1e-inaccessible");
+            let candidate = fx.candidate("rev9", 9);
+
+            fx.put_remote(&candidate);
+
+            let before = snapshot(&fx.state_dir());
+            let guard = hold_exclusively(&fx.remote);
+
+            let result = fx.observe();
+
+            assert!(
+                matches!(
+                    result,
+                    Err(RemoteTargetRefusal::TargetUnavailable(
+                        UnavailableReason::Io(_)
+                    ))
+                ),
+                "got {result:?}"
+            );
+            assert_eq!(snapshot(&fx.state_dir()), before);
+
+            drop(guard);
+
+            // Nothing retried by itself; an explicit later call simply works.
+            assert_eq!(snapshot(&fx.state_dir()), before);
+            assert_eq!(fx.observe(), Ok(Outcome::HighWaterRaised));
+        }
+
+        // 13. A directory or junction target is unavailable.
+        #[test]
+        fn a_directory_target_is_unavailable_and_changes_nothing() {
+            let fx = Fx::new("b1e-directory");
+            let before = snapshot(&fx.state_dir());
+
+            fs::create_dir(&fx.remote).unwrap();
+
+            assert_eq!(
+                fx.observe(),
+                Err(RemoteTargetRefusal::TargetUnavailable(
+                    UnavailableReason::UnexpectedObject
+                ))
+            );
+            assert_eq!(snapshot(&fx.state_dir()), before);
+            assert!(fx.remote.is_dir());
+        }
+
+        #[cfg(windows)]
+        #[test]
+        fn a_junction_target_is_unavailable_and_is_not_followed() {
+            let fx = Fx::new("b1e-junction");
+            let candidate = fx.candidate("rev9", 9);
+            let elsewhere = fx.dir.path().join("elsewhere");
+
+            fs::create_dir(&elsewhere).unwrap();
+            fs::write(elsewhere.join("inner.lvault"), &candidate).unwrap();
+            make_junction(&fx.remote, &elsewhere);
+
+            let before = snapshot(&fx.state_dir());
+            let elsewhere_before = snapshot(&elsewhere);
+
+            assert_eq!(
+                fx.observe(),
+                Err(RemoteTargetRefusal::TargetUnavailable(
+                    UnavailableReason::UnexpectedObject
+                ))
+            );
+            assert_eq!(snapshot(&fx.state_dir()), before);
+            assert_eq!(snapshot(&elsewhere), elsewhere_before);
+        }
+
+        // 14. Empty and oversized files are unavailable, never absent, never a mark.
+        #[test]
+        fn empty_and_oversized_targets_are_unavailable_and_raise_nothing() {
+            let fx = Fx::new("b1e-empty-oversized");
+            let before = snapshot(&fx.state_dir());
+
+            fx.put_remote(b"");
+
+            assert_eq!(
+                fx.observe(),
+                Err(RemoteTargetRefusal::TargetUnavailable(
+                    UnavailableReason::Empty
+                ))
+            );
+
+            fx.put_remote(&vec![0u8; MAX_ENVELOPE_BYTES + 1]);
+
+            assert_eq!(
+                fx.observe(),
+                Err(RemoteTargetRefusal::TargetUnavailable(
+                    UnavailableReason::TooLarge
+                ))
+            );
+
+            assert_eq!(snapshot(&fx.state_dir()), before);
+            assert_eq!(fx.loaded(), fx.state);
+        }
+
+        // 15. A candidate that does not authenticate is refused by B1c/core.
+        #[test]
+        fn a_file_that_does_not_authenticate_as_this_vault_is_refused() {
+            let fx = Fx::new("b1e-bad-candidate");
+            let genuine = fx.candidate("rev9", 9);
+            let before = snapshot(&fx.state_dir());
+
+            let malformed = refused(Obs::Inspection(BoundInspectionError::MalformedEnvelope {
+                input: EnvelopeInput::Candidate,
+            }));
+            let unauthenticated = refused(Obs::Inspection(BoundInspectionError::Inspection(
+                InspectionError::Candidate(PayloadRejection::AuthenticationFailed),
+            )));
+
+            fx.put_remote(b"{\"revision\": 99}");
+            assert_eq!(fx.observe(), malformed);
+
+            fx.put_remote(&genuine[..genuine.len() / 2]);
+            assert_eq!(fx.observe(), malformed);
+
+            // A genuine envelope whose ciphertext was altered: the revision inside
+            // it cannot be forged without the key.
+            let mut value: serde_json::Value = serde_json::from_slice(&genuine).unwrap();
+            let first = value["payload"]["ciphertext"][0].as_u64().unwrap();
+
+            value["payload"]["ciphertext"][0] = serde_json::json!((first + 1) % 256);
+            fx.put_remote(&serde_json::to_vec(&value).unwrap());
+            assert_eq!(fx.observe(), unauthenticated);
+
+            // Another vault, with another key.
+            let foreign_path = fx.dir.path().join("foreign").join("other.lvault");
+            let foreign = UnlockedVaultSession::create(
+                &foreign_path,
+                Zeroizing::new("another-password-entirely".to_owned()),
+                NOW_MS,
+            )
+            .unwrap();
+
+            fx.put_remote(&fs::read(&foreign_path).unwrap());
+            assert_eq!(fx.observe(), unauthenticated);
+            drop(foreign);
+
+            assert_eq!(snapshot(&fx.state_dir()), before);
+            assert_eq!(fx.loaded(), fx.state);
+        }
+
+        // 16. A pending push or an unbased state blocks every observation.
+        #[test]
+        fn a_pending_push_or_an_unbased_state_blocks_the_observation() {
+            let pending = Fx::with("b1e-pending", |local, vault_id, target| {
+                state_with(
+                    local,
+                    vault_id,
+                    target,
+                    checkpoint(5),
+                    Some(pending_push(6)),
+                )
+            });
+
+            pending.put_remote(&pending.candidate("rev9", 9));
+
+            let before = snapshot(&pending.state_dir());
+
+            assert_eq!(
+                pending.observe(),
+                refused(Obs::Transition(TransitionRefusal::PendingIntentExists))
+            );
+            assert_eq!(snapshot(&pending.state_dir()), before);
+            assert!(pending.loaded().pending_push().is_some());
+
+            let unbased = Fx::with("b1e-unbased", |local, vault_id, target| {
+                state_with(
+                    local,
+                    vault_id,
+                    target,
+                    SyncBase::Unbased,
+                    Some(
+                        PendingPush::new(
+                            INTENT,
+                            PushIntent::new(PushBaseline::Absent, fp(2)).unwrap(),
+                            1,
+                        )
+                        .unwrap(),
+                    ),
+                )
+            });
+
+            unbased.put_remote(&unbased.candidate("rev9", 9));
+
+            let before = snapshot(&unbased.state_dir());
+
+            assert_eq!(
+                unbased.observe(),
+                refused(Obs::Transition(TransitionRefusal::NotBased))
+            );
+            assert_eq!(snapshot(&unbased.state_dir()), before);
+        }
+
+        // 17. A replaced or deleted local primary is refused.
+        #[test]
+        fn a_vault_file_that_is_not_the_unlocked_one_is_refused() {
+            let fx = Fx::new("b1e-vault-changed");
+
+            fx.put_remote(&fx.candidate("rev9", 9));
+
+            // Replaced by a non-cooperating writer.
+            let replacement = create_envelope(PASSWORD, b"external replacement").unwrap();
+
+            save_envelope_atomic(&fx.vault, &replacement).unwrap();
+            fx.assert_refused_unread(Obs::Unavailable(SyncStateUnavailable::LocalVaultChanged));
+
+            // Deleted.
+            fs::remove_file(&fx.vault).unwrap();
+            fx.assert_refused_unread(Obs::Unavailable(SyncStateUnavailable::LocalVaultChanged));
+        }
+
+        #[test]
+        fn a_primary_replaced_during_the_read_is_caught_by_the_repeated_verification() {
+            let fx = Fx::new("b1e-vault-changed-mid-read");
+
+            fx.put_remote(&fx.candidate("rev9", 9));
+
+            let before = snapshot(&fx.state_dir());
+            let vault = fx.vault.clone();
+            let reads = Cell::new(0usize);
+
+            let result = fx
+                .session
+                .observe_remote_target_with(&fx.root, &fx.target, |target| {
+                    reads.set(reads.get() + 1);
+
+                    // After the binding check, before the observation is recorded.
+                    let replacement = create_envelope(PASSWORD, b"external replacement").unwrap();
+
+                    save_envelope_atomic(&vault, &replacement).unwrap();
+
+                    target.read()
+                });
+
+            assert_eq!(reads.get(), 1);
+            assert_eq!(
+                result,
+                refused(Obs::Unavailable(SyncStateUnavailable::LocalVaultChanged))
+            );
+            assert_eq!(snapshot(&fx.state_dir()), before);
+            assert_eq!(fx.record_bytes(), fx.state.encode().unwrap());
+        }
+
+        // 19. The exclusive session lock is held across the read and afterwards.
+        #[test]
+        fn the_session_lock_is_held_across_the_read() {
+            let fx = Fx::new("b1e-lock");
+
+            fx.put_remote(&fx.candidate("rev9", 9));
+
+            let vault = fx.vault.clone();
+            let probed = Cell::new(0u8);
+
+            let result = fx
+                .session
+                .observe_remote_target_with(&fx.root, &fx.target, |target| {
+                    // From inside the operation, between the binding check and
+                    // the observation: another session must be refused.
+                    let attempt = UnlockedVaultSession::unlock(&vault, password());
+
+                    probed.set(if matches!(attempt, Err(SessionError::InUse)) {
+                        1
+                    } else {
+                        2
+                    });
+
+                    target.read()
+                });
+
+            assert_eq!(result, Ok(Outcome::HighWaterRaised));
+            assert_eq!(probed.get(), 1, "the lock was not held during the read");
+
+            // Still held afterwards, released only by dropping the session.
+            assert!(matches!(
+                UnlockedVaultSession::unlock(&fx.vault, password()),
+                Err(SessionError::InUse)
+            ));
+        }
+
+        // 20. No outcome writes the target, the vault, its backup or a candidate.
+        #[test]
+        fn no_outcome_writes_the_target_the_vault_its_backup_or_a_candidate() {
+            let fx = Fx::new("b1e-no-writes");
+            let low = fx.candidate("rev3", 3);
+            let same = fx.candidate("rev5", 5);
+            let high = fx.candidate("rev8", 8);
+            let backup = PathBuf::from(format!("{}.backup", fx.vault.display()));
+
+            assert!(!backup.exists());
+
+            let vaults_before = snapshot(&fx.vaults_dir());
+            let candidates_before = snapshot(&fx.candidates_dir());
+
+            fx.put_remote(&low);
+            let remote_low = snapshot(&fx.remote_dir());
+            assert_eq!(fx.observe(), refused(Obs::KnownRegression));
+            assert_eq!(snapshot(&fx.remote_dir()), remote_low);
+
+            fx.put_remote(&same);
+            let remote_same = snapshot(&fx.remote_dir());
+            assert_eq!(fx.observe(), Ok(Outcome::Unchanged));
+            assert_eq!(snapshot(&fx.remote_dir()), remote_same);
+
+            fx.put_remote(&high);
+            let remote_high = snapshot(&fx.remote_dir());
+            assert_eq!(fx.observe(), Ok(Outcome::HighWaterRaised));
+            assert_eq!(snapshot(&fx.remote_dir()), remote_high);
+
+            // The mark is monotone: values acceptable before are now behind it.
+            fx.put_remote(&same);
+            assert_eq!(fx.observe(), refused(Obs::KnownRegression));
+            fx.put_remote(&high);
+            assert_eq!(fx.observe(), Ok(Outcome::Unchanged));
+            fx.put_remote(b"garbage");
+            assert!(fx.observe().is_err());
+
+            assert_eq!(snapshot(&fx.vaults_dir()), vaults_before);
+            assert_eq!(snapshot(&fx.candidates_dir()), candidates_before);
+            assert!(!backup.exists());
+            assert!(!fx.session.is_dirty());
+
+            // The binding is intact: same identity, checkpoint kept, mark at 8.
+            assert_eq!(fx.loaded(), rebuilt(&fx.state, checkpoint(8), None));
+        }
+
+        // 22. Neither outcomes nor errors reveal a path, identifier or content.
+        #[test]
+        fn outcomes_and_errors_reveal_no_path_identifier_or_content() {
+            let fx = Fx::new("b1e-no-leak");
+            let up = fx.candidate("rev9", 9);
+            let down = fx.candidate("rev3", 3);
+            let mut shown: Vec<String> = Vec::new();
+
+            let mut note = |result: Result<Outcome, RemoteTargetRefusal>| {
+                shown.push(format!("{result:?}"));
+
+                if let Err(error) = result {
+                    shown.push(error.to_string());
+
+                    let mut source = error.source();
+
+                    while let Some(inner) = source {
+                        shown.push(inner.to_string());
+                        shown.push(format!("{inner:?}"));
+                        source = inner.source();
+                    }
+                }
+            };
+
+            note(fx.observe()); // absent on disk
+            fx.put_remote(&down);
+            note(fx.observe()); // regression
+            fx.put_remote(&up);
+            note(fx.observe()); // raised
+            note(fx.observe()); // unchanged
+            fx.put_remote(b"garbage");
+            note(fx.observe()); // malformed
+            fx.put_remote(b"");
+            note(fx.observe()); // unavailable
+            note(Err(RemoteTargetRefusal::TargetUnavailable(
+                UnavailableReason::Io(io::ErrorKind::PermissionDenied),
+            )));
+            note(refused(Obs::PersistenceUnverified));
+            note(refused(Obs::Unavailable(
+                SyncStateUnavailable::LocalLocator,
+            )));
+
+            let fingerprint = |bytes: &[u8]| EnvelopeFingerprint::of_bytes(bytes).to_hex();
+            let prefix = String::from_utf8_lossy(&up[..48.min(up.len())]).into_owned();
+
+            let needles = vec![
+                fx.dir.path().to_string_lossy().into_owned(),
+                fx.remote.to_string_lossy().into_owned(),
+                fx.target.locator().as_str().to_owned(),
+                fx.local.clone(),
+                fx.vault_id.to_string(),
+                fx.vault_id.simple().to_string(),
+                BINDING.to_string(),
+                "target.lvault".to_owned(),
+                "vault.lvault".to_owned(),
+                ".qa-local".to_owned(),
+                "LEAKMARK".to_owned(),
+                PASSWORD.to_owned(),
+                fingerprint(&up),
+                fingerprint(&down),
+                fingerprint(&fs::read(&fx.vault).unwrap()),
+                prefix,
+            ];
+
+            assert!(shown.len() > 8);
+
+            for output in &shown {
+                for needle in &needles {
+                    assert!(
+                        !output.contains(needle.as_str()),
+                        "leaks {needle:?}: {output}"
+                    );
+                }
+            }
+        }
+
+        // 23. The raw-bytes B1c operation is unchanged, and the file path ends in
+        // the very same persisted state.
+        #[test]
+        fn the_raw_bytes_operation_is_unchanged_and_persists_the_same_state() {
+            let via_file = Fx::new("b1e-same-via-file");
+            let via_raw = Fx::new("b1e-same-via-raw");
+
+            via_file.put_remote(&via_file.candidate("rev9", 9));
+
+            let raw = via_raw.candidate("rev9", 9);
+
+            assert_eq!(via_file.observe(), Ok(Outcome::HighWaterRaised));
+            assert_eq!(
+                via_raw.session.record_remote_observation(
+                    &via_raw.root,
+                    via_raw.target.locator(),
+                    &raw
+                ),
+                Ok(Outcome::HighWaterRaised)
+            );
+
+            assert_eq!(
+                via_file.record_bytes(),
+                rebuilt(&via_file.state, checkpoint(9), None)
+                    .encode()
+                    .unwrap()
+            );
+            assert_eq!(
+                via_raw.record_bytes(),
+                rebuilt(&via_raw.state, checkpoint(9), None)
+                    .encode()
+                    .unwrap()
+            );
+
+            // The raw operation still checks the target itself, as before.
+            assert_eq!(
+                via_raw
+                    .session
+                    .record_remote_observation(&via_raw.root, &loc(OTHER_LOCAL), &raw),
+                Err(Obs::BindingMismatch(BindingMismatch::TargetLocator))
+            );
+        }
+
+        #[test]
+        fn the_read_runs_exactly_once_and_only_after_the_binding_is_confirmed() {
+            let fx = Fx::new("b1e-read-once");
+
+            fx.put_remote(&fx.candidate("rev9", 9));
+
+            let (result, reads) = fx.observe_counting(&fx.target);
+
+            assert_eq!(result, Ok(Outcome::HighWaterRaised));
+            assert_eq!(reads, 1);
         }
     }
 }
