@@ -9,6 +9,7 @@ use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, Read},
     path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
@@ -16,7 +17,10 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use localvault_core::{
-    sync::{inspect_remote_bytes, BoundInspectionError},
+    sync::{
+        inspect_remote_bytes, AuthenticatedRevision, BoundInspection, BoundInspectionError,
+        EnvelopeFingerprint,
+    },
     sync_state::{
         bind_identical_remote, record_remote_observation, BindingMismatch, HighWaterOutcome,
         Locator, NewBinding, RemoteEvidence, SyncBase, SyncState, SyncStateLoad, TransitionRefusal,
@@ -32,7 +36,7 @@ use localvault_core::{
 };
 
 use super::{
-    file_identity::{compare, facts_of, HandleFacts, IdentityError, PhysicalVerdict},
+    file_identity::{compare, facts_of, FileIdentity, HandleFacts, IdentityError, PhysicalVerdict},
     storage::{
         load_envelope, save_envelope_atomic_with_backup, StorageError, MAX_VAULT_FILE_BYTES,
     },
@@ -266,27 +270,35 @@ pub enum RemoteTargetRefusal {
 /// Typed proof-of-consent that [`UnlockedVaultSession::bind_existing_identical_target`]
 /// requires, bound to exactly one target.
 ///
-/// # This is not a confirmation, and nothing can currently produce one
+/// # Where an approval can come from
 ///
-/// **No user-confirmation flow exists yet.** There is no UI, command or event
-/// that asks the user whether this vault may be bound to a chosen file, and
-/// therefore nothing in production that may honestly claim "the user approved".
-/// For that reason this type has **no production constructor**: its field is
-/// private, it has no `Default`, `Clone`, `Copy` or `From`, and the only way to
-/// build one is the `#[cfg(test)]` helper below. In a production build the
-/// binding operation is consequently unreachable, by construction and not by
-/// convention. A boolean or an enum that any caller could set to "granted" would
-/// have claimed a confirmation that never happened; this does not.
+/// This type has exactly one production constructor, the private
+/// `from_confirmed`, and it is reachable only through
+/// [`UnlockedVaultSession::confirm_initial_binding`]. Its field is private, it
+/// has no `Default`, `Clone`, `Copy` or `From`, and no `pub` or `pub(crate)`
+/// constructor exists. The other way to build one is the `#[cfg(test)]` helper
+/// below. A boolean or an enum that any caller could set to "granted" would claim
+/// a confirmation that never happened; this does not.
 ///
-/// A later slice that adds the real confirmation (a dialog the user can see,
-/// naming the vault and the target, answered by a deliberate action) must add the
-/// production constructor, and it must live in this module because the field is
-/// private. It must take as its input a value that only that confirmation
-/// handler can produce, tie the approval to that one answer, and be consumed by
-/// a single call. It must not be a general "trusted" constructor that any caller
-/// in the crate could use. Passing this value is a precondition, never evidence
-/// that a confirmation was shown; only the code that builds it can make that
-/// true.
+/// `from_confirmed` takes a `PendingInitialBinding` **by value**. That value is
+/// private to this module and only
+/// [`UnlockedVaultSession::prepare_initial_binding`] can create one, after a
+/// successful read-only examination of exactly one target, and it is stored in
+/// the unlocked session itself. `confirm_initial_binding` removes it from the
+/// session (so one preparation can be spent at most once, whether the attempt
+/// succeeds or fails), checks that the caller names that very preparation, that it
+/// is fresh, and that the vault and the target are still what was examined, and
+/// only then builds the approval, which is consumed by the unchanged binding
+/// operation. The approval is therefore tied to one preparation, to one target
+/// and to one live session, and cannot outlive any of them.
+///
+/// **No user interface or command calls either step yet.** The frontend is
+/// inside the trust boundary: a caller that can reach both steps can prepare and
+/// confirm without a human, and this type does not claim otherwise. What it
+/// guarantees is that there is no binding without a separate confirm call that
+/// follows a successful prepare in the same live session. Passing this value is a
+/// precondition, never evidence that a person was shown anything; only the code
+/// that exposes the two steps to a person can make that true.
 ///
 /// The value is single-use (consumed by the operation), is bound to the target
 /// locator it was made for (an approval for one file cannot be spent on
@@ -297,8 +309,18 @@ pub struct InitialBindingApproval {
 }
 
 impl InitialBindingApproval {
-    /// Test-only. Not a model of any real confirmation: it exists so the
-    /// operation's behavior can be exercised before a confirmation flow exists.
+    /// The only production constructor. Private to this module, and called only
+    /// by [`UnlockedVaultSession::confirm_initial_binding_in`]. Taking the
+    /// pending preparation by value ties the approval to the one preparation it
+    /// came from and to the target that preparation examined.
+    fn from_confirmed(pending: PendingInitialBinding) -> Self {
+        Self {
+            target: pending.target.locator().clone(),
+        }
+    }
+
+    /// Test-only. Not a model of the real confirmation: it exists so the
+    /// operation's behavior can be exercised directly.
     #[cfg(test)]
     pub(crate) fn for_test(target: &SyncFileTarget) -> Self {
         Self {
@@ -423,6 +445,111 @@ pub enum InitialBindingRefusal {
     PersistenceUnverified,
 }
 
+/// How long a successful preparation stays confirmable. Measured from the
+/// preparation, not from user activity, and in addition to the session's own
+/// inactivity lock.
+const INITIAL_BINDING_APPROVAL_TTL: Duration = Duration::from_secs(120);
+
+/// What [`UnlockedVaultSession::prepare_initial_binding`] established and is now
+/// waiting to be confirmed. It exists only as a field of the unlocked session:
+/// it is never serialized, logged, persisted or handed out, and it is dropped
+/// with the session (lock, expiry, vault switch, process exit). Private to this
+/// module, so no other code can build one or turn it into an approval.
+struct PendingInitialBinding {
+    /// Opaque random correlation id. It ties a confirmation to the preview that
+    /// was shown; it is not a secret and not proof of consent.
+    id: Uuid,
+    /// The exact target the user selected.
+    target: SyncFileTarget,
+    /// Fingerprint of the exact bytes of the local vault file at preparation.
+    /// The target held byte-identical content, so this is also the target's.
+    local_fingerprint: EnvelopeFingerprint,
+    /// Physical identity of the target file at preparation.
+    target_identity: FileIdentity,
+    prepared_at: Instant,
+}
+
+impl std::fmt::Debug for PendingInitialBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingInitialBinding(<redacted>)")
+    }
+}
+
+/// What the user must be shown before an initial binding may be confirmed.
+/// Returned only by a successful [`UnlockedVaultSession::prepare_initial_binding`].
+///
+/// `target_path` is the exact locator string Rust will bind, not a copy supplied
+/// by a caller. Both paths are meant for display to the user and for nothing
+/// else: they are not shown by `Debug`, and this type is not `Clone`.
+pub struct InitialBindingPreview {
+    preparation_id: String,
+    vault_file_name: String,
+    target_path: String,
+}
+
+impl InitialBindingPreview {
+    /// Opaque correlation id to pass back to
+    /// [`UnlockedVaultSession::confirm_initial_binding`].
+    pub fn preparation_id(&self) -> &str {
+        &self.preparation_id
+    }
+
+    pub fn vault_file_name(&self) -> &str {
+        &self.vault_file_name
+    }
+
+    pub fn target_path(&self) -> &str {
+        &self.target_path
+    }
+}
+
+impl std::fmt::Debug for InitialBindingPreview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InitialBindingPreview(<redacted>)")
+    }
+}
+
+/// Why a confirmation was rejected as out of date, before the binding operation
+/// ran. Fixed categories only: no path, id, fingerprint or content. In every
+/// case nothing was written and the preparation is spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InitialBindingStale {
+    /// No successful preparation is pending: none was made, it was already
+    /// confirmed or cancelled, a later attempt replaced it, or the session it
+    /// belonged to is gone.
+    #[error("no initial binding is waiting for confirmation")]
+    NoPendingApproval,
+    /// The id does not name the pending preparation.
+    #[error("the confirmation does not belong to the current preparation")]
+    NotCurrentPreparation,
+    /// The preparation is older than its lifetime.
+    #[error("the preparation has expired")]
+    Expired,
+    /// The vault file changed after the preparation (for example a save or a
+    /// master-password change in this session).
+    #[error("the vault changed after the preparation")]
+    LocalVaultChanged,
+    /// The target's bytes or physical file changed after the preparation, which
+    /// includes an identical copy re-created at the same path.
+    #[error("the target changed after the preparation")]
+    TargetChanged,
+}
+
+/// Why [`UnlockedVaultSession::confirm_initial_binding`] bound nothing. Fixed
+/// categories only. Whatever the variant, the preparation is spent: a new one is
+/// needed for another attempt.
+///
+/// [`Binding`](Self::Binding) carries the unchanged binding operation's own
+/// refusal, with its documented meaning (in particular for
+/// [`InitialBindingRefusal::PersistenceUnverified`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InitialBindingConfirmRefusal {
+    #[error("the initial binding confirmation is out of date")]
+    Stale(InitialBindingStale),
+    #[error("the initial binding was refused")]
+    Binding(InitialBindingRefusal),
+}
+
 pub struct UnlockedVaultSession {
     path: PathBuf,
     backup_path: PathBuf,
@@ -430,6 +557,10 @@ pub struct UnlockedVaultSession {
     vault_key: SecretKey,
     data: VaultData,
     dirty: bool,
+
+    // In memory only, and never copied anywhere: it lives and dies with this
+    // session. See `PendingInitialBinding`.
+    pending_initial_binding: Option<PendingInitialBinding>,
 
     // Keeping this File alive keeps the OS-level exclusive
     // session lock alive. The file itself contains no secrets.
@@ -474,6 +605,7 @@ impl UnlockedVaultSession {
             vault_key,
             data,
             dirty: false,
+            pending_initial_binding: None,
             _lock_file: lock_file,
         })
     }
@@ -510,6 +642,7 @@ impl UnlockedVaultSession {
             vault_key,
             data,
             dirty: false,
+            pending_initial_binding: None,
             _lock_file: lock_file,
         })
     }
@@ -897,9 +1030,10 @@ impl UnlockedVaultSession {
 
     /// Bind this vault to an **existing, byte-identical** encrypted file for the
     /// first time (Stage 1U-4 B1f). Internal: no command, event, UI, startup or
-    /// unlock path reaches it, and in a production build nothing can: the
-    /// required [`InitialBindingApproval`] has no production constructor (see its
-    /// documentation). It enables no working synchronization.
+    /// unlock path reaches it. In a production build the only caller is
+    /// [`confirm_initial_binding`](Self::confirm_initial_binding), because the
+    /// required [`InitialBindingApproval`] has no other production constructor
+    /// (see its documentation). It enables no working synchronization.
     ///
     /// Supported scenario, and only this one: an existing target whose exact
     /// bytes equal the exact bytes of this session's vault file, authenticated
@@ -912,9 +1046,12 @@ impl UnlockedVaultSession {
     /// # The approval boundary
     ///
     /// The approval is a precondition, **not** evidence that a confirmation took
-    /// place. No confirmation flow exists. The future UI must show the user the
-    /// vault and the chosen file and obtain a deliberate explicit confirmation
-    /// **before** it constructs an approval and calls this. See
+    /// place. The Rust-side two-step flow
+    /// ([`prepare_initial_binding`](Self::prepare_initial_binding), then
+    /// [`confirm_initial_binding`](Self::confirm_initial_binding)) is the only
+    /// production source of one, but no user interface calls it yet: a future UI
+    /// must show the user the vault and the chosen file and obtain a deliberate
+    /// explicit confirmation before it makes the confirming call. See
     /// [`InitialBindingApproval`].
     ///
     /// # Order of operations
@@ -1034,71 +1171,15 @@ impl UnlockedVaultSession {
             return Err(Refusal::ApprovalTargetMismatch);
         }
 
-        // The primary is opened once; its bytes and physical facts come from this
-        // handle, which stays open until the operation returns.
-        let primary = self.hold_local_primary().ok_or(Refusal::Unavailable(
-            SyncStateUnavailable::LocalVaultChanged,
-        ))?;
-
-        let local_locator = self
-            .local_locator()
-            .ok_or(Refusal::Unavailable(SyncStateUnavailable::LocalLocator))?;
-
-        match store.load(&local_locator) {
-            StateLoad::NotConfigured => {}
-            StateLoad::Loaded(state) => {
-                let expected_local = effective_local_locator(&state, &local_locator);
-
-                return Err(
-                    match state.verify_binding(
-                        self.data.vault_id,
-                        &expected_local,
-                        state.target_locator(),
-                    ) {
-                        Ok(()) => Refusal::ExistingBinding,
-                        Err(mismatch) => Refusal::ExistingBindingMismatch(mismatch),
-                    },
-                );
-            }
-            StateLoad::Corrupt(reason) => return Err(Refusal::Corrupt(reason)),
-            StateLoad::UnsupportedVersion => return Err(Refusal::UnsupportedVersion),
-            StateLoad::Unreadable(reason) => return Err(Refusal::Unreadable(reason)),
-        }
-
-        // Refused before anything touches the network: a UNC path (also in its
-        // verbatim form) is never eligible, and is not resolved or read.
-        if target_is_unc(target) {
-            return Err(Refusal::TargetIdentityUncertain);
-        }
-
-        if self.target_names_vault_file(store.directory(), target, &local_locator) {
-            return Err(Refusal::TargetIsVaultFile);
-        }
-
-        let present = match read(target) {
-            SyncFileRead::Present(present) => present,
-            SyncFileRead::AbsentOnDisk => return Err(Refusal::TargetAbsentOnDisk),
-            SyncFileRead::Unavailable(reason) => return Err(Refusal::TargetUnavailable(reason)),
-        };
-
-        // The adapter pairs the bytes with the locator they were read from; a
-        // pairing that disagrees with the target asked for is not trusted.
-        if present.target() != target.locator() {
-            return Err(Refusal::EvidenceChanged);
-        }
-
-        // Same file, or an identity that cannot be established, is refused before
-        // the bytes are even authenticated.
-        let target_facts = physical_distinct(&primary, &present)?;
-
-        let inspection = inspect_remote_bytes(
-            &self.vault_key,
-            self.data.vault_id,
-            &primary.raw,
-            present.candidate_raw(),
-            None,
-        )
-        .map_err(Refusal::Inspection)?;
+        // Steps 2 to 6: the read-only examination shared with the preparation
+        // step. The primary stays open (inside `primary`) until this returns.
+        let Examined {
+            primary,
+            local_locator,
+            present,
+            target_facts,
+            inspection,
+        } = self.examine_identical_target(store, target, read)?;
 
         let mut id_bytes = [0u8; 16];
         let mut tag_salt = [0u8; BINDING_SALT_LEN];
@@ -1176,6 +1257,339 @@ impl UnlockedVaultSession {
         } else {
             Err(Refusal::PersistenceUnverified)
         }
+    }
+
+    /// The read-only examination both the binding operation and the preparation
+    /// step rest on (steps 2 to 6 of
+    /// [`bind_existing_identical_target`](Self::bind_existing_identical_target)),
+    /// in exactly that order: hold the primary, resolve the local locator,
+    /// require a confirmed `NotConfigured`, refuse a UNC target and the vault's
+    /// own files, read the target once, require a distinct physical file, and
+    /// authenticate both byte strings under this session's Vault Key. It writes
+    /// nothing, creates nothing and draws no randomness. The returned
+    /// [`Examined`] keeps the primary open.
+    fn examine_identical_target(
+        &self,
+        store: &SyncStateStore,
+        target: &SyncFileTarget,
+        read: &mut dyn FnMut(&SyncFileTarget) -> SyncFileRead,
+    ) -> Result<Examined, InitialBindingRefusal> {
+        use InitialBindingRefusal as Refusal;
+
+        // The primary is opened once; its bytes and physical facts come from this
+        // handle, which stays open until the caller is done with the result.
+        let primary = self.hold_local_primary().ok_or(Refusal::Unavailable(
+            SyncStateUnavailable::LocalVaultChanged,
+        ))?;
+
+        let local_locator = self
+            .local_locator()
+            .ok_or(Refusal::Unavailable(SyncStateUnavailable::LocalLocator))?;
+
+        match store.load(&local_locator) {
+            StateLoad::NotConfigured => {}
+            StateLoad::Loaded(state) => {
+                let expected_local = effective_local_locator(&state, &local_locator);
+
+                return Err(
+                    match state.verify_binding(
+                        self.data.vault_id,
+                        &expected_local,
+                        state.target_locator(),
+                    ) {
+                        Ok(()) => Refusal::ExistingBinding,
+                        Err(mismatch) => Refusal::ExistingBindingMismatch(mismatch),
+                    },
+                );
+            }
+            StateLoad::Corrupt(reason) => return Err(Refusal::Corrupt(reason)),
+            StateLoad::UnsupportedVersion => return Err(Refusal::UnsupportedVersion),
+            StateLoad::Unreadable(reason) => return Err(Refusal::Unreadable(reason)),
+        }
+
+        // Refused before anything touches the network: a UNC path (also in its
+        // verbatim form) is never eligible, and is not resolved or read.
+        if target_is_unc(target) {
+            return Err(Refusal::TargetIdentityUncertain);
+        }
+
+        if self.target_names_vault_file(store.directory(), target, &local_locator) {
+            return Err(Refusal::TargetIsVaultFile);
+        }
+
+        let present = match read(target) {
+            SyncFileRead::Present(present) => present,
+            SyncFileRead::AbsentOnDisk => return Err(Refusal::TargetAbsentOnDisk),
+            SyncFileRead::Unavailable(reason) => return Err(Refusal::TargetUnavailable(reason)),
+        };
+
+        // The adapter pairs the bytes with the locator they were read from; a
+        // pairing that disagrees with the target asked for is not trusted.
+        if present.target() != target.locator() {
+            return Err(Refusal::EvidenceChanged);
+        }
+
+        // Same file, or an identity that cannot be established, is refused before
+        // the bytes are even authenticated.
+        let target_facts = physical_distinct(&primary, &present)?;
+
+        let inspection = inspect_remote_bytes(
+            &self.vault_key,
+            self.data.vault_id,
+            &primary.raw,
+            present.candidate_raw(),
+            None,
+        )
+        .map_err(Refusal::Inspection)?;
+
+        Ok(Examined {
+            primary,
+            local_locator,
+            present,
+            target_facts,
+            inspection,
+        })
+    }
+
+    /// First half of the initial-binding consent (Stage 1U-4 B1h): examine
+    /// `target` read-only and, if it is a candidate for
+    /// [`bind_existing_identical_target`](Self::bind_existing_identical_target),
+    /// remember that fact in this session and return what the user must be shown.
+    /// Internal: no command, event or UI calls it, and it enables no
+    /// synchronization.
+    ///
+    /// **Nothing is bound, written or created.** Any earlier pending preparation
+    /// is discarded **first**, before any filesystem or cryptographic work, so a
+    /// failed attempt can never leave an older preparation usable. The
+    /// examination is the one the binding operation itself starts with (see
+    /// `examine_identical_target`), followed by a mirror of the core's
+    /// preconditions for identical bytes: equal fingerprints and schema-3 counter
+    /// revisions on both sides. That mirror only lets the preview refuse early; the
+    /// core decides again at confirmation, and a successful preparation promises
+    /// nothing about it.
+    ///
+    /// The pending preparation expires after 120 seconds, is dropped with this
+    /// session, and is spent by the first
+    /// [`confirm_initial_binding`](Self::confirm_initial_binding) after it.
+    pub fn prepare_initial_binding(
+        &mut self,
+        root: &SyncStateRoot,
+        target: &SyncFileTarget,
+    ) -> Result<InitialBindingPreview, InitialBindingRefusal> {
+        // Before anything that can fail, including opening the store.
+        self.pending_initial_binding = None;
+
+        let store = SyncStateStore::new(root.path())
+            .map_err(|_| InitialBindingRefusal::Unavailable(SyncStateUnavailable::Root))?;
+
+        self.prepare_initial_binding_in(
+            &store,
+            target,
+            &mut SyncFileTarget::read,
+            &mut |buffer| getrandom::fill(buffer).is_ok(),
+            Instant::now(),
+        )
+    }
+
+    /// [`prepare_initial_binding`](Self::prepare_initial_binding) over an
+    /// explicit store, read step, entropy source and clock. Crate-private so only
+    /// the crate's own tests can substitute them.
+    pub(crate) fn prepare_initial_binding_in(
+        &mut self,
+        store: &SyncStateStore,
+        target: &SyncFileTarget,
+        read: &mut dyn FnMut(&SyncFileTarget) -> SyncFileRead,
+        entropy: &mut dyn FnMut(&mut [u8]) -> bool,
+        now: Instant,
+    ) -> Result<InitialBindingPreview, InitialBindingRefusal> {
+        use InitialBindingRefusal as Refusal;
+
+        self.pending_initial_binding = None;
+
+        let examined = self.examine_identical_target(store, target, read)?;
+
+        // The core's preconditions for binding identical bytes, in the core's
+        // order. Not authoritative: confirmation runs the core transition.
+        let local_fingerprint = *examined.inspection.local_fingerprint();
+
+        if local_fingerprint != *examined.inspection.candidate_fingerprint() {
+            return Err(Refusal::Transition(TransitionRefusal::RemoteDiffers));
+        }
+
+        let revisions = examined.inspection.inspection();
+
+        let AuthenticatedRevision::Counter(local_revision) = revisions.local_revision() else {
+            return Err(Refusal::Transition(TransitionRefusal::LocalUnversioned));
+        };
+
+        let AuthenticatedRevision::Counter(remote_revision) = revisions.candidate_revision() else {
+            return Err(Refusal::Transition(TransitionRefusal::RemoteUnversioned));
+        };
+
+        if local_revision != remote_revision {
+            return Err(Refusal::Transition(TransitionRefusal::RemoteDiffers));
+        }
+
+        let mut id_bytes = [0u8; 16];
+
+        if !entropy(&mut id_bytes) {
+            return Err(Refusal::Randomness);
+        }
+
+        let id = uuid::Builder::from_random_bytes(id_bytes).into_uuid();
+
+        self.pending_initial_binding = Some(PendingInitialBinding {
+            id,
+            target: target.clone(),
+            local_fingerprint,
+            target_identity: examined.target_facts.identity(),
+            prepared_at: now,
+        });
+
+        Ok(InitialBindingPreview {
+            preparation_id: id.to_string(),
+            vault_file_name: self
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            target_path: target.locator().as_str().to_owned(),
+        })
+    }
+
+    /// Second half of the initial-binding consent (Stage 1U-4 B1h): spend the
+    /// pending preparation named by `preparation_id` and, if the vault and the
+    /// target are still what it examined, run the unchanged
+    /// [`bind_existing_identical_target`](Self::bind_existing_identical_target)
+    /// with an approval made from that very preparation. Internal: no command,
+    /// event or UI calls it.
+    ///
+    /// **The preparation is spent by every call**, whatever its outcome: it is
+    /// removed from the session before anything is checked, so a stale, mistaken
+    /// or failed confirmation can never be retried against the same preparation,
+    /// and a double submit binds at most once. In order:
+    ///
+    /// 1. a preparation must be pending, and `preparation_id` must name it
+    ///    ([`InitialBindingStale::NoPendingApproval`],
+    ///    [`NotCurrentPreparation`](InitialBindingStale::NotCurrentPreparation));
+    /// 2. it must be at most 120 seconds old
+    ///    ([`Expired`](InitialBindingStale::Expired)); a stale confirmation reads
+    ///    no file;
+    /// 3. the vault file must still be exactly what was examined
+    ///    ([`LocalVaultChanged`](InitialBindingStale::LocalVaultChanged); a file
+    ///    that is no longer this session's envelope is the binding operation's own
+    ///    `Unavailable(LocalVaultChanged)`);
+    /// 4. one read of the target must give the same bytes from the same physical
+    ///    file ([`TargetChanged`](InitialBindingStale::TargetChanged); an absent or
+    ///    unavailable target is the binding operation's own refusal);
+    /// 5. only then is the approval built and the unchanged binding operation run,
+    ///    which repeats every one of its own checks.
+    ///
+    /// The id is correlation, not proof of consent: it ties this call to the
+    /// preview that was shown. See [`InitialBindingApproval`] for what the whole
+    /// flow does and does not guarantee.
+    pub fn confirm_initial_binding(
+        &mut self,
+        root: &SyncStateRoot,
+        preparation_id: &str,
+    ) -> Result<InitialBindingOutcome, InitialBindingConfirmRefusal> {
+        let store = match SyncStateStore::new(root.path()) {
+            Ok(store) => store,
+            Err(_) => {
+                // Spent even though nothing could be checked.
+                self.pending_initial_binding = None;
+
+                return Err(InitialBindingConfirmRefusal::Binding(
+                    InitialBindingRefusal::Unavailable(SyncStateUnavailable::Root),
+                ));
+            }
+        };
+
+        self.confirm_initial_binding_in(
+            &store,
+            preparation_id,
+            &mut SyncFileTarget::read,
+            &mut |buffer| getrandom::fill(buffer).is_ok(),
+            Instant::now(),
+        )
+    }
+
+    /// [`confirm_initial_binding`](Self::confirm_initial_binding) over an explicit
+    /// store, read step, entropy source and clock. Crate-private so only the
+    /// crate's own tests can substitute them.
+    pub(crate) fn confirm_initial_binding_in(
+        &mut self,
+        store: &SyncStateStore,
+        preparation_id: &str,
+        read: &mut dyn FnMut(&SyncFileTarget) -> SyncFileRead,
+        entropy: &mut dyn FnMut(&mut [u8]) -> bool,
+        now: Instant,
+    ) -> Result<InitialBindingOutcome, InitialBindingConfirmRefusal> {
+        use InitialBindingConfirmRefusal::{Binding, Stale};
+        use InitialBindingRefusal as Refusal;
+
+        // Spent first and unconditionally.
+        let Some(pending) = self.pending_initial_binding.take() else {
+            return Err(Stale(InitialBindingStale::NoPendingApproval));
+        };
+
+        if Uuid::parse_str(preparation_id) != Ok(pending.id) {
+            return Err(Stale(InitialBindingStale::NotCurrentPreparation));
+        }
+
+        if now.saturating_duration_since(pending.prepared_at) > INITIAL_BINDING_APPROVAL_TTL {
+            return Err(Stale(InitialBindingStale::Expired));
+        }
+
+        // Evidence re-check against the preview. The primary is held open only
+        // for this block: the binding operation opens it again itself.
+        {
+            let primary = self
+                .hold_local_primary()
+                .ok_or(Binding(Refusal::Unavailable(
+                    SyncStateUnavailable::LocalVaultChanged,
+                )))?;
+
+            if EnvelopeFingerprint::of_bytes(&primary.raw) != pending.local_fingerprint {
+                return Err(Stale(InitialBindingStale::LocalVaultChanged));
+            }
+
+            let present = match read(&pending.target) {
+                SyncFileRead::Present(present) => present,
+                SyncFileRead::AbsentOnDisk => return Err(Binding(Refusal::TargetAbsentOnDisk)),
+                SyncFileRead::Unavailable(reason) => {
+                    return Err(Binding(Refusal::TargetUnavailable(reason)))
+                }
+            };
+
+            if present.target() != pending.target.locator() {
+                return Err(Binding(Refusal::EvidenceChanged));
+            }
+
+            // The target held the local vault's bytes at preparation, so the
+            // preparation's local fingerprint is also the target's.
+            if EnvelopeFingerprint::of_bytes(present.candidate_raw()) != pending.local_fingerprint {
+                return Err(Stale(InitialBindingStale::TargetChanged));
+            }
+
+            match present.physical() {
+                Ok(facts) if facts.identity() == pending.target_identity => {}
+                Ok(_) => return Err(Stale(InitialBindingStale::TargetChanged)),
+                Err(_) => return Err(Binding(Refusal::TargetIdentityUncertain)),
+            }
+        }
+
+        let target = pending.target.clone();
+        let approval = InitialBindingApproval::from_confirmed(pending);
+
+        self.bind_existing_identical_target_in(store, &target, approval, read, entropy)
+            .map_err(Binding)
+    }
+
+    /// Discard the pending initial-binding preparation, if any. Idempotent, and
+    /// never an error.
+    pub fn cancel_initial_binding(&mut self) {
+        self.pending_initial_binding = None;
     }
 
     /// Whether `target` names, or cannot be shown not to name, a file that
@@ -1328,6 +1742,17 @@ struct HeldPrimary {
     _handle: File,
     raw: Vec<u8>,
     physical: Result<HandleFacts, IdentityError>,
+}
+
+/// What [`UnlockedVaultSession::examine_identical_target`] established. Holds the
+/// primary open, so its object cannot be fully deleted (and its identifier
+/// reused) while the caller still relies on its physical facts.
+struct Examined {
+    primary: HeldPrimary,
+    local_locator: Locator,
+    present: PresentFile,
+    target_facts: HandleFacts,
+    inspection: BoundInspection,
 }
 
 /// Open for reading without following a reparse point, so a primary swapped for
@@ -5492,6 +5917,811 @@ mod tests {
                     create_error_may_follow_publication(ambiguous),
                     "{ambiguous:?} must be ambiguous"
                 );
+            }
+        }
+
+        // ---- Stage 1U-4 B1h: Rust-owned explicit consent ----------------------
+        //
+        // Prepare (read-only) and confirm (spends the preparation, then runs the
+        // unchanged B1f operation). All scratch is under the same git-ignored
+        // `.qa-local/sync-state-b1-tests/` as the B1f tests, via `Bx`.
+        //
+        // Not covered here, and why:
+        // * `PersistenceUnverified` through `confirm`: the store's fault hooks are
+        //   private to `sync_state_store` (out of scope for B1h). Its production
+        //   path is the unchanged B1f one and is classified by the B1f tests;
+        //   `confirm` only wraps it in `Binding(..)`, shown below for the other
+        //   post-check refusals (`RecordAppeared`, `Randomness`).
+        // * Any user interface or command: none exists.
+        mod consent {
+            use super::*;
+
+            type Stale = InitialBindingStale;
+            type Confirm = InitialBindingConfirmRefusal;
+
+            fn stale(reason: Stale) -> Confirm {
+                Confirm::Stale(reason)
+            }
+
+            fn binding(refusal: Refusal) -> Confirm {
+                Confirm::Binding(refusal)
+            }
+
+            fn prepare_target(
+                bx: &mut Bx,
+                target: &SyncFileTarget,
+            ) -> Result<InitialBindingPreview, Refusal> {
+                let store = bx.store();
+
+                bx.session.prepare_initial_binding_in(
+                    &store,
+                    target,
+                    &mut |t| t.read(),
+                    &mut entropy,
+                    Instant::now(),
+                )
+            }
+
+            fn prepare(bx: &mut Bx) -> Result<InitialBindingPreview, Refusal> {
+                bx.session.prepare_initial_binding(&bx.root, &bx.target)
+            }
+
+            fn prepared(bx: &mut Bx) -> String {
+                prepare(bx)
+                    .expect("the preparation succeeds")
+                    .preparation_id()
+                    .to_owned()
+            }
+
+            fn confirm(bx: &mut Bx, id: &str) -> Result<Outcome, Confirm> {
+                bx.session.confirm_initial_binding(&bx.root, id)
+            }
+
+            /// Confirm with a counting real read and counting real entropy.
+            fn confirm_counting(
+                bx: &mut Bx,
+                id: &str,
+                now: Instant,
+            ) -> (Result<Outcome, Confirm>, usize, usize) {
+                let reads = Cell::new(0usize);
+                let draws = Cell::new(0usize);
+                let store = bx.store();
+
+                let result = bx.session.confirm_initial_binding_in(
+                    &store,
+                    id,
+                    &mut |t| {
+                        reads.set(reads.get() + 1);
+
+                        t.read()
+                    },
+                    &mut |buffer| {
+                        draws.set(draws.get() + 1);
+
+                        getrandom::fill(buffer).is_ok()
+                    },
+                    now,
+                );
+
+                (result, reads.get(), draws.get())
+            }
+
+            fn unknown_id() -> String {
+                Uuid::from_u128(0x0123_4567_89ab_4def_8123_4567_89ab_cdef).to_string()
+            }
+
+            /// A second, valid, byte-identical target in the remote folder.
+            fn second_target(bx: &Bx) -> SyncFileTarget {
+                let path = bx.remote_dir().join("second.lvault");
+
+                fs::copy(&bx.vault, &path).unwrap();
+
+                SyncFileTarget::from_path(&path).unwrap()
+            }
+
+            /// The refusal equals the B1f operation's own for the same target,
+            /// creates nothing and leaves no pending preparation.
+            fn assert_prepare_refused(bx: &mut Bx, target: &SyncFileTarget, expected: Refusal) {
+                assert_eq!(
+                    bx.bind_counting(target).0,
+                    Err(expected),
+                    "the B1f operation disagrees"
+                );
+
+                let state_existed = bx.state_dir().exists();
+                let record = bx.record().map(|path| fs::read(path).unwrap());
+
+                assert_eq!(prepare_target(bx, target).map(|_| ()), Err(expected));
+                assert_eq!(
+                    confirm(bx, &unknown_id()),
+                    Err(stale(Stale::NoPendingApproval))
+                );
+                assert_eq!(bx.state_dir().exists(), state_existed);
+                assert_eq!(bx.record().map(|path| fs::read(path).unwrap()), record);
+            }
+
+            // 1. A successful preparation returns the preview and changes nothing.
+            #[test]
+            fn preparing_returns_a_preview_and_changes_nothing() {
+                let mut bx = Bx::new("b1h-prepare");
+                let vaults = snapshot(&bx.vaults_dir());
+                let remote = snapshot(&bx.remote_dir());
+                let vault_bytes = fs::read(&bx.vault).unwrap();
+                let reads = Cell::new(0usize);
+                let target = bx.target.clone();
+                let store = bx.store();
+
+                let preview = bx
+                    .session
+                    .prepare_initial_binding_in(
+                        &store,
+                        &target,
+                        &mut |t| {
+                            reads.set(reads.get() + 1);
+
+                            t.read()
+                        },
+                        &mut entropy,
+                        Instant::now(),
+                    )
+                    .unwrap();
+
+                assert_eq!(reads.get(), 1, "the target is read exactly once");
+                assert_eq!(preview.vault_file_name(), "vault.lvault");
+                assert_eq!(preview.target_path(), bx.target.locator().as_str());
+
+                let id = Uuid::parse_str(preview.preparation_id()).unwrap();
+
+                assert_eq!(id.get_version_num(), 4);
+
+                // Nothing was bound, written or created, not even the root.
+                assert_eq!(
+                    bx.session.load_sync_state(&bx.root),
+                    SessionSyncState::NotConfigured
+                );
+                assert!(!bx.root.path().exists());
+                assert!(bx.record().is_none());
+                assert_eq!(snapshot(&bx.vaults_dir()), vaults);
+                assert_eq!(snapshot(&bx.remote_dir()), remote);
+                assert_eq!(fs::read(&bx.vault).unwrap(), vault_bytes);
+                assert_eq!(fs::read(&bx.remote).unwrap(), vault_bytes);
+            }
+
+            // 2. Every refusal the B1f operation makes before the core transition
+            // is made by the preparation too, creates nothing and leaves nothing
+            // confirmable.
+            #[test]
+            fn preparation_refusals_mirror_the_binding_operation_and_leave_nothing_pending() {
+                // Differs, and not this vault.
+                let mut bx = Bx::new("b1h-refuse-differs");
+                let target = bx.target.clone();
+
+                bx.put_remote(&bx.resealed(|data| data.revision = 7));
+                assert_prepare_refused(
+                    &mut bx,
+                    &target,
+                    transition(TransitionRefusal::RemoteDiffers),
+                );
+                bx.put_remote(&bx.resealed(|data| data.vault_id = OTHER_VAULT_ID));
+                assert_prepare_refused(
+                    &mut bx,
+                    &target,
+                    candidate_rejected(PayloadRejection::VaultIdMismatch),
+                );
+                bx.put_remote(b"garbage");
+                assert_prepare_refused(
+                    &mut bx,
+                    &target,
+                    inspection(BoundInspectionError::MalformedEnvelope {
+                        input: EnvelopeInput::Candidate,
+                    }),
+                );
+
+                // A legacy local vault.
+                let mut legacy = Bx::legacy("b1h-refuse-legacy");
+                let target = legacy.target.clone();
+
+                assert_prepare_refused(
+                    &mut legacy,
+                    &target,
+                    transition(TransitionRefusal::LocalUnversioned),
+                );
+
+                // The vault's own file.
+                let mut own = Bx::new("b1h-refuse-own");
+                let primary = SyncFileTarget::from_path(&own.vault).unwrap();
+
+                assert_prepare_refused(&mut own, &primary, Refusal::TargetIsVaultFile);
+
+                // A hard link to the primary.
+                let mut linked = Bx::bare_b1g("b1h-refuse-hard-link");
+                let target = linked.target.clone();
+
+                fs::hard_link(&linked.vault, &linked.remote).unwrap();
+                assert_prepare_refused(&mut linked, &target, Refusal::TargetIsVaultFile);
+
+                // A network path.
+                #[cfg(windows)]
+                {
+                    let mut unc = Bx::new("b1h-refuse-unc");
+                    let target =
+                        SyncFileTarget::from_path(Path::new(r"\\localhost\share\t.lvault"))
+                            .unwrap();
+
+                    assert_prepare_refused(&mut unc, &target, Refusal::TargetIdentityUncertain);
+                }
+
+                // Absent, and unavailable.
+                let mut absent = Bx::bare("b1h-refuse-absent");
+                let target = absent.target.clone();
+
+                assert_prepare_refused(&mut absent, &target, Refusal::TargetAbsentOnDisk);
+                fs::create_dir(&absent.remote).unwrap();
+                assert_prepare_refused(
+                    &mut absent,
+                    &target,
+                    Refusal::TargetUnavailable(UnavailableReason::UnexpectedObject),
+                );
+
+                // An existing record, and a corrupt one.
+                let mut recorded = Bx::new("b1h-refuse-record");
+                let target = recorded.target.clone();
+
+                recorded.publish(&recorded.based());
+                assert_prepare_refused(&mut recorded, &target, Refusal::ExistingBinding);
+
+                let record = recorded.record().unwrap();
+
+                fs::write(&record, b"this is not a sync state").unwrap();
+                assert_prepare_refused(
+                    &mut recorded,
+                    &target,
+                    Refusal::Corrupt(CorruptReason::Undecodable),
+                );
+                assert_eq!(fs::read(&record).unwrap(), b"this is not a sync state");
+            }
+
+            // 3. The correct id binds, and only the record changes.
+            #[test]
+            fn confirming_the_current_preparation_binds_the_selected_target() {
+                let mut bx = Bx::new("b1h-confirm");
+                let vaults = snapshot(&bx.vaults_dir());
+                let remote = snapshot(&bx.remote_dir());
+                let id = prepared(&mut bx);
+
+                assert_eq!(confirm(&mut bx, &id), Ok(Outcome::BoundAndVerified));
+
+                let state = bx.loaded();
+
+                assert_eq!(state.target_locator(), bx.target.locator());
+                assert_eq!(state.local_locator().as_str(), bx.local);
+                assert!(state.vault_tag().matches_vault(bx.vault_id));
+                assert_eq!(snapshot(&bx.vaults_dir()), vaults);
+                assert_eq!(snapshot(&bx.remote_dir()), remote);
+                assert_eq!(names(bx.root.path()), [SYNC_STATE_DIRECTORY]);
+                assert_eq!(names(&bx.state_dir()).len(), 1);
+            }
+
+            // 4. A double submit binds at most once and cannot touch the record.
+            #[test]
+            fn a_second_confirmation_is_stale_and_changes_nothing() {
+                let mut bx = Bx::new("b1h-double");
+                let id = prepared(&mut bx);
+
+                assert_eq!(confirm(&mut bx, &id), Ok(Outcome::BoundAndVerified));
+
+                let record = bx.record_bytes();
+                let before = snapshot(&bx.state_dir());
+
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingApproval)));
+                assert_eq!(bx.record_bytes(), record);
+                assert_eq!(snapshot(&bx.state_dir()), before);
+            }
+
+            // 5. A wrong, garbage or foreign id binds nothing and spends the
+            // preparation: the user has to prepare again.
+            #[test]
+            fn a_wrong_id_is_stale_and_spends_the_preparation() {
+                let mut bx = Bx::new("b1h-wrong-id");
+
+                for wrong in [
+                    "",
+                    "not-an-id",
+                    "00000000-0000-0000-0000-000000000000",
+                    &unknown_id(),
+                ] {
+                    let id = prepared(&mut bx);
+                    let (result, reads, draws) = confirm_counting(&mut bx, wrong, Instant::now());
+
+                    assert_eq!(
+                        result,
+                        Err(stale(Stale::NotCurrentPreparation)),
+                        "{wrong:?}"
+                    );
+                    assert_eq!((reads, draws), (0, 0), "a stale id read or drew");
+                    assert!(!bx.root.path().exists());
+
+                    // Spent: not even the right id works now.
+                    assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingApproval)));
+                    assert!(!bx.root.path().exists());
+                }
+            }
+
+            // 6. A later attempt voids the earlier preparation, even a failed
+            // later attempt; a preview for one target cannot confirm another.
+            #[test]
+            fn a_new_preparation_voids_the_previous_one_even_when_it_fails() {
+                let mut bx = Bx::new("b1h-supersede");
+                let first = bx.target.clone();
+                let second = second_target(&bx);
+                let missing =
+                    SyncFileTarget::from_path(&bx.remote_dir().join("none.lvault")).unwrap();
+
+                // A, then a failing B.
+                let id_a = prepare_target(&mut bx, &first)
+                    .unwrap()
+                    .preparation_id()
+                    .to_owned();
+
+                assert_eq!(
+                    prepare_target(&mut bx, &missing).map(|_| ()),
+                    Err(Refusal::TargetAbsentOnDisk)
+                );
+                assert_eq!(
+                    confirm(&mut bx, &id_a),
+                    Err(stale(Stale::NoPendingApproval))
+                );
+
+                // A, then a successful B: A's id cannot confirm, and the attempt
+                // consumes B as well.
+                let id_a = prepare_target(&mut bx, &first)
+                    .unwrap()
+                    .preparation_id()
+                    .to_owned();
+                let id_b = prepare_target(&mut bx, &second)
+                    .unwrap()
+                    .preparation_id()
+                    .to_owned();
+
+                assert_ne!(id_a, id_b);
+                assert_eq!(
+                    confirm(&mut bx, &id_a),
+                    Err(stale(Stale::NotCurrentPreparation))
+                );
+                assert_eq!(
+                    confirm(&mut bx, &id_b),
+                    Err(stale(Stale::NoPendingApproval))
+                );
+                assert!(!bx.root.path().exists());
+
+                // A, then B, then B's own id: B and only B is bound.
+                prepare_target(&mut bx, &first).unwrap();
+
+                let id_b = prepare_target(&mut bx, &second)
+                    .unwrap()
+                    .preparation_id()
+                    .to_owned();
+
+                assert_eq!(confirm(&mut bx, &id_b), Ok(Outcome::BoundAndVerified));
+                assert_eq!(bx.loaded().target_locator(), second.locator());
+                assert_ne!(bx.loaded().target_locator(), first.locator());
+            }
+
+            // 6b. Even a preparation that fails before any file is touched voids
+            // the earlier one, and randomness is drawn only after the checks.
+            #[test]
+            fn a_failed_attempt_of_any_kind_voids_the_previous_preparation() {
+                // The very first step fails: the vault file is no longer this
+                // session's envelope. (An unusable application-data root cannot be
+                // built in a test: `SyncStateRoot` only holds absolute paths, which
+                // is the only thing `SyncStateStore::new` checks.)
+                let mut bx = Bx::new("b1h-void-first-step");
+                let id = prepared(&mut bx);
+                let original = fs::read(&bx.vault).unwrap();
+
+                fs::write(&bx.vault, bx.resealed(|_| {})).unwrap();
+
+                assert_eq!(
+                    prepare(&mut bx).map(|_| ()),
+                    Err(Refusal::Unavailable(
+                        SyncStateUnavailable::LocalVaultChanged
+                    ))
+                );
+
+                fs::write(&bx.vault, original).unwrap();
+
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingApproval)));
+
+                // Randomness is unavailable.
+                let id = prepared(&mut bx);
+                let target = bx.target.clone();
+                let store = bx.store();
+                let draws = Cell::new(0usize);
+
+                assert_eq!(
+                    bx.session
+                        .prepare_initial_binding_in(
+                            &store,
+                            &target,
+                            &mut |t| t.read(),
+                            &mut |_| {
+                                draws.set(draws.get() + 1);
+
+                                false
+                            },
+                            Instant::now(),
+                        )
+                        .map(|_| ()),
+                    Err(Refusal::Randomness)
+                );
+                assert_eq!(draws.get(), 1);
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingApproval)));
+                assert!(!bx.root.path().exists());
+            }
+
+            // 7. A preparation is confirmable for 120 seconds and no longer; an
+            // expired one reads no file.
+            #[test]
+            fn an_expired_preparation_is_stale_and_reads_nothing() {
+                let base = Instant::now();
+
+                let mut late = Bx::new("b1h-expired");
+                let target = late.target.clone();
+                let id = prepare_target_at(&mut late, &target, base);
+                let (result, reads, draws) =
+                    confirm_counting(&mut late, &id, base + Duration::from_secs(121));
+
+                assert_eq!(result, Err(stale(Stale::Expired)));
+                assert_eq!((reads, draws), (0, 0));
+                assert!(!late.root.path().exists());
+                assert_eq!(
+                    confirm(&mut late, &id),
+                    Err(stale(Stale::NoPendingApproval))
+                );
+
+                // The boundary is inclusive.
+                let mut edge = Bx::new("b1h-ttl-edge");
+                let target = edge.target.clone();
+                let id = prepare_target_at(&mut edge, &target, base);
+                let (result, _, _) =
+                    confirm_counting(&mut edge, &id, base + Duration::from_secs(120));
+
+                assert_eq!(result, Ok(Outcome::BoundAndVerified));
+            }
+
+            fn prepare_target_at(bx: &mut Bx, target: &SyncFileTarget, now: Instant) -> String {
+                let store = bx.store();
+
+                bx.session
+                    .prepare_initial_binding_in(
+                        &store,
+                        target,
+                        &mut |t| t.read(),
+                        &mut entropy,
+                        now,
+                    )
+                    .unwrap()
+                    .preparation_id()
+                    .to_owned()
+            }
+
+            // 8. The vault changing after the preparation is caught: an in-session
+            // save is stale, an external rewrite is the binding operation's own
+            // refusal.
+            #[test]
+            fn a_vault_that_changed_after_the_preparation_is_not_bound() {
+                let mut saved = Bx::new("b1h-local-saved");
+                let id = prepared(&mut saved);
+
+                saved.session.data_mut().updated_at_ms = NOW_MS + 5;
+                assert!(saved.session.save().unwrap());
+
+                let (result, reads, _) = confirm_counting(&mut saved, &id, Instant::now());
+
+                assert_eq!(result, Err(stale(Stale::LocalVaultChanged)));
+                assert_eq!(reads, 0, "the target was read after the vault changed");
+                assert!(!saved.root.path().exists());
+
+                let mut rewritten = Bx::new("b1h-local-rewritten");
+                let id = prepared(&mut rewritten);
+
+                fs::write(&rewritten.vault, rewritten.resealed(|_| {})).unwrap();
+
+                assert_eq!(
+                    confirm(&mut rewritten, &id),
+                    Err(binding(Refusal::Unavailable(
+                        SyncStateUnavailable::LocalVaultChanged
+                    )))
+                );
+                assert!(!rewritten.root.path().exists());
+            }
+
+            // 9. The target changing after the preparation is caught: different
+            // bytes, an identical copy that is a different physical file, a
+            // deleted target, a target that became a directory.
+            #[test]
+            fn a_target_that_changed_after_the_preparation_is_not_bound() {
+                let mut bytes = Bx::new("b1h-target-bytes");
+                let id = prepared(&mut bytes);
+
+                bytes.put_remote(&bytes.resealed(|data| data.revision = 7));
+                assert_eq!(confirm(&mut bytes, &id), Err(stale(Stale::TargetChanged)));
+                assert!(!bytes.root.path().exists());
+
+                // Same bytes, but another physical file at the same path.
+                let mut copy = Bx::new("b1h-target-recreated");
+                let id = prepared(&mut copy);
+                let replacement = copy.remote_dir().join("replacement.lvault");
+
+                fs::copy(&copy.vault, &replacement).unwrap();
+                fs::remove_file(&copy.remote).unwrap();
+                fs::rename(&replacement, &copy.remote).unwrap();
+
+                assert_eq!(
+                    fs::read(&copy.remote).unwrap(),
+                    fs::read(&copy.vault).unwrap()
+                );
+
+                let (result, reads, _) = confirm_counting(&mut copy, &id, Instant::now());
+
+                assert_eq!(result, Err(stale(Stale::TargetChanged)));
+                assert_eq!(reads, 1, "only the one confirmation read ran");
+                assert!(!copy.root.path().exists());
+
+                // The control: untouched, the same preparation binds.
+                let mut control = Bx::new("b1h-target-control");
+                let id = prepared(&mut control);
+
+                assert_eq!(confirm(&mut control, &id), Ok(Outcome::BoundAndVerified));
+
+                let mut gone = Bx::new("b1h-target-deleted");
+                let id = prepared(&mut gone);
+
+                fs::remove_file(&gone.remote).unwrap();
+                assert_eq!(
+                    confirm(&mut gone, &id),
+                    Err(binding(Refusal::TargetAbsentOnDisk))
+                );
+                assert!(!gone.root.path().exists());
+
+                let mut directory = Bx::new("b1h-target-directory");
+                let id = prepared(&mut directory);
+
+                fs::remove_file(&directory.remote).unwrap();
+                fs::create_dir(&directory.remote).unwrap();
+                assert_eq!(
+                    confirm(&mut directory, &id),
+                    Err(binding(Refusal::TargetUnavailable(
+                        UnavailableReason::UnexpectedObject
+                    )))
+                );
+                assert!(!directory.root.path().exists());
+            }
+
+            // 10. A record that appeared after the preparation is never replaced,
+            // whether before the confirmation or during it.
+            #[test]
+            fn a_record_that_appeared_after_the_preparation_is_never_replaced() {
+                let mut early = Bx::new("b1h-record-early");
+                let id = prepared(&mut early);
+
+                early.publish(&early.based());
+
+                let record = early.record_bytes();
+
+                assert_eq!(
+                    confirm(&mut early, &id),
+                    Err(binding(Refusal::ExistingBinding))
+                );
+                assert_eq!(early.record_bytes(), record);
+
+                // During the confirmation: published between the proposal and the
+                // no-clobber publication (the third read of the target).
+                let mut late = Bx::new("b1h-record-late");
+                let id = prepared(&mut late);
+                let rival = late.based();
+                let rival_store = late.store();
+                let store = late.store();
+                let reads = Cell::new(0usize);
+                let draws = Cell::new(0usize);
+
+                let result = late.session.confirm_initial_binding_in(
+                    &store,
+                    &id,
+                    &mut |t| {
+                        reads.set(reads.get() + 1);
+
+                        if reads.get() == 3 {
+                            rival_store.create(&rival).unwrap();
+                        }
+
+                        t.read()
+                    },
+                    &mut |buffer| {
+                        draws.set(draws.get() + 1);
+
+                        getrandom::fill(buffer).is_ok()
+                    },
+                    Instant::now(),
+                );
+
+                assert_eq!(result, Err(binding(Refusal::RecordAppeared)));
+                // Nothing is retried: the confirmation read once, the binding
+                // read twice, and the identity and the salt were drawn once.
+                assert_eq!((reads.get(), draws.get()), (3, 2));
+                assert_eq!(late.loaded(), rival);
+                assert_eq!(names(&late.state_dir()).len(), 1);
+                assert_eq!(
+                    confirm(&mut late, &id),
+                    Err(stale(Stale::NoPendingApproval))
+                );
+            }
+
+            // 11. Whatever refuses after the checks, the preparation is spent and
+            // nothing is retried or repaired.
+            #[test]
+            fn unavailable_randomness_at_confirmation_spends_the_preparation() {
+                let mut bx = Bx::new("b1h-confirm-entropy");
+                let id = prepared(&mut bx);
+                let store = bx.store();
+                let reads = Cell::new(0usize);
+                let draws = Cell::new(0usize);
+
+                let result = bx.session.confirm_initial_binding_in(
+                    &store,
+                    &id,
+                    &mut |t| {
+                        reads.set(reads.get() + 1);
+
+                        t.read()
+                    },
+                    &mut |_| {
+                        draws.set(draws.get() + 1);
+
+                        false
+                    },
+                    Instant::now(),
+                );
+
+                assert_eq!(result, Err(binding(Refusal::Randomness)));
+                assert_eq!((reads.get(), draws.get()), (2, 1));
+                assert!(!bx.root.path().exists());
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingApproval)));
+            }
+
+            // Cancelling discards the preparation, and is idempotent.
+            #[test]
+            fn cancelling_discards_the_preparation_and_is_idempotent() {
+                let mut bx = Bx::new("b1h-cancel");
+
+                bx.session.cancel_initial_binding();
+                bx.session.cancel_initial_binding();
+
+                let id = prepared(&mut bx);
+
+                bx.session.cancel_initial_binding();
+                bx.session.cancel_initial_binding();
+
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingApproval)));
+                assert!(!bx.root.path().exists());
+            }
+
+            // A new or reopened session has no preparation: it lives only in the
+            // session that made it.
+            #[test]
+            fn a_preparation_does_not_survive_its_session() {
+                let mut fresh = Bx::new("b1h-fresh-session");
+
+                assert_eq!(
+                    confirm(&mut fresh, &unknown_id()),
+                    Err(stale(Stale::NoPendingApproval))
+                );
+
+                let mut bx = Bx::new("b1h-reopen");
+                let id = prepared(&mut bx);
+                let Bx {
+                    session,
+                    root,
+                    vault,
+                    dir,
+                    ..
+                } = bx;
+
+                session.lock();
+
+                let mut reopened = UnlockedVaultSession::unlock(&vault, test_password()).unwrap();
+
+                assert_eq!(
+                    reopened.confirm_initial_binding(&root, &id),
+                    Err(stale(Stale::NoPendingApproval))
+                );
+                assert!(!root.path().exists());
+
+                drop(reopened);
+                drop(dir);
+            }
+
+            // 13. Nothing printed, by the preview, the pending value, a refusal or
+            // a stale category, carries a path, identifier or fingerprint.
+            #[test]
+            fn consent_types_reveal_no_path_identifier_or_fingerprint() {
+                let mut bx = Bx::new("b1h-no-leak");
+                let on_disk = fs::read(&bx.vault).unwrap();
+                let mut shown: Vec<String> = Vec::new();
+
+                let preview = prepare(&mut bx).unwrap();
+                let id = preview.preparation_id().to_owned();
+
+                shown.push(format!("{preview:?}"));
+                shown.push(format!("{:?}", bx.session.pending_initial_binding));
+                shown.push(format!(
+                    "{:?}",
+                    bx.session.pending_initial_binding.as_ref().unwrap()
+                ));
+
+                for reason in [
+                    Stale::NoPendingApproval,
+                    Stale::NotCurrentPreparation,
+                    Stale::Expired,
+                    Stale::LocalVaultChanged,
+                    Stale::TargetChanged,
+                ] {
+                    shown.push(format!("{reason:?}"));
+                    shown.push(reason.to_string());
+                    shown.push(format!("{:?}", stale(reason)));
+                    shown.push(stale(reason).to_string());
+                }
+
+                for refusal in [
+                    Refusal::TargetIsVaultFile,
+                    Refusal::PersistenceUnverified,
+                    Refusal::RecordAppeared,
+                    Refusal::Randomness,
+                    Refusal::TargetUnavailable(UnavailableReason::UnexpectedObject),
+                ] {
+                    shown.push(format!("{:?}", binding(refusal)));
+                    shown.push(binding(refusal).to_string());
+                }
+
+                // Real outcomes: a stale id and a success.
+                shown.push(format!("{:?}", confirm(&mut bx, "wrong-id-LEAKMARK")));
+                shown.push(format!("{:?}", prepare(&mut bx).map(|_| ())));
+                shown.push(format!("{:?}", confirm(&mut bx, &id)));
+
+                let id_now = prepared(&mut bx);
+
+                shown.push(format!("{:?}", confirm(&mut bx, &id_now)));
+
+                let prefix =
+                    String::from_utf8_lossy(&on_disk[..48.min(on_disk.len())]).into_owned();
+                let needles = vec![
+                    bx.dir.path().to_string_lossy().into_owned(),
+                    bx.remote.to_string_lossy().into_owned(),
+                    bx.local.clone(),
+                    bx.vault_id.to_string(),
+                    bx.vault_id.simple().to_string(),
+                    id.clone(),
+                    Uuid::parse_str(&id).unwrap().simple().to_string(),
+                    id_now.clone(),
+                    EnvelopeFingerprint::of_bytes(&on_disk).to_hex(),
+                    "target.lvault".to_owned(),
+                    "vault.lvault".to_owned(),
+                    ".qa-local".to_owned(),
+                    "LEAKMARK".to_owned(),
+                    prefix,
+                    MASTER_PASSWORD.to_owned(),
+                ];
+
+                assert!(shown.len() > 20);
+
+                for output in &shown {
+                    for needle in &needles {
+                        assert!(
+                            !output.contains(needle.as_str()),
+                            "leaks {needle:?}: {output}"
+                        );
+                    }
+                }
             }
         }
     }

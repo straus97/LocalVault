@@ -26,9 +26,10 @@ use crate::vault::{
     backup::BackupError,
     lifecycle::VaultLifecycleError,
     session::{
-        InitialBindingApproval, InitialBindingOutcome, InitialBindingRefusal,
-        RemoteObservationOutcome, RemoteObservationRefusal, RemoteTargetRefusal, SessionError,
-        SessionSyncState, UnlockedVaultSession,
+        InitialBindingApproval, InitialBindingConfirmRefusal, InitialBindingOutcome,
+        InitialBindingPreview, InitialBindingRefusal, RemoteObservationOutcome,
+        RemoteObservationRefusal, RemoteTargetRefusal, SessionError, SessionSyncState,
+        UnlockedVaultSession,
     },
     sync_file_adapter::SyncFileTarget,
     sync_state_store::SyncStateRoot,
@@ -337,10 +338,10 @@ impl AppState {
     /// The inner result is the session's own: see
     /// [`UnlockedVaultSession::bind_existing_identical_target`] for the order of
     /// checks, the failure classes (in particular `PersistenceUnverified`) and the
-    /// approval boundary. **No user-confirmation flow exists**: the
-    /// [`InitialBindingApproval`] it requires has no production constructor, so
-    /// this is unreachable from production code until a real confirmation
-    /// handler provides one.
+    /// approval boundary. **No user-facing confirmation exists yet**: the
+    /// [`InitialBindingApproval`] it requires can only be built by the session's
+    /// own `confirm_initial_binding`, so nothing outside the session (and its
+    /// tests) can call this with a real approval.
     ///
     /// The application-state mutex, and with it the session and its exclusive OS
     /// lock, is held across the whole read, the inspection and the publication, so
@@ -362,6 +363,63 @@ impl AppState {
         let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
 
         Ok(session.bind_existing_identical_target(root, target, approval))
+    }
+
+    /// First half of the initial-binding consent (Stage 1U-4 B1h): examine the
+    /// selected target read-only and remember the result in the unlocked session.
+    /// Internal: no command, event or UI is attached, and nothing is bound,
+    /// written or created. See [`UnlockedVaultSession::prepare_initial_binding`].
+    ///
+    /// The outer error is "no live session" (`VaultLocked`/`SessionExpired`), and
+    /// in that case the target is never opened. Unlike the passive sync checks,
+    /// this is an explicit user action and therefore counts as activity. The
+    /// application-state mutex, and with it the session and its exclusive OS
+    /// lock, is held for the whole examination.
+    pub fn prepare_initial_binding(
+        &self,
+        root: &SyncStateRoot,
+        target: &SyncFileTarget,
+    ) -> Result<Result<InitialBindingPreview, InitialBindingRefusal>, AppStateError> {
+        let mut guard = self.active_session_guard()?;
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.prepare_initial_binding(root, target))
+    }
+
+    /// Second half of the initial-binding consent (Stage 1U-4 B1h): spend the
+    /// pending preparation and, if it is still current, run the guarded initial
+    /// binding. Internal: no command, event or UI is attached. See
+    /// [`UnlockedVaultSession::confirm_initial_binding`] for the order of checks
+    /// and for why every call spends the preparation.
+    ///
+    /// The outer error is "no live session" (`VaultLocked`/`SessionExpired`);
+    /// the preparation, if any, dies with the session. Like preparation, this is
+    /// an explicit user action and counts as activity. The application-state
+    /// mutex is held across the whole operation.
+    pub fn confirm_initial_binding(
+        &self,
+        root: &SyncStateRoot,
+        preparation_id: &str,
+    ) -> Result<Result<InitialBindingOutcome, InitialBindingConfirmRefusal>, AppStateError> {
+        let mut guard = self.active_session_guard()?;
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.confirm_initial_binding(root, preparation_id))
+    }
+
+    /// Discard the pending initial-binding preparation, if any. Idempotent: with
+    /// no session there is nothing to discard, which is not an error. It neither
+    /// observes expiry nor counts as activity.
+    pub fn cancel_initial_binding(&self) -> Result<(), AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        if let Some(session) = guard.session.as_mut() {
+            session.cancel_initial_binding();
+        }
+
+        Ok(())
     }
 
     fn active_session_guard(&self) -> Result<MutexGuard<'_, AppStateInner>, AppStateError> {
@@ -1458,6 +1516,191 @@ mod tests {
         assert!(!other.root.path().exists());
 
         drop(other.scratch);
+        drop(unbound.scratch);
+    }
+
+    // -- Stage 1U-4 B1h: explicit initial-binding consent through the state ------
+    //
+    // The checks of the two steps are tested next to the session. Here: the
+    // live-session rule, that a preparation dies with the session (lock, expiry,
+    // a different vault), and the activity rules. Nothing outside these tests can
+    // call the steps: no command or UI exists.
+
+    use crate::vault::session::{InitialBindingConfirmRefusal, InitialBindingStale};
+
+    fn prepared_id(state: &AppState, unbound: &Unbound) -> String {
+        state
+            .prepare_initial_binding(&unbound.root, &unbound.target)
+            .unwrap()
+            .unwrap()
+            .preparation_id()
+            .to_owned()
+    }
+
+    fn no_pending() -> Result<InitialBindingOutcome, InitialBindingConfirmRefusal> {
+        Err(InitialBindingConfirmRefusal::Stale(
+            InitialBindingStale::NoPendingApproval,
+        ))
+    }
+
+    #[test]
+    fn consent_requires_a_live_session_and_binds_only_after_a_separate_confirmation() {
+        let unbound = unbound_vault("b1h-appstate-flow");
+        let state = AppState::default();
+
+        assert!(matches!(
+            state.prepare_initial_binding(&unbound.root, &unbound.target),
+            Err(AppStateError::VaultLocked)
+        ));
+        assert!(matches!(
+            state.confirm_initial_binding(&unbound.root, "any"),
+            Err(AppStateError::VaultLocked)
+        ));
+        // Cancelling with nothing to cancel is not an error.
+        state.cancel_initial_binding().unwrap();
+        assert!(!unbound.root.path().exists());
+
+        state
+            .unlock_vault(unbound.vault.clone(), password())
+            .unwrap();
+
+        let id = prepared_id(&state, &unbound);
+
+        // Preparing bound nothing.
+        assert_eq!(
+            state.load_sync_state(&unbound.root).unwrap(),
+            SessionSyncState::NotConfigured
+        );
+        assert!(!unbound.root.path().exists());
+
+        assert_eq!(
+            state.confirm_initial_binding(&unbound.root, &id).unwrap(),
+            Ok(InitialBindingOutcome::BoundAndVerified)
+        );
+
+        let SessionSyncState::Bound(bound) = state.load_sync_state(&unbound.root).unwrap() else {
+            panic!("the binding was not retained");
+        };
+
+        assert_eq!(bound.state().target_locator(), unbound.target.locator());
+        assert_eq!(
+            state.confirm_initial_binding(&unbound.root, &id).unwrap(),
+            no_pending()
+        );
+
+        state.cancel_initial_binding().unwrap();
+        state.lock_vault().unwrap();
+        state.cancel_initial_binding().unwrap();
+
+        drop(unbound.scratch);
+    }
+
+    #[test]
+    fn a_preparation_dies_with_a_lock_an_expiry_or_a_different_vault() {
+        let unbound = unbound_vault("b1h-appstate-lifetime");
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        // Lock, then unlock the same vault.
+        state
+            .unlock_vault(unbound.vault.clone(), password())
+            .unwrap();
+
+        let id = prepared_id(&state, &unbound);
+
+        state.lock_vault().unwrap();
+
+        assert!(matches!(
+            state.confirm_initial_binding(&unbound.root, &id),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        state
+            .unlock_vault(unbound.vault.clone(), password())
+            .unwrap();
+
+        assert_eq!(
+            state.confirm_initial_binding(&unbound.root, &id).unwrap(),
+            no_pending()
+        );
+        assert!(!unbound.root.path().exists());
+
+        // Expiry: reported as such, the session and the preparation are gone.
+        let id = prepared_id(&state, &unbound);
+
+        state.age_session_for_test(Duration::from_secs(31));
+
+        assert!(matches!(
+            state.confirm_initial_binding(&unbound.root, &id),
+            Err(AppStateError::SessionExpired)
+        ));
+        assert!(!state.status().unwrap().unlocked);
+
+        state
+            .unlock_vault(unbound.vault.clone(), password())
+            .unwrap();
+
+        assert_eq!(
+            state.confirm_initial_binding(&unbound.root, &id).unwrap(),
+            no_pending()
+        );
+        assert!(!unbound.root.path().exists());
+
+        // A preparation for one vault cannot be confirmed in another.
+        let id = prepared_id(&state, &unbound);
+        let other = unbound_vault("b1h-appstate-lifetime-other");
+
+        state.lock_vault().unwrap();
+        state.unlock_vault(other.vault.clone(), password()).unwrap();
+
+        assert_eq!(
+            state.confirm_initial_binding(&other.root, &id).unwrap(),
+            no_pending()
+        );
+        assert_eq!(
+            state.confirm_initial_binding(&unbound.root, &id).unwrap(),
+            no_pending()
+        );
+        assert!(!other.root.path().exists());
+        assert!(!unbound.root.path().exists());
+
+        drop(other.scratch);
+        drop(unbound.scratch);
+    }
+
+    #[test]
+    fn preparing_and_confirming_count_as_activity_but_cancelling_does_not() {
+        let unbound = unbound_vault("b1h-appstate-activity");
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        state
+            .unlock_vault(unbound.vault.clone(), password())
+            .unwrap();
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let aged = state.last_activity_for_test().unwrap();
+
+        // Cancelling is not an explicit user action on the vault.
+        state.cancel_initial_binding().unwrap();
+        assert_eq!(state.last_activity_for_test(), Some(aged));
+
+        let id = prepared_id(&state, &unbound);
+        let after_prepare = state.last_activity_for_test().unwrap();
+
+        assert!(after_prepare > aged, "preparing did not refresh activity");
+
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let aged = state.last_activity_for_test().unwrap();
+
+        assert_eq!(
+            state.confirm_initial_binding(&unbound.root, &id).unwrap(),
+            Ok(InitialBindingOutcome::BoundAndVerified)
+        );
+        assert!(
+            state.last_activity_for_test().unwrap() > aged,
+            "confirming did not refresh activity"
+        );
+
         drop(unbound.scratch);
     }
 }
