@@ -18,8 +18,9 @@ use zeroize::Zeroizing;
 use localvault_core::{
     sync::{inspect_remote_bytes, BoundInspectionError},
     sync_state::{
-        record_remote_observation, BindingMismatch, HighWaterOutcome, Locator, SyncBase, SyncState,
-        TransitionRefusal,
+        bind_identical_remote, record_remote_observation, BindingMismatch, HighWaterOutcome,
+        Locator, NewBinding, RemoteEvidence, SyncBase, SyncState, SyncStateLoad, TransitionRefusal,
+        UserApproval, BINDING_SALT_LEN,
     },
     vault::{
         data::{VaultData, VaultDataError},
@@ -259,6 +260,158 @@ pub enum RemoteTargetRefusal {
     /// absence, never retried.
     #[error("the target file could not be read")]
     TargetUnavailable(UnavailableReason),
+}
+
+/// Typed proof-of-consent that [`UnlockedVaultSession::bind_existing_identical_target`]
+/// requires, bound to exactly one target.
+///
+/// # This is not a confirmation, and nothing can currently produce one
+///
+/// **No user-confirmation flow exists yet.** There is no UI, command or event
+/// that asks the user whether this vault may be bound to a chosen file, and
+/// therefore nothing in production that may honestly claim "the user approved".
+/// For that reason this type has **no production constructor**: its field is
+/// private, it has no `Default`, `Clone`, `Copy` or `From`, and the only way to
+/// build one is the `#[cfg(test)]` helper below. In a production build the
+/// binding operation is consequently unreachable, by construction and not by
+/// convention. A boolean or an enum that any caller could set to "granted" would
+/// have claimed a confirmation that never happened; this does not.
+///
+/// A later slice that adds the real confirmation (a dialog the user can see,
+/// naming the vault and the target, answered by a deliberate action) must add the
+/// production constructor, and it must live in this module because the field is
+/// private. It must take as its input a value that only that confirmation
+/// handler can produce, tie the approval to that one answer, and be consumed by
+/// a single call. It must not be a general "trusted" constructor that any caller
+/// in the crate could use. Passing this value is a precondition, never evidence
+/// that a confirmation was shown; only the code that builds it can make that
+/// true.
+///
+/// The value is single-use (consumed by the operation), is bound to the target
+/// locator it was made for (an approval for one file cannot be spent on
+/// another), and is not shown by `Debug`.
+#[must_use = "an approval is consumed by the binding operation"]
+pub struct InitialBindingApproval {
+    target: Locator,
+}
+
+impl InitialBindingApproval {
+    /// Test-only. Not a model of any real confirmation: it exists so the
+    /// operation's behavior can be exercised before a confirmation flow exists.
+    #[cfg(test)]
+    pub(crate) fn for_test(target: &SyncFileTarget) -> Self {
+        Self {
+            target: target.locator().clone(),
+        }
+    }
+
+    fn target(&self) -> &Locator {
+        &self.target
+    }
+
+    /// The approval the accepted core transition understands. Consumes `self`,
+    /// so the only way to obtain `Granted` is to hold (and spend) this value.
+    fn into_core(self) -> UserApproval {
+        UserApproval::Granted
+    }
+}
+
+impl std::fmt::Debug for InitialBindingApproval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("InitialBindingApproval(<redacted>)")
+    }
+}
+
+/// What a successful [`UnlockedVaultSession::bind_existing_identical_target`]
+/// established. Fieldless on purpose: no revision, fingerprint, identifier or
+/// path.
+///
+/// It means: a new sync-state record was published, read back
+/// byte-identically by the store, and then loaded again by a fresh read that
+/// equalled the proposed state and passed the authenticated binding check. It
+/// does **not** mean any synchronization happened, that the target is fresh, or
+/// that a cloud provider has anything to do with the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum InitialBindingOutcome {
+    BoundAndVerified,
+}
+
+/// Why no initial binding was confirmed. Fixed categories only: no path,
+/// locator, identifier, fingerprint, revision, key or file content, in `Debug`
+/// or `Display`.
+///
+/// Every variant except [`PersistenceUnverified`](Self::PersistenceUnverified)
+/// leaves the sync-state directory as it was: the record was definitely not
+/// published by this call. After `PersistenceUnverified` the record may or may
+/// not exist, and nothing is retried, deleted or reset: any later decision must
+/// start with a fresh load. A refusal never resets, repairs or adopts an
+/// existing record, never writes the target, the vault or its backup, and never
+/// treats the target's absence as authority to publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum InitialBindingRefusal {
+    /// The session's own vault or location cannot serve as the binding anchor.
+    #[error("the session's vault or sync-state location is unavailable")]
+    Unavailable(SyncStateUnavailable),
+    /// The approval was made for a different target than the one supplied.
+    #[error("the approval does not belong to this target")]
+    ApprovalTargetMismatch,
+    /// A valid record for this vault and location already exists. Never
+    /// replaced; rebinding needs an explicit reset that this operation is not.
+    #[error("a synchronization binding already exists")]
+    ExistingBinding,
+    /// A readable record exists but belongs to a different vault, or to a
+    /// different location. Left untouched and never adopted.
+    #[error("a synchronization record for a different binding exists")]
+    ExistingBindingMismatch(BindingMismatch),
+    #[error("the synchronization binding record is corrupt")]
+    Corrupt(CorruptReason),
+    #[error("the synchronization binding record has an unsupported version")]
+    UnsupportedVersion,
+    /// Includes a stale recovery artifact: absence was not confirmed.
+    #[error("the synchronization binding record could not be read")]
+    Unreadable(UnreadableReason),
+    /// The target is, or cannot be shown not to be, this vault's own primary
+    /// file, its `.backup`, its `.lock` file or a file inside the sync-state
+    /// directory. This is a path-level check; see the operation's limits.
+    #[error("the target names a file that belongs to this vault or its sync state")]
+    TargetIsVaultFile,
+    /// Not found in a valid local folder. **Not** remote absence, never an
+    /// authorization to publish, and never creates anything.
+    #[error("the target file was not found in the local folder")]
+    TargetAbsentOnDisk,
+    #[error("the target file could not be read")]
+    TargetUnavailable(UnavailableReason),
+    /// The local vault file or the target changed between the inspection and
+    /// the point of publication, so the evidence no longer describes what is on
+    /// disk.
+    #[error("the evidence changed before the binding could be published")]
+    EvidenceChanged,
+    /// The local reference or the target did not authenticate as this vault's
+    /// envelope. Names the input at fault; carries no content.
+    #[error("the envelope inspection was rejected")]
+    Inspection(BoundInspectionError),
+    /// Secure randomness for the binding identity was unavailable.
+    #[error("secure randomness is unavailable")]
+    Randomness,
+    /// The accepted core transition refused (for example: not byte-identical, a
+    /// legacy payload with no revision counter).
+    #[error("the initial binding transition was refused")]
+    Transition(TransitionRefusal),
+    /// A record appeared between the check and publication. The store's
+    /// no-clobber publication refused it; the other record is untouched.
+    #[error("a synchronization record appeared before publication")]
+    RecordAppeared,
+    /// The store failed at a step that precedes publication (see
+    /// `create_error_may_follow_publication`): the record was not created.
+    #[error("the initial binding was not persisted")]
+    NotPersisted(StoreError),
+    /// The record may or may not have been published: the publication step
+    /// itself failed, or the readback or the fresh reload disagreed. The
+    /// persisted state is unknown until freshly loaded. Nothing is retried,
+    /// deleted or reset.
+    #[error("the initial binding could not be verified after writing")]
+    PersistenceUnverified,
 }
 
 pub struct UnlockedVaultSession {
@@ -733,6 +886,313 @@ impl UnlockedVaultSession {
         }
     }
 
+    /// Bind this vault to an **existing, byte-identical** encrypted file for the
+    /// first time (Stage 1U-4 B1f). Internal: no command, event, UI, startup or
+    /// unlock path reaches it, and in a production build nothing can: the
+    /// required [`InitialBindingApproval`] has no production constructor (see its
+    /// documentation). It enables no working synchronization.
+    ///
+    /// Supported scenario, and only this one: an existing target whose exact
+    /// bytes equal the exact bytes of this session's vault file, authenticated
+    /// under this session's Vault Key as this vault, at a schema-3 revision,
+    /// with no sync-state record for this location. Everything else is refused:
+    /// an absent target, initial publication, overwrite, import, divergence,
+    /// merge, a different encryption of the same plaintext, a legacy payload, an
+    /// existing record of any kind, and any rebinding.
+    ///
+    /// # The approval boundary
+    ///
+    /// The approval is a precondition, **not** evidence that a confirmation took
+    /// place. No confirmation flow exists. The future UI must show the user the
+    /// vault and the chosen file and obtain a deliberate explicit confirmation
+    /// **before** it constructs an approval and calls this. See
+    /// [`InitialBindingApproval`].
+    ///
+    /// # Order of operations
+    ///
+    /// All inside one `&self` borrow of the unlocked session, so the exclusive OS
+    /// lock held by `_lock_file` is held from the first step to the last.
+    ///
+    /// 1. the approval must be for this target;
+    /// 2. the vault file's exact current bytes must parse to precisely the
+    ///    envelope this session unlocked (they become the local reference), and
+    ///    the session's normalized local locator is resolved;
+    /// 3. the sync-state record is loaded: only a **confirmed** `NotConfigured`
+    ///    continues. A loaded record (valid or foreign), a corrupt, unsupported
+    ///    or unreadable one, and an unresolved recovery artifact are refused and
+    ///    left exactly as they are;
+    /// 4. the target is refused if it names this vault's primary, `.backup`,
+    ///    `.lock` or a file in the sync-state directory;
+    /// 5. only then [`SyncFileTarget::read`] runs, and only `Present` continues:
+    ///    absence on disk and unavailability are refusals, never authority to
+    ///    publish;
+    /// 6. `inspect_remote_bytes` authenticates both byte strings under this
+    ///    session's Vault Key and the session's own authenticated `vault_id`
+    ///    (never a caller, file name or the target);
+    /// 7. a fresh binding id and salt are drawn from the OS CSPRNG;
+    /// 8. the core `bind_identical_remote` proposes the state. It requires equal
+    ///    raw fingerprints, equal schema-3 counter revisions and a confirmed
+    ///    `NotConfigured`; no state is constructed by this module;
+    /// 9. the local file and the target are read again and must be byte-for-byte
+    ///    what was inspected;
+    /// 10. `SyncStateStore::create` publishes by no-clobber hard link;
+    /// 11. a fresh load must equal the proposed state and pass
+    ///     `verify_binding` for this vault, both locators exactly.
+    ///
+    /// Only then is [`InitialBindingOutcome::BoundAndVerified`] returned. The
+    /// only persistent change is the new record: the target, the vault, its
+    /// `.backup` and its lock file are never written, nothing is imported or
+    /// uploaded, no revision or high-water mark is changed independently of the
+    /// core, and nothing retries.
+    ///
+    /// # Failure classes
+    ///
+    /// * **Definitely not published**: every refusal other than the two below.
+    ///   The sync-state directory is unchanged by this call.
+    /// * **Record appeared** ([`InitialBindingRefusal::RecordAppeared`]): the
+    ///   no-clobber publication found another record and left it alone.
+    /// * **Possibly published, unverified**
+    ///   ([`InitialBindingRefusal::PersistenceUnverified`]): the publication
+    ///   step or the verification failed. The record is **not** deleted, rolled
+    ///   back or retried, and a possibly valid committed binding is never
+    ///   downgraded. A later decision must start with a fresh load.
+    ///
+    /// # What a success does and does not mean
+    ///
+    /// * The binding is local-filesystem evidence only. No cloud provider
+    ///   authority, freshness, or completed upload is established, and a path the
+    ///   user chose is not shown to be a provider's copy of anything.
+    /// * Byte identity and authentication prove that the target was, at that
+    ///   instant, an exact copy of this vault's envelope. They prove neither that
+    ///   it is the latest version nor that it will stay so.
+    /// * The target check is by canonical path string (ASCII case-insensitive on
+    ///   Windows). It does **not** detect a hard link, or any other second name,
+    ///   for the same physical file: stable `std` exposes no file identity, so an
+    ///   alias of the vault itself that sits at another path is byte-identical by
+    ///   construction and would be accepted. The adapter's own length-and-timestamp
+    ///   checks and the check-then-use windows documented on [`SyncFileTarget`]
+    ///   also apply.
+    pub fn bind_existing_identical_target(
+        &self,
+        root: &SyncStateRoot,
+        target: &SyncFileTarget,
+        approval: InitialBindingApproval,
+    ) -> Result<InitialBindingOutcome, InitialBindingRefusal> {
+        let store = SyncStateStore::new(root.path())
+            .map_err(|_| InitialBindingRefusal::Unavailable(SyncStateUnavailable::Root))?;
+
+        self.bind_existing_identical_target_in(
+            &store,
+            target,
+            approval,
+            &mut SyncFileTarget::read,
+            &mut |buffer| getrandom::fill(buffer).is_ok(),
+        )
+    }
+
+    /// [`bind_existing_identical_target`](Self::bind_existing_identical_target)
+    /// over an explicit store, read step and entropy source. Crate-private so no
+    /// caller outside the crate's own tests can substitute any of them: tests use
+    /// it to inject store faults, to prove the read runs only after the state
+    /// and target checks and only under the session lock, and to fail randomness.
+    pub(crate) fn bind_existing_identical_target_in(
+        &self,
+        store: &SyncStateStore,
+        target: &SyncFileTarget,
+        approval: InitialBindingApproval,
+        read: &mut dyn FnMut(&SyncFileTarget) -> SyncFileRead,
+        entropy: &mut dyn FnMut(&mut [u8]) -> bool,
+    ) -> Result<InitialBindingOutcome, InitialBindingRefusal> {
+        use InitialBindingRefusal as Refusal;
+
+        if approval.target() != target.locator() {
+            return Err(Refusal::ApprovalTargetMismatch);
+        }
+
+        let local_raw = self.current_local_raw().ok_or(Refusal::Unavailable(
+            SyncStateUnavailable::LocalVaultChanged,
+        ))?;
+
+        let local_locator = self
+            .local_locator()
+            .ok_or(Refusal::Unavailable(SyncStateUnavailable::LocalLocator))?;
+
+        match store.load(&local_locator) {
+            StateLoad::NotConfigured => {}
+            StateLoad::Loaded(state) => {
+                let expected_local = effective_local_locator(&state, &local_locator);
+
+                return Err(
+                    match state.verify_binding(
+                        self.data.vault_id,
+                        &expected_local,
+                        state.target_locator(),
+                    ) {
+                        Ok(()) => Refusal::ExistingBinding,
+                        Err(mismatch) => Refusal::ExistingBindingMismatch(mismatch),
+                    },
+                );
+            }
+            StateLoad::Corrupt(reason) => return Err(Refusal::Corrupt(reason)),
+            StateLoad::UnsupportedVersion => return Err(Refusal::UnsupportedVersion),
+            StateLoad::Unreadable(reason) => return Err(Refusal::Unreadable(reason)),
+        }
+
+        if self.target_names_vault_file(store.directory(), target, &local_locator) {
+            return Err(Refusal::TargetIsVaultFile);
+        }
+
+        let present = match read(target) {
+            SyncFileRead::Present(present) => present,
+            SyncFileRead::AbsentOnDisk => return Err(Refusal::TargetAbsentOnDisk),
+            SyncFileRead::Unavailable(reason) => return Err(Refusal::TargetUnavailable(reason)),
+        };
+
+        // The adapter pairs the bytes with the locator they were read from; a
+        // pairing that disagrees with the target asked for is not trusted.
+        if present.target() != target.locator() {
+            return Err(Refusal::EvidenceChanged);
+        }
+
+        let inspection = inspect_remote_bytes(
+            &self.vault_key,
+            self.data.vault_id,
+            &local_raw,
+            present.candidate_raw(),
+            None,
+        )
+        .map_err(Refusal::Inspection)?;
+
+        let mut id_bytes = [0u8; 16];
+        let mut tag_salt = [0u8; BINDING_SALT_LEN];
+
+        if !entropy(&mut id_bytes) || !entropy(&mut tag_salt) {
+            return Err(Refusal::Randomness);
+        }
+
+        // Version and variant bits make the id a valid, non-nil random UUID.
+        let binding_id = uuid::Builder::from_random_bytes(id_bytes).into_uuid();
+
+        let proposed = bind_identical_remote(
+            &SyncStateLoad::NotConfigured,
+            approval.into_core(),
+            RemoteEvidence::Inspected(&inspection),
+            &NewBinding {
+                binding_id,
+                tag_salt,
+                local_locator: &local_locator,
+                target_locator: present.target(),
+            },
+        )
+        .map_err(Refusal::Transition)?;
+
+        // Repeat, as close to publication as the filesystem allows, the two
+        // observations the proposal rests on. This narrows the window; it does
+        // not close it.
+        match self.current_local_raw() {
+            Some(raw) if raw == local_raw => {}
+            _ => {
+                return Err(Refusal::Unavailable(
+                    SyncStateUnavailable::LocalVaultChanged,
+                ))
+            }
+        }
+
+        match read(target) {
+            SyncFileRead::Present(again)
+                if again.target() == present.target()
+                    && again.candidate_raw() == present.candidate_raw() => {}
+            _ => return Err(Refusal::EvidenceChanged),
+        }
+
+        match store.create(&proposed) {
+            Ok(()) => {}
+            Err(StoreError::AlreadyExists) => return Err(Refusal::RecordAppeared),
+            Err(error) if create_error_may_follow_publication(error) => {
+                return Err(Refusal::PersistenceUnverified)
+            }
+            Err(error) => return Err(Refusal::NotPersisted(error)),
+        }
+
+        // A fresh, independent load must be exactly the proposal and must be
+        // bound to this authenticated vault and to both locators.
+        if fresh_load_confirms_binding(
+            store.load(&local_locator),
+            &proposed,
+            self.data.vault_id,
+            &local_locator,
+            present.target(),
+        ) {
+            Ok(InitialBindingOutcome::BoundAndVerified)
+        } else {
+            Err(Refusal::PersistenceUnverified)
+        }
+    }
+
+    /// Whether `target` names, or cannot be shown not to name, a file that
+    /// belongs to this vault: its primary, `.backup` or `.lock`, or anything
+    /// inside the sync-state directory.
+    ///
+    /// Compares canonical path strings (ASCII case-insensitive, the project's
+    /// path-identity rule), so `D:\x\v.lvault` and `\\?\d:\X\V.lvault` agree. A
+    /// target that does not exist cannot alias anything and is left to the read
+    /// (which reports it as absent or unavailable); any other failure to resolve
+    /// an existing target fails closed. This is a string-level check: it cannot
+    /// see a hard link or another second name of the same file.
+    fn target_names_vault_file(
+        &self,
+        state_directory: &Path,
+        target: &SyncFileTarget,
+        local_locator: &Locator,
+    ) -> bool {
+        if path_identity_eq(target.locator().as_str(), local_locator.as_str()) {
+            return true;
+        }
+
+        let canonical_target = match fs::canonicalize(target.locator().as_str()) {
+            Ok(canonical) => canonical,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        };
+
+        let Some(canonical_target) = canonical_target.to_str() else {
+            return true;
+        };
+
+        let comparable = |path: &Path| -> Option<String> {
+            match fs::canonicalize(path) {
+                Ok(canonical) => canonical.to_str().map(str::to_owned),
+                Err(_) => path.to_str().map(str::to_owned),
+            }
+        };
+
+        let owned = [
+            comparable(Path::new(local_locator.as_str())),
+            comparable(&self.path),
+            comparable(&self.backup_path),
+            comparable(&lock_path_for(&self.path)),
+        ];
+
+        if owned.iter().any(|path| {
+            path.as_deref()
+                .is_none_or(|p| path_identity_eq(p, canonical_target))
+        }) {
+            return true;
+        }
+
+        let in_state_directory =
+            Path::new(canonical_target).parent().is_some_and(|parent| {
+                match (parent.to_str(), comparable(state_directory)) {
+                    (Some(parent), Some(state_directory)) => {
+                        path_identity_eq(parent, &state_directory)
+                    }
+                    _ => true,
+                }
+            });
+
+        in_state_directory
+    }
+
     /// The session's normalized local location (the existing
     /// `normalize_existing_vault_path` result), if it has one.
     fn local_locator(&self) -> Option<Locator> {
@@ -819,6 +1279,80 @@ pub(crate) fn replace_error_may_follow_publication(error: StoreError) -> bool {
         | StoreError::UnresolvedArtifacts
         | StoreError::NoClobberUnsupported
         | StoreError::IncompleteDeletion => true,
+    }
+}
+
+/// Whether a `SyncStateStore::create` error could have happened at or after
+/// publication. Derived from the store's own sequence: encoding, the directory,
+/// the existence check, the artifact scan and temp staging (`Directory`,
+/// `Inspect`, `Scan`, `Open`, `Write`, `Sync`) all fail before the hard link and
+/// leave the record unpublished, and `AlreadyExists` and `NoClobberUnsupported`
+/// are the link itself refusing, so nothing was created by this call. Any other
+/// failure of the link (`Replace`, which `create` reports for a link error that
+/// is neither of those) cannot be shown not to have published, and
+/// `VerificationFailed` is by construction post-publication. The match is
+/// exhaustive on purpose; an error `create` does not produce, or one that is not
+/// understood, fails closed as ambiguous.
+pub(crate) fn create_error_may_follow_publication(error: StoreError) -> bool {
+    use super::sync_state_store::IoStage;
+
+    match error {
+        StoreError::Io {
+            stage:
+                IoStage::Directory
+                | IoStage::Inspect
+                | IoStage::Scan
+                | IoStage::Open
+                | IoStage::Write
+                | IoStage::Sync,
+            ..
+        }
+        | StoreError::RootNotAbsolute
+        | StoreError::AlreadyExists
+        | StoreError::UnresolvedArtifacts
+        | StoreError::UnexpectedObject
+        | StoreError::NoClobberUnsupported
+        | StoreError::Encode(_) => false,
+
+        StoreError::Io {
+            stage: IoStage::Replace,
+            ..
+        }
+        | StoreError::VerificationFailed
+        | StoreError::Missing
+        | StoreError::CurrentUnreadable
+        | StoreError::CurrentCorrupt
+        | StoreError::CurrentUnsupportedVersion
+        | StoreError::CurrentLocatorMismatch
+        | StoreError::Changed
+        | StoreError::LocatorMismatch
+        | StoreError::BindingIdentityChanged
+        | StoreError::TrustedHistoryRegression
+        | StoreError::IncompleteDeletion => true,
+    }
+}
+
+/// Whether a fresh load confirms an initial binding: the record must be exactly
+/// the proposed state **and** pass the core's `verify_binding` for the
+/// authenticated vault and both locators. Anything else (no record, an
+/// unreadable, corrupt or unsupported one, a different record, a mismatch) does
+/// not confirm, and the caller reports the persistence as unverified.
+fn fresh_load_confirms_binding(
+    load: StateLoad,
+    proposed: &SyncState,
+    authenticated_vault_id: Uuid,
+    local_locator: &Locator,
+    target_locator: &Locator,
+) -> bool {
+    match load {
+        StateLoad::Loaded(current) if *current == *proposed => {
+            let expected_local = effective_local_locator(&current, local_locator);
+
+            current
+                .verify_binding(authenticated_vault_id, &expected_local, target_locator)
+                .is_ok()
+        }
+        _ => false,
     }
 }
 
@@ -2815,6 +3349,1508 @@ mod tests {
 
             assert_eq!(result, Ok(Outcome::HighWaterRaised));
             assert_eq!(reads, 1);
+        }
+    }
+
+    // -- Stage 1U-4 B1f: initial binding to an existing identical target -------
+    //
+    // Real unlocked sessions, real synthetic vaults, real synthetic target files
+    // and a real sync-state store, all beneath the git-ignored
+    // `.qa-local/sync-state-b1-tests/` (never `%TEMP%`). The "remote" is a byte
+    // copy of the vault file; every other candidate is a genuine envelope of the
+    // same vault produced by the real sealing path.
+    //
+    // Not covered here (and not claimed):
+    // * Store fault injection (the store's hooks are private to its module): the
+    //   pre-publication, publication and verification failures are tested in
+    //   `sync_state_store::tests`, through the same operation.
+    // * The adapter's own change-during-read detection (its probe seam is private
+    //   to the adapter and covered by its B1d tests); here only the session's
+    //   reaction to an `Unavailable(Changed)` result and to a target that differs
+    //   at the second read is exercised.
+    // * A physical file symlink (needs a privilege this account lacks); a
+    //   junction is exercised instead.
+    // * A hard link or any other second name of the same physical file (not
+    //   detectable with stable `std`; the limitation is documented, not tested).
+    // * Any provider, network or cloud behavior (none exists and none is called;
+    //   this cannot be asserted by a test, only by the absence of such code in
+    //   the diff), the user-confirmation flow (none exists), and cross-process
+    //   races.
+    mod initial_binding {
+        use std::{
+            cell::{Cell, RefCell},
+            error::Error as _,
+            time::SystemTime,
+        };
+
+        use localvault_core::sync::{
+            BoundInspectionError, EnvelopeFingerprint, EnvelopeInput, InspectionError,
+            PayloadRejection, PushBaseline, PushIntent, RemoteHighWater, MAX_ENVELOPE_BYTES,
+        };
+        use localvault_core::sync_state::{
+            BindingId, PendingPush, SyncCheckpoint, VaultBindingTag,
+        };
+
+        use super::*;
+        use crate::vault::sync_state_store::{IoStage, SYNC_STATE_DIRECTORY};
+
+        type Refusal = InitialBindingRefusal;
+        type Outcome = InitialBindingOutcome;
+
+        const OTHER_VAULT_ID: Uuid = Uuid::from_u128(0xfedc_ba98_7654_3210_fedc_ba98_7654_3210);
+        const BINDING: Uuid = Uuid::from_u128(0x1111_1111_2222_3333_4444_5555_5555_5555);
+        const INTENT: Uuid = Uuid::from_u128(0xaaaa_aaaa_bbbb_4ccc_8ddd_eeee_eeee_eeee);
+        const STALE_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+        fn loc(value: &str) -> Locator {
+            Locator::new(value).unwrap()
+        }
+
+        fn fp(tag: u8) -> EnvelopeFingerprint {
+            EnvelopeFingerprint::of_bytes(&[tag])
+        }
+
+        fn scratch(name: &str) -> tempfile::TempDir {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(".qa-local")
+                .join("sync-state-b1-tests");
+
+            fs::create_dir_all(&base).unwrap();
+
+            tempfile::Builder::new()
+                .prefix(&format!("{name}-"))
+                .tempdir_in(&base)
+                .unwrap()
+        }
+
+        fn names(dir: &Path) -> Vec<String> {
+            let mut found: Vec<String> = fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+
+            found.sort();
+
+            found
+        }
+
+        /// Everything beneath `dir` without following reparse points: kind, name
+        /// and, for plain files, length, modification time and content hash. The
+        /// session's own exclusively locked `.lock` file is recorded by name only.
+        fn snapshot(dir: &Path) -> Vec<String> {
+            fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) {
+                let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+
+                entries.sort_by_key(|entry| entry.file_name());
+
+                for entry in entries {
+                    let path = entry.path();
+                    let metadata = fs::symlink_metadata(&path).unwrap();
+                    let relative = path
+                        .strip_prefix(base)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    let kind = metadata.file_type();
+
+                    if kind.is_symlink() {
+                        out.push(format!("L {relative}"));
+                    } else if kind.is_dir() {
+                        out.push(format!("D {relative}"));
+                        walk(&path, base, out);
+                    } else if relative.ends_with(".lock") {
+                        out.push(format!("K {relative}"));
+                    } else {
+                        let modified: SystemTime = metadata.modified().unwrap();
+                        let hash = EnvelopeFingerprint::of_bytes(&fs::read(&path).unwrap());
+
+                        out.push(format!(
+                            "F {relative} {} {modified:?} {}",
+                            metadata.len(),
+                            hash.to_hex()
+                        ));
+                    }
+                }
+            }
+
+            let mut out = Vec::new();
+
+            walk(dir, dir, &mut out);
+
+            out
+        }
+
+        /// Open without sharing: later opens for data fail with a sharing
+        /// violation.
+        #[cfg(windows)]
+        fn hold_exclusively(path: &Path) -> fs::File {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(path)
+                .unwrap()
+        }
+
+        #[cfg(windows)]
+        fn make_junction(link: &Path, destination: &Path) {
+            let status = std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(destination)
+                .output()
+                .unwrap();
+
+            assert!(status.status.success(), "could not create a test junction");
+        }
+
+        /// An unlocked session over a synthetic schema-3 vault, an application
+        /// root with no sync state, and a target. `session` is declared first so
+        /// that it (and its exclusive lock file) drops before the scratch
+        /// directory is removed.
+        struct Bx {
+            session: UnlockedVaultSession,
+            root: SyncStateRoot,
+            target: SyncFileTarget,
+            vault: PathBuf,
+            remote: PathBuf,
+            local: String,
+            vault_id: Uuid,
+            dir: tempfile::TempDir,
+        }
+
+        impl Bx {
+            /// The target is a byte-for-byte copy of the vault file.
+            fn new(name: &str) -> Self {
+                let bx = Self::bare(name);
+
+                fs::copy(&bx.vault, &bx.remote).unwrap();
+
+                bx
+            }
+
+            /// The target does not exist.
+            fn bare(name: &str) -> Self {
+                Self::from_vault(name, |vault| {
+                    UnlockedVaultSession::create(vault, test_password(), NOW_MS).unwrap()
+                })
+            }
+
+            /// A legacy (schema 2, no revision) vault, unlocked, with an
+            /// identical target.
+            fn legacy(name: &str) -> Self {
+                let bx = Self::from_vault(name, |vault| {
+                    write_legacy_vault(vault, 2);
+
+                    UnlockedVaultSession::unlock(vault, test_password()).unwrap()
+                });
+
+                fs::copy(&bx.vault, &bx.remote).unwrap();
+
+                bx
+            }
+
+            fn from_vault(name: &str, open: impl FnOnce(&Path) -> UnlockedVaultSession) -> Self {
+                let dir = scratch(name);
+                let vaults = dir.path().join("vaults");
+                let remote_dir = dir.path().join("remote");
+
+                fs::create_dir_all(&vaults).unwrap();
+                fs::create_dir_all(&remote_dir).unwrap();
+
+                let vault = vaults.join("vault.lvault");
+                let remote = remote_dir.join("target.lvault");
+
+                let session = open(&vault);
+                let vault_id = session.data().vault_id;
+                let local = normalize_existing_vault_path(&vault).unwrap();
+                let target = SyncFileTarget::from_path(&remote).unwrap();
+                let root = SyncStateRoot::for_test(dir.path().join("app-local"));
+
+                Self {
+                    session,
+                    root,
+                    target,
+                    vault,
+                    remote,
+                    local,
+                    vault_id,
+                    dir,
+                }
+            }
+
+            fn vaults_dir(&self) -> PathBuf {
+                self.vault.parent().unwrap().to_path_buf()
+            }
+
+            fn remote_dir(&self) -> PathBuf {
+                self.remote.parent().unwrap().to_path_buf()
+            }
+
+            fn state_dir(&self) -> PathBuf {
+                self.root.path().join(SYNC_STATE_DIRECTORY)
+            }
+
+            fn store(&self) -> SyncStateStore {
+                SyncStateStore::new(self.root.path()).unwrap()
+            }
+
+            /// The single record file, if one exists.
+            fn record(&self) -> Option<PathBuf> {
+                let dir = self.state_dir();
+
+                if !dir.exists() {
+                    return None;
+                }
+
+                let mut found: Vec<PathBuf> = fs::read_dir(dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                    .collect();
+
+                assert!(found.len() <= 1);
+
+                found.pop()
+            }
+
+            fn record_bytes(&self) -> Vec<u8> {
+                fs::read(self.record().expect("a record")).unwrap()
+            }
+
+            fn approval(&self) -> InitialBindingApproval {
+                InitialBindingApproval::for_test(&self.target)
+            }
+
+            fn bind(&self) -> Result<Outcome, Refusal> {
+                self.session.bind_existing_identical_target(
+                    &self.root,
+                    &self.target,
+                    self.approval(),
+                )
+            }
+
+            /// Bind with the real filesystem read and entropy, counting reads.
+            fn bind_counting(&self, target: &SyncFileTarget) -> (Result<Outcome, Refusal>, usize) {
+                let reads = Cell::new(0usize);
+
+                let result = self.bind_with(
+                    target,
+                    &mut |t| {
+                        reads.set(reads.get() + 1);
+
+                        t.read()
+                    },
+                    &mut |buffer| getrandom::fill(buffer).is_ok(),
+                );
+
+                (result, reads.get())
+            }
+
+            fn bind_with(
+                &self,
+                target: &SyncFileTarget,
+                read: &mut dyn FnMut(&SyncFileTarget) -> SyncFileRead,
+                entropy: &mut dyn FnMut(&mut [u8]) -> bool,
+            ) -> Result<Outcome, Refusal> {
+                self.session.bind_existing_identical_target_in(
+                    &self.store(),
+                    target,
+                    InitialBindingApproval::for_test(target),
+                    read,
+                    entropy,
+                )
+            }
+
+            /// A record for this very vault, location and target.
+            fn state(&self, base: SyncBase, pending: Option<PendingPush>) -> SyncState {
+                let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+
+                SyncState::new(
+                    BindingId::new(BINDING).unwrap(),
+                    VaultBindingTag::derive(salt, self.vault_id).unwrap(),
+                    loc(&self.local),
+                    self.target.locator().clone(),
+                    base,
+                    pending,
+                )
+                .unwrap()
+            }
+
+            fn based(&self) -> SyncState {
+                self.state(
+                    SyncBase::Based(
+                        SyncCheckpoint::new(fp(1), 1, RemoteHighWater::new(5)).unwrap(),
+                    ),
+                    None,
+                )
+            }
+
+            fn publish(&self, state: &SyncState) {
+                self.store().create(state).unwrap();
+            }
+
+            /// Envelope bytes of this vault with `edit` applied to the payload,
+            /// sealed by the real sealing path under the real Vault Key. A fresh
+            /// nonce makes them differ from the file even without an edit.
+            fn resealed(&self, edit: impl FnOnce(&mut VaultData)) -> Vec<u8> {
+                let mut data = self.session.data().clone();
+
+                edit(&mut data);
+
+                let plaintext = Zeroizing::new(serde_json::to_vec(&data).unwrap());
+                let envelope = reseal_envelope(
+                    &self.session.envelope,
+                    &self.session.vault_key,
+                    plaintext.as_slice(),
+                )
+                .unwrap();
+
+                serde_json::to_vec(&envelope).unwrap()
+            }
+
+            fn put_remote(&self, bytes: &[u8]) {
+                fs::write(&self.remote, bytes).unwrap();
+            }
+
+            /// Assert the refusal happened without creating or changing any
+            /// sync state, and without writing the vault folder or the target
+            /// folder.
+            fn assert_refused(&self, expected: Refusal) {
+                let vaults = snapshot(&self.vaults_dir());
+                let remote = snapshot(&self.remote_dir());
+                let state_existed = self.state_dir().exists();
+                let state = state_existed.then(|| snapshot(&self.state_dir()));
+
+                assert_eq!(self.bind(), Err(expected));
+
+                assert_eq!(snapshot(&self.vaults_dir()), vaults);
+                assert_eq!(snapshot(&self.remote_dir()), remote);
+                assert_eq!(self.state_dir().exists(), state_existed);
+
+                if let Some(state) = state {
+                    assert_eq!(snapshot(&self.state_dir()), state);
+                }
+            }
+
+            /// As [`assert_refused`](Self::assert_refused), and the target was
+            /// never read.
+            fn assert_refused_unread(&self, expected: Refusal) {
+                let state_existed = self.state_dir().exists();
+                let state = state_existed.then(|| snapshot(&self.state_dir()));
+
+                let (result, reads) = self.bind_counting(&self.target);
+
+                assert_eq!(result, Err(expected));
+                assert_eq!(reads, 0, "the target was read before the check");
+                assert_eq!(self.state_dir().exists(), state_existed);
+
+                if let Some(state) = state {
+                    assert_eq!(snapshot(&self.state_dir()), state);
+                }
+            }
+
+            fn loaded(&self) -> SyncState {
+                match self.session.load_sync_state(&self.root) {
+                    SessionSyncState::Bound(bound) => bound.state().clone(),
+                    other => panic!("expected a bound state, got {other:?}"),
+                }
+            }
+        }
+
+        fn transition(refusal: TransitionRefusal) -> Refusal {
+            Refusal::Transition(refusal)
+        }
+
+        fn inspection(error: BoundInspectionError) -> Refusal {
+            Refusal::Inspection(error)
+        }
+
+        fn candidate_rejected(reason: PayloadRejection) -> Refusal {
+            inspection(BoundInspectionError::Inspection(
+                InspectionError::Candidate(reason),
+            ))
+        }
+
+        // 1, 2, 8, 25, 26, 29. An identical target creates a verified binding that
+        // a fresh load retains, with the right locators and checkpoint, and
+        // nothing else changes.
+        #[test]
+        fn an_identical_target_creates_a_verified_binding_and_changes_only_the_record() {
+            let bx = Bx::new("b1f-bind");
+            let vault_bytes = fs::read(&bx.vault).unwrap();
+
+            assert_eq!(fs::read(&bx.remote).unwrap(), vault_bytes);
+
+            // First use: not even the application-data root exists.
+            assert!(!bx.root.path().exists());
+            assert_eq!(
+                bx.session.load_sync_state(&bx.root),
+                SessionSyncState::NotConfigured
+            );
+
+            let vaults_before = snapshot(&bx.vaults_dir());
+            let remote_before = snapshot(&bx.remote_dir());
+
+            assert_eq!(bx.bind(), Ok(Outcome::BoundAndVerified));
+
+            // Only the sync-state record exists afterwards.
+            assert_eq!(snapshot(&bx.vaults_dir()), vaults_before);
+            assert_eq!(snapshot(&bx.remote_dir()), remote_before);
+            assert_eq!(fs::read(&bx.vault).unwrap(), vault_bytes);
+            assert_eq!(fs::read(&bx.remote).unwrap(), vault_bytes);
+            assert_eq!(names(bx.root.path()), [SYNC_STATE_DIRECTORY]);
+            assert_eq!(names(&bx.state_dir()).len(), 1, "no staging file is left");
+
+            // A fresh load retains the binding.
+            let state = bx.loaded();
+
+            assert_eq!(state.local_locator().as_str(), bx.local);
+            assert_eq!(state.target_locator(), bx.target.locator());
+            assert!(state.vault_tag().matches_vault(bx.vault_id));
+            assert!(!state.vault_tag().matches_vault(OTHER_VAULT_ID));
+            assert!(state.pending_push().is_none());
+            assert_eq!(bx.record_bytes(), state.encode().unwrap());
+
+            // The checkpoint is exactly the core's: the exact bytes' fingerprint,
+            // the authenticated revision (0 for a new vault) as both the synced
+            // revision and the starting high-water mark.
+            let SyncBase::Based(checkpoint) = state.base() else {
+                panic!("expected a based state");
+            };
+
+            assert_eq!(
+                *checkpoint.synced(),
+                EnvelopeFingerprint::of_bytes(&vault_bytes)
+            );
+            assert_eq!(checkpoint.synced_revision(), 0);
+            assert_eq!(checkpoint.high_water().revision(), 0);
+        }
+
+        #[test]
+        fn the_binding_survives_closing_and_reopening_the_session() {
+            let bx = Bx::new("b1f-reopen");
+
+            assert_eq!(bx.bind(), Ok(Outcome::BoundAndVerified));
+
+            let expected = bx.loaded();
+            let Bx {
+                session,
+                root,
+                vault,
+                dir,
+                ..
+            } = bx;
+
+            session.lock();
+
+            let reopened = UnlockedVaultSession::unlock(&vault, test_password()).unwrap();
+
+            let SessionSyncState::Bound(bound) = reopened.load_sync_state(&root) else {
+                panic!("the binding was not retained");
+            };
+
+            assert_eq!(*bound.state(), expected);
+
+            drop(reopened);
+            drop(dir);
+        }
+
+        // 31. The binding is a real one: the accepted B1c/B1e observation works on
+        // it unchanged, and an observation of the identical target changes nothing.
+        #[test]
+        fn the_new_binding_is_usable_by_the_unchanged_observation() {
+            let bx = Bx::new("b1f-observe");
+
+            assert_eq!(bx.bind(), Ok(Outcome::BoundAndVerified));
+
+            let record = bx.record_bytes();
+            let before = snapshot(&bx.state_dir());
+
+            assert_eq!(
+                bx.session.observe_remote_target(&bx.root, &bx.target),
+                Ok(RemoteObservationOutcome::Unchanged)
+            );
+            assert_eq!(bx.record_bytes(), record);
+            assert_eq!(snapshot(&bx.state_dir()), before);
+        }
+
+        // 3. A target that differs in bytes is refused and creates nothing.
+        #[test]
+        fn a_target_that_differs_in_bytes_is_refused_and_creates_nothing() {
+            let bx = Bx::new("b1f-differs");
+
+            // A genuine envelope of this vault at a higher revision.
+            bx.put_remote(&bx.resealed(|data| data.revision = 7));
+            bx.assert_refused(transition(TransitionRefusal::RemoteDiffers));
+            assert!(bx.record().is_none());
+            assert!(!bx.state_dir().exists());
+
+            // One byte appended to an otherwise identical copy: not an envelope.
+            let mut longer = fs::read(&bx.vault).unwrap();
+
+            longer.push(b' ');
+            bx.put_remote(&longer);
+
+            // Trailing whitespace is tolerated by JSON parsing, so the envelope
+            // authenticates, and the bytes differ.
+            bx.assert_refused(transition(TransitionRefusal::RemoteDiffers));
+            assert!(!bx.state_dir().exists());
+        }
+
+        // 4. The same plaintext and key, sealed again or merely reformatted, is a
+        // different byte string and is refused: byte identity is required.
+        #[test]
+        fn a_different_encryption_of_the_same_plaintext_is_refused() {
+            let bx = Bx::new("b1f-representation");
+            let on_disk = fs::read(&bx.vault).unwrap();
+
+            // Re-sealed: fresh nonce, identical authenticated contents.
+            let resealed = bx.resealed(|_| {});
+
+            assert_ne!(resealed, on_disk);
+
+            bx.put_remote(&resealed);
+            bx.assert_refused(transition(TransitionRefusal::RemoteDiffers));
+
+            // Same envelope, different JSON formatting.
+            let envelope: VaultEnvelope = serde_json::from_slice(&on_disk).unwrap();
+            let pretty = serde_json::to_vec_pretty(&envelope).unwrap();
+
+            assert_ne!(pretty, on_disk);
+
+            bx.put_remote(&pretty);
+            bx.assert_refused(transition(TransitionRefusal::RemoteDiffers));
+
+            assert!(!bx.state_dir().exists());
+        }
+
+        // 5. A payload authenticated under this vault's key but carrying another
+        // vault identity is refused; the identity is never taken from the target.
+        #[test]
+        fn a_target_with_another_authenticated_vault_identity_is_refused() {
+            let bx = Bx::new("b1f-identity");
+
+            bx.put_remote(&bx.resealed(|data| data.vault_id = OTHER_VAULT_ID));
+            bx.assert_refused(candidate_rejected(PayloadRejection::VaultIdMismatch));
+            assert!(!bx.state_dir().exists());
+        }
+
+        // 6. A foreign vault, a damaged envelope and garbage never authenticate.
+        #[test]
+        fn a_target_that_does_not_authenticate_as_this_vault_is_refused() {
+            let bx = Bx::new("b1f-authentication");
+
+            // Another vault entirely: a different Vault Key.
+            let foreign_path = bx.dir.path().join("foreign").join("foreign.lvault");
+            let foreign =
+                UnlockedVaultSession::create(&foreign_path, test_password(), NOW_MS).unwrap();
+
+            foreign.lock();
+
+            bx.put_remote(&fs::read(&foreign_path).unwrap());
+            bx.assert_refused(candidate_rejected(PayloadRejection::AuthenticationFailed));
+
+            // This vault's own envelope with one payload byte flipped.
+            let mut damaged: VaultEnvelope =
+                serde_json::from_slice(&fs::read(&bx.vault).unwrap()).unwrap();
+
+            damaged.payload.ciphertext[0] ^= 0x01;
+            bx.put_remote(&serde_json::to_vec(&damaged).unwrap());
+            bx.assert_refused(candidate_rejected(PayloadRejection::AuthenticationFailed));
+
+            // Not an envelope at all.
+            bx.put_remote(b"this is not an envelope");
+            bx.assert_refused(inspection(BoundInspectionError::MalformedEnvelope {
+                input: EnvelopeInput::Candidate,
+            }));
+
+            assert!(!bx.state_dir().exists());
+        }
+
+        // 7. A payload with no authenticated revision cannot be bound, on either
+        // side.
+        #[test]
+        fn a_legacy_payload_without_an_authenticated_revision_is_refused() {
+            // A legacy local vault and a byte-identical legacy target: the
+            // identity holds, but there is no revision to checkpoint.
+            let legacy = Bx::legacy("b1f-legacy-local");
+
+            assert_eq!(
+                fs::read(&legacy.vault).unwrap(),
+                fs::read(&legacy.remote).unwrap()
+            );
+            legacy.assert_refused(transition(TransitionRefusal::LocalUnversioned));
+            assert!(!legacy.state_dir().exists());
+
+            // A schema-3 local vault and a legacy copy of the same vault.
+            let bx = Bx::new("b1f-legacy-target");
+
+            bx.put_remote(&bx.resealed(|data| data.schema_version = 2));
+            bx.assert_refused(transition(TransitionRefusal::RemoteDiffers));
+            assert!(!bx.state_dir().exists());
+        }
+
+        // 9, 10, 11. An existing record, of any base, is never replaced.
+        #[test]
+        fn an_existing_based_unbased_or_pending_record_is_never_overwritten() {
+            type MakeState = Box<dyn Fn(&Bx) -> SyncState>;
+
+            let cases: Vec<(&str, MakeState)> = vec![
+                ("based", Box::new(|bx| bx.based())),
+                (
+                    "unbased",
+                    Box::new(|bx| {
+                        bx.state(
+                            SyncBase::Unbased,
+                            Some(
+                                PendingPush::new(
+                                    INTENT,
+                                    PushIntent::new(PushBaseline::Absent, fp(2)).unwrap(),
+                                    1,
+                                )
+                                .unwrap(),
+                            ),
+                        )
+                    }),
+                ),
+                (
+                    "pending",
+                    Box::new(|bx| {
+                        bx.state(
+                            SyncBase::Based(
+                                SyncCheckpoint::new(fp(1), 1, RemoteHighWater::new(5)).unwrap(),
+                            ),
+                            Some(
+                                PendingPush::new(
+                                    INTENT,
+                                    PushIntent::new(PushBaseline::Present(fp(1)), fp(3)).unwrap(),
+                                    6,
+                                )
+                                .unwrap(),
+                            ),
+                        )
+                    }),
+                ),
+            ];
+
+            for (name, make) in cases {
+                let bx = Bx::new(&format!("b1f-existing-{name}"));
+                let existing = make(&bx);
+
+                bx.publish(&existing);
+
+                let record = bx.record_bytes();
+
+                bx.assert_refused_unread(Refusal::ExistingBinding);
+
+                assert_eq!(bx.record_bytes(), record, "{name}");
+                assert_eq!(bx.loaded(), existing, "{name}");
+            }
+        }
+
+        // A record for another vault, or another location, is also refused, left
+        // alone and never adopted.
+        #[test]
+        fn a_record_for_another_vault_is_refused_and_left_alone() {
+            let bx = Bx::new("b1f-existing-foreign");
+            let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+            let foreign = SyncState::new(
+                BindingId::new(BINDING).unwrap(),
+                VaultBindingTag::derive(salt, OTHER_VAULT_ID).unwrap(),
+                loc(&bx.local),
+                bx.target.locator().clone(),
+                bx.based().base().to_owned(),
+                None,
+            )
+            .unwrap();
+
+            bx.publish(&foreign);
+
+            let record = bx.record_bytes();
+
+            bx.assert_refused_unread(Refusal::ExistingBindingMismatch(
+                BindingMismatch::VaultIdentity,
+            ));
+            assert_eq!(bx.record_bytes(), record);
+        }
+
+        // 12, 13, 14, 15. Corrupt, unsupported, unreadable and stale-artifact
+        // states are refused, never reset, never treated as absence.
+        #[test]
+        fn corrupt_unsupported_unreadable_and_stale_states_are_never_replaced() {
+            let bx = Bx::new("b1f-unusable");
+
+            bx.publish(&bx.based());
+
+            let record = bx.record().unwrap();
+            let valid = bx.based();
+
+            let check = |bytes: &[u8], expected: Refusal| {
+                fs::write(&record, bytes).unwrap();
+
+                bx.assert_refused_unread(expected);
+
+                assert_eq!(fs::read(&record).unwrap(), bytes);
+                assert_eq!(names(&bx.state_dir()).len(), 1);
+            };
+
+            check(
+                b"this is not a sync state",
+                Refusal::Corrupt(CorruptReason::Undecodable),
+            );
+            check(b"", Refusal::Corrupt(CorruptReason::Empty));
+
+            let mut future: serde_json::Value =
+                serde_json::from_slice(&valid.encode().unwrap()).unwrap();
+
+            future["version"] = serde_json::json!(2);
+            future["added_in_v2"] = serde_json::json!(true);
+            check(
+                &serde_json::to_vec(&future).unwrap(),
+                Refusal::UnsupportedVersion,
+            );
+
+            // Unreadable: the record is held open without sharing.
+            fs::write(&record, valid.encode().unwrap()).unwrap();
+
+            #[cfg(windows)]
+            {
+                let original = fs::read(&record).ok();
+                let guard = hold_exclusively(&record);
+                let (result, reads) = bx.bind_counting(&bx.target);
+
+                assert!(
+                    matches!(result, Err(Refusal::Unreadable(UnreadableReason::Io(_)))),
+                    "got {result:?}"
+                );
+                assert_eq!(reads, 0);
+
+                drop(guard);
+
+                assert_eq!(fs::read(&record).ok(), original);
+            }
+
+            // An interrupted-write artifact without a record: absence is not
+            // established.
+            let key = record.file_stem().unwrap().to_string_lossy().into_owned();
+            let artifact = bx.state_dir().join(format!("{key}.{STALE_TOKEN}.tmp"));
+
+            fs::remove_file(&record).unwrap();
+            fs::write(&artifact, b"debris").unwrap();
+            bx.assert_refused_unread(Refusal::Unreadable(UnreadableReason::UnresolvedArtifacts));
+
+            assert_eq!(fs::read(&artifact).unwrap(), b"debris");
+            assert!(bx.record().is_none());
+        }
+
+        // 16. A target absent from a valid local folder is a refusal, never
+        // authority to publish.
+        #[test]
+        fn a_missing_target_is_refused_and_nothing_is_published() {
+            let bx = Bx::bare("b1f-missing");
+
+            assert!(!bx.remote.exists());
+
+            let (result, reads) = bx.bind_counting(&bx.target);
+
+            // The read ran (it is the step that reports absence) but nothing was
+            // created: no target, no state directory, no application root.
+            assert_eq!(result, Err(Refusal::TargetAbsentOnDisk));
+            assert_eq!(reads, 1);
+            assert!(!bx.remote.exists());
+            assert!(!bx.state_dir().exists());
+            assert!(!bx.root.path().exists());
+
+            // A missing folder is unavailable, not absent.
+            let nested =
+                SyncFileTarget::from_path(&bx.dir.path().join("nowhere").join("t.lvault")).unwrap();
+            let (result, _) = bx.bind_counting(&nested);
+
+            assert_eq!(
+                result,
+                Err(Refusal::TargetUnavailable(UnavailableReason::ParentMissing))
+            );
+            assert!(!bx.root.path().exists());
+        }
+
+        // 17. An inaccessible, special or redirected target is unavailable.
+        #[test]
+        fn an_inaccessible_target_is_refused_and_nothing_is_published() {
+            let bx = Bx::new("b1f-inaccessible");
+
+            #[cfg(windows)]
+            {
+                let guard = hold_exclusively(&bx.remote);
+                let (result, _) = bx.bind_counting(&bx.target);
+
+                assert!(
+                    matches!(
+                        result,
+                        Err(Refusal::TargetUnavailable(UnavailableReason::Io(_)))
+                    ),
+                    "got {result:?}"
+                );
+
+                drop(guard);
+            }
+
+            // A directory in the target's place.
+            fs::remove_file(&bx.remote).unwrap();
+            fs::create_dir(&bx.remote).unwrap();
+            bx.assert_refused(Refusal::TargetUnavailable(
+                UnavailableReason::UnexpectedObject,
+            ));
+
+            // A junction in the target's folder chain is not followed.
+            #[cfg(windows)]
+            {
+                fs::remove_dir(&bx.remote).unwrap();
+
+                let real = bx.dir.path().join("real");
+
+                fs::create_dir_all(&real).unwrap();
+                fs::copy(&bx.vault, real.join("target.lvault")).unwrap();
+
+                let link = bx.dir.path().join("link");
+
+                make_junction(&link, &real);
+
+                let through = SyncFileTarget::from_path(&link.join("target.lvault")).unwrap();
+                let (result, _) = bx.bind_counting(&through);
+
+                assert_eq!(
+                    result,
+                    Err(Refusal::TargetUnavailable(
+                        UnavailableReason::UnexpectedObject
+                    ))
+                );
+
+                // Removes only the junction, not what it points to.
+                fs::remove_dir(&link).unwrap();
+                assert!(real.join("target.lvault").exists());
+            }
+
+            assert!(!bx.state_dir().exists());
+            assert!(!bx.root.path().exists());
+        }
+
+        // 18. An empty or oversized target is refused.
+        #[test]
+        fn an_empty_or_oversized_target_is_refused_and_nothing_is_published() {
+            let bx = Bx::new("b1f-empty-oversized");
+
+            bx.put_remote(b"");
+            bx.assert_refused(Refusal::TargetUnavailable(UnavailableReason::Empty));
+
+            bx.put_remote(&vec![0u8; MAX_ENVELOPE_BYTES + 1]);
+            bx.assert_refused(Refusal::TargetUnavailable(UnavailableReason::TooLarge));
+
+            assert!(!bx.state_dir().exists());
+            assert!(!bx.root.path().exists());
+        }
+
+        // 19. The vault's own primary, backup, lock and sync state are never a
+        // target, however the path is spelled, and are refused before any read.
+        #[test]
+        fn a_target_naming_a_vault_file_is_refused_before_any_read() {
+            let bx = Bx::new("b1f-alias");
+
+            // The backup file, as a save would leave it.
+            let backup = bx.session.backup_path().to_path_buf();
+
+            fs::copy(&bx.vault, &backup).unwrap();
+
+            // A file inside the sync-state directory, with no record for this
+            // location (so the state is still confirmed absent).
+            fs::create_dir_all(bx.state_dir()).unwrap();
+
+            let unrelated = bx.state_dir().join("unrelated.json");
+
+            fs::write(&unrelated, fs::read(&bx.vault).unwrap()).unwrap();
+
+            let primary = bx.vault.to_string_lossy().into_owned();
+            let spellings = [
+                // As the user would pick it.
+                primary.clone(),
+                // The normalized form the binding itself stores.
+                bx.local.clone(),
+                // Case differences are the same file on Windows.
+                primary.to_ascii_uppercase(),
+                backup.to_string_lossy().into_owned(),
+                lock_path_for(&bx.vault).to_string_lossy().into_owned(),
+                unrelated.to_string_lossy().into_owned(),
+            ];
+
+            for spelling in spellings {
+                let aliased = SyncFileTarget::from_path(Path::new(&spelling)).unwrap();
+                let state = snapshot(&bx.state_dir());
+                let vaults = snapshot(&bx.vaults_dir());
+                let (result, reads) = bx.bind_counting(&aliased);
+
+                assert_eq!(result, Err(Refusal::TargetIsVaultFile), "{spelling}");
+                assert_eq!(reads, 0, "read before the check: {spelling}");
+                assert_eq!(snapshot(&bx.state_dir()), state);
+                assert_eq!(snapshot(&bx.vaults_dir()), vaults);
+            }
+
+            // The control: an unrelated byte copy elsewhere is accepted.
+            assert_eq!(bx.bind(), Ok(Outcome::BoundAndVerified));
+        }
+
+        // The approval belongs to one target.
+        #[test]
+        fn an_approval_for_another_target_is_refused_before_anything_is_read() {
+            let bx = Bx::new("b1f-approval");
+            let other = SyncFileTarget::from_path(&bx.remote_dir().join("other.lvault")).unwrap();
+            let reads = Cell::new(0usize);
+
+            let result = bx.session.bind_existing_identical_target_in(
+                &bx.store(),
+                &bx.target,
+                InitialBindingApproval::for_test(&other),
+                &mut |t| {
+                    reads.set(reads.get() + 1);
+
+                    t.read()
+                },
+                &mut |buffer| getrandom::fill(buffer).is_ok(),
+            );
+
+            assert_eq!(result, Err(Refusal::ApprovalTargetMismatch));
+            assert_eq!(reads.get(), 0);
+            assert!(!bx.root.path().exists());
+        }
+
+        // 20. A local vault that is not the unlocked one is refused before the
+        // target is read.
+        #[test]
+        fn a_vault_file_that_is_not_the_unlocked_one_is_refused() {
+            let bx = Bx::new("b1f-vault-changed");
+            let unavailable = Refusal::Unavailable(SyncStateUnavailable::LocalVaultChanged);
+
+            // Replaced by a non-cooperating writer.
+            let replacement = create_envelope(MASTER_PASSWORD, b"external replacement").unwrap();
+
+            save_envelope_atomic(&bx.vault, &replacement).unwrap();
+            bx.assert_refused_unread(unavailable);
+
+            // Deleted.
+            fs::remove_file(&bx.vault).unwrap();
+            bx.assert_refused_unread(unavailable);
+
+            assert!(!bx.root.path().exists());
+        }
+
+        // 21. A local vault replaced between the inspection and the publication,
+        // and a target that changes or is withdrawn before it, are caught by the
+        // repeated verification.
+        #[test]
+        fn evidence_that_changes_before_publication_is_refused() {
+            // The target is unavailable (as the adapter reports a change during
+            // a read).
+            let bx = Bx::new("b1f-changed-during-read");
+            let result = bx.bind_with(
+                &bx.target,
+                &mut |_| SyncFileRead::Unavailable(UnavailableReason::Changed),
+                &mut |buffer| getrandom::fill(buffer).is_ok(),
+            );
+
+            assert_eq!(
+                result,
+                Err(Refusal::TargetUnavailable(UnavailableReason::Changed))
+            );
+            assert!(!bx.root.path().exists());
+
+            // The local vault is replaced after the first read.
+            let bx = Bx::new("b1f-local-replaced");
+            let vault = bx.vault.clone();
+            let reads = Cell::new(0usize);
+
+            let result = bx.bind_with(
+                &bx.target,
+                &mut |t| {
+                    let read = t.read();
+
+                    if reads.get() == 0 {
+                        let replacement =
+                            create_envelope(MASTER_PASSWORD, b"external replacement").unwrap();
+
+                        save_envelope_atomic(&vault, &replacement).unwrap();
+                    }
+
+                    reads.set(reads.get() + 1);
+
+                    read
+                },
+                &mut |buffer| getrandom::fill(buffer).is_ok(),
+            );
+
+            assert_eq!(
+                result,
+                Err(Refusal::Unavailable(
+                    SyncStateUnavailable::LocalVaultChanged
+                ))
+            );
+            assert_eq!(reads.get(), 1, "the target was read again after the change");
+            assert!(!bx.root.path().exists());
+
+            // The target is replaced before the second read.
+            let bx = Bx::new("b1f-target-replaced");
+            let remote = bx.remote.clone();
+            let changed = bx.resealed(|_| {});
+            let reads = Cell::new(0usize);
+
+            let result = bx.bind_with(
+                &bx.target,
+                &mut |t| {
+                    if reads.get() == 1 {
+                        fs::write(&remote, &changed).unwrap();
+                    }
+
+                    reads.set(reads.get() + 1);
+
+                    t.read()
+                },
+                &mut |buffer| getrandom::fill(buffer).is_ok(),
+            );
+
+            assert_eq!(result, Err(Refusal::EvidenceChanged));
+            assert_eq!(reads.get(), 2);
+            assert!(!bx.root.path().exists());
+
+            // The target is withdrawn before the second read.
+            let bx = Bx::new("b1f-target-withdrawn");
+            let remote = bx.remote.clone();
+            let reads = Cell::new(0usize);
+
+            let result = bx.bind_with(
+                &bx.target,
+                &mut |t| {
+                    if reads.get() == 1 {
+                        fs::remove_file(&remote).unwrap();
+                    }
+
+                    reads.set(reads.get() + 1);
+
+                    t.read()
+                },
+                &mut |buffer| getrandom::fill(buffer).is_ok(),
+            );
+
+            assert_eq!(result, Err(Refusal::EvidenceChanged));
+            assert!(!bx.root.path().exists());
+        }
+
+        // 22. A record that appears between the check and publication is never
+        // clobbered.
+        #[test]
+        fn a_record_that_appears_before_publication_is_not_replaced() {
+            let bx = Bx::new("b1f-appeared");
+            let planted = bx.based();
+            let store = bx.store();
+            let reads = Cell::new(0usize);
+
+            let result = bx.session.bind_existing_identical_target_in(
+                &store,
+                &bx.target,
+                bx.approval(),
+                &mut |t| {
+                    // After the second (pre-publication) read the record is
+                    // created by someone else.
+                    if reads.get() == 1 {
+                        let publisher = SyncStateStore::new(bx.root.path()).unwrap();
+
+                        publisher.create(&planted).unwrap();
+                    }
+
+                    reads.set(reads.get() + 1);
+
+                    t.read()
+                },
+                &mut |buffer| getrandom::fill(buffer).is_ok(),
+            );
+
+            assert_eq!(result, Err(Refusal::RecordAppeared));
+            assert_eq!(bx.record_bytes(), planted.encode().unwrap());
+            assert_eq!(bx.loaded(), planted);
+            assert_eq!(names(&bx.state_dir()).len(), 1);
+        }
+
+        // 26. A fresh id and salt per binding, drawn from the entropy source.
+        #[test]
+        fn each_binding_draws_a_fresh_id_and_salt() {
+            let first = Bx::new("b1f-fresh-1");
+
+            // The same vault (same authenticated vault id) at a second location.
+            let second_vault = first.dir.path().join("vaults").join("second.lvault");
+
+            fs::copy(&first.vault, &second_vault).unwrap();
+
+            let second_session =
+                UnlockedVaultSession::unlock(&second_vault, test_password()).unwrap();
+            let second_remote = first.dir.path().join("remote").join("second-target.lvault");
+
+            fs::copy(&second_vault, &second_remote).unwrap();
+
+            let second_target = SyncFileTarget::from_path(&second_remote).unwrap();
+
+            let requested = RefCell::new(Vec::new());
+
+            assert_eq!(
+                first.bind_with(&first.target, &mut |t| t.read(), &mut |buffer| {
+                    requested.borrow_mut().push(buffer.len());
+
+                    getrandom::fill(buffer).is_ok()
+                },),
+                Ok(Outcome::BoundAndVerified)
+            );
+            assert_eq!(*requested.borrow(), [16, BINDING_SALT_LEN]);
+
+            assert_eq!(
+                second_session.bind_existing_identical_target(
+                    &first.root,
+                    &second_target,
+                    InitialBindingApproval::for_test(&second_target),
+                ),
+                Ok(Outcome::BoundAndVerified)
+            );
+
+            let one = first.loaded();
+            let SessionSyncState::Bound(two) = second_session.load_sync_state(&first.root) else {
+                panic!("the second binding was not retained");
+            };
+            let two = two.state();
+
+            assert_eq!(first.vault_id, second_session.data().vault_id);
+            assert_ne!(one.binding_id(), two.binding_id());
+            assert_ne!(one.vault_tag(), two.vault_tag(), "the salt was reused");
+            assert_eq!(one.binding_id().uuid().get_version_num(), 4);
+            assert!(!one.binding_id().uuid().is_nil());
+            assert!(one.vault_tag().matches_vault(first.vault_id));
+            assert!(two.vault_tag().matches_vault(first.vault_id));
+
+            drop(second_session);
+        }
+
+        #[test]
+        fn unavailable_randomness_creates_nothing() {
+            let bx = Bx::new("b1f-no-entropy");
+            let draws = Cell::new(0usize);
+
+            let result = bx.bind_with(&bx.target, &mut |t| t.read(), &mut |_| {
+                draws.set(draws.get() + 1);
+
+                false
+            });
+
+            assert_eq!(result, Err(Refusal::Randomness));
+            assert_eq!(draws.get(), 1, "a second draw was attempted");
+            assert!(!bx.root.path().exists());
+        }
+
+        // 24 (the branch no store fault can reach). After a successful
+        // publication and the store's own readback, success is reported only if a
+        // fresh, independent load is exactly the proposal and still passes the
+        // core's binding check for this authenticated vault and both locators.
+        // Every other load, or any disagreement, leaves the persistence
+        // unverified. Exercised directly, because no hook exists between the
+        // store's verification and the operation's reload.
+        #[test]
+        fn only_a_fresh_load_equal_to_the_proposal_and_bound_to_this_vault_confirms() {
+            let bx = Bx::new("b1f-fresh-load");
+            let proposed = bx.based();
+            let local = loc(&bx.local);
+            let target = bx.target.locator().clone();
+
+            let confirms = |load: StateLoad, vault: Uuid, local: &Locator, target: &Locator| {
+                fresh_load_confirms_binding(load, &proposed, vault, local, target)
+            };
+            let loaded = |state: &SyncState| StateLoad::Loaded(Box::new(state.clone()));
+
+            // The control: exactly the proposal, for this vault and locators.
+            assert!(confirms(loaded(&proposed), bx.vault_id, &local, &target));
+
+            // No usable record is never a confirmation.
+            for load in [
+                StateLoad::NotConfigured,
+                StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts),
+                StateLoad::Unreadable(UnreadableReason::Io(io::ErrorKind::PermissionDenied)),
+                StateLoad::Corrupt(CorruptReason::Undecodable),
+                StateLoad::UnsupportedVersion,
+            ] {
+                assert!(!confirms(load, bx.vault_id, &local, &target));
+            }
+
+            // A valid record that is not the proposal (another binding id, another
+            // checkpoint, a pending push) is not a confirmation.
+            let other_id = SyncState::new(
+                BindingId::new(INTENT).unwrap(),
+                *proposed.vault_tag(),
+                proposed.local_locator().clone(),
+                proposed.target_locator().clone(),
+                *proposed.base(),
+                None,
+            )
+            .unwrap();
+            let other_checkpoint = bx.state(
+                SyncBase::Based(SyncCheckpoint::new(fp(9), 3, RemoteHighWater::new(3)).unwrap()),
+                None,
+            );
+
+            assert!(!confirms(loaded(&other_id), bx.vault_id, &local, &target));
+            assert!(!confirms(
+                loaded(&other_checkpoint),
+                bx.vault_id,
+                &local,
+                &target
+            ));
+
+            // The proposal itself, but not bound to the authenticated vault or to
+            // the locators the operation used.
+            assert!(!confirms(
+                loaded(&proposed),
+                OTHER_VAULT_ID,
+                &local,
+                &target
+            ));
+            assert!(!confirms(
+                loaded(&proposed),
+                bx.vault_id,
+                &loc("C:\\elsewhere\\vault.lvault"),
+                &target
+            ));
+            assert!(!confirms(
+                loaded(&proposed),
+                bx.vault_id,
+                &local,
+                &loc("C:\\elsewhere\\target.lvault")
+            ));
+        }
+
+        // 27. The exclusive OS lock is held for the whole operation, across both
+        // reads of the target and the publication, and afterwards.
+        #[test]
+        fn the_session_lock_is_held_across_the_operation() {
+            let bx = Bx::new("b1f-lock");
+            let vault = bx.vault.clone();
+            let refused = Cell::new(0u8);
+
+            let result = bx.bind_with(
+                &bx.target,
+                &mut |t| {
+                    let attempt = UnlockedVaultSession::unlock(&vault, test_password());
+
+                    if matches!(attempt, Err(SessionError::InUse)) {
+                        refused.set(refused.get() + 1);
+                    }
+
+                    t.read()
+                },
+                &mut |buffer| getrandom::fill(buffer).is_ok(),
+            );
+
+            assert_eq!(result, Ok(Outcome::BoundAndVerified));
+            assert_eq!(refused.get(), 2, "the lock was not held during both reads");
+
+            assert!(matches!(
+                UnlockedVaultSession::unlock(&bx.vault, test_password()),
+                Err(SessionError::InUse)
+            ));
+        }
+
+        // 29. No outcome writes the target, the vault, its backup, or anything
+        // outside the sync-state directory.
+        #[test]
+        fn no_outcome_writes_anything_but_the_new_record() {
+            let bx = Bx::new("b1f-no-writes");
+            let vaults = snapshot(&bx.vaults_dir());
+
+            // A refusal.
+            bx.put_remote(b"garbage");
+
+            let remote_garbage = snapshot(&bx.remote_dir());
+
+            assert!(bx.bind().is_err());
+            assert_eq!(snapshot(&bx.vaults_dir()), vaults);
+            assert_eq!(snapshot(&bx.remote_dir()), remote_garbage);
+            assert!(!bx.root.path().exists());
+
+            // Success.
+            fs::copy(&bx.vault, &bx.remote).unwrap();
+
+            let remote = snapshot(&bx.remote_dir());
+
+            assert_eq!(bx.bind(), Ok(Outcome::BoundAndVerified));
+            assert_eq!(snapshot(&bx.vaults_dir()), vaults);
+            assert_eq!(snapshot(&bx.remote_dir()), remote);
+
+            let created = names(bx.root.path());
+
+            assert_eq!(created, [SYNC_STATE_DIRECTORY]);
+            assert_eq!(names(&bx.state_dir()).len(), 1);
+        }
+
+        // 30. Nothing printed, in any outcome, carries a path, identifier,
+        // fingerprint, key, password or content.
+        #[test]
+        fn outcomes_and_errors_reveal_no_path_identifier_or_content() {
+            let bx = Bx::new("b1f-no-leak");
+            let on_disk = fs::read(&bx.vault).unwrap();
+            let mut shown: Vec<String> = Vec::new();
+
+            let mut note = |result: Result<Outcome, Refusal>| {
+                shown.push(format!("{result:?}"));
+
+                if let Err(error) = result {
+                    shown.push(error.to_string());
+
+                    let mut source = error.source();
+
+                    while let Some(inner) = source {
+                        shown.push(inner.to_string());
+                        shown.push(format!("{inner:?}"));
+                        source = inner.source();
+                    }
+                }
+            };
+
+            bx.put_remote(&bx.resealed(|data| data.revision = 7));
+            note(bx.bind()); // differs
+            bx.put_remote(&bx.resealed(|data| data.vault_id = OTHER_VAULT_ID));
+            note(bx.bind()); // another identity
+            bx.put_remote(b"garbage");
+            note(bx.bind()); // malformed
+            bx.put_remote(b"");
+            note(bx.bind()); // unavailable
+            fs::remove_file(&bx.remote).unwrap();
+            note(bx.bind()); // absent
+            note(bx.session.bind_existing_identical_target(
+                &bx.root,
+                &bx.target,
+                InitialBindingApproval::for_test(
+                    &SyncFileTarget::from_path(&bx.remote_dir().join("x.lvault")).unwrap(),
+                ),
+            )); // approval mismatch
+            note(bx.session.bind_existing_identical_target(
+                &bx.root,
+                &SyncFileTarget::from_path(&bx.vault).unwrap(),
+                InitialBindingApproval::for_test(&SyncFileTarget::from_path(&bx.vault).unwrap()),
+            )); // the primary itself
+            fs::write(&bx.remote, &on_disk).unwrap();
+            note(bx.bind()); // success
+            note(bx.bind()); // existing
+            note(Err(Refusal::NotPersisted(StoreError::Io {
+                stage: IoStage::Sync,
+                kind: io::ErrorKind::PermissionDenied,
+            })));
+            note(Err(Refusal::PersistenceUnverified));
+            note(Err(Refusal::RecordAppeared));
+            note(Err(Refusal::Randomness));
+            note(Err(Refusal::Corrupt(CorruptReason::Undecodable)));
+            note(Err(Refusal::Unreadable(UnreadableReason::Io(
+                io::ErrorKind::PermissionDenied,
+            ))));
+
+            shown.push(format!("{:?}", bx.approval()));
+
+            let fingerprint = |bytes: &[u8]| EnvelopeFingerprint::of_bytes(bytes).to_hex();
+            let prefix = String::from_utf8_lossy(&on_disk[..48.min(on_disk.len())]).into_owned();
+
+            let needles = vec![
+                bx.dir.path().to_string_lossy().into_owned(),
+                bx.remote.to_string_lossy().into_owned(),
+                bx.target.locator().as_str().to_owned(),
+                bx.local.clone(),
+                bx.vault_id.to_string(),
+                bx.vault_id.simple().to_string(),
+                OTHER_VAULT_ID.to_string(),
+                BINDING.to_string(),
+                "target.lvault".to_owned(),
+                "vault.lvault".to_owned(),
+                ".qa-local".to_owned(),
+                "LEAKMARK".to_owned(),
+                MASTER_PASSWORD.to_owned(),
+                fingerprint(&on_disk),
+                prefix,
+            ];
+
+            assert!(shown.len() > 20);
+
+            for output in &shown {
+                for needle in &needles {
+                    assert!(
+                        !output.contains(needle.as_str()),
+                        "leaks {needle:?}: {output}"
+                    );
+                }
+            }
+
+            // The stored binding id is not printed by the session's own view.
+            let SessionSyncState::Bound(bound) = bx.session.load_sync_state(&bx.root) else {
+                panic!("expected a bound state");
+            };
+            let printed = format!("{bound:?}");
+
+            assert!(!printed.contains(&bound.state().binding_id().uuid().to_string()));
+        }
+
+        // The classification of every store error, the heart of "definitely not
+        // published" versus "possibly published".
+        #[test]
+        fn create_errors_are_classified_as_published_only_where_publication_may_have_happened() {
+            let io = |stage| StoreError::Io {
+                stage,
+                kind: io::ErrorKind::PermissionDenied,
+            };
+
+            // Fail before the hard link: the record was not created.
+            for definite in [
+                io(IoStage::Directory),
+                io(IoStage::Inspect),
+                io(IoStage::Scan),
+                io(IoStage::Open),
+                io(IoStage::Write),
+                io(IoStage::Sync),
+                StoreError::RootNotAbsolute,
+                StoreError::AlreadyExists,
+                StoreError::UnresolvedArtifacts,
+                StoreError::UnexpectedObject,
+                StoreError::NoClobberUnsupported,
+                StoreError::Encode(localvault_core::sync_state::SyncStateEncodeError::TooLarge),
+            ] {
+                assert!(
+                    !create_error_may_follow_publication(definite),
+                    "{definite:?} must be definite"
+                );
+            }
+
+            // The link itself failed for another reason, or the verification
+            // failed, or the error is not one `create` produces.
+            for ambiguous in [
+                io(IoStage::Replace),
+                StoreError::VerificationFailed,
+                StoreError::Missing,
+                StoreError::CurrentUnreadable,
+                StoreError::CurrentCorrupt,
+                StoreError::CurrentUnsupportedVersion,
+                StoreError::CurrentLocatorMismatch,
+                StoreError::Changed,
+                StoreError::LocatorMismatch,
+                StoreError::BindingIdentityChanged,
+                StoreError::TrustedHistoryRegression,
+                StoreError::IncompleteDeletion,
+            ] {
+                assert!(
+                    create_error_may_follow_publication(ambiguous),
+                    "{ambiguous:?} must be ambiguous"
+                );
+            }
         }
     }
 }

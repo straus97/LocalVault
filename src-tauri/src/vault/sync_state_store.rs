@@ -409,6 +409,13 @@ impl SyncStateStore {
         })
     }
 
+    /// The `sync-state` directory this store reads and writes. A path, never an
+    /// authorization: it lets a caller refuse a selected target that lies inside
+    /// the store itself.
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     /// Strictly read the record of `local_locator`.
     ///
     /// Never creates, repairs, deletes or resets anything.
@@ -4264,5 +4271,255 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- Stage 1U-4 B1f: persistence failures of the initial binding ------------
+    //
+    // The initial-binding operation
+    // (`UnlockedVaultSession::bind_existing_identical_target`) is exercised end to
+    // end over a real unlocked session, a real identical target file and a real
+    // store; the store's private fault hooks are the only way to reach the
+    // failure classes below. The success path and every refusal that needs no
+    // fault are tested next to the session.
+    //
+    // Not covered here (and not claimed): the branch where publication and the
+    // store's own readback succeed but the operation's *fresh reload* then
+    // disagrees (no hook exists after the store's verification), and real
+    // power-loss or provider behavior.
+
+    use crate::vault::{
+        session::{InitialBindingApproval, InitialBindingOutcome, InitialBindingRefusal},
+        sync_file_adapter::SyncFileTarget,
+    };
+
+    struct Initial {
+        session: UnlockedVaultSession,
+        root: SyncStateRoot,
+        target: SyncFileTarget,
+        locator: String,
+        fx: Fixture,
+    }
+
+    impl Initial {
+        fn new(name: &str) -> Self {
+            let fx = Fixture::new(name);
+            let session = create_session(&fx.vault);
+            let remote_dir = fx.scratch.root().join("remote");
+
+            fs::create_dir_all(&remote_dir).unwrap();
+
+            let remote = remote_dir.join("target.lvault");
+
+            fs::copy(&fx.vault, &remote).unwrap();
+
+            let target = SyncFileTarget::from_path(&remote).unwrap();
+            let root = fx.root();
+            let locator = canonical(&fx.vault);
+
+            Self {
+                session,
+                root,
+                target,
+                locator,
+                fx,
+            }
+        }
+
+        fn state_dir(&self) -> PathBuf {
+            self.root.path().join(SYNC_STATE_DIRECTORY)
+        }
+
+        fn store(&self) -> SyncStateStore {
+            SyncStateStore::new(self.root.path()).unwrap()
+        }
+
+        fn record(&self) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.json", record_key(&loc(&self.locator))))
+        }
+
+        /// Bind through `store`, counting how many times the target was read.
+        fn bind_in(
+            &self,
+            store: &SyncStateStore,
+        ) -> (Result<InitialBindingOutcome, InitialBindingRefusal>, usize) {
+            let reads = AtomicUsize::new(0);
+
+            let result = self.session.bind_existing_identical_target_in(
+                store,
+                &self.target,
+                InitialBindingApproval::for_test(&self.target),
+                &mut |target| {
+                    reads.fetch_add(1, Ordering::SeqCst);
+
+                    target.read()
+                },
+                &mut |buffer| getrandom::fill(buffer).is_ok(),
+            );
+
+            (result, reads.load(Ordering::SeqCst))
+        }
+    }
+
+    #[test]
+    fn a_failure_before_publication_is_definite_and_leaves_no_record() {
+        let i = Initial::new("b1f-store-before");
+        let faulted = i.store();
+
+        fail_at(&faulted, Point::TempSync, io::ErrorKind::PermissionDenied);
+
+        let (result, reads) = i.bind_in(&faulted);
+
+        assert_eq!(
+            result,
+            Err(InitialBindingRefusal::NotPersisted(StoreError::Io {
+                stage: IoStage::Sync,
+                kind: io::ErrorKind::PermissionDenied,
+            }))
+        );
+        // Both reads of the target happened, and nothing was retried.
+        assert_eq!(reads, 2);
+
+        // Not published, and the staging file was removed: no record, no
+        // artifact, and the store reports a confirmed absence, not a fault.
+        assert!(!i.record().exists());
+        assert!(names(&i.state_dir()).is_empty());
+        assert_eq!(i.store().load(&loc(&i.locator)), StateLoad::NotConfigured);
+        assert_eq!(
+            i.session.load_sync_state(&i.root),
+            SessionSyncState::NotConfigured
+        );
+
+        // The target and the vault are untouched, and a later, separate, fresh
+        // operation is free to bind: nothing was left in the way.
+        assert_eq!(
+            fs::read(&i.fx.vault).unwrap(),
+            fs::read(i.target.locator().as_str()).unwrap()
+        );
+        assert_eq!(
+            i.bind_in(&i.store()).0,
+            Ok(InitialBindingOutcome::BoundAndVerified)
+        );
+    }
+
+    #[test]
+    fn a_failure_of_the_publication_step_is_ambiguous_and_nothing_is_cleaned_up() {
+        let i = Initial::new("b1f-store-publish");
+        let faulted = i.store();
+
+        // The store reports a failed link only as such (`IoStage::Replace`); it
+        // cannot show that nothing was published, so the operation must not
+        // claim it. Here nothing was in fact published.
+        fail_at(&faulted, Point::Publish, io::ErrorKind::PermissionDenied);
+
+        let (result, reads) = i.bind_in(&faulted);
+
+        assert_eq!(result, Err(InitialBindingRefusal::PersistenceUnverified));
+        assert_eq!(reads, 2);
+
+        // No rollback, deletion or reset was attempted on anything.
+        assert!(!i.record().exists());
+        assert_eq!(i.store().load(&loc(&i.locator)), StateLoad::NotConfigured);
+    }
+
+    #[test]
+    fn a_verification_failure_after_publication_is_ambiguous_and_never_undone() {
+        let i = Initial::new("b1f-store-verify");
+        let faulted = i.store();
+
+        fail_at(&faulted, Point::Verify, io::ErrorKind::Other);
+
+        let (result, reads) = i.bind_in(&faulted);
+
+        assert_eq!(result, Err(InitialBindingRefusal::PersistenceUnverified));
+        assert_eq!(reads, 2, "the operation retried");
+
+        // The record was published and is **not** deleted, rolled back or
+        // downgraded: a fresh load finds a valid binding for this vault, both
+        // locators and a checkpoint.
+        assert!(i.record().exists());
+
+        let published = SyncState::decode(&fs::read(i.record()).unwrap()).unwrap();
+        let SessionSyncState::Bound(bound) = i.session.load_sync_state(&i.root) else {
+            panic!("the published record is not loadable");
+        };
+
+        assert_eq!(*bound.state(), published);
+        assert_eq!(published.local_locator().as_str(), i.locator);
+        assert_eq!(published.target_locator(), i.target.locator());
+        assert!(matches!(published.base(), SyncBase::Based(_)));
+        assert_eq!(names(&i.state_dir()).len(), 1, "no staging file is left");
+
+        // A later operation, as the caller must do after an ambiguous result,
+        // starts from a fresh load: it sees the binding and replaces nothing.
+        let before = fs::read(i.record()).unwrap();
+
+        assert_eq!(
+            i.bind_in(&i.store()).0,
+            Err(InitialBindingRefusal::ExistingBinding)
+        );
+        assert_eq!(fs::read(i.record()).unwrap(), before);
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_verified_is_left_exactly_as_found() {
+        let i = Initial::new("b1f-store-damaged");
+        let faulted = i.store();
+        let record = i.record();
+
+        // Something replaces the freshly published record before it is read
+        // back.
+        run_at(&faulted, Point::Verify, {
+            let record = record.clone();
+
+            move || fs::write(&record, b"damaged by someone else").unwrap()
+        });
+
+        let (result, reads) = i.bind_in(&faulted);
+
+        assert_eq!(result, Err(InitialBindingRefusal::PersistenceUnverified));
+        assert_eq!(reads, 2);
+
+        // Not deleted, not repaired, not reset, and not reported as absent.
+        assert_eq!(fs::read(&record).unwrap(), b"damaged by someone else");
+        assert_eq!(
+            i.store().load(&loc(&i.locator)),
+            StateLoad::Corrupt(CorruptReason::Undecodable)
+        );
+        assert_eq!(names(&i.state_dir()).len(), 1);
+
+        // And it blocks, rather than permits, a new binding.
+        assert_eq!(
+            i.bind_in(&i.store()).0,
+            Err(InitialBindingRefusal::Corrupt(CorruptReason::Undecodable))
+        );
+        assert_eq!(fs::read(&record).unwrap(), b"damaged by someone else");
+    }
+
+    #[test]
+    fn a_record_created_at_the_instant_of_publication_is_never_clobbered() {
+        let i = Initial::new("b1f-store-race");
+        let faulted = i.store();
+        let planted = build(&i.locator, VAULT_ID, checkpoint(5), None)
+            .encode()
+            .unwrap();
+
+        // After the store's own existence check, immediately before the
+        // no-clobber link, another writer publishes a record.
+        run_at(&faulted, Point::Publish, {
+            let record = i.record();
+            let planted = planted.clone();
+
+            move || fs::write(&record, &planted).unwrap()
+        });
+
+        let (result, reads) = i.bind_in(&faulted);
+
+        assert_eq!(result, Err(InitialBindingRefusal::RecordAppeared));
+        assert_eq!(reads, 2);
+
+        // The other record is intact, and our staging file is gone.
+        assert_eq!(fs::read(i.record()).unwrap(), planted);
+        assert_eq!(names(&i.state_dir()).len(), 1);
     }
 }

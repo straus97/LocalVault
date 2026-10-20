@@ -26,6 +26,7 @@ use crate::vault::{
     backup::BackupError,
     lifecycle::VaultLifecycleError,
     session::{
+        InitialBindingApproval, InitialBindingOutcome, InitialBindingRefusal,
         RemoteObservationOutcome, RemoteObservationRefusal, RemoteTargetRefusal, SessionError,
         SessionSyncState, UnlockedVaultSession,
     },
@@ -324,6 +325,43 @@ impl AppState {
         let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
 
         Ok(session.observe_remote_target(root, target))
+    }
+
+    /// Bind the unlocked vault to an existing, byte-identical encrypted file for
+    /// the first time (Stage 1U-4 B1f). Internal: no command, event or UI is
+    /// attached, nothing calls it on startup or unlock, and it enables no working
+    /// synchronization.
+    ///
+    /// The outer error is "no live session" (`VaultLocked`/`SessionExpired`), and
+    /// in that case the target is never opened and the approval is simply dropped.
+    /// The inner result is the session's own: see
+    /// [`UnlockedVaultSession::bind_existing_identical_target`] for the order of
+    /// checks, the failure classes (in particular `PersistenceUnverified`) and the
+    /// approval boundary. **No user-confirmation flow exists**: the
+    /// [`InitialBindingApproval`] it requires has no production constructor, so
+    /// this is unreachable from production code until a real confirmation
+    /// handler provides one.
+    ///
+    /// The application-state mutex, and with it the session and its exclusive OS
+    /// lock, is held across the whole read, the inspection and the publication, so
+    /// a concurrent lock, expiry or save cannot interleave. Like the other sync
+    /// operations it observes expiry but does not count as user activity: an
+    /// internal check must never keep a vault unlocked.
+    pub fn bind_existing_identical_target(
+        &self,
+        root: &SyncStateRoot,
+        target: &SyncFileTarget,
+        approval: InitialBindingApproval,
+    ) -> Result<Result<InitialBindingOutcome, InitialBindingRefusal>, AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        if self.expire_if_needed(&mut guard, Instant::now()) {
+            return Err(AppStateError::SessionExpired);
+        }
+
+        let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.bind_existing_identical_target(root, target, approval))
     }
 
     fn active_session_guard(&self) -> Result<MutexGuard<'_, AppStateInner>, AppStateError> {
@@ -1246,5 +1284,180 @@ mod tests {
         assert_eq!(record_of(&bound), record_before_expiry);
 
         drop(bound.scratch);
+    }
+
+    // -- Stage 1U-4 B1f: initial binding through the state ----------------------
+    //
+    // The order of checks, every refusal and every persistence failure class are
+    // tested next to the session and the store. Here: the live-session, lock and
+    // activity rules, plus one real end-to-end binding. As for B1e, "the target
+    // was not opened without a live session" is shown by the result being
+    // `VaultLocked`/`SessionExpired` and by the target being a path a read would
+    // classify differently. There is no user-confirmation flow: the approval is
+    // the test-only constructor.
+
+    use crate::vault::session::{
+        InitialBindingApproval, InitialBindingOutcome, InitialBindingRefusal,
+    };
+
+    struct Unbound {
+        scratch: tempfile::TempDir,
+        vault: PathBuf,
+        root: SyncStateRoot,
+        target: SyncFileTarget,
+        remote: PathBuf,
+    }
+
+    /// A vault with no sync state, and an identical byte copy as the target. The
+    /// vault is locked again before this returns.
+    fn unbound_vault(name: &str) -> Unbound {
+        let scratch = qa_scratch(name);
+        let vaults = scratch.path().join("vaults");
+        let remote_dir = scratch.path().join("remote");
+
+        std::fs::create_dir_all(&vaults).unwrap();
+        std::fs::create_dir_all(&remote_dir).unwrap();
+
+        let vault = vaults.join("vault.lvault");
+        let remote = remote_dir.join("target.lvault");
+        let root = SyncStateRoot::for_test(scratch.path().join("app-local"));
+
+        UnlockedVaultSession::create(&vault, password(), 1_700_000_000_000)
+            .unwrap()
+            .lock();
+
+        std::fs::copy(&vault, &remote).unwrap();
+
+        let target = SyncFileTarget::from_path(&remote).unwrap();
+
+        Unbound {
+            scratch,
+            vault,
+            root,
+            target,
+            remote,
+        }
+    }
+
+    fn approve(unbound: &Unbound) -> InitialBindingApproval {
+        InitialBindingApproval::for_test(&unbound.target)
+    }
+
+    #[test]
+    fn binding_a_target_requires_a_live_session_and_creates_nothing_otherwise() {
+        let unbound = unbound_vault("b1f-appstate-locked");
+        let state = AppState::default();
+
+        assert!(matches!(
+            state.bind_existing_identical_target(&unbound.root, &unbound.target, approve(&unbound)),
+            Err(AppStateError::VaultLocked)
+        ));
+        assert!(!unbound.root.path().exists());
+
+        state
+            .unlock_vault(unbound.vault.clone(), password())
+            .unwrap();
+
+        assert_eq!(
+            state
+                .bind_existing_identical_target(&unbound.root, &unbound.target, approve(&unbound))
+                .unwrap(),
+            Ok(InitialBindingOutcome::BoundAndVerified)
+        );
+
+        // The binding is visible to the unchanged load, through the same state.
+        let SessionSyncState::Bound(bound) = state.load_sync_state(&unbound.root).unwrap() else {
+            panic!("the binding was not retained");
+        };
+
+        assert_eq!(bound.state().target_locator(), unbound.target.locator());
+
+        // A second attempt is a refusal, not a replacement.
+        let record = std::fs::read_dir(unbound.root.path().join(SYNC_STATE_DIRECTORY))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .unwrap();
+        let bytes = std::fs::read(&record).unwrap();
+
+        assert_eq!(
+            state
+                .bind_existing_identical_target(&unbound.root, &unbound.target, approve(&unbound))
+                .unwrap(),
+            Err(InitialBindingRefusal::ExistingBinding)
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), bytes);
+
+        state.lock_vault().unwrap();
+
+        assert!(matches!(
+            state.bind_existing_identical_target(&unbound.root, &unbound.target, approve(&unbound)),
+            Err(AppStateError::VaultLocked)
+        ));
+        assert_eq!(std::fs::read(&record).unwrap(), bytes);
+
+        drop(unbound.scratch);
+    }
+
+    #[test]
+    fn binding_does_not_count_as_activity_and_fails_after_expiry() {
+        let unbound = unbound_vault("b1f-appstate-expiry");
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        state
+            .unlock_vault(unbound.vault.clone(), password())
+            .unwrap();
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let before = state.last_activity_for_test();
+
+        // A refusal is not activity either: the target is made unavailable.
+        std::fs::remove_file(&unbound.remote).unwrap();
+        std::fs::create_dir(&unbound.remote).unwrap();
+
+        assert_eq!(
+            state
+                .bind_existing_identical_target(&unbound.root, &unbound.target, approve(&unbound))
+                .unwrap(),
+            Err(InitialBindingRefusal::TargetUnavailable(
+                UnavailableReason::UnexpectedObject
+            ))
+        );
+        assert_eq!(state.last_activity_for_test(), before);
+        assert!(!unbound.root.path().exists());
+
+        std::fs::remove_dir(&unbound.remote).unwrap();
+        std::fs::copy(&unbound.vault, &unbound.remote).unwrap();
+
+        assert_eq!(
+            state
+                .bind_existing_identical_target(&unbound.root, &unbound.target, approve(&unbound))
+                .unwrap(),
+            Ok(InitialBindingOutcome::BoundAndVerified)
+        );
+        assert_eq!(state.last_activity_for_test(), before);
+
+        // Expiry: reported as such, the session is gone, nothing is created.
+        let other = unbound_vault("b1f-appstate-expiry-second");
+        let second = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        second
+            .unlock_vault(other.vault.clone(), password())
+            .unwrap();
+        second.age_session_for_test(Duration::from_secs(31));
+
+        assert!(matches!(
+            second.bind_existing_identical_target(&other.root, &other.target, approve(&other)),
+            Err(AppStateError::SessionExpired)
+        ));
+        assert!(!second.status().unwrap().unlocked);
+        assert!(matches!(
+            second.bind_existing_identical_target(&other.root, &other.target, approve(&other)),
+            Err(AppStateError::VaultLocked)
+        ));
+        assert!(!other.root.path().exists());
+
+        drop(other.scratch);
+        drop(unbound.scratch);
     }
 }
