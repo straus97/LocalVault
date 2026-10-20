@@ -1,4 +1,5 @@
 pub mod backup;
+pub(crate) mod file_identity;
 pub mod lifecycle;
 pub mod session;
 pub mod storage;

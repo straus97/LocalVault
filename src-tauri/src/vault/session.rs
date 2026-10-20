@@ -32,10 +32,11 @@ use localvault_core::{
 };
 
 use super::{
+    file_identity::{compare, facts_of, HandleFacts, IdentityError, PhysicalVerdict},
     storage::{
         load_envelope, save_envelope_atomic_with_backup, StorageError, MAX_VAULT_FILE_BYTES,
     },
-    sync_file_adapter::{SyncFileRead, SyncFileTarget, UnavailableReason},
+    sync_file_adapter::{PresentFile, SyncFileRead, SyncFileTarget, UnavailableReason},
     sync_state_store::{
         path_identity_eq, CorruptReason, StateLoad, StoreError, SyncStateRoot, SyncStateStore,
         UnreadableReason,
@@ -373,9 +374,17 @@ pub enum InitialBindingRefusal {
     Unreadable(UnreadableReason),
     /// The target is, or cannot be shown not to be, this vault's own primary
     /// file, its `.backup`, its `.lock` file or a file inside the sync-state
-    /// directory. This is a path-level check; see the operation's limits.
+    /// directory, by path or by physical identity (for example a hard link to the
+    /// primary). See the operation's limits.
     #[error("the target names a file that belongs to this vault or its sync state")]
     TargetIsVaultFile,
+    /// The physical identity of the local vault file or the target could not be
+    /// established with certainty: a lookup failed, a volume is not local NTFS or
+    /// ReFS, an identifier is degenerate, a file is delete-pending, the target has
+    /// more than one name, or the target is a network (UNC) path. Never authority
+    /// to publish.
+    #[error("the physical identity of the vault file or target is uncertain")]
+    TargetIdentityUncertain,
     /// Not found in a valid local folder. **Not** remote absence, never an
     /// authorization to publish, and never creates anything.
     #[error("the target file was not found in the local folder")]
@@ -914,18 +923,26 @@ impl UnlockedVaultSession {
     /// lock held by `_lock_file` is held from the first step to the last.
     ///
     /// 1. the approval must be for this target;
-    /// 2. the vault file's exact current bytes must parse to precisely the
-    ///    envelope this session unlocked (they become the local reference), and
-    ///    the session's normalized local locator is resolved;
+    /// 2. the vault file is opened once, read through that handle and held open
+    ///    for the whole operation: its exact current bytes must parse to
+    ///    precisely the envelope this session unlocked (they become the local
+    ///    reference), its physical identity is read from the same handle, and the
+    ///    session's normalized local locator is resolved;
     /// 3. the sync-state record is loaded: only a **confirmed** `NotConfigured`
     ///    continues. A loaded record (valid or foreign), a corrupt, unsupported
     ///    or unreadable one, and an unresolved recovery artifact are refused and
     ///    left exactly as they are;
-    /// 4. the target is refused if it names this vault's primary, `.backup`,
-    ///    `.lock` or a file in the sync-state directory;
+    /// 4. the target is refused if it is a network (UNC) path, or names this
+    ///    vault's primary, `.backup`, `.lock` or a file in the sync-state
+    ///    directory;
     /// 5. only then [`SyncFileTarget::read`] runs, and only `Present` continues:
     ///    absence on disk and unavailability are refusals, never authority to
-    ///    publish;
+    ///    publish. The target's physical identity (read from the handle that
+    ///    produced its bytes) must then be a **distinct** file from the primary,
+    ///    both on local NTFS or ReFS volumes, the target with exactly one name;
+    ///    the same file is [`InitialBindingRefusal::TargetIsVaultFile`] and
+    ///    anything not established with certainty is
+    ///    [`InitialBindingRefusal::TargetIdentityUncertain`];
     /// 6. `inspect_remote_bytes` authenticates both byte strings under this
     ///    session's Vault Key and the session's own authenticated `vault_id`
     ///    (never a caller, file name or the target);
@@ -934,7 +951,8 @@ impl UnlockedVaultSession {
     ///    raw fingerprints, equal schema-3 counter revisions and a confirmed
     ///    `NotConfigured`; no state is constructed by this module;
     /// 9. the local file and the target are read again and must be byte-for-byte
-    ///    what was inspected;
+    ///    what was inspected and the same physical files (the target again
+    ///    distinct and singly named);
     /// 10. `SyncStateStore::create` publishes by no-clobber hard link;
     /// 11. a fresh load must equal the proposed state and pass
     ///     `verify_binding` for this vault, both locators exactly.
@@ -965,13 +983,20 @@ impl UnlockedVaultSession {
     /// * Byte identity and authentication prove that the target was, at that
     ///   instant, an exact copy of this vault's envelope. They prove neither that
     ///   it is the latest version nor that it will stay so.
-    /// * The target check is by canonical path string (ASCII case-insensitive on
-    ///   Windows). It does **not** detect a hard link, or any other second name,
-    ///   for the same physical file: stable `std` exposes no file identity, so an
-    ///   alias of the vault itself that sits at another path is byte-identical by
-    ///   construction and would be accepted. The adapter's own length-and-timestamp
-    ///   checks and the check-then-use windows documented on [`SyncFileTarget`]
-    ///   also apply.
+    /// * The target is first compared by canonical path string (ASCII
+    ///   case-insensitive on Windows) and then, on the open handles, by volume and
+    ///   128-bit file identifier (see `file_identity`), so a hard link to the
+    ///   primary is refused. This is a policy, not a proof: it accepts only local
+    ///   NTFS or ReFS volumes (FAT/exFAT, SMB and other network redirectors,
+    ///   virtual volumes and unidentifiable filesystems are refused, including
+    ///   legitimate ones) and a target with exactly one name. Driver-reported
+    ///   filesystem and device properties cannot be independently guaranteed; ReFS
+    ///   is accepted on documentation and has not been exercised; the checks hold
+    ///   at the instants they ran and filesystem races are narrowed, not
+    ///   eliminated. The identity is not persisted: every save replaces the
+    ///   primary file.
+    /// * The adapter's own length-and-timestamp checks and the check-then-use
+    ///   windows documented on [`SyncFileTarget`] also apply.
     pub fn bind_existing_identical_target(
         &self,
         root: &SyncStateRoot,
@@ -1009,7 +1034,9 @@ impl UnlockedVaultSession {
             return Err(Refusal::ApprovalTargetMismatch);
         }
 
-        let local_raw = self.current_local_raw().ok_or(Refusal::Unavailable(
+        // The primary is opened once; its bytes and physical facts come from this
+        // handle, which stays open until the operation returns.
+        let primary = self.hold_local_primary().ok_or(Refusal::Unavailable(
             SyncStateUnavailable::LocalVaultChanged,
         ))?;
 
@@ -1038,6 +1065,12 @@ impl UnlockedVaultSession {
             StateLoad::Unreadable(reason) => return Err(Refusal::Unreadable(reason)),
         }
 
+        // Refused before anything touches the network: a UNC path (also in its
+        // verbatim form) is never eligible, and is not resolved or read.
+        if target_is_unc(target) {
+            return Err(Refusal::TargetIdentityUncertain);
+        }
+
         if self.target_names_vault_file(store.directory(), target, &local_locator) {
             return Err(Refusal::TargetIsVaultFile);
         }
@@ -1054,10 +1087,14 @@ impl UnlockedVaultSession {
             return Err(Refusal::EvidenceChanged);
         }
 
+        // Same file, or an identity that cannot be established, is refused before
+        // the bytes are even authenticated.
+        let target_facts = physical_distinct(&primary, &present)?;
+
         let inspection = inspect_remote_bytes(
             &self.vault_key,
             self.data.vault_id,
-            &local_raw,
+            &primary.raw,
             present.candidate_raw(),
             None,
         )
@@ -1087,10 +1124,15 @@ impl UnlockedVaultSession {
         .map_err(Refusal::Transition)?;
 
         // Repeat, as close to publication as the filesystem allows, the two
-        // observations the proposal rests on. This narrows the window; it does
-        // not close it.
-        match self.current_local_raw() {
-            Some(raw) if raw == local_raw => {}
+        // observations the proposal rests on, now including the physical files.
+        // This narrows the window; it does not close it.
+        match self.hold_local_primary() {
+            Some(again)
+                if again.raw == primary.raw
+                    && matches!(
+                        (&again.physical, &primary.physical),
+                        (Ok(now), Ok(held)) if now.identity() == held.identity()
+                    ) => {}
             _ => {
                 return Err(Refusal::Unavailable(
                     SyncStateUnavailable::LocalVaultChanged,
@@ -1101,7 +1143,14 @@ impl UnlockedVaultSession {
         match read(target) {
             SyncFileRead::Present(again)
                 if again.target() == present.target()
-                    && again.candidate_raw() == present.candidate_raw() => {}
+                    && again.candidate_raw() == present.candidate_raw() =>
+            {
+                let again_facts = physical_distinct(&primary, &again)?;
+
+                if again_facts.identity() != target_facts.identity() {
+                    return Err(Refusal::EvidenceChanged);
+                }
+            }
             _ => return Err(Refusal::EvidenceChanged),
         }
 
@@ -1138,7 +1187,8 @@ impl UnlockedVaultSession {
     /// target that does not exist cannot alias anything and is left to the read
     /// (which reports it as absent or unavailable); any other failure to resolve
     /// an existing target fails closed. This is a string-level check: it cannot
-    /// see a hard link or another second name of the same file.
+    /// see a hard link or another second name of the same file. The physical
+    /// check on the open handles (`physical_distinct`) does.
     fn target_names_vault_file(
         &self,
         state_directory: &Path,
@@ -1213,6 +1263,123 @@ impl UnlockedVaultSession {
         parsed.validate_header().ok()?;
 
         (parsed == self.envelope).then_some(raw)
+    }
+
+    /// The primary opened once, for the bound inspection: the same acceptance
+    /// rules as [`current_local_raw`](Self::current_local_raw) (not a symlink, a
+    /// regular file, `1..=MAX_VAULT_FILE_BYTES`, parses to exactly this session's
+    /// envelope), but the file is opened without following a reparse point, judged
+    /// again on the handle, read through that handle and queried for its physical
+    /// facts on it. `None` means this is not the session's vault file.
+    fn hold_local_primary(&self) -> Option<HeldPrimary> {
+        fn acceptable(metadata: &fs::Metadata) -> bool {
+            !metadata.file_type().is_symlink()
+                && metadata.is_file()
+                && metadata.len() != 0
+                && metadata.len() <= MAX_VAULT_FILE_BYTES
+        }
+
+        if !acceptable(&fs::symlink_metadata(&self.path).ok()?) {
+            return None;
+        }
+
+        let handle = open_without_following(&self.path).ok()?;
+        let opened = handle.metadata().ok()?;
+
+        // The object actually opened, not the path that may have been swapped.
+        if !acceptable(&opened) {
+            return None;
+        }
+
+        let mut raw = Vec::with_capacity(opened.len() as usize);
+
+        (&handle)
+            .take(MAX_VAULT_FILE_BYTES + 1)
+            .read_to_end(&mut raw)
+            .ok()?;
+
+        if raw.is_empty() || raw.len() as u64 > MAX_VAULT_FILE_BYTES {
+            return None;
+        }
+
+        let parsed: VaultEnvelope = serde_json::from_slice(&raw).ok()?;
+
+        parsed.validate_header().ok()?;
+
+        if parsed != self.envelope {
+            return None;
+        }
+
+        let physical = facts_of(&handle);
+
+        Some(HeldPrimary {
+            _handle: handle,
+            raw,
+            physical,
+        })
+    }
+}
+
+/// The primary, opened once: its bytes and physical facts come from the same
+/// handle, which is held open for the whole binding operation so the object
+/// cannot be fully deleted (and its identifier reused) while the target is
+/// examined. The facts are private to this module.
+struct HeldPrimary {
+    _handle: File,
+    raw: Vec<u8>,
+    physical: Result<HandleFacts, IdentityError>,
+}
+
+/// Open for reading without following a reparse point, so a primary swapped for
+/// a link after the path check is judged as the link, not as what it points to.
+fn open_without_following(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
+}
+
+/// Whether the target names a network share (UNC, also verbatim). Such a path
+/// is refused outright; this is a syntactic refusal only, never a reason to
+/// accept anything.
+fn target_is_unc(target: &SyncFileTarget) -> bool {
+    use std::path::{Component, Prefix};
+
+    matches!(
+        Path::new(target.locator().as_str()).components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+    )
+}
+
+/// The target's facts if, and only if, the primary and the target are distinct
+/// files on local NTFS or ReFS volumes and the target has exactly one name.
+/// Fail closed: a lookup failure on either side is uncertainty, never
+/// distinctness.
+fn physical_distinct(
+    primary: &HeldPrimary,
+    present: &PresentFile,
+) -> Result<HandleFacts, InitialBindingRefusal> {
+    let (Ok(primary), Ok(target)) = (primary.physical.as_ref(), present.physical()) else {
+        return Err(InitialBindingRefusal::TargetIdentityUncertain);
+    };
+
+    match compare(primary, target) {
+        PhysicalVerdict::Distinct => Ok(*target),
+        PhysicalVerdict::Same => Err(InitialBindingRefusal::TargetIsVaultFile),
+        PhysicalVerdict::Uncertain => Err(InitialBindingRefusal::TargetIdentityUncertain),
     }
 }
 
@@ -3370,8 +3537,10 @@ mod tests {
     //   at the second read is exercised.
     // * A physical file symlink (needs a privilege this account lacks); a
     //   junction is exercised instead.
-    // * A hard link or any other second name of the same physical file (not
-    //   detectable with stable `std`; the limitation is documented, not tested).
+    // * ReFS, FAT/exFAT, SMB and virtual volumes (none is available here): their
+    //   refusal is covered only through injected facts, never claimed as a
+    //   physical test. B1g tests below use real NTFS files beneath the
+    //   git-ignored `.qa-local/file-identity-b1g-tests/`.
     // * Any provider, network or cloud behavior (none exists and none is called;
     //   this cannot be asserted by a test, only by the absence of such code in
     //   the diff), the user-confirmation flow (none exists), and cross-process
@@ -3392,6 +3561,7 @@ mod tests {
         };
 
         use super::*;
+        use crate::vault::file_identity::FileSystemKind;
         use crate::vault::sync_state_store::{IoStage, SYNC_STATE_DIRECTORY};
 
         type Refusal = InitialBindingRefusal;
@@ -3410,12 +3580,15 @@ mod tests {
             EnvelopeFingerprint::of_bytes(&[tag])
         }
 
-        fn scratch(name: &str) -> tempfile::TempDir {
+        const B1F_SCRATCH: &str = "sync-state-b1-tests";
+        const B1G_SCRATCH: &str = "file-identity-b1g-tests";
+
+        fn scratch_in(base: &str, name: &str) -> tempfile::TempDir {
             let base = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .unwrap()
                 .join(".qa-local")
-                .join("sync-state-b1-tests");
+                .join(base);
 
             fs::create_dir_all(&base).unwrap();
 
@@ -3555,8 +3728,33 @@ mod tests {
                 bx
             }
 
+            /// As [`bare`](Self::bare), under the B1g scratch directory.
+            fn bare_b1g(name: &str) -> Self {
+                Self::from_vault_in(B1G_SCRATCH, name, |vault| {
+                    UnlockedVaultSession::create(vault, test_password(), NOW_MS).unwrap()
+                })
+            }
+
+            /// As [`new`](Self::new), under the B1g scratch directory: the
+            /// target is an independent byte copy of the vault file.
+            fn new_b1g(name: &str) -> Self {
+                let bx = Self::bare_b1g(name);
+
+                fs::copy(&bx.vault, &bx.remote).unwrap();
+
+                bx
+            }
+
             fn from_vault(name: &str, open: impl FnOnce(&Path) -> UnlockedVaultSession) -> Self {
-                let dir = scratch(name);
+                Self::from_vault_in(B1F_SCRATCH, name, open)
+            }
+
+            fn from_vault_in(
+                base: &str,
+                name: &str,
+                open: impl FnOnce(&Path) -> UnlockedVaultSession,
+            ) -> Self {
+                let dir = scratch_in(base, name);
                 let vaults = dir.path().join("vaults");
                 let remote_dir = dir.path().join("remote");
 
@@ -4798,6 +4996,450 @@ mod tests {
             let printed = format!("{bound:?}");
 
             assert!(!printed.contains(&bound.state().binding_id().uuid().to_string()));
+        }
+
+        // ---- Stage 1U-4 B1g: physical file identity ---------------------------
+        //
+        // Real NTFS files on this machine (D:, local). ReFS, FAT/exFAT, SMB and
+        // virtual volumes are NOT available here: those verdicts are exercised
+        // only through injected facts (the `PresentFile` test seam) and the pure
+        // `compare` unit tests, and no physical result is claimed for them.
+
+        fn entropy(buffer: &mut [u8]) -> bool {
+            getrandom::fill(buffer).is_ok()
+        }
+
+        /// A real read whose physical facts are replaced (test seam).
+        fn read_injecting(
+            target: &SyncFileTarget,
+            physical: Result<HandleFacts, IdentityError>,
+        ) -> SyncFileRead {
+            match target.read() {
+                SyncFileRead::Present(present) => {
+                    SyncFileRead::Present(present.with_physical_for_test(physical))
+                }
+                other => other,
+            }
+        }
+
+        fn assert_nothing_created(bx: &Bx) {
+            assert!(!bx.state_dir().exists());
+            assert!(!bx.root.path().exists());
+            assert!(bx.record().is_none());
+        }
+
+        // 2, 8. A hard link to the primary is the same physical file: refused,
+        // no binding, and the primary, its backup and the link are untouched.
+        #[test]
+        fn a_hard_link_to_the_primary_is_refused_and_writes_nothing() {
+            let bx = Bx::bare_b1g("b1g-hard-link");
+            let backup = bx.session.backup_path().to_path_buf();
+
+            fs::copy(&bx.vault, &backup).unwrap();
+            fs::hard_link(&bx.vault, &bx.remote).unwrap();
+
+            // The alias is a different path string and byte-identical.
+            assert_eq!(fs::read(&bx.remote).unwrap(), fs::read(&bx.vault).unwrap());
+
+            let vaults = snapshot(&bx.vaults_dir());
+            let remote = snapshot(&bx.remote_dir());
+            let vault_bytes = fs::read(&bx.vault).unwrap();
+            let (result, reads) = bx.bind_counting(&bx.target);
+
+            assert_eq!(result, Err(Refusal::TargetIsVaultFile));
+            assert_eq!(reads, 1, "the check runs on the read target");
+            assert_eq!(snapshot(&bx.vaults_dir()), vaults);
+            assert_eq!(snapshot(&bx.remote_dir()), remote);
+            assert_eq!(fs::read(&bx.vault).unwrap(), vault_bytes);
+            assert_eq!(fs::read(&backup).unwrap(), vault_bytes);
+            assert_nothing_created(&bx);
+        }
+
+        // 3. An independent copy with identical encrypted bytes is a distinct
+        // physical file and binds. A primary that has another name elsewhere is
+        // allowed: only the target must have exactly one name.
+        #[test]
+        fn an_independent_identical_copy_binds_even_if_the_primary_has_another_name() {
+            let bx = Bx::new_b1g("b1g-independent-copy");
+            let extra_name = bx.dir.path().join("another-name-of-the-primary.lvault");
+
+            fs::hard_link(&bx.vault, &extra_name).unwrap();
+
+            let vaults = snapshot(&bx.vaults_dir());
+            let remote = snapshot(&bx.remote_dir());
+
+            assert_eq!(bx.bind(), Ok(Outcome::BoundAndVerified));
+            assert_eq!(snapshot(&bx.vaults_dir()), vaults);
+            assert_eq!(snapshot(&bx.remote_dir()), remote);
+            assert_eq!(bx.loaded().target_locator(), bx.target.locator());
+            assert_eq!(names(&bx.state_dir()).len(), 1);
+        }
+
+        // 4. A distinct file with different bytes is still refused by the core.
+        #[test]
+        fn a_distinct_file_with_different_bytes_is_still_refused_by_the_core() {
+            let bx = Bx::new_b1g("b1g-divergent");
+
+            bx.put_remote(&bx.resealed(|data| data.revision = 7));
+            bx.assert_refused(transition(TransitionRefusal::RemoteDiffers));
+            assert_nothing_created(&bx);
+        }
+
+        // 5. A failed identity lookup is uncertainty, never distinctness.
+        #[test]
+        fn an_identity_that_cannot_be_established_is_refused_and_creates_nothing() {
+            let bx = Bx::new_b1g("b1g-lookup-failure");
+            let vaults = snapshot(&bx.vaults_dir());
+            let remote = snapshot(&bx.remote_dir());
+
+            for error in [IdentityError::Lookup, IdentityError::Unsupported] {
+                let result = bx.bind_with(
+                    &bx.target,
+                    &mut |t| read_injecting(t, Err(error)),
+                    &mut entropy,
+                );
+
+                assert_eq!(result, Err(Refusal::TargetIdentityUncertain), "{error:?}");
+                assert_nothing_created(&bx);
+            }
+
+            assert_eq!(snapshot(&bx.vaults_dir()), vaults);
+            assert_eq!(snapshot(&bx.remote_dir()), remote);
+
+            // The control: the real read binds.
+            assert_eq!(bx.bind(), Ok(Outcome::BoundAndVerified));
+        }
+
+        // 6a. A network (UNC) target is refused syntactically, before any read.
+        #[cfg(windows)]
+        #[test]
+        fn a_unc_target_is_refused_before_it_is_read() {
+            let bx = Bx::new_b1g("b1g-unc");
+
+            for text in [
+                r"\\localhost\share\t.lvault",
+                r"\\?\UNC\localhost\share\t.lvault",
+            ] {
+                let unc = SyncFileTarget::from_path(Path::new(text)).unwrap();
+                let (result, reads) = bx.bind_counting(&unc);
+
+                assert_eq!(result, Err(Refusal::TargetIdentityUncertain), "{text}");
+                assert_eq!(reads, 0, "a UNC target was read: {text}");
+                assert_nothing_created(&bx);
+            }
+        }
+
+        // 6b. Unsupported, non-local, degenerate, delete-pending and multiply
+        // named targets (injected: no such volume is available here), and the
+        // same identity (injected equal to the real primary's).
+        #[test]
+        fn unsupported_or_degenerate_target_facts_are_refused() {
+            let bx = Bx::new_b1g("b1g-injected-facts");
+            let facts = |volume: u64,
+                         id: [u8; 16],
+                         links: u32,
+                         pending: bool,
+                         filesystem: FileSystemKind,
+                         local: bool| {
+                HandleFacts::for_test(volume, id, links, pending, filesystem, local)
+            };
+            let ntfs = FileSystemKind::Ntfs;
+
+            let cases = [
+                (
+                    "other filesystem",
+                    facts(5, [9; 16], 1, false, FileSystemKind::Other, true),
+                ),
+                (
+                    "not a local device",
+                    facts(5, [9; 16], 1, false, ntfs, false),
+                ),
+                ("zero volume", facts(0, [9; 16], 1, false, ntfs, true)),
+                ("zero file id", facts(5, [0; 16], 1, false, ntfs, true)),
+                ("delete pending", facts(5, [9; 16], 1, true, ntfs, true)),
+                ("two links", facts(5, [9; 16], 2, false, ntfs, true)),
+                ("no links", facts(5, [9; 16], 0, false, ntfs, true)),
+            ];
+
+            for (name, injected) in cases {
+                let result = bx.bind_with(
+                    &bx.target,
+                    &mut |t| read_injecting(t, Ok(injected)),
+                    &mut entropy,
+                );
+
+                assert_eq!(result, Err(Refusal::TargetIdentityUncertain), "{name}");
+                assert_nothing_created(&bx);
+            }
+
+            // The injected identity equals the real primary's: the same file.
+            let primary = facts_of(&File::open(&bx.vault).unwrap()).unwrap();
+            let same = facts(5, [9; 16], 1, false, ntfs, true).with_identity_of(&primary);
+            let result = bx.bind_with(
+                &bx.target,
+                &mut |t| read_injecting(t, Ok(same)),
+                &mut entropy,
+            );
+
+            assert_eq!(result, Err(Refusal::TargetIsVaultFile));
+            assert_nothing_created(&bx);
+
+            // The control: trustworthy, distinct, singly named facts bind.
+            let good = facts(5, [9; 16], 1, false, ntfs, true);
+
+            assert_eq!(
+                bx.bind_with(
+                    &bx.target,
+                    &mut |t| read_injecting(t, Ok(good)),
+                    &mut entropy
+                ),
+                Ok(Outcome::BoundAndVerified)
+            );
+        }
+
+        // 7. A target replaced between the two reads by a byte-identical but
+        // physically different file is an observable change.
+        #[test]
+        fn a_target_replaced_by_an_identical_copy_between_reads_is_refused() {
+            let bx = Bx::new_b1g("b1g-target-swapped");
+            let (vault, remote) = (bx.vault.clone(), bx.remote.clone());
+            let reads = Cell::new(0usize);
+
+            let result = bx.bind_with(
+                &bx.target,
+                &mut |t| {
+                    if reads.get() == 1 {
+                        let staging = remote.with_file_name("staging.lvault");
+
+                        fs::copy(&vault, &staging).unwrap();
+                        fs::rename(&staging, &remote).unwrap();
+                    }
+
+                    reads.set(reads.get() + 1);
+
+                    t.read()
+                },
+                &mut entropy,
+            );
+
+            assert_eq!(result, Err(Refusal::EvidenceChanged));
+            assert_eq!(reads.get(), 2);
+            assert_nothing_created(&bx);
+        }
+
+        // 7b. A second name for the target created between the reads.
+        #[test]
+        fn a_hard_link_added_to_the_target_between_reads_is_refused() {
+            let bx = Bx::new_b1g("b1g-target-linked");
+            let remote = bx.remote.clone();
+            let reads = Cell::new(0usize);
+
+            let result = bx.bind_with(
+                &bx.target,
+                &mut |t| {
+                    if reads.get() == 1 {
+                        fs::hard_link(&remote, remote.with_file_name("alias.lvault")).unwrap();
+                    }
+
+                    reads.set(reads.get() + 1);
+
+                    t.read()
+                },
+                &mut entropy,
+            );
+
+            assert_eq!(result, Err(Refusal::TargetIdentityUncertain));
+            assert_eq!(reads.get(), 2);
+            assert_nothing_created(&bx);
+        }
+
+        // 7c. The primary path re-pointed (byte-identical, different file)
+        // between the checks.
+        #[test]
+        fn a_primary_path_re_pointed_between_checks_is_refused() {
+            let bx = Bx::new_b1g("b1g-primary-swapped");
+            let vault = bx.vault.clone();
+            let reads = Cell::new(0usize);
+
+            let result = bx.bind_with(
+                &bx.target,
+                &mut |t| {
+                    let read = t.read();
+
+                    // After the first read, before the primary is re-checked.
+                    if reads.get() == 0 {
+                        let staging = vault.with_file_name("staging.lvault");
+
+                        fs::copy(&vault, &staging).unwrap();
+                        fs::rename(&staging, &vault).unwrap();
+                    }
+
+                    reads.set(reads.get() + 1);
+
+                    read
+                },
+                &mut entropy,
+            );
+
+            assert_eq!(
+                result,
+                Err(Refusal::Unavailable(
+                    SyncStateUnavailable::LocalVaultChanged
+                ))
+            );
+            assert_eq!(reads.get(), 1, "the target was read again after the change");
+            assert_nothing_created(&bx);
+        }
+
+        // A primary replaced by a file symlink is judged as the link, not
+        // followed. Needs the symlink privilege; skipped (and said so) without it.
+        #[cfg(windows)]
+        #[test]
+        fn a_primary_replaced_by_a_file_symlink_is_not_followed() {
+            let bx = Bx::new_b1g("b1g-primary-symlink");
+            let real = bx.dir.path().join("real-copy.lvault");
+
+            fs::copy(&bx.vault, &real).unwrap();
+            fs::remove_file(&bx.vault).unwrap();
+
+            if std::os::windows::fs::symlink_file(&real, &bx.vault).is_err() {
+                eprintln!("SKIPPED: the file-symlink privilege is unavailable");
+
+                return;
+            }
+
+            let (result, reads) = bx.bind_counting(&bx.target);
+
+            assert_eq!(
+                result,
+                Err(Refusal::Unavailable(
+                    SyncStateUnavailable::LocalVaultChanged
+                ))
+            );
+            assert_eq!(reads, 0);
+            assert_nothing_created(&bx);
+
+            fs::remove_file(&bx.vault).unwrap();
+        }
+
+        // 11. The B1c/B1e observation never reads the physical facts: a failed
+        // lookup changes nothing about what it records.
+        #[test]
+        fn observation_ignores_a_failed_physical_lookup() {
+            let outcome = |inject: bool| {
+                let bx = Bx::new_b1g(if inject {
+                    "b1g-observe-injected"
+                } else {
+                    "b1g-observe-real"
+                });
+
+                assert_eq!(bx.bind(), Ok(Outcome::BoundAndVerified));
+
+                let unchanged = bx
+                    .session
+                    .observe_remote_target_with(&bx.root, &bx.target, |t| {
+                        if inject {
+                            read_injecting(t, Err(IdentityError::Lookup))
+                        } else {
+                            t.read()
+                        }
+                    });
+
+                bx.put_remote(&bx.resealed(|data| data.revision = 7));
+
+                let raised = bx
+                    .session
+                    .observe_remote_target_with(&bx.root, &bx.target, |t| {
+                        if inject {
+                            read_injecting(t, Err(IdentityError::Lookup))
+                        } else {
+                            t.read()
+                        }
+                    });
+
+                let SyncBase::Based(checkpoint) = *bx.loaded().base() else {
+                    panic!("expected a based state");
+                };
+
+                (unchanged, raised, checkpoint.high_water().revision())
+            };
+
+            let real = outcome(false);
+            let injected = outcome(true);
+
+            assert_eq!(real.0, Ok(RemoteObservationOutcome::Unchanged));
+            assert_eq!(real.1, Ok(RemoteObservationOutcome::HighWaterRaised));
+            assert_eq!(real.2, 7);
+            assert_eq!(injected, real);
+        }
+
+        // 12. The new refusal and the physical facts print nothing identifying.
+        #[test]
+        fn physical_checks_reveal_no_path_identifier_or_content() {
+            let bx = Bx::new_b1g("b1g-LEAKMARK-leak");
+            let mut shown: Vec<String> = Vec::new();
+
+            let mut note = |result: Result<Outcome, Refusal>| {
+                shown.push(format!("{result:?}"));
+
+                if let Err(error) = result {
+                    shown.push(error.to_string());
+                    shown.push(format!("{error:?}"));
+                }
+            };
+
+            note(Err(Refusal::TargetIdentityUncertain));
+            note(bx.bind_with(
+                &bx.target,
+                &mut |t| read_injecting(t, Err(IdentityError::Lookup)),
+                &mut entropy,
+            ));
+
+            // A hard link to the primary.
+            let link = bx.remote_dir().join("link.lvault");
+
+            fs::hard_link(&bx.vault, &link).unwrap();
+
+            let linked = SyncFileTarget::from_path(&link).unwrap();
+
+            note(bx.bind_with(&linked, &mut |t| t.read(), &mut entropy));
+
+            if let SyncFileRead::Present(present) = bx.target.read() {
+                shown.push(format!("{present:?}"));
+                shown.push(format!("{:?}", present.physical()));
+                shown.push(format!(
+                    "{:?}",
+                    present.physical().map(|facts| facts.identity())
+                ));
+            }
+
+            shown.push(format!("{:?}", IdentityError::Lookup));
+            shown.push(IdentityError::Lookup.to_string());
+
+            let needles = vec![
+                bx.dir.path().to_string_lossy().into_owned(),
+                bx.remote.to_string_lossy().into_owned(),
+                bx.local.clone(),
+                bx.vault_id.to_string(),
+                bx.vault_id.simple().to_string(),
+                "target.lvault".to_owned(),
+                "vault.lvault".to_owned(),
+                "link.lvault".to_owned(),
+                ".qa-local".to_owned(),
+                "LEAKMARK".to_owned(),
+                MASTER_PASSWORD.to_owned(),
+            ];
+
+            assert!(shown.len() > 8);
+
+            for output in &shown {
+                for needle in &needles {
+                    assert!(
+                        !output.contains(needle.as_str()),
+                        "leaks {needle:?}: {output}"
+                    );
+                }
+            }
         }
 
         // The classification of every store error, the heart of "definitely not

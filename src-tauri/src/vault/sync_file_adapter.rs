@@ -70,10 +70,20 @@
 //!   that differs from the length, is [`UnavailableReason::Changed`].
 //!
 //! `std::fs` offers **no snapshot isolation**, and stable `std` exposes neither
-//! the NTFS file index nor the volume serial number. Identity is therefore
-//! established only by length and creation/last-write timestamps; a writer that
-//! changes content while restoring the same length and timestamps, or a
-//! replacement that has the same length and timestamps, is not detectable. Every
+//! the NTFS file index nor the volume serial number. The read's own change
+//! detection is therefore only length and creation/last-write timestamps; a
+//! writer that changes content while restoring the same length and timestamps, or
+//! a replacement that has the same length and timestamps, is not detectable by it.
+//!
+//! Separately, and only for initial synchronization binding, the physical facts
+//! of the opened file (volume, 128-bit file identifier, link count, filesystem,
+//! device locality; see `file_identity`) are queried through Windows FFI **on
+//! the same handle that produced the bytes**, and stored privately in the
+//! [`PresentFile`]. They never influence classification: a failed lookup is kept
+//! as an error beside the bytes, not turned into `Unavailable`, and
+//! [`observe_remote_target`](super::session::UnlockedVaultSession::observe_remote_target)
+//! never reads them. They are not a snapshot either; they describe the handle at
+//! the instant they were read. Every
 //! check here is check-then-use: a completed read does not prove the path still
 //! refers to the same object, and the ancestor guards do not stop a redirection
 //! installed after they ran. The file is opened with the default share mode
@@ -101,6 +111,8 @@ use std::{
 
 use localvault_core::{sync::MAX_ENVELOPE_BYTES, sync_state::Locator};
 use thiserror::Error;
+
+use super::file_identity::{HandleFacts, IdentityError};
 
 #[cfg(windows)]
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -170,9 +182,10 @@ impl SyncFileTarget {
         #[cfg(windows)]
         {
             match self.read_inner(probe) {
-                Ok(Outcome::Bytes(candidate)) => SyncFileRead::Present(PresentFile {
+                Ok(Outcome::Bytes(candidate, physical)) => SyncFileRead::Present(PresentFile {
                     target: self.locator.clone(),
                     candidate,
+                    physical,
                 }),
                 Ok(Outcome::Absent) => SyncFileRead::AbsentOnDisk,
                 Err(reason) => SyncFileRead::Unavailable(reason),
@@ -236,6 +249,11 @@ impl SyncFileTarget {
             return Err(UnavailableReason::Changed);
         }
 
+        // Physical facts from the very handle that produced `candidate`, while it
+        // is still open. A failure is recorded, never turned into a different
+        // classification.
+        let physical = super::file_identity::facts_of(&file);
+
         let current = match fs::symlink_metadata(&self.path) {
             Ok(current) => current,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -248,7 +266,7 @@ impl SyncFileTarget {
         }
 
         match confirm_ancestors(&self.path)? {
-            Chain::Intact => Ok(Outcome::Bytes(candidate)),
+            Chain::Intact => Ok(Outcome::Bytes(candidate, physical)),
             Chain::MissingAncestor => Err(UnavailableReason::Changed),
         }
     }
@@ -290,9 +308,30 @@ impl fmt::Debug for SyncFileRead {
 pub struct PresentFile {
     target: Locator,
     candidate: Vec<u8>,
+    /// Facts of the handle that produced `candidate`, or why there are none.
+    /// Private, and only [`SyncFileTarget::read`] can set it.
+    physical: Result<HandleFacts, IdentityError>,
 }
 
 impl PresentFile {
+    /// The physical facts of the file these bytes were read from, if they could
+    /// be established. Used only by initial binding.
+    pub(crate) fn physical(&self) -> Result<&HandleFacts, IdentityError> {
+        self.physical.as_ref().map_err(|error| *error)
+    }
+
+    /// Test-only seam: replaces the physical facts, to model a lookup failure or
+    /// an unsupported volume. No production constructor exists.
+    #[cfg(test)]
+    pub(crate) fn with_physical_for_test(
+        mut self,
+        physical: Result<HandleFacts, IdentityError>,
+    ) -> Self {
+        self.physical = physical;
+
+        self
+    }
+
     /// The locator of the target these bytes were read from.
     pub fn target(&self) -> &Locator {
         &self.target
@@ -345,7 +384,7 @@ enum Stage {
 
 #[cfg(windows)]
 enum Outcome {
-    Bytes(Vec<u8>),
+    Bytes(Vec<u8>, Result<HandleFacts, IdentityError>),
     Absent,
 }
 
@@ -606,6 +645,7 @@ mod tests {
 
     use super::*;
     use crate::vault::{
+        file_identity,
         storage::MAX_VAULT_FILE_BYTES,
         sync_state_store::{SyncStateRoot, SyncStateStore},
     };
@@ -1385,5 +1425,45 @@ mod tests {
             read,
             SyncFileRead::Unavailable(UnavailableReason::ParentMissing)
         );
+    }
+
+    // ---- B1g: physical facts from the reading handle ---------------------------
+
+    #[cfg(windows)]
+    #[test]
+    fn present_carries_the_physical_facts_of_the_file_it_read() {
+        let scratch = Scratch::new("physical-facts");
+        let path = scratch.put("sync.lvault", CONTENT);
+        let present = present(target(&path).read());
+
+        let expected = file_identity::facts_of(&File::open(&path).unwrap()).unwrap();
+
+        assert_eq!(present.physical(), Ok(&expected));
+        assert_eq!(present.candidate_raw(), CONTENT);
+
+        // A second name for the same file is visible in the facts of the read.
+        let alias = scratch.file("alias.lvault");
+
+        fs::hard_link(&path, &alias).unwrap();
+
+        let linked = self::present(target(&alias).read());
+
+        assert_eq!(linked.physical().unwrap().identity(), expected.identity());
+        assert_ne!(linked.physical(), Ok(&expected), "link count differs");
+    }
+
+    #[test]
+    fn a_failed_identity_lookup_never_changes_the_classification() {
+        let scratch = Scratch::new("physical-failure");
+        let path = scratch.put("sync.lvault", CONTENT);
+        let original = present(target(&path).read());
+        let failed = original
+            .clone()
+            .with_physical_for_test(Err(IdentityError::Lookup));
+
+        assert_eq!(failed.physical(), Err(IdentityError::Lookup));
+        assert_eq!(failed.candidate_raw(), original.candidate_raw());
+        assert_eq!(failed.target(), original.target());
+        assert_eq!(format!("{failed:?}"), "PresentFile(<redacted>)");
     }
 }

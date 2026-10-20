@@ -39,6 +39,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "=5.4.1"
+# Physical file identity for initial sync binding (vault/file_identity.rs). Raw
+# Microsoft bindings, already compiled transitively; the only unsafe FFI in the crate.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_SystemServices",
+] }
 
 # [profile.release] moved to the workspace root Cargo.toml — Cargo only
 # honors profile tables from the workspace root, not member manifests.
