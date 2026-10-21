@@ -84,15 +84,17 @@ A later dedicated, coordinated desktop + Android design/UX pass is still planned
 No further named 1T stage is defined and no new numbered stage is introduced. The next stages remain 1U → 1V → 1W → 1X below. Do not mix sync work into Android stabilization.
 
 
-## 1U — Sync foundation (IN PROGRESS: 1U-1 and 1U-2 complete)
+## 1U — Sync foundation (IN PROGRESS: 1U-1 … 1U-3 and 1U-4 A1–B1i complete; 1U-4 B1j next)
 
-**Slice status (synchronization itself is NOT implemented):**
-- **1U-1 — COMPLETE** (`8d001a147201f2ba8f1afe625bcffc169d42c029`): pure sync-state classifier (`localvault_core::sync`): raw-envelope SHA-256 fingerprints, description-only classification, push-intent reconciliation. No I/O, provider or network.
-- **1U-2 — COMPLETE** (`d7b71a28ca466732b6eb838ca386af42e91ffbcb`): encrypted schema-3 revision migration — authenticated `revision: u64` in the AEAD payload, legacy schemas 1/2 readable, migration on a committed write, one shared core rule used by desktop and the Android bridge, envelope format and encryption unchanged. Verified on a disposable synthetic vault across Android and Windows (300 → 301 → 302 entries, matching SHA256 transfers).
-- **1U-3 — NEXT:** safe inspection of remote encrypted vault versions.
-- **Remaining 1U work:** local synchronization binding/state; Windows file-target adapter; Android SAF-target adapter; cross-platform synchronization acceptance.
+**Slice status (synchronization itself is NOT implemented; nothing below is reachable by an end user):**
+- **1U-1 — COMPLETE** (`8d001a1`): pure sync-state classifier (`localvault_core::sync`): raw-envelope SHA-256 fingerprints, description-only classification, push-intent reconciliation. No I/O, provider or network.
+- **1U-2 — COMPLETE** (`d7b71a2`): encrypted schema-3 revision migration — authenticated `revision: u64` in the AEAD payload, legacy schemas 1/2 readable, migration on a committed write, one shared core rule used by desktop and the Android bridge, envelope format and encryption unchanged. Verified on a disposable synthetic vault across Android and Windows (300 → 301 → 302 entries, matching SHA256 transfers).
+- **1U-3 — COMPLETE** (`ebe4ae5`; with `d4ad19d`, 1U-4 A2a): authenticated inspection of a remote encrypted vault candidate, bound to the exact raw envelope bytes.
+- **1U-4 — device-local binding foundation (Windows), slices complete:** A1 `c9158e5` (validated sync-state model/codec); A2b `1f41344` (pure authenticated state transitions); B1a `b232679` (guarded sync-state file store); Windows no-clobber hotfix `177ce4a` (vault creation); B1b `615c69c` (session-verified state); B1c `0b4f33b` (authenticated high-water observation); B1d `f22dc76` (read-only file adapter); B1e `401513d` (observation of a bound target); B1f `5476afb` (internal initial binding to an identical artifact); B1g `76af84e` (physical-file identity check); B1h `719e298` (Rust-owned one-time binding consent, 120 s); B1i `a1a94aa` (read-only binding status and guarded local reset). B1h and B1i are dormant internal Rust infrastructure.
+- **NEXT — 1U-4 B1j:** Windows Tauri commands and a Russian-language binding-management UI. It exposes **only** the approved initial-binding / status / reset workflows and must **not** claim to enable synchronization: no push, pull, publication, transport or automatic behavior.
+- **Future (not started, not scheduled):** real sync transport and provider choice; provider authority / cloud freshness; initial publication to an absent remote; actual push and pull; remote-to-local adoption; merge and conflict-resolution workflow; automatic synchronization; Android SAF-target adapter and Android sync-state integration; security hardening of the above; cross-platform synchronization acceptance. These are open items, not approved designs.
 
-**Product direction for 1U (agreed):** manual synchronization first; a separate encrypted synchronization artifact; local primary vaults remain independent; automatic synchronization only after the manual foundation has been validated and hardened. Everything beyond that — provider choice, any network transport, and the detailed architecture proposals from the earlier 1U assessment — is **not yet approved and remains open**. Anti-rollback and remote revision validation are not implemented (the revision is not a freshness proof; see `@docs/SECURITY_MODEL.md`). Vault Key rotation is not implemented or approved.
+**Product direction for 1U (agreed):** manual synchronization first; a separate encrypted synchronization artifact; local primary vaults remain independent; automatic synchronization only after the manual foundation has been validated and hardened. Everything beyond that — provider choice, any network transport, and the detailed architecture proposals from the earlier 1U assessment — is **not yet approved and remains open**. A local synchronized folder is not automatically an authoritative remote provider (`@docs/ARCHITECTURE.md`). Anti-rollback and authoritative remote freshness are not implemented (the revision and the device-local high-water mark are not freshness proofs; see `@docs/SECURITY_MODEL.md`). Vault Key rotation is not implemented or approved.
 
 Design and implement (stage-level scope, unchanged):
 - provider abstraction
@@ -102,6 +104,8 @@ Design and implement (stage-level scope, unchanged):
 - offline-first workflow
 - safe atomic updates
 - recovery path
+
+(Partially realized so far: encrypted-artifact inspection, device-local sync state, revision semantics and a read-only file adapter exist as dormant internal code; the provider abstraction, conflict detection, offline-first workflow, atomic remote updates and recovery path remain open.)
 
 A paid LocalVault-owned server is **not** required for the first sync implementation. Preferred initial direction: an existing storage/sync provider or a generic provider abstraction, transporting only encrypted LocalVault state. Provider candidates (WebDAV, existing user cloud storage, OS-synchronized folder, provider APIs) should be evaluated at this stage rather than hard-coded earlier. Do not implement naive "last writer silently overwrites everything" sync. A custom zero-knowledge LocalVault sync service may be considered later but is not required for the first mobile/sync milestone.
 

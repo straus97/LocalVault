@@ -19,7 +19,9 @@ crates/localvault-core/src/
                                         # TotpConfig/TotpAlgorithm, schema 3 + revision, schema validation,
                                         # prepare_for_write, zeroization
     format.rs                          # VaultEnvelope: authenticated create/open/reseal/rewrap
-  sync.rs                              # pure envelope-fingerprint + sync-state classifier (1U-1); no I/O
+  sync.rs                              # pure envelope-fingerprint + sync-state classifier (1U-1) and authenticated
+                                        # remote/local inspection bound to raw envelope bytes (1U-3); no I/O
+  sync_state.rs                        # device-local sync-state model, codec and pure transitions (1U-4 A1/A2b); no I/O
   site.rs                              # derived, non-persisted site_key(url) -> Option<String> (Android grouping)
   totp.rs                              # RFC 6238 parser + generator (bare Base32 / otpauth:// URI,
                                         # SHA1/SHA256/SHA512, caller-supplied time, no system clock)
@@ -32,7 +34,9 @@ src-tauri/src/
                                        # credentials, entries, password_health, passwords,
                                        # recent_vaults, site_icons, totp
   vault/                              # backup, lifecycle, session, storage — orchestration/filesystem,
-                                       # NOT the format/data model, which now live in localvault-core
+                                       # NOT the format/data model, which now live in localvault-core;
+                                       # plus the dormant Windows sync adapters (1U-4): sync_state_store.rs,
+                                       # sync_file_adapter.rs, file_identity.rs (see "Sync binding architecture")
   password_generator.rs
   recent_vaults.rs
   secure_clipboard.rs                 # Windows clipboard integration
@@ -74,7 +78,25 @@ Source authority: `crates/localvault-core/src/vault/data.rs`, `src-tauri/src/vau
 - The rule is owned by the shared core: `VaultData::prepare_for_write` upgrades a legacy schema, increments the revision and validates, on a *candidate* copy and failure-atomically. Desktop (`UnlockedVaultSession::save` / `commit_candidate`) and the Android bridge (every `stage_*` mutation) both call it; neither re-implements it. Migration is therefore not orchestrated exclusively by `src-tauri`.
 - Failure behavior: desktop prepares a clone, so a failed save leaves the committed in-memory schema and revision unchanged and a retry advances the revision once. Android stages a candidate first and promotes it to the session only in `commit_staged_save`, after the SAF write is verified.
 - The envelope format and cryptography are unchanged. Changing the master-password wrapper (`rewrap_envelope_master_password`) keeps the Vault Key and encrypted payload, so it does **not** bump the payload revision, but it does change the raw envelope bytes and therefore the envelope fingerprint.
-- `localvault_core::sync` (1U-1) is **pure logic**: SHA-256 fingerprints of raw envelope bytes, a description-only classifier, and push-intent reconciliation. It performs no I/O, reads no clock, decrypts nothing, and does not read `revision`. No sync provider, remote adoption, automatic sync, network transport or sync UI exists; synchronization is not implemented.
+- `localvault_core::sync` began (1U-1) as **pure logic**: SHA-256 fingerprints of raw envelope bytes, a description-only classifier, and push-intent reconciliation. Since 1U-3 it also authenticates and inspects envelope bytes handed to it (including their `revision`) through `localvault_core::vault::format`; it still performs no I/O and reads no clock. No sync provider, remote adoption, automatic sync, network transport or sync UI exists; synchronization is not implemented. The 1U-4 layers built on it are described in the next section.
+
+## Sync binding architecture (Stage 1U-4, through B1i; Windows, dormant)
+
+Nothing in this section is reachable by an end user: no Tauri command, frontend code or startup path calls it yet (B1j adds the first commands/UI, initial-binding/status/reset only). It is infrastructure, not a sync feature. Source authority: `crates/localvault-core/src/sync.rs`, `sync_state.rs`, `src-tauri/src/vault/{sync_state_store,sync_file_adapter,file_identity,session}.rs`, `src-tauri/src/app_state.rs`.
+
+Distinct objects, deliberately kept separate:
+
+- **Primary local encrypted vault** — the user's `.lvault` file. Unchanged by any 1U-4 slice; binding never rewrites it.
+- **Separate encrypted sync artifact** — a user-chosen encrypted vault file that may live in a synchronized folder. It is only ever read, and only as candidate bytes.
+- **Trusted device-local sync-state record** — a small device-local file (under the per-user local application-data root, subdirectory `sync-state`, one record per local vault *location*) holding the binding, the last synced checkpoint, an optional pending push and a remote high-water mark. It holds no plaintext vault id, key, password or entries; the vault is referenced through a salted tag. Its checksum detects accidental corruption only; it is not a MAC.
+- **Rust Core authenticated evidence and pure transitions** (`localvault-core`) — decides what is true. Authentication of local and candidate envelopes, vault identity, revisions and fingerprints, and the state transitions (bind an identical remote, record an observation) are computed in core and return *proposals*; core performs no I/O, reads no clock and generates no randomness.
+- **Windows session-scoped operations** (`UnlockedVaultSession`, `AppState`) — run only inside an unlocked session: verify the stored state against the authenticated vault identity, observe a bound target, and perform the guarded operations. Failure leaves the previous durable state as the source of truth.
+- **Read-only filesystem adapter** (`sync_file_adapter.rs`, `file_identity.rs`) — reads one regular, non-reparse file through one handle, never writes, and reports a local miss as `AbsentOnDisk`, which is deliberately not convertible to remote absence. `file_identity.rs` reads physical file identity (volume + 128-bit file id, hard-link count, delete-pending, filesystem name, local-disk check) so that an alias of the primary vault is not accepted as a target; only local NTFS/ReFS are recognized.
+- **Rust-owned approval and reset lifecycle** — initial binding and local reset each follow prepare → confirm/cancel inside the session: an opaque one-time preparation id, a 120-second expiry, dropped with the session (lock, expiry, vault switch) or by any newer preparation, and revalidated against fresh evidence at confirmation. The approval state lives only in Rust, so a future UI relays an id and cannot mint an approval. The two approvals exclude each other. `binding_status` is read-only and reveals no path, id, fingerprint or revision unless the binding is verified as linked.
+
+**A local synchronized folder is not an authoritative remote provider.** A file seen through the folder reflects only what this machine's sync client has materialized; it may be stale, delayed, offline, unhydrated or incomplete. The adapter therefore yields candidate bytes to be authenticated by core, never provider state, and no cloud-freshness or ancestry claim is made. Transport, provider authority, publication to an absent remote, push, pull and adoption are not built.
+
+Platform boundary: the state record, adapters and session wiring are Windows `src-tauri` code. Android has no sync state or adapter yet; core types (`sync`, `sync_state`) are platform-neutral and reusable when an Android adapter is built.
 
 A pre-extraction compatibility safety net (1S-B1, `bcdb1ad`; `src-tauri/tests/compat_baseline.rs` plus committed schema-1/schema-2 fixtures) exercises real persisted-format compatibility — including the v1→v2 upgrade-on-write path and the fixed-time TOTP vector — through every extraction step. `src-tauri/tests/data_storage_integration.rs` separately covers the encrypted-storage round trip for the persisted data model against desktop storage.
 
@@ -94,7 +116,7 @@ The following are still implemented only in `src-tauri`. Some are genuine platfo
 - password-health orchestration and current implementation (`app_state/password_health.rs`, `commands/password_health.rs`) — placement undecided
 - password generator (`password_generator.rs`) — placement undecided
 - Android adapter (`crates/localvault-android-bridge/`, `android/`) — exists and, as of 1T-B5c-2 (`4d75bb81042dfcf339073240472b2129265f23e1`), supports vault creation, transactional SAF saves, entry/category CRUD and TOTP set/replace/remove — see `@docs/HANDOFF_1T_PROGRESS.md`
-- synchronization — not implemented. Only the pure 1U-1 classifier (`localvault_core::sync`) and the 1U-2 revision counter exist; there is no provider, transport or adoption logic (remaining 1U/1V work)
+- synchronization — not implemented. Core sync inspection/state types (`sync`, `sync_state`), the 1U-2 revision counter and dormant Windows binding infrastructure exist (see "Sync binding architecture"); there is no provider, transport, publication, push/pull or adoption logic (remaining 1U/1V work)
 
 The subset of this list that is a permanent platform-adapter responsibility (not just "not yet extracted") is listed separately below in "What must stay outside the shared core."
 
@@ -115,10 +137,11 @@ localvault-core (Rust, no Tauri/platform dependency)
     +-- migrations (schema 1/2 -> 3)           [DONE — schema constants/validation 1S-C2; legacy-schema upgrade
     |                                           and revision preparation in core (`VaultData::prepare_for_write`,
     |                                           1U-2); adapters only call it]
-    +-- sync state classifier (pure)           [DONE — 1U-1 `localvault_core::sync`; no I/O, no provider]
+    +-- sync state classifier + authenticated inspection + sync-state model/transitions (pure)
+    |                                          [DONE — 1U-1/1U-3 `localvault_core::sync`, 1U-4 `sync_state`; no I/O, no provider]
     +-- password health                        [NOT STARTED — placement undecided; deferred, not required before 1T]
     +-- TOTP (RFC 6238 generation/validation)  [DONE — 1S-C3]
-    +-- future sync metadata and merge/conflict semantics  [NOT STARTED]
+    +-- merge/conflict semantics and remote-adoption rules  [NOT STARTED]
     |
     +-- Desktop/Tauri adapter   (src-tauri, current app)
     +-- Android adapter         (1T — closed as an engineering milestone; not a production release)
@@ -183,4 +206,4 @@ Full toolchain pins (Rust/NDK/AGP/Gradle/Kotlin/UniFFI/JNA versions), the storag
 
 ## Future sync abstraction
 
-Sync (1U/1V) is a provider-abstracted transport for **encrypted** vault state only — see `@docs/SECURITY_MODEL.md` for what must never leave the device unencrypted. The sync layer needs, at minimum, before implementation: stable vault identity, revision/version semantics, device identity where required, conflict detection, atomic update rules, offline-first behavior, a recovery strategy, backup interaction, and migration/version compatibility. This design work belongs in the core (sync metadata, merge/conflict semantics) with the actual transport (WebDAV, cloud-storage provider, OS-synced folder, etc.) implemented as a swappable adapter — not hard-coded into the core.
+Sync (1U/1V) is a provider-abstracted transport for **encrypted** vault state only — see `@docs/SECURITY_MODEL.md` for what must never leave the device unencrypted. The sync layer needs, at minimum, before implementation: stable vault identity, revision/version semantics, device identity where required, conflict detection, atomic update rules, offline-first behavior, a recovery strategy, backup interaction, and migration/version compatibility. Of these, the revision semantics, a device-local binding state and authenticated inspection exist (1U-2 … 1U-4 B1i); the rest is open. This design work belongs in the core (sync metadata, merge/conflict semantics) with the actual transport (WebDAV, cloud-storage provider, OS-synced folder, etc.) implemented as a swappable adapter — not hard-coded into the core.
