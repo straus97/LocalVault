@@ -26,7 +26,8 @@ use crate::vault::{
     backup::BackupError,
     lifecycle::VaultLifecycleError,
     session::{
-        InitialBindingApproval, InitialBindingConfirmRefusal, InitialBindingOutcome,
+        BindingResetConfirmRefusal, BindingResetOutcome, BindingResetPreview, BindingResetRefusal,
+        BindingStatus, InitialBindingApproval, InitialBindingConfirmRefusal, InitialBindingOutcome,
         InitialBindingPreview, InitialBindingRefusal, RemoteObservationOutcome,
         RemoteObservationRefusal, RemoteTargetRefusal, SessionError, SessionSyncState,
         UnlockedVaultSession,
@@ -417,6 +418,82 @@ impl AppState {
 
         if let Some(session) = guard.session.as_mut() {
             session.cancel_initial_binding();
+        }
+
+        Ok(())
+    }
+
+    /// Sanitized, read-only summary of the unlocked vault's synchronization
+    /// binding (Stage 1U-4 B1i). Internal: no command or UI is attached. See
+    /// [`UnlockedVaultSession::binding_status`].
+    ///
+    /// Fails with `VaultLocked`/`SessionExpired` unless a session is live. Like
+    /// `load_sync_state` it observes expiry but does not count as user activity:
+    /// a status check must never keep a vault unlocked.
+    pub fn binding_status(&self, root: &SyncStateRoot) -> Result<BindingStatus, AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        if self.expire_if_needed(&mut guard, Instant::now()) {
+            return Err(AppStateError::SessionExpired);
+        }
+
+        let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.binding_status(root))
+    }
+
+    /// First half of the explicit binding reset (Stage 1U-4 B1i): examine the
+    /// stored state read-only and remember it in the unlocked session. Internal:
+    /// no command, event or UI is attached, and nothing is removed. See
+    /// [`UnlockedVaultSession::prepare_binding_reset`] for which states are
+    /// resettable.
+    ///
+    /// The outer error is "no live session" (`VaultLocked`/`SessionExpired`);
+    /// the inner result is the session's own. This is an explicit user action
+    /// and therefore counts as activity. It voids a pending initial-binding
+    /// preparation. The application-state mutex is held for the whole call.
+    pub fn prepare_binding_reset(
+        &self,
+        root: &SyncStateRoot,
+    ) -> Result<Result<BindingResetPreview, BindingResetRefusal>, AppStateError> {
+        let mut guard = self.active_session_guard()?;
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.prepare_binding_reset(root))
+    }
+
+    /// Second half of the explicit binding reset (Stage 1U-4 B1i): spend the
+    /// pending preparation and, if the stored state is still exactly what it
+    /// examined, remove it. Internal: no command, event or UI is attached. See
+    /// [`UnlockedVaultSession::confirm_binding_reset`] for the order of checks,
+    /// the definite and ambiguous outcomes, and why this is not an atomic
+    /// compare-and-swap.
+    ///
+    /// The outer error is "no live session" (`VaultLocked`/`SessionExpired`); the
+    /// preparation, if any, dies with the session. Like preparation, this is an
+    /// explicit user action and counts as activity. The application-state mutex
+    /// is held across the whole operation.
+    pub fn confirm_binding_reset(
+        &self,
+        root: &SyncStateRoot,
+        preparation_id: &str,
+    ) -> Result<Result<BindingResetOutcome, BindingResetConfirmRefusal>, AppStateError> {
+        let mut guard = self.active_session_guard()?;
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.confirm_binding_reset(root, preparation_id))
+    }
+
+    /// Discard the pending reset preparation, if any. Idempotent: with no session
+    /// there is nothing to discard, which is not an error. It neither observes
+    /// expiry nor counts as activity.
+    pub fn cancel_binding_reset(&self) -> Result<(), AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        if let Some(session) = guard.session.as_mut() {
+            session.cancel_binding_reset();
         }
 
         Ok(())
@@ -1702,5 +1779,281 @@ mod tests {
         );
 
         drop(unbound.scratch);
+    }
+
+    // -- Stage 1U-4 B1i: binding status and explicit reset through the state ----
+    //
+    // The eligibility rules, the evidence checks and every outcome are tested
+    // next to the session and the store. Here: the live-session, lock, expiry,
+    // vault-switch and activity rules, plus one real end-to-end reset.
+
+    use crate::vault::session::{
+        BindingResetOutcome, BindingResetRefusal, BindingResetStale, BindingState,
+        PendingPushIndication,
+    };
+
+    type ResetConfirm =
+        Result<BindingResetOutcome, crate::vault::session::BindingResetConfirmRefusal>;
+
+    fn reset_no_pending() -> ResetConfirm {
+        Err(crate::vault::session::BindingResetConfirmRefusal::Stale(
+            BindingResetStale::NoPendingReset,
+        ))
+    }
+
+    fn reset_prepared_id(state: &AppState, bound: &Bound) -> String {
+        state
+            .prepare_binding_reset(&bound.root)
+            .unwrap()
+            .expect("the reset preparation succeeds")
+            .preparation_id()
+            .to_owned()
+    }
+
+    #[test]
+    fn binding_status_requires_a_live_session_and_is_not_activity() {
+        let bound = bound_vault("b1i-appstate-status");
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+        let original = record_of(&bound);
+
+        assert!(matches!(
+            state.binding_status(&bound.root),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let aged = state.last_activity_for_test();
+        let status = state.binding_status(&bound.root).unwrap();
+
+        assert!(matches!(status.state(), BindingState::Linked(_)));
+        assert_eq!(status.target_path(), Some(bound.target.locator().as_str()));
+        assert_eq!(status.pending_push(), PendingPushIndication::None);
+        assert_eq!(state.last_activity_for_test(), aged);
+        assert_eq!(record_of(&bound), original);
+
+        state.age_session_for_test(Duration::from_secs(31));
+
+        assert!(matches!(
+            state.binding_status(&bound.root),
+            Err(AppStateError::SessionExpired)
+        ));
+        assert!(matches!(
+            state.binding_status(&bound.root),
+            Err(AppStateError::VaultLocked)
+        ));
+        assert_eq!(record_of(&bound), original);
+
+        drop(bound.scratch);
+    }
+
+    #[test]
+    fn a_reset_needs_a_live_session_and_does_not_outlive_it() {
+        let bound = bound_vault("b1i-appstate-lifetime");
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+        let original = record_of(&bound);
+
+        // Locked: nothing is examined or removed, and cancelling is not an error.
+        assert!(matches!(
+            state.prepare_binding_reset(&bound.root),
+            Err(AppStateError::VaultLocked)
+        ));
+        assert!(matches!(
+            state.confirm_binding_reset(&bound.root, "00000000-0000-4000-8000-000000000000"),
+            Err(AppStateError::VaultLocked)
+        ));
+        assert!(state.cancel_binding_reset().is_ok());
+        assert_eq!(record_of(&bound), original);
+
+        // Lock after preparing: the same vault, unlocked again, has no preparation.
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+
+        let id = reset_prepared_id(&state, &bound);
+
+        state.lock_vault().unwrap();
+
+        assert!(matches!(
+            state.confirm_binding_reset(&bound.root, &id),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+
+        assert_eq!(
+            state.confirm_binding_reset(&bound.root, &id).unwrap(),
+            reset_no_pending()
+        );
+        assert_eq!(record_of(&bound), original);
+
+        // Expiry: reported as such; the session and the preparation are gone.
+        let id = reset_prepared_id(&state, &bound);
+
+        state.age_session_for_test(Duration::from_secs(31));
+
+        assert!(matches!(
+            state.confirm_binding_reset(&bound.root, &id),
+            Err(AppStateError::SessionExpired)
+        ));
+        assert!(!state.status().unwrap().unlocked);
+
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+
+        assert_eq!(
+            state.confirm_binding_reset(&bound.root, &id).unwrap(),
+            reset_no_pending()
+        );
+        assert_eq!(record_of(&bound), original);
+
+        // A preparation for one vault cannot be confirmed in another.
+        let id = reset_prepared_id(&state, &bound);
+        let other = bound_vault("b1i-appstate-lifetime-other");
+        let other_original = record_of(&other);
+
+        state.lock_vault().unwrap();
+        state.unlock_vault(other.vault.clone(), password()).unwrap();
+
+        assert_eq!(
+            state.confirm_binding_reset(&other.root, &id).unwrap(),
+            reset_no_pending()
+        );
+        assert_eq!(
+            state.confirm_binding_reset(&bound.root, &id).unwrap(),
+            reset_no_pending()
+        );
+        assert_eq!(record_of(&bound), original);
+        assert_eq!(record_of(&other), other_original);
+
+        drop(other.scratch);
+        drop(bound.scratch);
+    }
+
+    #[test]
+    fn a_reset_through_the_state_removes_only_the_sync_state_record() {
+        let bound = bound_vault("b1i-appstate-reset");
+
+        std::fs::write(&bound.remote, &bound.candidate).unwrap();
+
+        let vault_bytes = std::fs::read(&bound.vault).unwrap();
+        let remote_bytes = std::fs::read(&bound.remote).unwrap();
+        let state = AppState::default();
+
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+
+        let id = reset_prepared_id(&state, &bound);
+
+        assert_eq!(
+            state.confirm_binding_reset(&bound.root, &id).unwrap(),
+            Ok(BindingResetOutcome::ResetAndVerified)
+        );
+
+        assert!(!bound
+            .root
+            .path()
+            .join(SYNC_STATE_DIRECTORY)
+            .read_dir()
+            .unwrap()
+            .any(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|e| e == "json")));
+        assert_eq!(std::fs::read(&bound.vault).unwrap(), vault_bytes);
+        assert_eq!(std::fs::read(&bound.remote).unwrap(), remote_bytes);
+        assert!(matches!(
+            state.binding_status(&bound.root).unwrap().state(),
+            BindingState::NotConfigured
+        ));
+
+        // The session and its lock are still the state's.
+        assert!(matches!(
+            UnlockedVaultSession::unlock(&bound.vault, password()),
+            Err(crate::vault::session::SessionError::InUse)
+        ));
+
+        // Nothing is left to reset, and nothing was rebuilt.
+        assert_eq!(
+            state
+                .prepare_binding_reset(&bound.root)
+                .unwrap()
+                .map(|_| ()),
+            Err(BindingResetRefusal::NothingToReset)
+        );
+
+        drop(bound.scratch);
+    }
+
+    #[test]
+    fn preparing_and_confirming_a_reset_count_as_activity_but_cancelling_does_not() {
+        let bound = bound_vault("b1i-appstate-activity");
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let aged = state.last_activity_for_test().unwrap();
+
+        state.cancel_binding_reset().unwrap();
+        assert_eq!(state.last_activity_for_test(), Some(aged));
+
+        let id = reset_prepared_id(&state, &bound);
+
+        assert!(
+            state.last_activity_for_test().unwrap() > aged,
+            "preparing did not refresh activity"
+        );
+
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let aged = state.last_activity_for_test().unwrap();
+
+        assert_eq!(
+            state.confirm_binding_reset(&bound.root, &id).unwrap(),
+            Ok(BindingResetOutcome::ResetAndVerified)
+        );
+        assert!(
+            state.last_activity_for_test().unwrap() > aged,
+            "confirming did not refresh activity"
+        );
+
+        drop(bound.scratch);
+    }
+
+    #[test]
+    fn a_reset_and_an_initial_binding_preparation_void_each_other_through_the_state() {
+        let bound = bound_vault("b1i-appstate-exclusion");
+        let state = AppState::default();
+        let original = record_of(&bound);
+
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+
+        // An initial-binding attempt (refused here: a binding exists) voids a
+        // pending reset.
+        let id = reset_prepared_id(&state, &bound);
+
+        assert_eq!(
+            state
+                .prepare_initial_binding(&bound.root, &bound.target)
+                .unwrap()
+                .map(|_| ()),
+            Err(InitialBindingRefusal::ExistingBinding)
+        );
+        assert_eq!(
+            state.confirm_binding_reset(&bound.root, &id).unwrap(),
+            reset_no_pending()
+        );
+        assert_eq!(record_of(&bound), original);
+
+        // Cancelling the initial binding does not cancel a reset.
+        let id = reset_prepared_id(&state, &bound);
+
+        state.cancel_initial_binding().unwrap();
+
+        assert_eq!(
+            state.confirm_binding_reset(&bound.root, &id).unwrap(),
+            Ok(BindingResetOutcome::ResetAndVerified)
+        );
+
+        drop(bound.scratch);
     }
 }

@@ -68,6 +68,18 @@
 //! leftover artifacts (an unpublished temp can never be adopted), so `load` and
 //! `replace` tolerate them.
 //!
+//! # Reset evidence (Stage 1U-4 B1i)
+//!
+//! [`SyncStateStore::evidence`] captures read-only [`RecordEvidence`]: whether
+//! the primary record exists and the length and SHA-256 of its exact bytes, plus
+//! every recognized recovery artifact by name, length and SHA-256. It refuses
+//! (never guesses) when any of those files cannot be read in full and judged a
+//! plain file. [`SyncStateStore::delete_if_evidence_matches`] is `delete` that
+//! first compares fresh evidence with the expected evidence, immediately before
+//! its first removal, and refuses with nothing removed on any difference. It is
+//! a narrowed read-then-delete, **not** compare-and-swap. `load` and `delete`
+//! are unchanged.
+//!
 //! # Guarantees and limits
 //!
 //! * **Create** is no-clobber because publication is `hard_link(temp, record)`,
@@ -320,6 +332,138 @@ pub enum DeleteOutcome {
     AlreadyAbsent,
 }
 
+/// Why [`SyncStateStore::evidence`] could not capture exact evidence. Categories
+/// only: no path, name, size or `io::ErrorKind`. Every one of them means "do not
+/// treat this record as resettable": nothing was concluded about its contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum EvidenceRefusal {
+    /// An I/O or permission failure while inspecting or reading a file.
+    #[error("the sync-state files could not be read to capture evidence")]
+    Unreadable,
+    /// A directory, symlink, junction or other reparse point where a plain file
+    /// or directory was required.
+    #[error("a sync-state path is not a regular file or directory")]
+    UnexpectedObject,
+    /// The directory holds too many entries to scan.
+    #[error("the sync-state directory holds too many entries")]
+    EntryLimit,
+    /// The record or a recovery artifact is larger than the supported maximum, so
+    /// it cannot be read in full and bound exactly.
+    #[error("a sync-state file is larger than the supported maximum")]
+    Oversized,
+    /// A file disappeared between listing it and reading it.
+    #[error("a sync-state file changed while evidence was captured")]
+    Unstable,
+}
+
+impl From<Fault> for EvidenceRefusal {
+    fn from(fault: Fault) -> Self {
+        match fault {
+            Fault::Io(_) => Self::Unreadable,
+            Fault::Unexpected => Self::UnexpectedObject,
+            Fault::EntryLimit => Self::EntryLimit,
+        }
+    }
+}
+
+/// Length and SHA-256 of the exact bytes of one fully read file.
+#[derive(Clone, PartialEq, Eq)]
+struct FileEvidence {
+    len: u64,
+    digest: EnvelopeFingerprint,
+}
+
+impl FileEvidence {
+    fn of(bytes: &[u8]) -> Self {
+        Self {
+            len: bytes.len() as u64,
+            digest: EnvelopeFingerprint::of_bytes(bytes),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct ArtifactEvidence {
+    /// ASCII-lowercased file name (the store's own artifact-name rule).
+    name: String,
+    file: FileEvidence,
+}
+
+/// Exact, read-only evidence of what the store holds for **one local location**
+/// at one instant: whether the primary record is present and, if it is, the
+/// length and SHA-256 of its exact bytes, plus the complete set of recognized
+/// recovery artifacts, each by name, length and SHA-256 of its exact bytes.
+///
+/// Equality of two values means every one of those bytes was identical when they
+/// were captured, for the same record key. It is **not** proof that no other
+/// process changed anything in between, it carries no physical file identity (a
+/// file replaced by an identical copy is equal evidence), and it is not a lock.
+///
+/// It exists so that an explicit, user-approved reset can refuse to delete state
+/// that differs from what the user was shown; see
+/// [`SyncStateStore::delete_if_evidence_matches`]. `Debug` reveals nothing: no
+/// path, name, length, hash or key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecordEvidence {
+    key: String,
+    primary: Option<FileEvidence>,
+    artifacts: Vec<ArtifactEvidence>,
+}
+
+impl RecordEvidence {
+    /// Whether a primary record file was present.
+    pub fn primary_present(&self) -> bool {
+        self.primary.is_some()
+    }
+
+    /// How many recognized recovery artifacts were present.
+    pub fn artifact_count(&self) -> usize {
+        self.artifacts.len()
+    }
+}
+
+impl fmt::Debug for RecordEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RecordEvidence(<redacted>)")
+    }
+}
+
+/// Why [`SyncStateStore::delete_if_evidence_matches`] did not complete.
+///
+/// [`Evidence`](Self::Evidence), [`EvidenceChanged`](Self::EvidenceChanged) and
+/// every [`Store`](Self::Store) error except `IncompleteDeletion` are reported
+/// strictly **before the first removal**: this call removed nothing. Only
+/// `Store(IncompleteDeletion)` can follow a partial removal. See
+/// [`removal_may_have_started`](Self::removal_may_have_started).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ConditionalDeleteError {
+    #[error("evidence could not be captured; nothing was removed")]
+    Evidence(EvidenceRefusal),
+    #[error("the sync-state files differ from the expected evidence; nothing was removed")]
+    EvidenceChanged,
+    #[error("sync-state deletion failed")]
+    Store(StoreError),
+}
+
+impl ConditionalDeleteError {
+    /// Whether this call may already have removed something. Derived from the
+    /// deletion's own sequence: every precondition (directory, artifact scan, the
+    /// plain-file checks, the evidence comparison) precedes the first removal and
+    /// reports a different error; once removal has begun, a failure to remove or
+    /// to verify the removal is `IncompleteDeletion`, and nothing else.
+    pub fn removal_may_have_started(self) -> bool {
+        matches!(self, Self::Store(StoreError::IncompleteDeletion))
+    }
+}
+
+/// What a deletion will remove, established before anything is removed.
+struct DeletePlan {
+    key: String,
+    record: PathBuf,
+    artifacts: Vec<PathBuf>,
+    record_present: bool,
+}
+
 /// Internal filesystem failure, before it is mapped to a public type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fault {
@@ -373,6 +517,7 @@ enum Point {
     Verify,
     RemoveArtifact,
     RemovePrimary,
+    BeforeEvidenceRecheck,
 }
 
 #[cfg(test)]
@@ -581,13 +726,145 @@ impl SyncStateStore {
     /// `Unreadable`, never absent. Anything that cannot be removed or verified
     /// gone is [`StoreError::IncompleteDeletion`]. Nothing else ever deletes.
     pub fn delete(&self, local_locator: &Locator) -> Result<DeleteOutcome, StoreError> {
+        match self.plan_delete(local_locator)? {
+            None => Ok(DeleteOutcome::AlreadyAbsent),
+            Some(plan) => self.execute_delete(&plan),
+        }
+    }
+
+    /// Capture exact, read-only [`RecordEvidence`] of everything the store holds
+    /// for `local_locator`: the primary record's length and SHA-256 and every
+    /// recognized recovery artifact's name, length and SHA-256.
+    ///
+    /// It reads through the same guarded paths as [`load`](Self::load): every
+    /// existing ancestor and the directory must be plain directories, files are
+    /// judged with `symlink_metadata` and on the opened handle, nothing follows a
+    /// reparse point, and reads are bounded by `MAX_SYNC_STATE_BYTES`. It never
+    /// creates, repairs or removes anything.
+    ///
+    /// It **refuses** (an [`EvidenceRefusal`]) rather than guess whenever a file
+    /// cannot be read in full and judged a plain file: a permission or I/O
+    /// failure, a directory or reparse point where a file belongs, an oversized
+    /// record or artifact, too many entries, or a file that vanished mid-capture.
+    /// A missing directory or an empty one is the empty evidence (nothing present).
+    ///
+    /// A corrupt or unsupported record is **not** refused: its exact bytes are
+    /// bound whatever they decode to.
+    pub fn evidence(&self, local_locator: &Locator) -> Result<RecordEvidence, EvidenceRefusal> {
+        let key = record_key(local_locator);
+
+        match self.inspect_directory()? {
+            DirState::Absent => {
+                return Ok(RecordEvidence {
+                    key,
+                    primary: None,
+                    artifacts: Vec::new(),
+                })
+            }
+            DirState::Present => {}
+        }
+
+        let primary = match self.read_primary(&self.record_path(&key))? {
+            Primary::Absent => None,
+            Primary::Empty => Some(FileEvidence::of(&[])),
+            Primary::TooLarge => return Err(EvidenceRefusal::Oversized),
+            Primary::Bytes(bytes) => Some(FileEvidence::of(&bytes)),
+        };
+
+        let mut artifacts = Vec::new();
+
+        for path in self.scan_artifacts(&key)? {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_ascii_lowercase)
+                .ok_or(EvidenceRefusal::UnexpectedObject)?;
+
+            let file = match self.read_primary(&path)? {
+                Primary::Absent => return Err(EvidenceRefusal::Unstable),
+                Primary::Empty => FileEvidence::of(&[]),
+                Primary::TooLarge => return Err(EvidenceRefusal::Oversized),
+                Primary::Bytes(bytes) => FileEvidence::of(&bytes),
+            };
+
+            artifacts.push(ArtifactEvidence { name, file });
+        }
+
+        artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+
+        Ok(RecordEvidence {
+            key,
+            primary,
+            artifacts,
+        })
+    }
+
+    /// [`delete`](Self::delete), but only if the store still holds exactly the
+    /// state that `expected` describes for `local_locator`.
+    ///
+    /// In order: the same preconditions as `delete` (directory, artifact scan,
+    /// every target a plain file), then **immediately before the first removal**
+    /// fresh evidence is captured and compared with `expected`; any difference,
+    /// or any failure to capture it, refuses with nothing removed. Only then are
+    /// the artifacts and finally the record removed and the removal verified,
+    /// exactly as `delete` does. Nothing outside this location's record and its
+    /// recognized artifacts is touched, and nothing is followed through a reparse
+    /// point.
+    ///
+    /// # What this is not
+    ///
+    /// It is **not** compare-and-swap, and not atomic against another process:
+    /// the evidence is read, then the files are removed, and a writer that is not
+    /// bound by the exclusive per-vault session lock can still change them in
+    /// between (the window is narrowed to the few calls between the comparison and
+    /// the first removal, not closed). A file that changes after the comparison is
+    /// either removed as it then is, or makes the final verification report
+    /// `IncompleteDeletion`. The unlocked vault session lock must be held by the
+    /// caller, as for every state operation.
+    ///
+    /// `Ok(AlreadyAbsent)` is returned only when the store holds nothing **and**
+    /// `expected` is the empty evidence.
+    pub fn delete_if_evidence_matches(
+        &self,
+        local_locator: &Locator,
+        expected: &RecordEvidence,
+    ) -> Result<DeleteOutcome, ConditionalDeleteError> {
+        let plan = self
+            .plan_delete(local_locator)
+            .map_err(ConditionalDeleteError::Store)?;
+
+        if self.hook(Point::BeforeEvidenceRecheck).is_err() {
+            return Err(ConditionalDeleteError::Evidence(
+                EvidenceRefusal::Unreadable,
+            ));
+        }
+
+        let current = self
+            .evidence(local_locator)
+            .map_err(ConditionalDeleteError::Evidence)?;
+
+        if current != *expected {
+            return Err(ConditionalDeleteError::EvidenceChanged);
+        }
+
+        match plan {
+            None => Ok(DeleteOutcome::AlreadyAbsent),
+            Some(plan) => self
+                .execute_delete(&plan)
+                .map_err(ConditionalDeleteError::Store),
+        }
+    }
+
+    /// Everything `delete` checks before it removes anything. `None` is verified
+    /// absence. Any error is reported with nothing removed.
+    fn plan_delete(&self, local_locator: &Locator) -> Result<Option<DeletePlan>, StoreError> {
         let key = record_key(local_locator);
 
         match self
             .inspect_directory()
             .map_err(|fault| fault.into_store_error(IoStage::Inspect))?
         {
-            DirState::Absent => return Ok(DeleteOutcome::AlreadyAbsent),
+            DirState::Absent => return Ok(None),
             DirState::Present => {}
         }
 
@@ -625,22 +902,32 @@ impl SyncStateStore {
         };
 
         if artifacts.is_empty() && !record_present {
-            return Ok(DeleteOutcome::AlreadyAbsent);
+            return Ok(None);
         }
 
-        for artifact in &artifacts {
+        Ok(Some(DeletePlan {
+            key,
+            record,
+            artifacts,
+            record_present,
+        }))
+    }
+
+    /// The removal and its verification. Artifacts first, the record last.
+    fn execute_delete(&self, plan: &DeletePlan) -> Result<DeleteOutcome, StoreError> {
+        for artifact in &plan.artifacts {
             self.remove(Point::RemoveArtifact, artifact)?;
         }
-        if record_present {
-            self.remove(Point::RemovePrimary, &record)?;
+        if plan.record_present {
+            self.remove(Point::RemovePrimary, &plan.record)?;
         }
 
         // Verify, treating "cannot tell" as incomplete.
-        match fs::symlink_metadata(&record) {
+        match fs::symlink_metadata(&plan.record) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             _ => return Err(StoreError::IncompleteDeletion),
         }
-        match self.scan_artifacts(&key) {
+        match self.scan_artifacts(&plan.key) {
             Ok(remaining) if remaining.is_empty() => Ok(DeleteOutcome::Removed),
             _ => Err(StoreError::IncompleteDeletion),
         }
@@ -883,6 +1170,18 @@ impl SyncStateStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(StoreError::IncompleteDeletion),
         }
+    }
+
+    /// Test seam for the session's tests (the fault hooks are private): run
+    /// `run` inside [`delete_if_evidence_matches`](Self::delete_if_evidence_matches)
+    /// after its preconditions and before its evidence comparison, which is the
+    /// window the comparison exists to close.
+    #[cfg(test)]
+    pub(crate) fn run_before_evidence_recheck_for_test(&self, run: impl Fn() + Send + 'static) {
+        self.faults
+            .lock()
+            .unwrap()
+            .push((Point::BeforeEvidenceRecheck, Action::Run(Box::new(run))));
     }
 
     #[cfg(not(test))]
@@ -2229,6 +2528,658 @@ mod tests {
             assert_eq!(loaded(store.load(&loc(LOCAL))), state);
         }
         assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
+    }
+
+    // ---- B1i. reset evidence and conditional deletion -------------------------
+
+    const OTHER_TOKEN: &str = "fedcba9876543210fedcba9876543210";
+
+    /// Name and exact bytes of every plain file in `dir`.
+    fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        names(dir)
+            .into_iter()
+            .map(|name| {
+                let bytes = fs::read(dir.join(&name)).unwrap();
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn evidence_binds_the_exact_bytes_of_the_record_and_every_artifact() {
+        let scratch = Scratch::new("evidence-bytes");
+        let store = scratch.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris-one");
+        scratch.put(&scratch.artifact(LOCAL, OTHER_TOKEN), b"debris-two");
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        assert!(evidence.primary_present());
+        assert_eq!(evidence.artifact_count(), 2);
+        assert_eq!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+
+        // One byte of the record changes, its length does not.
+        let record = fs::read(scratch.record(LOCAL)).unwrap();
+        let mut altered = record.clone();
+        altered[10] ^= 0x01;
+        fs::write(scratch.record(LOCAL), &altered).unwrap();
+        assert_ne!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+
+        // The evidence is the bytes, not a timestamp: restoring them restores it.
+        fs::write(scratch.record(LOCAL), &record).unwrap();
+        assert_eq!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+
+        // An artifact keeps its name and length but not its content.
+        fs::write(scratch.artifact(LOCAL, STALE_TOKEN), b"debris-ONE").unwrap();
+        assert_ne!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+        fs::write(scratch.artifact(LOCAL, STALE_TOKEN), b"debris-one").unwrap();
+        assert_eq!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+
+        // The same bytes under another artifact name.
+        fs::rename(
+            scratch.artifact(LOCAL, OTHER_TOKEN),
+            scratch.artifact(LOCAL, "00000000000000000000000000000000"),
+        )
+        .unwrap();
+        assert_ne!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+        fs::rename(
+            scratch.artifact(LOCAL, "00000000000000000000000000000000"),
+            scratch.artifact(LOCAL, OTHER_TOKEN),
+        )
+        .unwrap();
+        assert_eq!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+
+        // An artifact added, one removed, the record removed.
+        let extra = scratch.artifact(LOCAL, "11111111111111111111111111111111");
+        fs::write(&extra, b"more").unwrap();
+        assert_ne!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+        fs::remove_file(&extra).unwrap();
+        fs::remove_file(scratch.artifact(LOCAL, OTHER_TOKEN)).unwrap();
+        assert_ne!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+        fs::write(scratch.artifact(LOCAL, OTHER_TOKEN), b"debris-two").unwrap();
+        assert_eq!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+        fs::remove_file(scratch.record(LOCAL)).unwrap();
+        assert_ne!(store.evidence(&loc(LOCAL)).unwrap(), evidence);
+    }
+
+    #[test]
+    fn evidence_tells_absence_from_presence_and_reads_unusable_records() {
+        let scratch = Scratch::new("evidence-absence");
+        let store = scratch.store();
+
+        // No directory at all: the empty evidence, and reading it creates nothing.
+        let nothing = store.evidence(&loc(LOCAL)).unwrap();
+        assert!(!nothing.primary_present());
+        assert_eq!(nothing.artifact_count(), 0);
+        assert!(!scratch.state_dir().exists());
+
+        // An empty directory is the same nothing.
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+        assert_eq!(store.evidence(&loc(LOCAL)).unwrap(), nothing);
+
+        // Files that are not this record's own are not part of its evidence.
+        scratch.put(&scratch.record(OTHER_LOCAL), b"someone else's");
+        let key = record_key(&loc(LOCAL));
+        fs::write(scratch.state_dir().join(format!("{key}.notes.txt")), b"x").unwrap();
+        assert_eq!(store.evidence(&loc(LOCAL)).unwrap(), nothing);
+
+        // A zero-byte record is present, and not the same as nothing.
+        scratch.put(&scratch.record(LOCAL), b"");
+        let empty = store.evidence(&loc(LOCAL)).unwrap();
+        assert!(empty.primary_present());
+        assert_ne!(empty, nothing);
+
+        // Corrupt and unsupported records are bound by their exact bytes too.
+        scratch.put(&scratch.record(LOCAL), b"garbage");
+        let garbage = store.evidence(&loc(LOCAL)).unwrap();
+        assert!(matches!(store.load(&loc(LOCAL)), StateLoad::Corrupt(_)));
+        assert_ne!(garbage, empty);
+
+        let future = tampered(&based(LOCAL, 9), |value| {
+            value["version"] = serde_json::json!(2);
+        });
+        scratch.put(&scratch.record(LOCAL), &future);
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::UnsupportedVersion);
+        let unsupported = store.evidence(&loc(LOCAL)).unwrap();
+        assert!(unsupported.primary_present());
+        assert_ne!(unsupported, garbage);
+
+        // Artifact-only remnants: no record, one artifact.
+        fs::remove_file(scratch.record(LOCAL)).unwrap();
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+        let remnants = store.evidence(&loc(LOCAL)).unwrap();
+        assert!(!remnants.primary_present());
+        assert_eq!(remnants.artifact_count(), 1);
+        assert_ne!(remnants, nothing);
+
+        // An empty artifact is still a present artifact.
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"");
+        assert_ne!(store.evidence(&loc(LOCAL)).unwrap(), remnants);
+    }
+
+    #[test]
+    fn evidence_for_one_location_is_not_evidence_for_another() {
+        let scratch = Scratch::new("evidence-key");
+        let store = scratch.store();
+
+        // Both locations hold nothing, yet their evidence is not interchangeable.
+        assert_ne!(
+            store.evidence(&loc(LOCAL)).unwrap(),
+            store.evidence(&loc(OTHER_LOCAL)).unwrap()
+        );
+
+        // The key follows the store's own path-identity rule (ASCII case).
+        assert_eq!(
+            store.evidence(&loc(LOCAL)).unwrap(),
+            store
+                .evidence(&loc(&LOCAL
+                    .to_ascii_uppercase()
+                    .replace("LVAULT", "lvault")))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn evidence_capture_writes_nothing() {
+        let scratch = Scratch::new("evidence-readonly");
+        let store = scratch.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+        scratch.put(&scratch.record(OTHER_LOCAL), b"neighbour");
+
+        let before = contents(&scratch.state_dir());
+        let modified = fs::metadata(scratch.record(LOCAL))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        for _ in 0..3 {
+            let _ = store.evidence(&loc(LOCAL)).unwrap();
+        }
+
+        assert_eq!(contents(&scratch.state_dir()), before);
+        assert_eq!(
+            fs::metadata(scratch.record(LOCAL))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            modified
+        );
+    }
+
+    #[test]
+    fn evidence_refuses_what_it_cannot_read_in_full_as_a_plain_file() {
+        // An oversized record cannot be bound exactly.
+        let big = Scratch::new("evidence-oversized-record");
+        let store = big.store();
+        fs::create_dir_all(big.state_dir()).unwrap();
+        let file = File::create(big.record(LOCAL)).unwrap();
+        file.set_len(MAX_SYNC_STATE_BYTES as u64 + 1).unwrap();
+        drop(file);
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Corrupt(CorruptReason::TooLarge)
+        );
+        assert_eq!(
+            store.evidence(&loc(LOCAL)).unwrap_err(),
+            EvidenceRefusal::Oversized
+        );
+
+        // So cannot an oversized artifact beside a readable record.
+        let artifact = Scratch::new("evidence-oversized-artifact");
+        let store = artifact.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        let file = File::create(artifact.artifact(LOCAL, STALE_TOKEN)).unwrap();
+        file.set_len(MAX_SYNC_STATE_BYTES as u64 + 1).unwrap();
+        drop(file);
+        assert_eq!(
+            store.evidence(&loc(LOCAL)).unwrap_err(),
+            EvidenceRefusal::Oversized
+        );
+
+        // A directory where the record belongs.
+        let directory = Scratch::new("evidence-directory-record");
+        let store = directory.store();
+        fs::create_dir_all(directory.record(LOCAL)).unwrap();
+        assert_eq!(
+            store.evidence(&loc(LOCAL)).unwrap_err(),
+            EvidenceRefusal::UnexpectedObject
+        );
+
+        // A directory named like an artifact.
+        let named = Scratch::new("evidence-directory-artifact");
+        let store = named.store();
+        fs::create_dir_all(named.artifact(LOCAL, STALE_TOKEN)).unwrap();
+        assert_eq!(
+            store.evidence(&loc(LOCAL)).unwrap_err(),
+            EvidenceRefusal::UnexpectedObject
+        );
+
+        // A regular file where the sync-state directory belongs.
+        let file_dir = Scratch::new("evidence-file-directory");
+        let store = file_dir.store();
+        fs::write(file_dir.state_dir(), b"not a directory").unwrap();
+        assert!(store.evidence(&loc(LOCAL)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn evidence_refuses_inaccessible_files_and_reparse_points() {
+        // A record that cannot be opened for reading.
+        let scratch = Scratch::new("evidence-inaccessible-record");
+        let store = scratch.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        {
+            let _guard = hold_exclusively(&scratch.record(LOCAL));
+            assert_eq!(
+                store.evidence(&loc(LOCAL)).unwrap_err(),
+                EvidenceRefusal::Unreadable
+            );
+        }
+        assert!(store.evidence(&loc(LOCAL)).is_ok());
+
+        // An artifact that cannot be opened for reading.
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+        {
+            let _guard = hold_exclusively(&scratch.artifact(LOCAL, STALE_TOKEN));
+            assert_eq!(
+                store.evidence(&loc(LOCAL)).unwrap_err(),
+                EvidenceRefusal::Unreadable
+            );
+        }
+
+        // The sync-state directory is a junction: never read through.
+        let junction = Scratch::new("evidence-junction-directory");
+        let elsewhere = junction.root().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(
+            elsewhere.join(format!("{}.json", record_key(&loc(LOCAL)))),
+            based(LOCAL, 9).encode().unwrap(),
+        )
+        .unwrap();
+        make_junction(&junction.state_dir(), &elsewhere);
+        assert_eq!(
+            junction.store().evidence(&loc(LOCAL)).unwrap_err(),
+            EvidenceRefusal::UnexpectedObject
+        );
+        fs::remove_dir(junction.state_dir()).unwrap();
+
+        // The record path is a junction to a directory.
+        let record = Scratch::new("evidence-junction-record");
+        let target = record.root().join("target-dir");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(record.state_dir()).unwrap();
+        make_junction(&record.record(LOCAL), &target);
+        assert_eq!(
+            record.store().evidence(&loc(LOCAL)).unwrap_err(),
+            EvidenceRefusal::UnexpectedObject
+        );
+        fs::remove_dir(record.record(LOCAL)).unwrap();
+    }
+
+    #[test]
+    fn evidence_reveals_nothing_when_printed() {
+        let scratch = Scratch::new("evidence-debug");
+        let store = scratch.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"LEAKMARK-debris");
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        let record = fs::read(scratch.record(LOCAL)).unwrap();
+        let mut shown = vec![format!("{evidence:?}"), format!("{:#?}", evidence)];
+
+        for refusal in [
+            EvidenceRefusal::Unreadable,
+            EvidenceRefusal::UnexpectedObject,
+            EvidenceRefusal::EntryLimit,
+            EvidenceRefusal::Oversized,
+            EvidenceRefusal::Unstable,
+        ] {
+            shown.push(format!("{refusal:?}"));
+            shown.push(refusal.to_string());
+            shown.push(format!("{:?}", ConditionalDeleteError::Evidence(refusal)));
+            shown.push(ConditionalDeleteError::Evidence(refusal).to_string());
+        }
+        shown.push(format!("{:?}", ConditionalDeleteError::EvidenceChanged));
+        shown.push(ConditionalDeleteError::EvidenceChanged.to_string());
+        shown.push(ConditionalDeleteError::Store(StoreError::IncompleteDeletion).to_string());
+
+        let needles = [
+            scratch.root().to_string_lossy().into_owned(),
+            record_key(&loc(LOCAL)),
+            STALE_TOKEN.to_owned(),
+            EnvelopeFingerprint::of_bytes(&record).to_hex(),
+            EnvelopeFingerprint::of_bytes(b"LEAKMARK-debris").to_hex(),
+            record.len().to_string(),
+            "LEAKMARK".to_owned(),
+            ".json".to_owned(),
+            ".tmp".to_owned(),
+            "MARKER".to_owned(),
+        ];
+
+        for output in &shown {
+            for needle in &needles {
+                assert!(
+                    !output.contains(needle.as_str()),
+                    "leaks {needle:?}: {output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conditional_deletion_removes_exactly_what_the_evidence_describes() {
+        let scratch = Scratch::new("conditional-delete");
+        let store = scratch.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        let survivor = based(OTHER_LOCAL, 4);
+        store.create(&survivor).unwrap();
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+        let key = record_key(&loc(LOCAL));
+        let unrelated = scratch.state_dir().join(format!("{key}.notes.txt"));
+        fs::write(&unrelated, b"unrelated").unwrap();
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+            Ok(DeleteOutcome::Removed)
+        );
+
+        assert!(!scratch.record(LOCAL).exists());
+        assert!(!scratch.artifact(LOCAL, STALE_TOKEN).exists());
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+        assert_eq!(loaded(store.load(&loc(OTHER_LOCAL))), survivor);
+
+        // The old evidence is not an authorization to delete again: what is
+        // there now is nothing, and nothing is not what it described.
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+            Err(ConditionalDeleteError::EvidenceChanged)
+        );
+        assert_eq!(loaded(store.load(&loc(OTHER_LOCAL))), survivor);
+    }
+
+    #[test]
+    fn conditional_deletion_of_a_corrupt_unsupported_or_remnant_state() {
+        type Setup = Box<dyn Fn(&Scratch)>;
+
+        let cases: Vec<(&str, Setup)> = vec![
+            ("corrupt", Box::new(|s| s.put(&s.record(LOCAL), b"garbage"))),
+            ("empty", Box::new(|s| s.put(&s.record(LOCAL), b""))),
+            (
+                "unsupported",
+                Box::new(|s| {
+                    let future = tampered(&based(LOCAL, 9), |value| {
+                        value["version"] = serde_json::json!(2);
+                    });
+                    s.put(&s.record(LOCAL), &future);
+                }),
+            ),
+            (
+                "remnants",
+                Box::new(|s| s.put(&s.artifact(LOCAL, STALE_TOKEN), b"debris")),
+            ),
+        ];
+
+        for (name, setup) in &cases {
+            let scratch = Scratch::new(&format!("conditional-{name}"));
+            let store = scratch.store();
+            setup(&scratch);
+
+            let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+            assert_eq!(
+                store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+                Ok(DeleteOutcome::Removed),
+                "{name}"
+            );
+            assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured, "{name}");
+        }
+    }
+
+    #[test]
+    fn conditional_deletion_refuses_any_difference_and_removes_nothing() {
+        type Change = Box<dyn Fn(&Scratch)>;
+
+        let changes: Vec<(&str, Change)> = vec![
+            (
+                "record bytes",
+                Box::new(|s| {
+                    let mut bytes = fs::read(s.record(LOCAL)).unwrap();
+                    bytes[10] ^= 0x01;
+                    fs::write(s.record(LOCAL), bytes).unwrap();
+                }),
+            ),
+            (
+                "record replaced by a valid other state",
+                Box::new(|s| {
+                    fs::write(s.record(LOCAL), based(LOCAL, 77).encode().unwrap()).unwrap();
+                }),
+            ),
+            (
+                "record removed",
+                Box::new(|s| fs::remove_file(s.record(LOCAL)).unwrap()),
+            ),
+            (
+                "artifact content",
+                Box::new(|s| fs::write(s.artifact(LOCAL, STALE_TOKEN), b"DEBRIS").unwrap()),
+            ),
+            (
+                "artifact removed",
+                Box::new(|s| fs::remove_file(s.artifact(LOCAL, STALE_TOKEN)).unwrap()),
+            ),
+            (
+                "artifact added",
+                Box::new(|s| fs::write(s.artifact(LOCAL, OTHER_TOKEN), b"new").unwrap()),
+            ),
+        ];
+
+        for (name, change) in &changes {
+            let scratch = Scratch::new("conditional-changed");
+            let store = scratch.store();
+            store.create(&based(LOCAL, 9)).unwrap();
+            scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+            let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+            change(&scratch);
+            let after_change = contents(&scratch.state_dir());
+
+            let error = store
+                .delete_if_evidence_matches(&loc(LOCAL), &evidence)
+                .unwrap_err();
+
+            assert_eq!(error, ConditionalDeleteError::EvidenceChanged, "{name}");
+            assert!(!error.removal_may_have_started(), "{name}");
+            assert_eq!(contents(&scratch.state_dir()), after_change, "{name}");
+        }
+    }
+
+    #[test]
+    fn conditional_deletion_rechecks_immediately_before_the_first_removal() {
+        let scratch = Scratch::new("conditional-window");
+        let store = scratch.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        // The record is rewritten after the preconditions passed and before the
+        // comparison: the hook runs exactly there.
+        let record = scratch.record(LOCAL);
+        run_at(&store, Point::BeforeEvidenceRecheck, move || {
+            fs::write(&record, based(LOCAL, 123).encode().unwrap()).unwrap();
+        });
+
+        let before = fs::read(scratch.record(LOCAL)).unwrap();
+
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+            Err(ConditionalDeleteError::EvidenceChanged)
+        );
+        assert_ne!(fs::read(scratch.record(LOCAL)).unwrap(), before);
+        assert!(scratch.record(LOCAL).exists());
+        assert!(scratch.artifact(LOCAL, STALE_TOKEN).exists());
+    }
+
+    #[test]
+    fn evidence_for_another_location_never_authorizes_a_deletion() {
+        let scratch = Scratch::new("conditional-other-key");
+        let store = scratch.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        let foreign = store.evidence(&loc(OTHER_LOCAL)).unwrap();
+        let before = contents(&scratch.state_dir());
+
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &foreign),
+            Err(ConditionalDeleteError::EvidenceChanged)
+        );
+        assert_eq!(contents(&scratch.state_dir()), before);
+    }
+
+    #[test]
+    fn conditional_deletion_of_nothing_needs_the_empty_evidence() {
+        let scratch = Scratch::new("conditional-nothing");
+        let store = scratch.store();
+
+        let nothing = store.evidence(&loc(LOCAL)).unwrap();
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &nothing),
+            Ok(DeleteOutcome::AlreadyAbsent)
+        );
+        assert!(!scratch.state_dir().exists());
+
+        // Evidence of something that has since vanished is a change.
+        store.create(&based(LOCAL, 9)).unwrap();
+        let something = store.evidence(&loc(LOCAL)).unwrap();
+        fs::remove_file(scratch.record(LOCAL)).unwrap();
+
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &something),
+            Err(ConditionalDeleteError::EvidenceChanged)
+        );
+    }
+
+    #[test]
+    fn conditional_deletion_failures_are_classified_by_whether_removal_began() {
+        // Before the first removal: an unexpected object blocks, nothing removed.
+        let blocked = Scratch::new("conditional-blocked");
+        let store = blocked.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        fs::remove_file(blocked.record(LOCAL)).unwrap();
+        fs::create_dir_all(blocked.record(LOCAL)).unwrap();
+
+        let error = store
+            .delete_if_evidence_matches(&loc(LOCAL), &evidence)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ConditionalDeleteError::Store(StoreError::UnexpectedObject)
+        );
+        assert!(!error.removal_may_have_started());
+        assert!(blocked.record(LOCAL).is_dir());
+
+        // The recheck cannot capture evidence: refused, nothing removed.
+        let unreadable = Scratch::new("conditional-recheck-fault");
+        let store = unreadable.store();
+        store.create(&based(LOCAL, 9)).unwrap();
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        fail_at(
+            &store,
+            Point::BeforeEvidenceRecheck,
+            io::ErrorKind::PermissionDenied,
+        );
+        let error = store
+            .delete_if_evidence_matches(&loc(LOCAL), &evidence)
+            .unwrap_err();
+        assert!(matches!(error, ConditionalDeleteError::Evidence(_)));
+        assert!(!error.removal_may_have_started());
+        assert!(unreadable.record(LOCAL).exists());
+
+        // After removal began: an artifact removal fails; the record is intact.
+        let partial = Scratch::new("conditional-artifact-fault");
+        let store = partial.store();
+        let state = based(LOCAL, 9);
+        store.create(&state).unwrap();
+        partial.put(&partial.artifact(LOCAL, STALE_TOKEN), b"debris");
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        fail_at(
+            &store,
+            Point::RemoveArtifact,
+            io::ErrorKind::PermissionDenied,
+        );
+        let error = store
+            .delete_if_evidence_matches(&loc(LOCAL), &evidence)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ConditionalDeleteError::Store(StoreError::IncompleteDeletion)
+        );
+        assert!(error.removal_may_have_started());
+        assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+
+        // After removal began: the artifacts are gone but the record is not.
+        let late = Scratch::new("conditional-record-fault");
+        let store = late.store();
+        store.create(&state).unwrap();
+        late.put(&late.artifact(LOCAL, STALE_TOKEN), b"debris");
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        fail_at(
+            &store,
+            Point::RemovePrimary,
+            io::ErrorKind::PermissionDenied,
+        );
+        let error = store
+            .delete_if_evidence_matches(&loc(LOCAL), &evidence)
+            .unwrap_err();
+        assert!(error.removal_may_have_started());
+        assert!(!late.artifact(LOCAL, STALE_TOKEN).exists());
+        assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_state_directory_is_never_deleted_through() {
+        let scratch = Scratch::new("conditional-junction");
+        let elsewhere = scratch.root().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let record = elsewhere.join(format!("{}.json", record_key(&loc(LOCAL))));
+        fs::write(&record, based(LOCAL, 9).encode().unwrap()).unwrap();
+        make_junction(&scratch.state_dir(), &elsewhere);
+
+        let store = scratch.store();
+        let nothing = {
+            let empty = Scratch::new("conditional-junction-empty");
+            empty.store().evidence(&loc(LOCAL)).unwrap()
+        };
+
+        let error = store
+            .delete_if_evidence_matches(&loc(LOCAL), &nothing)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ConditionalDeleteError::Store(StoreError::UnexpectedObject)
+        );
+        assert!(!error.removal_may_have_started());
+        assert!(record.exists());
+        fs::remove_dir(scratch.state_dir()).unwrap();
+    }
+
+    #[test]
+    fn the_plain_deletion_keeps_its_contract() {
+        // `delete` still removes without any evidence, and still reports
+        // `AlreadyAbsent` for nothing: B1i added a conditional sibling and left
+        // this one alone.
+        let scratch = Scratch::new("plain-delete-unchanged");
+        let store = scratch.store();
+        scratch.put(&scratch.record(LOCAL), b"garbage");
+        scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
+
+        assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
+        assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::AlreadyAbsent));
     }
 
     // ---- 19. unexpected objects and reparse points -------------------------------

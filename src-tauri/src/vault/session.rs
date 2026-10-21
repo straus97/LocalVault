@@ -42,8 +42,8 @@ use super::{
     },
     sync_file_adapter::{PresentFile, SyncFileRead, SyncFileTarget, UnavailableReason},
     sync_state_store::{
-        path_identity_eq, CorruptReason, StateLoad, StoreError, SyncStateRoot, SyncStateStore,
-        UnreadableReason,
+        path_identity_eq, ConditionalDeleteError, CorruptReason, DeleteOutcome, EvidenceRefusal,
+        RecordEvidence, StateLoad, StoreError, SyncStateRoot, SyncStateStore, UnreadableReason,
     },
 };
 use crate::recent_vaults::normalize_existing_vault_path;
@@ -550,6 +550,298 @@ pub enum InitialBindingConfirmRefusal {
     Binding(InitialBindingRefusal),
 }
 
+/// Whether a push is recorded as started and not yet resolved. Separate from the
+/// binding state on purpose: it says nothing about the target, and it is
+/// reported only from a record that passed the authenticated binding check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingPushIndication {
+    /// A verified record exists and holds no pending push.
+    None,
+    /// A verified record holds a pending push (an unresolved local sync intent).
+    Pending,
+    /// There is no verified record to read it from (none exists, or the record is
+    /// corrupt, unsupported, unreadable, foreign or unverifiable). Not "none".
+    Unavailable,
+}
+
+/// The target a verified binding retains, for an informed-consent display. A
+/// local path string: never shown by `Debug`, and not evidence about the file.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LinkedTarget {
+    path: String,
+}
+
+impl LinkedTarget {
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl std::fmt::Debug for LinkedTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LinkedTarget(<redacted>)")
+    }
+}
+
+/// Why a stored binding cannot be shown as linked. One fixed category each; none
+/// is a healthy binding, and none exposes a stored target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingAttention {
+    Corrupt(CorruptReason),
+    UnsupportedVersion,
+    /// Includes an unresolved recovery artifact: absence was not confirmed.
+    Unreadable(UnreadableReason),
+    /// A readable record for another vault or another location. Its target is
+    /// not exposed.
+    Mismatch(BindingMismatch),
+    /// The session's vault, its location or the state root could not anchor the
+    /// check at all.
+    Unavailable(SyncStateUnavailable),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingState {
+    /// Confirmed no record. Not a trusted prior checkpoint.
+    NotConfigured,
+    /// A record that passed the authenticated binding check for this vault and
+    /// this location. The target was not read and nothing is claimed about it.
+    Linked(LinkedTarget),
+    NeedsAttention(BindingAttention),
+}
+
+/// Sanitized, read-only summary of this vault's local synchronization binding
+/// (Stage 1U-4 B1i). `Debug` and every category reveal no path, identifier,
+/// fingerprint or revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingStatus {
+    state: BindingState,
+    pending_push: PendingPushIndication,
+}
+
+impl BindingStatus {
+    pub fn state(&self) -> &BindingState {
+        &self.state
+    }
+
+    pub fn pending_push(&self) -> PendingPushIndication {
+        self.pending_push
+    }
+
+    /// The target path of a **linked** binding only; `None` for every other state,
+    /// in particular after a mismatch or any verification failure.
+    pub fn target_path(&self) -> Option<&str> {
+        match &self.state {
+            BindingState::Linked(target) => Some(target.path()),
+            _ => None,
+        }
+    }
+}
+
+/// What kind of local state a reset would remove, as the user is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingResetSubject {
+    /// A record that passed the authenticated binding check.
+    VerifiedBinding,
+    /// A readable record for another vault or another location.
+    MismatchedRecord,
+    /// A record that exists but cannot be decoded (or is for another location).
+    CorruptRecord,
+    /// A record written by a newer, unsupported version.
+    UnsupportedRecord,
+    /// No record, only the recovery artifacts of an interrupted write.
+    InterruptedWriteRemnants,
+}
+
+/// A fixed fact about what a reset does and does not do, for the confirmation
+/// dialog. The list is the same for every subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingResetConsequence {
+    RemovesLocalBindingRecord,
+    RemovesTrustedSyncHistory,
+    MayDiscardPendingSyncIntent,
+    KeepsVaultAndBackup,
+    KeepsRemoteTarget,
+    DoesNotProveRemoteContentAbsent,
+    DoesNotEnablePublication,
+}
+
+const BINDING_RESET_CONSEQUENCES: [BindingResetConsequence; 7] = [
+    BindingResetConsequence::RemovesLocalBindingRecord,
+    BindingResetConsequence::RemovesTrustedSyncHistory,
+    BindingResetConsequence::MayDiscardPendingSyncIntent,
+    BindingResetConsequence::KeepsVaultAndBackup,
+    BindingResetConsequence::KeepsRemoteTarget,
+    BindingResetConsequence::DoesNotProveRemoteContentAbsent,
+    BindingResetConsequence::DoesNotEnablePublication,
+];
+
+/// How long a successful reset preparation stays confirmable. Measured from the
+/// preparation, in addition to the session's own inactivity lock.
+const BINDING_RESET_TTL: Duration = Duration::from_secs(120);
+
+/// What [`UnlockedVaultSession::prepare_binding_reset`] established and is now
+/// waiting to be confirmed. Like [`PendingInitialBinding`] it exists only as a
+/// field of the unlocked session: never serialized, logged or handed out, and
+/// dropped with the session. Private to this module.
+struct PendingBindingReset {
+    /// Opaque random correlation id: ties a confirmation to the preview shown.
+    id: Uuid,
+    /// The session's local location when it was prepared.
+    local_locator: Locator,
+    subject: BindingResetSubject,
+    /// The exact store state the user was shown.
+    evidence: RecordEvidence,
+    prepared_at: Instant,
+}
+
+impl std::fmt::Debug for PendingBindingReset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingBindingReset(<redacted>)")
+    }
+}
+
+/// What the user must be shown before a reset may be confirmed. Returned only by
+/// a successful [`UnlockedVaultSession::prepare_binding_reset`]. Paths are for
+/// display only; `Debug` shows nothing, and the type is not `Clone`.
+pub struct BindingResetPreview {
+    preparation_id: String,
+    subject: BindingResetSubject,
+    target_path: Option<String>,
+    pending_push: PendingPushIndication,
+}
+
+impl BindingResetPreview {
+    /// Opaque correlation id to pass back to
+    /// [`UnlockedVaultSession::confirm_binding_reset`].
+    pub fn preparation_id(&self) -> &str {
+        &self.preparation_id
+    }
+
+    pub fn subject(&self) -> BindingResetSubject {
+        self.subject
+    }
+
+    /// The retained target of a **verified** binding only.
+    pub fn target_path(&self) -> Option<&str> {
+        self.target_path.as_deref()
+    }
+
+    pub fn pending_push(&self) -> PendingPushIndication {
+        self.pending_push
+    }
+
+    pub fn consequences(&self) -> &'static [BindingResetConsequence] {
+        &BINDING_RESET_CONSEQUENCES
+    }
+}
+
+impl std::fmt::Debug for BindingResetPreview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BindingResetPreview(<redacted>)")
+    }
+}
+
+/// What a successful reset established: the local record and its recognized
+/// recovery artifacts were removed, and a fresh load confirmed that nothing is
+/// configured. Fieldless on purpose. It does **not** mean the remote target is
+/// empty, that publication is enabled, or that a new binding exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum BindingResetOutcome {
+    ResetAndVerified,
+}
+
+/// Why no reset was prepared, or why a confirmation refused before anything was
+/// removed. Fixed categories only. Nothing here removed anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BindingResetRefusal {
+    /// The session's own vault or location cannot anchor the check.
+    #[error("the session's vault or sync-state location is unavailable")]
+    Unavailable(SyncStateUnavailable),
+    /// No record and no recovery artifact exists (confirmed): nothing to reset.
+    #[error("there is no synchronization binding to reset")]
+    NothingToReset,
+    /// The state could not be read, and absence or contents are unknown. These
+    /// are **intentionally not resettable**: an I/O or permission failure, an
+    /// unexpected object (directory, junction, symlink), or too many entries.
+    #[error("the synchronization state could not be read and is not resettable")]
+    UnreadableState(UnreadableReason),
+    /// Exact evidence of the stored files could not be captured (for example an
+    /// inaccessible or oversized file, or a reparse point). Not resettable.
+    #[error("exact evidence of the synchronization state could not be captured")]
+    Evidence(EvidenceRefusal),
+    /// The stored state changed while it was being examined, or the load and the
+    /// evidence disagree.
+    #[error("the synchronization state changed while it was examined")]
+    RecordChanged,
+    /// Secure randomness for the preparation id was unavailable.
+    #[error("secure randomness is unavailable")]
+    Randomness,
+}
+
+/// Why a confirmation was rejected as out of date, before anything was removed.
+/// In every case the preparation is spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BindingResetStale {
+    #[error("no reset is waiting for confirmation")]
+    NoPendingReset,
+    #[error("the confirmation does not belong to the current preparation")]
+    NotCurrentPreparation,
+    #[error("the preparation has expired")]
+    Expired,
+    /// The session's local location is not the one that was prepared.
+    #[error("the vault location changed after the preparation")]
+    LocatorChanged,
+    /// The stored state is not what the user was shown: its bytes, its artifacts
+    /// or its kind differ, or it is gone. A record that is **already absent** is
+    /// reported here, never as a reset performed by this confirmation.
+    #[error("the synchronization state changed after the preparation")]
+    RecordChanged,
+}
+
+/// Why a reset ended without a confirmed result after removal may have begun.
+/// Never a success, never retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BindingResetAmbiguity {
+    /// The deletion reported that it could not remove or verify everything. Some
+    /// files may be gone and others not.
+    #[error("the synchronization state deletion is incomplete")]
+    IncompleteDeletion,
+    /// The deletion reported success, but a fresh load did not confirm that
+    /// nothing is configured.
+    #[error("the removal could not be confirmed by a fresh load")]
+    AbsenceNotConfirmed,
+}
+
+/// Why [`UnlockedVaultSession::confirm_binding_reset`] did not report a verified
+/// reset. Fixed categories only. Whatever the variant, the preparation is spent.
+///
+/// * [`Stale`](Self::Stale) and [`Refused`](Self::Refused) and
+///   [`NotRemoved`](Self::NotRemoved): **definitely nothing was removed** by this
+///   call.
+/// * [`Ambiguous`](Self::Ambiguous): removal may have happened in part or in
+///   whole. Nothing is retried, repaired or rebound; the next decision starts with
+///   a fresh status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum BindingResetConfirmRefusal {
+    #[error("the reset confirmation is out of date")]
+    Stale(BindingResetStale),
+    #[error("the reset was refused")]
+    Refused(BindingResetRefusal),
+    /// The store refused or failed strictly before the first removal.
+    #[error("the synchronization state could not be removed")]
+    NotRemoved(StoreError),
+    #[error("the reset could not be confirmed")]
+    Ambiguous(BindingResetAmbiguity),
+}
+
+/// Classification of a loaded state for reset, with the facts a preview shows.
+struct ResetClass {
+    subject: BindingResetSubject,
+    pending_push: PendingPushIndication,
+    target_path: Option<String>,
+}
+
 pub struct UnlockedVaultSession {
     path: PathBuf,
     backup_path: PathBuf,
@@ -561,6 +853,10 @@ pub struct UnlockedVaultSession {
     // In memory only, and never copied anywhere: it lives and dies with this
     // session. See `PendingInitialBinding`.
     pending_initial_binding: Option<PendingInitialBinding>,
+
+    // Same lifetime rules. At most one of the two pending values exists at a
+    // time: preparing or confirming either one discards the other.
+    pending_binding_reset: Option<PendingBindingReset>,
 
     // Keeping this File alive keeps the OS-level exclusive
     // session lock alive. The file itself contains no secrets.
@@ -606,6 +902,7 @@ impl UnlockedVaultSession {
             data,
             dirty: false,
             pending_initial_binding: None,
+            pending_binding_reset: None,
             _lock_file: lock_file,
         })
     }
@@ -643,6 +940,7 @@ impl UnlockedVaultSession {
             data,
             dirty: false,
             pending_initial_binding: None,
+            pending_binding_reset: None,
             _lock_file: lock_file,
         })
     }
@@ -1376,8 +1674,10 @@ impl UnlockedVaultSession {
         root: &SyncStateRoot,
         target: &SyncFileTarget,
     ) -> Result<InitialBindingPreview, InitialBindingRefusal> {
-        // Before anything that can fail, including opening the store.
+        // Before anything that can fail, including opening the store. A reset
+        // preparation is voided too: the two approvals exclude each other.
         self.pending_initial_binding = None;
+        self.pending_binding_reset = None;
 
         let store = SyncStateStore::new(root.path())
             .map_err(|_| InitialBindingRefusal::Unavailable(SyncStateUnavailable::Root))?;
@@ -1405,6 +1705,7 @@ impl UnlockedVaultSession {
         use InitialBindingRefusal as Refusal;
 
         self.pending_initial_binding = None;
+        self.pending_binding_reset = None;
 
         let examined = self.examine_identical_target(store, target, read)?;
 
@@ -1498,6 +1799,7 @@ impl UnlockedVaultSession {
             Err(_) => {
                 // Spent even though nothing could be checked.
                 self.pending_initial_binding = None;
+                self.pending_binding_reset = None;
 
                 return Err(InitialBindingConfirmRefusal::Binding(
                     InitialBindingRefusal::Unavailable(SyncStateUnavailable::Root),
@@ -1528,7 +1830,10 @@ impl UnlockedVaultSession {
         use InitialBindingConfirmRefusal::{Binding, Stale};
         use InitialBindingRefusal as Refusal;
 
-        // Spent first and unconditionally.
+        // A reset preparation is voided by any confirmation attempt, and this
+        // one is spent first and unconditionally.
+        self.pending_binding_reset = None;
+
         let Some(pending) = self.pending_initial_binding.take() else {
             return Err(Stale(InitialBindingStale::NoPendingApproval));
         };
@@ -1590,6 +1895,371 @@ impl UnlockedVaultSession {
     /// never an error.
     pub fn cancel_initial_binding(&mut self) {
         self.pending_initial_binding = None;
+    }
+
+    /// Sanitized, strictly read-only summary of this vault's local
+    /// synchronization binding (Stage 1U-4 B1i). Internal: no command or UI calls
+    /// it.
+    ///
+    /// It is [`load_sync_state`](Self::load_sync_state) re-expressed in fixed
+    /// categories: a record is `Linked` only after the existing authenticated
+    /// binding check (this session's `vault_id` and normalized location), and
+    /// after a mismatch or any other failure the stored target is **not**
+    /// exposed. The pending-push indication is read only from a verified record.
+    /// It never reads the target, never repairs, writes, resets or creates
+    /// anything, and assumes no provider authority.
+    pub fn binding_status(&self, root: &SyncStateRoot) -> BindingStatus {
+        let attention = |reason| BindingStatus {
+            state: BindingState::NeedsAttention(reason),
+            pending_push: PendingPushIndication::Unavailable,
+        };
+
+        match self.load_sync_state(root) {
+            SessionSyncState::NotConfigured => BindingStatus {
+                state: BindingState::NotConfigured,
+                pending_push: PendingPushIndication::None,
+            },
+            SessionSyncState::Bound(bound) => {
+                let state = bound.state();
+
+                BindingStatus {
+                    state: BindingState::Linked(LinkedTarget {
+                        path: state.target_locator().as_str().to_owned(),
+                    }),
+                    pending_push: if state.pending_push().is_some() {
+                        PendingPushIndication::Pending
+                    } else {
+                        PendingPushIndication::None
+                    },
+                }
+            }
+            SessionSyncState::Corrupt(reason) => attention(BindingAttention::Corrupt(reason)),
+            SessionSyncState::UnsupportedVersion => attention(BindingAttention::UnsupportedVersion),
+            SessionSyncState::Unreadable(reason) => attention(BindingAttention::Unreadable(reason)),
+            SessionSyncState::BindingMismatch(mismatch) => {
+                attention(BindingAttention::Mismatch(mismatch))
+            }
+            SessionSyncState::Unavailable(reason) => {
+                attention(BindingAttention::Unavailable(reason))
+            }
+        }
+    }
+
+    /// First half of the explicit binding reset (Stage 1U-4 B1i): examine this
+    /// location's stored synchronization state **read-only**, remember exactly
+    /// what was seen, and return what the user must be shown. Internal: no
+    /// command, event or UI calls it, and nothing is removed.
+    ///
+    /// Any earlier reset preparation **and any pending initial-binding
+    /// preparation** are discarded first, before any filesystem work, so a failed
+    /// attempt never leaves an older approval usable.
+    ///
+    /// # What is resettable
+    ///
+    /// Only states for which exact evidence of every stored byte can be captured
+    /// ([`SyncStateStore::evidence`]) and that an explicit reset can fully
+    /// remove:
+    ///
+    /// * a verified binding (with or without a pending push);
+    /// * a readable record for another vault or location;
+    /// * a corrupt record (any decodable-or-not bytes, empty included) or one of
+    ///   an unsupported version;
+    /// * recovery artifacts of an interrupted write with no record.
+    ///
+    /// Refused, and **intentionally not resettable**: no state at all
+    /// ([`NothingToReset`](BindingResetRefusal::NothingToReset)); any
+    /// `Unreadable` state other than unresolved artifacts (an I/O or permission
+    /// failure, a directory, junction or symlink where a file belongs, too many
+    /// entries); and anything whose evidence cannot be captured (an inaccessible
+    /// or oversized record or artifact). Their contents are unknown, so no
+    /// confirmation could be shown to be about them.
+    ///
+    /// The state is read, bound by evidence, read again and bound again; the two
+    /// must agree, or the preparation is refused as changed.
+    pub fn prepare_binding_reset(
+        &mut self,
+        root: &SyncStateRoot,
+    ) -> Result<BindingResetPreview, BindingResetRefusal> {
+        self.pending_initial_binding = None;
+        self.pending_binding_reset = None;
+
+        let store = SyncStateStore::new(root.path())
+            .map_err(|_| BindingResetRefusal::Unavailable(SyncStateUnavailable::Root))?;
+
+        self.prepare_binding_reset_in(
+            &store,
+            &mut |buffer| getrandom::fill(buffer).is_ok(),
+            Instant::now(),
+        )
+    }
+
+    /// [`prepare_binding_reset`](Self::prepare_binding_reset) over an explicit
+    /// store, entropy source and clock. Crate-private so only the crate's own
+    /// tests can substitute them.
+    pub(crate) fn prepare_binding_reset_in(
+        &mut self,
+        store: &SyncStateStore,
+        entropy: &mut dyn FnMut(&mut [u8]) -> bool,
+        now: Instant,
+    ) -> Result<BindingResetPreview, BindingResetRefusal> {
+        self.pending_initial_binding = None;
+        self.pending_binding_reset = None;
+
+        let (local_locator, class, evidence) = self.examine_binding_reset(store)?;
+
+        let mut id_bytes = [0u8; 16];
+
+        if !entropy(&mut id_bytes) {
+            return Err(BindingResetRefusal::Randomness);
+        }
+
+        let id = uuid::Builder::from_random_bytes(id_bytes).into_uuid();
+
+        self.pending_binding_reset = Some(PendingBindingReset {
+            id,
+            local_locator,
+            subject: class.subject,
+            evidence,
+            prepared_at: now,
+        });
+
+        Ok(BindingResetPreview {
+            preparation_id: id.to_string(),
+            subject: class.subject,
+            target_path: class.target_path,
+            pending_push: class.pending_push,
+        })
+    }
+
+    /// Second half of the explicit binding reset (Stage 1U-4 B1i): spend the
+    /// pending preparation named by `preparation_id` and, if the stored state is
+    /// still exactly what it examined, remove this location's sync-state record
+    /// and recognized recovery artifacts with the store's conditional deletion.
+    /// Internal: no command, event or UI calls it.
+    ///
+    /// **The preparation is spent by every call**, whatever its outcome, and any
+    /// pending initial-binding preparation is discarded too. In order:
+    ///
+    /// 1. a preparation must be pending and `preparation_id` must name it, and it
+    ///    must be at most 120 seconds old ([`BindingResetStale`]);
+    /// 2. the vault file must still be this session's, and its normalized location
+    ///    must equal the prepared one;
+    /// 3. the state is examined again exactly as at preparation (same
+    ///    resettability rules, same load, evidence, load, evidence agreement) and
+    ///    must be the same kind with equal evidence. A state that is now **gone**
+    ///    is [`RecordChanged`](BindingResetStale::RecordChanged), never a reset
+    ///    performed here;
+    /// 4. only then `SyncStateStore::delete_if_evidence_matches` runs, which
+    ///    compares evidence once more immediately before its first removal;
+    /// 5. a fresh load must report that nothing is configured.
+    ///
+    /// # Outcomes
+    ///
+    /// * [`BindingResetOutcome::ResetAndVerified`]: removal verified by the store
+    ///   **and** by the fresh load.
+    /// * `Stale`, `Refused`, `NotRemoved`: nothing was removed by this call.
+    /// * `Ambiguous`: removal may have happened in part (`IncompleteDeletion`) or
+    ///   the fresh load did not confirm absence. Never reported as success, never
+    ///   retried; the binding is not rebuilt and nothing is published.
+    ///
+    /// # Not guaranteed
+    ///
+    /// This is a read-compare-delete sequence, **not** an atomic cross-process
+    /// compare-and-swap. The exclusive session lock keeps other LocalVault
+    /// sessions out of this vault, but a process that ignores it can still change
+    /// the files between the comparison and the removal. The vault, its `.backup`
+    /// and `.lock`, and any remote or selected sync file are never touched.
+    pub fn confirm_binding_reset(
+        &mut self,
+        root: &SyncStateRoot,
+        preparation_id: &str,
+    ) -> Result<BindingResetOutcome, BindingResetConfirmRefusal> {
+        let store = match SyncStateStore::new(root.path()) {
+            Ok(store) => store,
+            Err(_) => {
+                // Spent even though nothing could be checked.
+                self.pending_initial_binding = None;
+                self.pending_binding_reset = None;
+
+                return Err(BindingResetConfirmRefusal::Refused(
+                    BindingResetRefusal::Unavailable(SyncStateUnavailable::Root),
+                ));
+            }
+        };
+
+        self.confirm_binding_reset_in(
+            &store,
+            preparation_id,
+            &mut |store, locator| store.load(locator),
+            Instant::now(),
+        )
+    }
+
+    /// [`confirm_binding_reset`](Self::confirm_binding_reset) over an explicit
+    /// store, post-deletion load and clock. Crate-private so only the crate's own
+    /// tests can substitute them: the load seam exists to prove that a deletion
+    /// which the store calls complete is still not reported as a success unless a
+    /// fresh load agrees.
+    pub(crate) fn confirm_binding_reset_in(
+        &mut self,
+        store: &SyncStateStore,
+        preparation_id: &str,
+        reload: &mut dyn FnMut(&SyncStateStore, &Locator) -> StateLoad,
+        now: Instant,
+    ) -> Result<BindingResetOutcome, BindingResetConfirmRefusal> {
+        use BindingResetConfirmRefusal::{Ambiguous, NotRemoved, Refused, Stale};
+
+        // A pending initial binding is voided by any reset confirmation attempt,
+        // and the reset preparation is spent first and unconditionally.
+        self.pending_initial_binding = None;
+
+        let Some(pending) = self.pending_binding_reset.take() else {
+            return Err(Stale(BindingResetStale::NoPendingReset));
+        };
+
+        if Uuid::parse_str(preparation_id) != Ok(pending.id) {
+            return Err(Stale(BindingResetStale::NotCurrentPreparation));
+        }
+
+        if now.saturating_duration_since(pending.prepared_at) > BINDING_RESET_TTL {
+            return Err(Stale(BindingResetStale::Expired));
+        }
+
+        let (local_locator, class, evidence) = match self.examine_binding_reset(store) {
+            Ok(examined) => examined,
+            // Prepared over an existing state, now confirmed absent: stale.
+            Err(BindingResetRefusal::NothingToReset) => {
+                return Err(Stale(BindingResetStale::RecordChanged))
+            }
+            Err(refusal) => return Err(Refused(refusal)),
+        };
+
+        if local_locator != pending.local_locator {
+            return Err(Stale(BindingResetStale::LocatorChanged));
+        }
+
+        if class.subject != pending.subject || evidence != pending.evidence {
+            return Err(Stale(BindingResetStale::RecordChanged));
+        }
+
+        match store.delete_if_evidence_matches(&local_locator, &pending.evidence) {
+            Ok(DeleteOutcome::Removed) => {}
+            // Nothing was there to remove: not a reset performed by this call.
+            Ok(DeleteOutcome::AlreadyAbsent) | Err(ConditionalDeleteError::EvidenceChanged) => {
+                return Err(Stale(BindingResetStale::RecordChanged))
+            }
+            Err(ConditionalDeleteError::Evidence(reason)) => {
+                return Err(Refused(BindingResetRefusal::Evidence(reason)))
+            }
+            Err(error) if error.removal_may_have_started() => {
+                return Err(Ambiguous(BindingResetAmbiguity::IncompleteDeletion))
+            }
+            Err(ConditionalDeleteError::Store(error)) => return Err(NotRemoved(error)),
+        }
+
+        // The store's own verification is not taken on trust alone.
+        match reload(store, &local_locator) {
+            StateLoad::NotConfigured => Ok(BindingResetOutcome::ResetAndVerified),
+            _ => Err(Ambiguous(BindingResetAmbiguity::AbsenceNotConfirmed)),
+        }
+    }
+
+    /// Discard the pending reset preparation, if any. Idempotent, and never an
+    /// error. It does not touch a pending initial-binding preparation.
+    pub fn cancel_binding_reset(&mut self) {
+        self.pending_binding_reset = None;
+    }
+
+    /// The read-only examination both reset steps rest on. Requires the session's
+    /// vault to still be the file at its path, resolves the local location,
+    /// refuses states that are not resettable, and returns the kind of state with
+    /// the exact evidence of it. The state is loaded and its evidence captured
+    /// twice, and the two must agree. Writes and creates nothing.
+    fn examine_binding_reset(
+        &self,
+        store: &SyncStateStore,
+    ) -> Result<(Locator, ResetClass, RecordEvidence), BindingResetRefusal> {
+        use BindingResetRefusal as Refusal;
+
+        if self.current_local_raw().is_none() {
+            return Err(Refusal::Unavailable(
+                SyncStateUnavailable::LocalVaultChanged,
+            ));
+        }
+
+        let local_locator = self
+            .local_locator()
+            .ok_or(Refusal::Unavailable(SyncStateUnavailable::LocalLocator))?;
+
+        let first = store.load(&local_locator);
+        let class = self.classify_for_reset(first.clone(), &local_locator)?;
+
+        let before = store.evidence(&local_locator).map_err(Refusal::Evidence)?;
+        let second = store.load(&local_locator);
+        let after = store.evidence(&local_locator).map_err(Refusal::Evidence)?;
+
+        if first != second || before != after {
+            return Err(Refusal::RecordChanged);
+        }
+
+        // The load and the evidence must describe the same kind of state.
+        let consistent = match class.subject {
+            BindingResetSubject::InterruptedWriteRemnants => {
+                !after.primary_present() && after.artifact_count() > 0
+            }
+            _ => after.primary_present(),
+        };
+
+        if !consistent {
+            return Err(Refusal::RecordChanged);
+        }
+
+        Ok((local_locator, class, after))
+    }
+
+    /// Which resettable kind a load is, or why it is not resettable. The stored
+    /// target and pending push are read only from a record that passed the
+    /// authenticated binding check.
+    fn classify_for_reset(
+        &self,
+        load: StateLoad,
+        local_locator: &Locator,
+    ) -> Result<ResetClass, BindingResetRefusal> {
+        let unverified = |subject| ResetClass {
+            subject,
+            pending_push: PendingPushIndication::Unavailable,
+            target_path: None,
+        };
+
+        match load {
+            StateLoad::NotConfigured => Err(BindingResetRefusal::NothingToReset),
+            StateLoad::Loaded(state) => {
+                match bind_loaded(*state, self.data.vault_id, local_locator) {
+                    SessionSyncState::Bound(bound) => {
+                        let state = bound.state();
+
+                        Ok(ResetClass {
+                            subject: BindingResetSubject::VerifiedBinding,
+                            pending_push: if state.pending_push().is_some() {
+                                PendingPushIndication::Pending
+                            } else {
+                                PendingPushIndication::None
+                            },
+                            target_path: Some(state.target_locator().as_str().to_owned()),
+                        })
+                    }
+                    // `bind_loaded` yields nothing else; anything unexpected is
+                    // treated as unverified, never as a linked binding.
+                    _ => Ok(unverified(BindingResetSubject::MismatchedRecord)),
+                }
+            }
+            StateLoad::Corrupt(_) => Ok(unverified(BindingResetSubject::CorruptRecord)),
+            StateLoad::UnsupportedVersion => Ok(unverified(BindingResetSubject::UnsupportedRecord)),
+            StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts) => {
+                Ok(unverified(BindingResetSubject::InterruptedWriteRemnants))
+            }
+            StateLoad::Unreadable(reason) => Err(BindingResetRefusal::UnreadableState(reason)),
+        }
     }
 
     /// Whether `target` names, or cannot be shown not to name, a file that
@@ -6713,6 +7383,1540 @@ mod tests {
                 ];
 
                 assert!(shown.len() > 20);
+
+                for output in &shown {
+                    for needle in &needles {
+                        assert!(
+                            !output.contains(needle.as_str()),
+                            "leaks {needle:?}: {output}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Stage 1U-4 B1i: binding status and the explicit two-step reset.
+        //
+        // Real synthetic vault sessions, real records, real files under the
+        // git-ignored `.qa-local/sync-state-b1-tests/` (never `%TEMP%`).
+        //
+        // Not proven here, and not claimed:
+        //
+        // * Atomicity. The reset is read, compare, delete; the evidence is
+        //   compared again inside the store immediately before the first removal
+        //   (shown through the store's window seam), but a process that ignores
+        //   the session lock can still change a file after that comparison. The
+        //   outcome is then either a removal of what is there or a reported
+        //   incomplete deletion.
+        // * `NotRemoved`: a store refusal strictly between the second examination
+        //   and the first removal cannot be provoked without a store fault the
+        //   session's tests cannot reach; its mapping is a single arm, and the
+        //   store tests classify every such error as pre-removal.
+        // * A `LocatorChanged` caused by the filesystem: the pending value is
+        //   altered directly instead.
+        // * Any user interface or command: none exists.
+        mod reset {
+            use super::*;
+
+            type Reset = BindingResetRefusal;
+            type Stale = BindingResetStale;
+            type Confirm = BindingResetConfirmRefusal;
+            type Done = BindingResetOutcome;
+
+            const OTHER_TOKEN: &str = "fedcba9876543210fedcba9876543210";
+
+            fn stale(reason: Stale) -> Confirm {
+                Confirm::Stale(reason)
+            }
+
+            fn refused(refusal: Reset) -> Confirm {
+                Confirm::Refused(refusal)
+            }
+
+            fn key(bx: &Bx) -> String {
+                EnvelopeFingerprint::of_bytes(bx.local.to_ascii_lowercase().as_bytes()).to_hex()
+            }
+
+            fn record_path(bx: &Bx) -> PathBuf {
+                bx.state_dir().join(format!("{}.json", key(bx)))
+            }
+
+            fn artifact_path(bx: &Bx, token: &str) -> PathBuf {
+                bx.state_dir().join(format!("{}.{token}.tmp", key(bx)))
+            }
+
+            fn put(bx: &Bx, path: &Path, bytes: &[u8]) {
+                fs::create_dir_all(bx.state_dir()).unwrap();
+                fs::write(path, bytes).unwrap();
+            }
+
+            fn state_for(bx: &Bx, local: &str, vault_id: Uuid, pending: bool) -> SyncState {
+                let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+                let checkpoint = SyncBase::Based(
+                    SyncCheckpoint::new(fp(1), 1, RemoteHighWater::new(5)).unwrap(),
+                );
+                let pending = pending.then(|| {
+                    PendingPush::new(
+                        INTENT,
+                        PushIntent::new(PushBaseline::Present(fp(1)), fp(3)).unwrap(),
+                        6,
+                    )
+                    .unwrap()
+                });
+
+                SyncState::new(
+                    BindingId::new(BINDING).unwrap(),
+                    VaultBindingTag::derive(salt, vault_id).unwrap(),
+                    loc(local),
+                    bx.target.locator().clone(),
+                    checkpoint,
+                    pending,
+                )
+                .unwrap()
+            }
+
+            fn pending_push_state(bx: &Bx) -> SyncState {
+                state_for(bx, &bx.local, bx.vault_id, true)
+            }
+
+            /// A readable record at this vault's location that belongs to another
+            /// vault.
+            fn foreign_state(bx: &Bx) -> SyncState {
+                state_for(bx, &bx.local, OTHER_VAULT_ID, false)
+            }
+
+            /// A readable record whose own location is not the one it is stored
+            /// under (`Corrupt(LocatorMismatch)`).
+            fn misplaced_state(bx: &Bx) -> SyncState {
+                state_for(
+                    bx,
+                    r"\\?\C:\Synthetic\Vaults\Elsewhere.lvault",
+                    bx.vault_id,
+                    false,
+                )
+            }
+
+            fn state_snapshot(bx: &Bx) -> Option<Vec<String>> {
+                bx.state_dir().exists().then(|| snapshot(&bx.state_dir()))
+            }
+
+            /// Everything outside the sync-state directory that a reset must
+            /// leave alone: the vault folder (primary, backup, lock) and the
+            /// target folder.
+            fn untouchable(bx: &Bx) -> (Vec<String>, Vec<String>) {
+                (snapshot(&bx.vaults_dir()), snapshot(&bx.remote_dir()))
+            }
+
+            fn prepare(bx: &mut Bx) -> Result<BindingResetPreview, Reset> {
+                bx.session.prepare_binding_reset(&bx.root)
+            }
+
+            fn prepared(bx: &mut Bx) -> String {
+                prepare(bx)
+                    .expect("the reset preparation succeeds")
+                    .preparation_id()
+                    .to_owned()
+            }
+
+            fn prepared_at(bx: &mut Bx, now: Instant) -> String {
+                let store = bx.store();
+
+                bx.session
+                    .prepare_binding_reset_in(&store, &mut entropy, now)
+                    .expect("the reset preparation succeeds")
+                    .preparation_id()
+                    .to_owned()
+            }
+
+            fn confirm(bx: &mut Bx, id: &str) -> Result<Done, Confirm> {
+                bx.session.confirm_binding_reset(&bx.root, id)
+            }
+
+            /// Confirm with a counting post-deletion load, optionally replaced.
+            fn confirm_with(
+                bx: &mut Bx,
+                id: &str,
+                now: Instant,
+                loads: &Cell<usize>,
+                lie: Option<StateLoad>,
+            ) -> Result<Done, Confirm> {
+                let store = bx.store();
+
+                bx.session.confirm_binding_reset_in(
+                    &store,
+                    id,
+                    &mut |store, locator| {
+                        loads.set(loads.get() + 1);
+
+                        lie.clone().unwrap_or_else(|| store.load(locator))
+                    },
+                    now,
+                )
+            }
+
+            fn unknown_id() -> String {
+                Uuid::from_u128(0x0123_4567_89ab_4def_8123_4567_89ab_cdef).to_string()
+            }
+
+            fn assert_nothing_pending(bx: &mut Bx) {
+                assert_eq!(
+                    confirm(bx, &unknown_id()),
+                    Err(stale(Stale::NoPendingReset))
+                );
+            }
+
+            /// Open for reading while forbidding deletion and writing by anyone
+            /// else: reading still works, removal fails with a sharing violation.
+            #[cfg(windows)]
+            fn hold_against_removal(path: &Path) -> fs::File {
+                use std::os::windows::fs::OpenOptionsExt;
+
+                const FILE_SHARE_READ: u32 = 1;
+
+                OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ)
+                    .open(path)
+                    .unwrap()
+            }
+
+            // -- status -------------------------------------------------------
+
+            /// The status of the state `setup` leaves, with the proof that taking
+            /// it wrote, created and removed nothing anywhere.
+            fn status_after(name: &str, setup: impl FnOnce(&Bx)) -> (Bx, BindingStatus) {
+                let bx = Bx::new(name);
+
+                setup(&bx);
+
+                let outside = untouchable(&bx);
+                let state = state_snapshot(&bx);
+                let root_existed = bx.root.path().exists();
+
+                let first = bx.session.binding_status(&bx.root);
+                let second = bx.session.binding_status(&bx.root);
+
+                assert_eq!(first, second, "{name}");
+                assert_eq!(untouchable(&bx), outside, "{name}");
+                assert_eq!(state_snapshot(&bx), state, "{name}");
+                assert_eq!(bx.root.path().exists(), root_existed, "{name}");
+
+                (bx, first)
+            }
+
+            #[test]
+            fn status_reports_a_fixed_category_for_every_state_and_writes_nothing() {
+                // No record: not configured, and nothing is created.
+                let (bx, status) = status_after("b1i-status-absent", |_| {});
+
+                assert_eq!(status.state(), &BindingState::NotConfigured);
+                assert_eq!(status.pending_push(), PendingPushIndication::None);
+                assert_eq!(status.target_path(), None);
+                assert!(!bx.root.path().exists());
+
+                // A verified binding: the retained target is shown, no push pending.
+                let (bx, status) = status_after("b1i-status-linked", |bx| bx.publish(&bx.based()));
+
+                assert!(
+                    matches!(status.state(), BindingState::Linked(t) if t.path() == bx.target.locator().as_str())
+                );
+                assert_eq!(status.target_path(), Some(bx.target.locator().as_str()));
+                assert_eq!(status.pending_push(), PendingPushIndication::None);
+
+                // A pending push is a separate indication on the same linked state.
+                let (_, status) = status_after("b1i-status-pending", |bx| {
+                    bx.publish(&pending_push_state(bx))
+                });
+
+                assert!(matches!(status.state(), BindingState::Linked(_)));
+                assert_eq!(status.pending_push(), PendingPushIndication::Pending);
+
+                // Everything else needs attention, names a distinct category and
+                // exposes no stored target.
+                type Setup = Box<dyn Fn(&Bx)>;
+
+                let cases: Vec<(&str, Setup, BindingAttention)> = vec![
+                    (
+                        "b1i-status-corrupt",
+                        Box::new(|bx| put(bx, &record_path(bx), b"garbage")),
+                        BindingAttention::Corrupt(CorruptReason::Undecodable),
+                    ),
+                    (
+                        "b1i-status-empty",
+                        Box::new(|bx| put(bx, &record_path(bx), b"")),
+                        BindingAttention::Corrupt(CorruptReason::Empty),
+                    ),
+                    (
+                        "b1i-status-misplaced",
+                        Box::new(|bx| {
+                            put(bx, &record_path(bx), &misplaced_state(bx).encode().unwrap())
+                        }),
+                        BindingAttention::Corrupt(CorruptReason::LocatorMismatch),
+                    ),
+                    (
+                        "b1i-status-unsupported",
+                        Box::new(|bx| {
+                            let future = tampered_version(&bx.based());
+
+                            put(bx, &record_path(bx), &future);
+                        }),
+                        BindingAttention::UnsupportedVersion,
+                    ),
+                    (
+                        "b1i-status-remnants",
+                        Box::new(|bx| put(bx, &artifact_path(bx, STALE_TOKEN), b"debris")),
+                        BindingAttention::Unreadable(UnreadableReason::UnresolvedArtifacts),
+                    ),
+                    (
+                        "b1i-status-directory",
+                        Box::new(|bx| {
+                            fs::create_dir_all(record_path(bx)).unwrap();
+                        }),
+                        BindingAttention::Unreadable(UnreadableReason::UnexpectedObject),
+                    ),
+                    (
+                        "b1i-status-foreign",
+                        Box::new(|bx| bx.publish(&foreign_state(bx))),
+                        BindingAttention::Mismatch(BindingMismatch::VaultIdentity),
+                    ),
+                    (
+                        "b1i-status-vault-changed",
+                        Box::new(|bx| fs::write(&bx.vault, bx.resealed(|_| {})).unwrap()),
+                        BindingAttention::Unavailable(SyncStateUnavailable::LocalVaultChanged),
+                    ),
+                ];
+
+                for (name, setup, expected) in &cases {
+                    let (_, status) = status_after(name, |bx| setup(bx));
+
+                    assert_eq!(
+                        status.state(),
+                        &BindingState::NeedsAttention(*expected),
+                        "{name}"
+                    );
+                    assert_eq!(status.target_path(), None, "{name}");
+                    assert_eq!(
+                        status.pending_push(),
+                        PendingPushIndication::Unavailable,
+                        "{name}"
+                    );
+                }
+            }
+
+            /// A schema-valid record that claims a future version.
+            fn tampered_version(state: &SyncState) -> Vec<u8> {
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(&state.encode().unwrap()).unwrap();
+
+                value["version"] = serde_json::json!(2);
+
+                serde_json::to_vec(&value).unwrap()
+            }
+
+            // -- preparation --------------------------------------------------
+
+            #[test]
+            fn preparing_returns_a_typed_preview_and_changes_nothing() {
+                let mut bx = Bx::new("b1i-prepare");
+
+                bx.session.data_mut().updated_at_ms = NOW_MS + 5;
+                assert!(bx.session.save().unwrap());
+
+                bx.publish(&pending_push_state(&bx));
+                put(&bx, &artifact_path(&bx, STALE_TOKEN), b"debris");
+
+                let outside = untouchable(&bx);
+                let state = state_snapshot(&bx);
+
+                let preview = prepare(&mut bx).expect("the reset preparation succeeds");
+
+                assert_eq!(preview.subject(), BindingResetSubject::VerifiedBinding);
+                assert_eq!(preview.target_path(), Some(bx.target.locator().as_str()));
+                assert_eq!(preview.pending_push(), PendingPushIndication::Pending);
+                assert!(Uuid::parse_str(preview.preparation_id()).is_ok());
+                assert_eq!(preview.consequences(), &BINDING_RESET_CONSEQUENCES[..]);
+
+                for fact in [
+                    BindingResetConsequence::RemovesLocalBindingRecord,
+                    BindingResetConsequence::RemovesTrustedSyncHistory,
+                    BindingResetConsequence::MayDiscardPendingSyncIntent,
+                    BindingResetConsequence::KeepsVaultAndBackup,
+                    BindingResetConsequence::KeepsRemoteTarget,
+                    BindingResetConsequence::DoesNotProveRemoteContentAbsent,
+                    BindingResetConsequence::DoesNotEnablePublication,
+                ] {
+                    assert!(preview.consequences().contains(&fact), "{fact:?}");
+                }
+
+                // Preparation is read-only: not one byte, name or timestamp moved.
+                assert_eq!(untouchable(&bx), outside);
+                assert_eq!(state_snapshot(&bx), state);
+                assert!(bx.session.backup_path().exists());
+                assert!(matches!(
+                    bx.session.load_sync_state(&bx.root),
+                    SessionSyncState::Bound(_)
+                ));
+            }
+
+            #[test]
+            fn a_preview_shows_a_target_only_for_a_verified_binding() {
+                let mut foreign = Bx::new("b1i-preview-foreign");
+
+                foreign.publish(&foreign_state(&foreign));
+
+                let preview = prepare(&mut foreign).unwrap();
+
+                assert_eq!(preview.subject(), BindingResetSubject::MismatchedRecord);
+                assert_eq!(preview.target_path(), None);
+                assert_eq!(preview.pending_push(), PendingPushIndication::Unavailable);
+
+                let mut corrupt = Bx::new("b1i-preview-corrupt");
+
+                put(&corrupt, &record_path(&corrupt), b"garbage");
+
+                let preview = prepare(&mut corrupt).unwrap();
+
+                assert_eq!(preview.subject(), BindingResetSubject::CorruptRecord);
+                assert_eq!(preview.target_path(), None);
+            }
+
+            // -- confirmation: what is removed --------------------------------
+
+            #[test]
+            fn confirming_removes_only_this_locations_sync_state() {
+                let mut bx = Bx::new("b1i-confirm");
+
+                bx.session.data_mut().updated_at_ms = NOW_MS + 5;
+                assert!(bx.session.save().unwrap());
+
+                let backup = bx.session.backup_path().to_path_buf();
+
+                bx.publish(&pending_push_state(&bx));
+                put(&bx, &artifact_path(&bx, STALE_TOKEN), b"debris");
+
+                // Neighbours the reset must not touch: another location's
+                // record and a file that merely shares this record's prefix.
+                let neighbour = state_for(
+                    &bx,
+                    r"\\?\C:\Synthetic\Vaults\Neighbour.lvault",
+                    OTHER_VAULT_ID,
+                    false,
+                );
+                bx.store().create(&neighbour).unwrap();
+                let unrelated = bx.state_dir().join(format!("{}.notes.txt", key(&bx)));
+                fs::write(&unrelated, b"unrelated").unwrap();
+
+                let vault_bytes = fs::read(&bx.vault).unwrap();
+                let backup_bytes = fs::read(&backup).unwrap();
+                let remote_bytes = fs::read(&bx.remote).unwrap();
+                let outside = untouchable(&bx);
+
+                let id = prepared(&mut bx);
+
+                assert_eq!(confirm(&mut bx, &id), Ok(Done::ResetAndVerified));
+
+                // Exactly this location's record and artifact are gone.
+                assert!(!record_path(&bx).exists());
+                assert!(!artifact_path(&bx, STALE_TOKEN).exists());
+                assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated");
+                assert_eq!(
+                    bx.store().load(neighbour.local_locator()),
+                    StateLoad::Loaded(Box::new(neighbour.clone()))
+                );
+                assert_eq!(names(&bx.state_dir()).len(), 2);
+
+                // The vault, its backup and lock, and the target are untouched.
+                assert_eq!(fs::read(&bx.vault).unwrap(), vault_bytes);
+                assert_eq!(fs::read(&backup).unwrap(), backup_bytes);
+                assert_eq!(fs::read(&bx.remote).unwrap(), remote_bytes);
+                assert_eq!(untouchable(&bx), outside);
+
+                // Nothing was rebuilt: a fresh load and the status agree.
+                assert_eq!(
+                    bx.session.load_sync_state(&bx.root),
+                    SessionSyncState::NotConfigured
+                );
+                assert_eq!(
+                    bx.session.binding_status(&bx.root).state(),
+                    &BindingState::NotConfigured
+                );
+                assert!(!record_path(&bx).exists());
+
+                // The session is still usable and still holds its lock.
+                assert!(matches!(
+                    UnlockedVaultSession::unlock(&bx.vault, test_password()),
+                    Err(SessionError::InUse)
+                ));
+            }
+
+            #[test]
+            fn every_resettable_kind_is_removed_and_nothing_else_changes() {
+                type Setup = Box<dyn Fn(&Bx)>;
+
+                let cases: Vec<(&str, Setup, BindingResetSubject)> = vec![
+                    (
+                        "b1i-kind-verified",
+                        Box::new(|bx| bx.publish(&bx.based())),
+                        BindingResetSubject::VerifiedBinding,
+                    ),
+                    (
+                        "b1i-kind-pending",
+                        Box::new(|bx| bx.publish(&pending_push_state(bx))),
+                        BindingResetSubject::VerifiedBinding,
+                    ),
+                    (
+                        "b1i-kind-foreign",
+                        Box::new(|bx| bx.publish(&foreign_state(bx))),
+                        BindingResetSubject::MismatchedRecord,
+                    ),
+                    (
+                        "b1i-kind-corrupt",
+                        Box::new(|bx| put(bx, &record_path(bx), b"garbage")),
+                        BindingResetSubject::CorruptRecord,
+                    ),
+                    (
+                        "b1i-kind-empty",
+                        Box::new(|bx| put(bx, &record_path(bx), b"")),
+                        BindingResetSubject::CorruptRecord,
+                    ),
+                    (
+                        "b1i-kind-misplaced",
+                        Box::new(|bx| {
+                            put(bx, &record_path(bx), &misplaced_state(bx).encode().unwrap())
+                        }),
+                        BindingResetSubject::CorruptRecord,
+                    ),
+                    (
+                        "b1i-kind-unsupported",
+                        Box::new(|bx| {
+                            put(bx, &record_path(bx), &tampered_version(&bx.based()));
+                        }),
+                        BindingResetSubject::UnsupportedRecord,
+                    ),
+                    (
+                        "b1i-kind-remnants",
+                        Box::new(|bx| {
+                            put(bx, &artifact_path(bx, STALE_TOKEN), b"debris");
+                            put(bx, &artifact_path(bx, OTHER_TOKEN), b"");
+                        }),
+                        BindingResetSubject::InterruptedWriteRemnants,
+                    ),
+                    (
+                        "b1i-kind-record-and-artifacts",
+                        Box::new(|bx| {
+                            bx.publish(&bx.based());
+                            put(bx, &artifact_path(bx, STALE_TOKEN), b"debris");
+                        }),
+                        BindingResetSubject::VerifiedBinding,
+                    ),
+                ];
+
+                for (name, setup, subject) in &cases {
+                    let mut bx = Bx::new(name);
+
+                    setup(&bx);
+
+                    let outside = untouchable(&bx);
+                    let id;
+
+                    {
+                        let preview = prepare(&mut bx).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+
+                        assert_eq!(preview.subject(), *subject, "{name}");
+                        id = preview.preparation_id().to_owned();
+                    }
+
+                    assert_eq!(confirm(&mut bx, &id), Ok(Done::ResetAndVerified), "{name}");
+                    assert_eq!(
+                        bx.session.load_sync_state(&bx.root),
+                        SessionSyncState::NotConfigured,
+                        "{name}"
+                    );
+                    assert_eq!(
+                        bx.session.binding_status(&bx.root).state(),
+                        &BindingState::NotConfigured,
+                        "{name}"
+                    );
+                    assert!(
+                        names(&bx.state_dir()).is_empty(),
+                        "{name}: {:?}",
+                        names(&bx.state_dir())
+                    );
+                    assert_eq!(untouchable(&bx), outside, "{name}");
+
+                    // Nothing left to reset; nothing was recreated.
+                    assert_eq!(
+                        prepare(&mut bx).map(|_| ()),
+                        Err(Reset::NothingToReset),
+                        "{name}"
+                    );
+                }
+            }
+
+            // -- states that are deliberately not resettable ------------------
+
+            #[test]
+            fn states_without_exact_evidence_are_refused_not_accepted() {
+                // Nothing at all.
+                let mut bx = Bx::new("b1i-refuse-nothing");
+
+                assert_eq!(prepare(&mut bx).map(|_| ()), Err(Reset::NothingToReset));
+                assert!(!bx.root.path().exists());
+                assert_nothing_pending(&mut bx);
+
+                // A directory where the record belongs.
+                let mut bx = Bx::new("b1i-refuse-directory");
+                fs::create_dir_all(record_path(&bx)).unwrap();
+                fs::write(record_path(&bx).join("inner.txt"), b"keep").unwrap();
+                let state = state_snapshot(&bx);
+
+                assert_eq!(
+                    prepare(&mut bx).map(|_| ()),
+                    Err(Reset::UnreadableState(UnreadableReason::UnexpectedObject))
+                );
+                assert_eq!(state_snapshot(&bx), state);
+                assert_nothing_pending(&mut bx);
+
+                // The sync-state path is a regular file.
+                let mut bx = Bx::new("b1i-refuse-file");
+                fs::create_dir_all(bx.root.path()).unwrap();
+                fs::write(bx.state_dir(), b"not a directory").unwrap();
+
+                assert!(matches!(prepare(&mut bx), Err(Reset::UnreadableState(_))));
+                assert_eq!(fs::read(bx.state_dir()).unwrap(), b"not a directory");
+                assert_nothing_pending(&mut bx);
+
+                // A record too large to read in full: its category is corrupt, but
+                // its bytes cannot be bound.
+                let mut bx = Bx::new("b1i-refuse-oversized-record");
+                fs::create_dir_all(bx.state_dir()).unwrap();
+                let file = fs::File::create(record_path(&bx)).unwrap();
+                file.set_len(localvault_core::sync_state::MAX_SYNC_STATE_BYTES as u64 + 1)
+                    .unwrap();
+                drop(file);
+
+                assert_eq!(
+                    prepare(&mut bx).map(|_| ()),
+                    Err(Reset::Evidence(EvidenceRefusal::Oversized))
+                );
+                assert!(record_path(&bx).exists());
+                assert_nothing_pending(&mut bx);
+
+                // A valid record beside an oversized artifact.
+                let mut bx = Bx::new("b1i-refuse-oversized-artifact");
+                bx.publish(&bx.based());
+                let file = fs::File::create(artifact_path(&bx, STALE_TOKEN)).unwrap();
+                file.set_len(localvault_core::sync_state::MAX_SYNC_STATE_BYTES as u64 + 1)
+                    .unwrap();
+                drop(file);
+
+                assert_eq!(
+                    prepare(&mut bx).map(|_| ()),
+                    Err(Reset::Evidence(EvidenceRefusal::Oversized))
+                );
+                assert!(record_path(&bx).exists());
+                assert_nothing_pending(&mut bx);
+
+                // Recovery artifacts that are not plain files.
+                let mut bx = Bx::new("b1i-refuse-artifact-directory");
+                fs::create_dir_all(artifact_path(&bx, STALE_TOKEN)).unwrap();
+
+                assert_eq!(
+                    bx.session.load_sync_state(&bx.root),
+                    SessionSyncState::Unreadable(UnreadableReason::UnresolvedArtifacts)
+                );
+                assert_eq!(
+                    prepare(&mut bx).map(|_| ()),
+                    Err(Reset::Evidence(EvidenceRefusal::UnexpectedObject))
+                );
+                assert!(artifact_path(&bx, STALE_TOKEN).is_dir());
+                assert_nothing_pending(&mut bx);
+            }
+
+            #[cfg(windows)]
+            #[test]
+            fn inaccessible_files_and_reparse_points_are_refused_not_accepted() {
+                // A record that cannot be opened: contents unknown.
+                let mut bx = Bx::new("b1i-refuse-held-record");
+                bx.publish(&bx.based());
+                let state = state_snapshot(&bx);
+                {
+                    let _guard = hold_exclusively(&record_path(&bx));
+
+                    assert!(matches!(
+                        prepare(&mut bx),
+                        Err(Reset::UnreadableState(UnreadableReason::Io(_)))
+                    ));
+                }
+                assert_eq!(state_snapshot(&bx), state);
+                assert_nothing_pending(&mut bx);
+
+                // A readable record beside an artifact that cannot be opened:
+                // the artifact set cannot be bound exactly.
+                let mut bx = Bx::new("b1i-refuse-held-artifact");
+                bx.publish(&bx.based());
+                put(&bx, &artifact_path(&bx, STALE_TOKEN), b"debris");
+                let state = state_snapshot(&bx);
+                {
+                    let _guard = hold_exclusively(&artifact_path(&bx, STALE_TOKEN));
+
+                    assert_eq!(
+                        prepare(&mut bx).map(|_| ()),
+                        Err(Reset::Evidence(EvidenceRefusal::Unreadable))
+                    );
+                }
+                assert_eq!(state_snapshot(&bx), state);
+                assert_nothing_pending(&mut bx);
+
+                // The sync-state directory is a junction.
+                let mut bx = Bx::new("b1i-refuse-junction-directory");
+                let elsewhere = bx.dir.path().join("elsewhere");
+                fs::create_dir_all(&elsewhere).unwrap();
+                fs::write(
+                    elsewhere.join(format!("{}.json", key(&bx))),
+                    bx.based().encode().unwrap(),
+                )
+                .unwrap();
+                fs::create_dir_all(bx.root.path()).unwrap();
+                make_junction(&bx.state_dir(), &elsewhere);
+                let outside = snapshot(&elsewhere);
+
+                assert_eq!(
+                    prepare(&mut bx).map(|_| ()),
+                    Err(Reset::UnreadableState(UnreadableReason::UnexpectedObject))
+                );
+                assert_eq!(snapshot(&elsewhere), outside);
+                assert_nothing_pending(&mut bx);
+                fs::remove_dir(bx.state_dir()).unwrap();
+
+                // The record itself is a junction.
+                let mut bx = Bx::new("b1i-refuse-junction-record");
+                let target = bx.dir.path().join("junction-target");
+                fs::create_dir_all(&target).unwrap();
+                fs::create_dir_all(bx.state_dir()).unwrap();
+                make_junction(&record_path(&bx), &target);
+
+                assert_eq!(
+                    prepare(&mut bx).map(|_| ()),
+                    Err(Reset::UnreadableState(UnreadableReason::UnexpectedObject))
+                );
+                assert!(snapshot(&target).is_empty());
+                assert_nothing_pending(&mut bx);
+                fs::remove_dir(record_path(&bx)).unwrap();
+            }
+
+            // -- identifiers, expiry, single use ------------------------------
+
+            #[test]
+            fn a_wrong_id_is_stale_and_spends_the_preparation() {
+                let mut bx = Bx::new("b1i-wrong-id");
+                bx.publish(&bx.based());
+                let record = bx.record_bytes();
+                let id = prepared(&mut bx);
+                let unknown = unknown_id();
+
+                for wrong in ["", "not-a-uuid", "LEAKMARK", unknown.as_str()] {
+                    let mut again = Bx::new("b1i-wrong-id-each");
+                    again.publish(&again.based());
+                    let id = prepared(&mut again);
+                    let before = state_snapshot(&again);
+
+                    assert_eq!(
+                        confirm(&mut again, wrong),
+                        Err(stale(Stale::NotCurrentPreparation)),
+                        "{wrong:?}"
+                    );
+                    assert_eq!(state_snapshot(&again), before);
+                    // The right id no longer works either: spent.
+                    assert_eq!(confirm(&mut again, &id), Err(stale(Stale::NoPendingReset)));
+                    assert_eq!(state_snapshot(&again), before);
+                }
+
+                // The first fixture was never confirmed and is untouched.
+                assert_eq!(bx.record_bytes(), record);
+                assert_eq!(confirm(&mut bx, &id), Ok(Done::ResetAndVerified));
+            }
+
+            #[test]
+            fn a_confirmation_works_once() {
+                let mut bx = Bx::new("b1i-double");
+                bx.publish(&bx.based());
+                let id = prepared(&mut bx);
+
+                assert_eq!(confirm(&mut bx, &id), Ok(Done::ResetAndVerified));
+
+                // Same id again: stale, and the freshly absent state is not
+                // reported as a second reset.
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingReset)));
+
+                // A binding made in between is not removed by the spent id.
+                bx.publish(&bx.based());
+                let record = bx.record_bytes();
+
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(bx.record_bytes(), record);
+            }
+
+            #[test]
+            fn a_new_preparation_voids_the_previous_one() {
+                let mut bx = Bx::new("b1i-new-prep");
+                bx.publish(&bx.based());
+                let record = bx.record_bytes();
+
+                let first = prepared(&mut bx);
+                let second = prepared(&mut bx);
+
+                assert_ne!(first, second);
+
+                // The old id is not current, and naming it spends the new one too.
+                assert_eq!(
+                    confirm(&mut bx, &first),
+                    Err(stale(Stale::NotCurrentPreparation))
+                );
+                assert_eq!(confirm(&mut bx, &second), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(bx.record_bytes(), record);
+
+                // The newest one does work.
+                let first = prepared(&mut bx);
+                let second = prepared(&mut bx);
+
+                assert_ne!(first, second);
+                assert_eq!(confirm(&mut bx, &second), Ok(Done::ResetAndVerified));
+                assert!(!record_path(&bx).exists());
+            }
+
+            #[test]
+            fn a_failed_preparation_also_voids_the_previous_one() {
+                let mut bx = Bx::new("b1i-failed-prep");
+                bx.publish(&bx.based());
+                let id = prepared(&mut bx);
+
+                // The state becomes something that cannot be reset.
+                let record = fs::read(record_path(&bx)).unwrap();
+                fs::remove_file(record_path(&bx)).unwrap();
+                fs::create_dir_all(record_path(&bx)).unwrap();
+
+                assert_eq!(
+                    prepare(&mut bx).map(|_| ()),
+                    Err(Reset::UnreadableState(UnreadableReason::UnexpectedObject))
+                );
+
+                fs::remove_dir(record_path(&bx)).unwrap();
+                fs::write(record_path(&bx), &record).unwrap();
+
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(fs::read(record_path(&bx)).unwrap(), record);
+
+                // Unavailable randomness is a failed preparation too.
+                let id = prepared(&mut bx);
+                let store = bx.store();
+
+                assert_eq!(
+                    bx.session
+                        .prepare_binding_reset_in(&store, &mut |_| false, Instant::now())
+                        .map(|_| ()),
+                    Err(Reset::Randomness)
+                );
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(fs::read(record_path(&bx)).unwrap(), record);
+            }
+
+            #[test]
+            fn a_preparation_is_confirmable_for_120_seconds_and_no_longer() {
+                let base = Instant::now();
+
+                let mut late = Bx::new("b1i-expired");
+                late.publish(&late.based());
+                let id = prepared_at(&mut late, base);
+                let state = state_snapshot(&late);
+                let loads = Cell::new(0usize);
+
+                assert_eq!(
+                    confirm_with(
+                        &mut late,
+                        &id,
+                        base + Duration::from_secs(121),
+                        &loads,
+                        None
+                    ),
+                    Err(stale(Stale::Expired))
+                );
+                assert_eq!(loads.get(), 0);
+                assert_eq!(state_snapshot(&late), state);
+                assert_eq!(confirm(&mut late, &id), Err(stale(Stale::NoPendingReset)));
+
+                // The boundary is inclusive.
+                let mut edge = Bx::new("b1i-ttl-edge");
+                edge.publish(&edge.based());
+                let id = prepared_at(&mut edge, base);
+
+                assert_eq!(
+                    confirm_with(
+                        &mut edge,
+                        &id,
+                        base + Duration::from_secs(120),
+                        &loads,
+                        None
+                    ),
+                    Ok(Done::ResetAndVerified)
+                );
+            }
+
+            // -- interaction with the initial-binding approval ----------------
+
+            #[test]
+            fn a_reset_and_an_initial_binding_approval_void_each_other() {
+                // Initial binding prepared, then a reset is prepared over a
+                // record that appeared: the binding approval is voided.
+                let mut bx = Bx::new("b1i-exclusion-a");
+                let initial = consent_prepare(&mut bx);
+
+                bx.publish(&bx.based());
+                let reset = prepared(&mut bx);
+
+                assert_eq!(
+                    bx.session.confirm_initial_binding(&bx.root, &initial),
+                    Err(InitialBindingConfirmRefusal::Stale(
+                        InitialBindingStale::NoPendingApproval
+                    ))
+                );
+                // ...and that confirmation attempt voided the reset in turn.
+                assert_eq!(confirm(&mut bx, &reset), Err(stale(Stale::NoPendingReset)));
+                assert!(record_path(&bx).exists());
+
+                // Reset prepared, then the record is removed and an initial
+                // binding is prepared: the reset is voided.
+                let mut bx = Bx::new("b1i-exclusion-b");
+                bx.publish(&bx.based());
+                let reset = prepared(&mut bx);
+
+                fs::remove_file(record_path(&bx)).unwrap();
+                let initial = consent_prepare(&mut bx);
+
+                assert_eq!(confirm(&mut bx, &reset), Err(stale(Stale::NoPendingReset)));
+                // The confirmation attempt voided the binding approval too.
+                assert_eq!(
+                    bx.session.confirm_initial_binding(&bx.root, &initial),
+                    Err(InitialBindingConfirmRefusal::Stale(
+                        InitialBindingStale::NoPendingApproval
+                    ))
+                );
+                assert!(!bx.state_dir().exists() || names(&bx.state_dir()).is_empty());
+
+                // Neither kind of id can be spent on the other kind.
+                let mut bx = Bx::new("b1i-exclusion-c");
+                let initial = consent_prepare(&mut bx);
+
+                assert_eq!(
+                    confirm(&mut bx, &initial),
+                    Err(stale(Stale::NoPendingReset))
+                );
+                assert_eq!(
+                    bx.session.confirm_initial_binding(&bx.root, &initial),
+                    Err(InitialBindingConfirmRefusal::Stale(
+                        InitialBindingStale::NoPendingApproval
+                    ))
+                );
+                assert!(!bx.root.path().exists());
+
+                let mut bx = Bx::new("b1i-exclusion-d");
+                bx.publish(&bx.based());
+                let reset = prepared(&mut bx);
+                let record = bx.record_bytes();
+
+                assert_eq!(
+                    bx.session.confirm_initial_binding(&bx.root, &reset),
+                    Err(InitialBindingConfirmRefusal::Stale(
+                        InitialBindingStale::NoPendingApproval
+                    ))
+                );
+                assert_eq!(confirm(&mut bx, &reset), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(bx.record_bytes(), record);
+
+                // A failed attempt of either kind voids the other kind.
+                let mut bx = Bx::new("b1i-exclusion-e");
+                let initial = consent_prepare(&mut bx);
+
+                assert_eq!(prepare(&mut bx).map(|_| ()), Err(Reset::NothingToReset));
+                assert_eq!(
+                    bx.session.confirm_initial_binding(&bx.root, &initial),
+                    Err(InitialBindingConfirmRefusal::Stale(
+                        InitialBindingStale::NoPendingApproval
+                    ))
+                );
+
+                let mut bx = Bx::new("b1i-exclusion-f");
+                bx.publish(&bx.based());
+                let reset = prepared(&mut bx);
+
+                assert!(bx
+                    .session
+                    .prepare_initial_binding(&bx.root, &bx.target)
+                    .is_err());
+                assert_eq!(confirm(&mut bx, &reset), Err(stale(Stale::NoPendingReset)));
+
+                // Cancelling one kind leaves the other alone.
+                let mut bx = Bx::new("b1i-exclusion-g");
+                bx.publish(&bx.based());
+                let reset = prepared(&mut bx);
+
+                bx.session.cancel_initial_binding();
+                assert_eq!(confirm(&mut bx, &reset), Ok(Done::ResetAndVerified));
+
+                let mut bx = Bx::new("b1i-exclusion-h");
+                let initial = consent_prepare(&mut bx);
+
+                bx.session.cancel_binding_reset();
+                assert_eq!(
+                    bx.session.confirm_initial_binding(&bx.root, &initial),
+                    Ok(InitialBindingOutcome::BoundAndVerified)
+                );
+            }
+
+            fn consent_prepare(bx: &mut Bx) -> String {
+                bx.session
+                    .prepare_initial_binding(&bx.root, &bx.target)
+                    .expect("the initial-binding preparation succeeds")
+                    .preparation_id()
+                    .to_owned()
+            }
+
+            // -- the state changing between preparation and confirmation ------
+
+            #[test]
+            fn state_that_changed_after_the_preparation_is_not_removed() {
+                type Setup = Box<dyn Fn(&Bx)>;
+                type Change = Box<dyn Fn(&Bx)>;
+
+                let setup: Setup = Box::new(|bx| {
+                    bx.publish(&bx.based());
+                    put(bx, &artifact_path(bx, STALE_TOKEN), b"debris");
+                });
+
+                let changes: Vec<(&str, Change)> = vec![
+                    (
+                        "record byte",
+                        Box::new(|bx| {
+                            let mut bytes = fs::read(record_path(bx)).unwrap();
+
+                            bytes[10] ^= 0x01;
+                            fs::write(record_path(bx), bytes).unwrap();
+                        }),
+                    ),
+                    (
+                        "record replaced by another valid state",
+                        Box::new(|bx| {
+                            let newer = rebuilt_high_water(bx, 77);
+
+                            fs::write(record_path(bx), newer.encode().unwrap()).unwrap();
+                        }),
+                    ),
+                    (
+                        "record became corrupt",
+                        Box::new(|bx| fs::write(record_path(bx), b"garbage").unwrap()),
+                    ),
+                    (
+                        "record removed, artifact remains",
+                        Box::new(|bx| fs::remove_file(record_path(bx)).unwrap()),
+                    ),
+                    (
+                        "everything removed",
+                        Box::new(|bx| {
+                            fs::remove_file(record_path(bx)).unwrap();
+                            fs::remove_file(artifact_path(bx, STALE_TOKEN)).unwrap();
+                        }),
+                    ),
+                    (
+                        "artifact content",
+                        Box::new(|bx| {
+                            fs::write(artifact_path(bx, STALE_TOKEN), b"DEBRIS").unwrap()
+                        }),
+                    ),
+                    (
+                        "artifact removed",
+                        Box::new(|bx| fs::remove_file(artifact_path(bx, STALE_TOKEN)).unwrap()),
+                    ),
+                    (
+                        "artifact added",
+                        Box::new(|bx| put(bx, &artifact_path(bx, OTHER_TOKEN), b"more")),
+                    ),
+                ];
+
+                for (name, change) in &changes {
+                    let mut bx = Bx::new("b1i-changed");
+
+                    setup(&bx);
+
+                    let id = prepared(&mut bx);
+
+                    change(&bx);
+
+                    let after_change = state_snapshot(&bx);
+                    let outside = untouchable(&bx);
+                    let result = confirm(&mut bx, &id);
+
+                    assert_eq!(result, Err(stale(Stale::RecordChanged)), "{name}");
+                    assert!(result.is_err(), "{name}: reported a reset");
+                    assert_eq!(state_snapshot(&bx), after_change, "{name}");
+                    assert_eq!(untouchable(&bx), outside, "{name}");
+                    assert_eq!(
+                        confirm(&mut bx, &id),
+                        Err(stale(Stale::NoPendingReset)),
+                        "{name}"
+                    );
+                    assert_eq!(state_snapshot(&bx), after_change, "{name}");
+                }
+
+                // Something that cannot be examined any more is refused for what
+                // it is, and also left exactly as it is.
+                let mut bx = Bx::new("b1i-changed-unreadable");
+
+                setup(&bx);
+
+                let id = prepared(&mut bx);
+
+                fs::remove_file(record_path(&bx)).unwrap();
+                fs::create_dir_all(record_path(&bx)).unwrap();
+                let after_change = state_snapshot(&bx);
+
+                assert_eq!(
+                    confirm(&mut bx, &id),
+                    Err(refused(Reset::UnreadableState(
+                        UnreadableReason::UnexpectedObject
+                    )))
+                );
+                assert_eq!(state_snapshot(&bx), after_change);
+            }
+
+            fn rebuilt_high_water(bx: &Bx, high_water: u64) -> SyncState {
+                SyncState::new(
+                    BindingId::new(BINDING).unwrap(),
+                    *bx.based().vault_tag(),
+                    loc(&bx.local),
+                    bx.target.locator().clone(),
+                    SyncBase::Based(
+                        SyncCheckpoint::new(fp(1), 1, RemoteHighWater::new(high_water)).unwrap(),
+                    ),
+                    None,
+                )
+                .unwrap()
+            }
+
+            #[test]
+            fn a_state_that_vanished_is_stale_never_a_reset_by_this_confirmation() {
+                let mut bx = Bx::new("b1i-vanished");
+                bx.publish(&bx.based());
+                let id = prepared(&mut bx);
+
+                // Somebody else removed it between the two steps.
+                fs::remove_file(record_path(&bx)).unwrap();
+
+                let loads = Cell::new(0usize);
+                let result = confirm_with(&mut bx, &id, Instant::now(), &loads, None);
+
+                assert_eq!(result, Err(stale(Stale::RecordChanged)));
+                assert_eq!(
+                    loads.get(),
+                    0,
+                    "nothing was deleted, so nothing was reloaded"
+                );
+                assert!(!record_path(&bx).exists());
+            }
+
+            #[test]
+            fn a_change_in_the_window_before_the_first_removal_is_caught_by_the_store() {
+                let mut bx = Bx::new("b1i-window");
+                bx.publish(&bx.based());
+                put(&bx, &artifact_path(&bx, STALE_TOKEN), b"debris");
+                let id = prepared(&mut bx);
+                let store = bx.store();
+                let record = record_path(&bx);
+                let newer = rebuilt_high_water(&bx, 88).encode().unwrap();
+                let written = newer.clone();
+
+                // After the session's own second examination, inside the store's
+                // conditional deletion: the record is rewritten.
+                store.run_before_evidence_recheck_for_test(move || {
+                    fs::write(&record, &written).unwrap();
+                });
+
+                let loads = Cell::new(0usize);
+                let result = bx.session.confirm_binding_reset_in(
+                    &store,
+                    &id,
+                    &mut |store, locator| {
+                        loads.set(loads.get() + 1);
+
+                        store.load(locator)
+                    },
+                    Instant::now(),
+                );
+
+                assert_eq!(result, Err(stale(Stale::RecordChanged)));
+                assert_eq!(loads.get(), 0);
+                assert_eq!(fs::read(record_path(&bx)).unwrap(), newer);
+                assert_eq!(
+                    fs::read(artifact_path(&bx, STALE_TOKEN)).unwrap(),
+                    b"debris"
+                );
+            }
+
+            #[test]
+            fn a_changed_vault_or_location_is_refused_and_removes_nothing() {
+                // An in-session save does not change the location or the state:
+                // the reset still works.
+                let mut saved = Bx::new("b1i-vault-saved");
+                saved.publish(&saved.based());
+                let id = prepared(&mut saved);
+
+                saved.session.data_mut().updated_at_ms = NOW_MS + 5;
+                assert!(saved.session.save().unwrap());
+
+                assert_eq!(confirm(&mut saved, &id), Ok(Done::ResetAndVerified));
+
+                // The vault file rewritten from outside: no longer this session's.
+                let mut rewritten = Bx::new("b1i-vault-rewritten");
+                rewritten.publish(&rewritten.based());
+                let id = prepared(&mut rewritten);
+
+                fs::write(&rewritten.vault, rewritten.resealed(|_| {})).unwrap();
+                let state = state_snapshot(&rewritten);
+
+                assert_eq!(
+                    confirm(&mut rewritten, &id),
+                    Err(refused(Reset::Unavailable(
+                        SyncStateUnavailable::LocalVaultChanged
+                    )))
+                );
+                assert_eq!(state_snapshot(&rewritten), state);
+                assert_eq!(
+                    prepare(&mut rewritten).map(|_| ()),
+                    Err(Reset::Unavailable(SyncStateUnavailable::LocalVaultChanged))
+                );
+
+                // A preparation for another location is not applied to this one.
+                let mut moved = Bx::new("b1i-locator");
+                moved.publish(&moved.based());
+                let id = prepared(&mut moved);
+
+                moved
+                    .session
+                    .pending_binding_reset
+                    .as_mut()
+                    .unwrap()
+                    .local_locator = loc(r"\\?\C:\Synthetic\Vaults\Other.lvault");
+                let state = state_snapshot(&moved);
+
+                assert_eq!(confirm(&mut moved, &id), Err(stale(Stale::LocatorChanged)));
+                assert_eq!(state_snapshot(&moved), state);
+            }
+
+            // -- definite and ambiguous outcomes ------------------------------
+
+            #[test]
+            fn a_deletion_the_store_calls_complete_is_not_success_unless_a_fresh_load_agrees() {
+                let mut bx = Bx::new("b1i-absence-unconfirmed");
+                bx.publish(&bx.based());
+                let id = prepared(&mut bx);
+                let loads = Cell::new(0usize);
+
+                let result = confirm_with(
+                    &mut bx,
+                    &id,
+                    Instant::now(),
+                    &loads,
+                    Some(StateLoad::Unreadable(UnreadableReason::Io(
+                        io::ErrorKind::Other,
+                    ))),
+                );
+
+                assert_eq!(
+                    result,
+                    Err(Confirm::Ambiguous(
+                        BindingResetAmbiguity::AbsenceNotConfirmed
+                    ))
+                );
+                // One fresh load, never retried, and nothing was rebuilt.
+                assert_eq!(loads.get(), 1);
+                assert!(!record_path(&bx).exists());
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingReset)));
+
+                // A load that finds the record again (somebody recreated it) is
+                // equally not a success.
+                let mut bx = Bx::new("b1i-absence-recreated");
+                bx.publish(&bx.based());
+                let id = prepared(&mut bx);
+                let again = bx.based();
+                let loads = Cell::new(0usize);
+
+                assert_eq!(
+                    confirm_with(
+                        &mut bx,
+                        &id,
+                        Instant::now(),
+                        &loads,
+                        Some(StateLoad::Loaded(Box::new(again)))
+                    ),
+                    Err(Confirm::Ambiguous(
+                        BindingResetAmbiguity::AbsenceNotConfirmed
+                    ))
+                );
+                assert_eq!(loads.get(), 1);
+            }
+
+            #[cfg(windows)]
+            #[test]
+            fn an_incomplete_deletion_is_ambiguous_and_is_never_retried() {
+                // An artifact that cannot be removed: artifacts go first, so the
+                // record is still intact.
+                let mut bx = Bx::new("b1i-incomplete-artifact");
+                bx.publish(&bx.based());
+                put(&bx, &artifact_path(&bx, STALE_TOKEN), b"debris");
+                let record = bx.record_bytes();
+                let id = prepared(&mut bx);
+                let loads = Cell::new(0usize);
+                let outside = untouchable(&bx);
+
+                {
+                    let _guard = hold_against_removal(&artifact_path(&bx, STALE_TOKEN));
+
+                    assert_eq!(
+                        confirm_with(&mut bx, &id, Instant::now(), &loads, None),
+                        Err(Confirm::Ambiguous(
+                            BindingResetAmbiguity::IncompleteDeletion
+                        ))
+                    );
+                }
+
+                assert_eq!(loads.get(), 0, "no verification is claimed after a failure");
+                assert_eq!(bx.record_bytes(), record);
+                assert!(artifact_path(&bx, STALE_TOKEN).exists());
+                assert_eq!(untouchable(&bx), outside);
+
+                // Nothing retries on its own, even once the obstacle is gone.
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(bx.record_bytes(), record);
+                assert!(matches!(
+                    bx.session.binding_status(&bx.root).state(),
+                    BindingState::Linked(_)
+                ));
+
+                // Only a new, explicit preparation and confirmation finishes it.
+                let id = prepared(&mut bx);
+
+                assert_eq!(confirm(&mut bx, &id), Ok(Done::ResetAndVerified));
+
+                // The record itself cannot be removed after the artifacts went:
+                // a partial state, reported as ambiguous.
+                let mut bx = Bx::new("b1i-incomplete-record");
+                bx.publish(&bx.based());
+                put(&bx, &artifact_path(&bx, STALE_TOKEN), b"debris");
+                let record = bx.record_bytes();
+                let id = prepared(&mut bx);
+
+                {
+                    let _guard = hold_against_removal(&record_path(&bx));
+
+                    assert_eq!(
+                        confirm(&mut bx, &id),
+                        Err(Confirm::Ambiguous(
+                            BindingResetAmbiguity::IncompleteDeletion
+                        ))
+                    );
+                }
+
+                assert!(!artifact_path(&bx, STALE_TOKEN).exists());
+                assert_eq!(bx.record_bytes(), record);
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(bx.record_bytes(), record);
+            }
+
+            // -- lifetime -----------------------------------------------------
+
+            #[test]
+            fn a_reset_preparation_does_not_survive_its_session() {
+                let mut fresh = Bx::new("b1i-fresh-session");
+
+                assert_eq!(
+                    confirm(&mut fresh, &unknown_id()),
+                    Err(stale(Stale::NoPendingReset))
+                );
+
+                let mut bx = Bx::new("b1i-reopen");
+                bx.publish(&bx.based());
+                let id = prepared(&mut bx);
+                let record = bx.record_bytes();
+                let Bx {
+                    session,
+                    root,
+                    vault,
+                    dir,
+                    ..
+                } = bx;
+
+                session.lock();
+
+                let mut reopened = UnlockedVaultSession::unlock(&vault, test_password()).unwrap();
+
+                assert_eq!(
+                    reopened.confirm_binding_reset(&root, &id),
+                    Err(stale(Stale::NoPendingReset))
+                );
+                assert!(matches!(
+                    reopened.binding_status(&root).state(),
+                    BindingState::Linked(_)
+                ));
+
+                drop(reopened);
+
+                let state_dir = root
+                    .path()
+                    .join(crate::vault::sync_state_store::SYNC_STATE_DIRECTORY);
+                let kept: Vec<_> = fs::read_dir(&state_dir)
+                    .unwrap()
+                    .map(|e| fs::read(e.unwrap().path()).unwrap())
+                    .collect();
+
+                assert_eq!(kept, vec![record]);
+
+                drop(dir);
+            }
+
+            #[test]
+            fn a_reset_preparation_belongs_to_one_vault() {
+                let mut one = Bx::new("b1i-vault-one");
+                one.publish(&one.based());
+                let id = prepared(&mut one);
+
+                let mut two = Bx::new("b1i-vault-two");
+                two.publish(&two.based());
+                let record_one = one.record_bytes();
+                let record_two = two.record_bytes();
+
+                assert_eq!(confirm(&mut two, &id), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(two.record_bytes(), record_two);
+                assert_eq!(one.record_bytes(), record_one);
+                assert_eq!(confirm(&mut one, &id), Ok(Done::ResetAndVerified));
+                assert_eq!(two.record_bytes(), record_two);
+            }
+
+            #[test]
+            fn cancelling_discards_a_reset_preparation_and_is_idempotent() {
+                let mut bx = Bx::new("b1i-cancel");
+                bx.publish(&bx.based());
+                let record = bx.record_bytes();
+
+                bx.session.cancel_binding_reset();
+                bx.session.cancel_binding_reset();
+
+                let id = prepared(&mut bx);
+
+                bx.session.cancel_binding_reset();
+                bx.session.cancel_binding_reset();
+
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(bx.record_bytes(), record);
+            }
+
+            // -- nothing is printed -------------------------------------------
+
+            #[test]
+            fn reset_types_reveal_no_path_identifier_fingerprint_or_content() {
+                let mut bx = Bx::new("b1i-no-leak");
+                bx.publish(&pending_push_state(&bx));
+                put(&bx, &artifact_path(&bx, STALE_TOKEN), b"LEAKMARK-debris");
+
+                let record = bx.record_bytes();
+                let status = bx.session.binding_status(&bx.root);
+                let preview = prepare(&mut bx).unwrap();
+                let id = preview.preparation_id().to_owned();
+                let mut shown: Vec<String> = Vec::new();
+
+                shown.push(format!("{status:?}"));
+                shown.push(format!("{:?}", status.state()));
+                shown.push(format!("{preview:?}"));
+                shown.push(format!("{:?}", bx.session.pending_binding_reset));
+                shown.push(format!(
+                    "{:?}",
+                    bx.session.pending_binding_reset.as_ref().unwrap()
+                ));
+                shown.push(format!("{:?}", preview.consequences()));
+                shown.push(format!("{:?}", preview.subject()));
+                shown.push(format!("{:?}", bx.session.load_sync_state(&bx.root)));
+
+                for reason in [
+                    Stale::NoPendingReset,
+                    Stale::NotCurrentPreparation,
+                    Stale::Expired,
+                    Stale::LocatorChanged,
+                    Stale::RecordChanged,
+                ] {
+                    shown.push(format!("{reason:?}"));
+                    shown.push(reason.to_string());
+                    shown.push(format!("{:?}", stale(reason)));
+                    shown.push(stale(reason).to_string());
+                }
+
+                for refusal in [
+                    Reset::NothingToReset,
+                    Reset::Randomness,
+                    Reset::RecordChanged,
+                    Reset::UnreadableState(UnreadableReason::UnexpectedObject),
+                    Reset::Evidence(EvidenceRefusal::Oversized),
+                    Reset::Evidence(EvidenceRefusal::Unreadable),
+                    Reset::Unavailable(SyncStateUnavailable::LocalVaultChanged),
+                ] {
+                    shown.push(format!("{refusal:?}"));
+                    shown.push(refusal.to_string());
+                    shown.push(format!("{:?}", refused(refusal)));
+                    shown.push(refused(refusal).to_string());
+                }
+
+                for ambiguity in [
+                    BindingResetAmbiguity::IncompleteDeletion,
+                    BindingResetAmbiguity::AbsenceNotConfirmed,
+                ] {
+                    shown.push(format!("{:?}", Confirm::Ambiguous(ambiguity)));
+                    shown.push(Confirm::Ambiguous(ambiguity).to_string());
+                    shown.push(ambiguity.to_string());
+                }
+
+                shown.push(format!(
+                    "{:?}",
+                    Confirm::NotRemoved(StoreError::UnexpectedObject)
+                ));
+                shown.push(Confirm::NotRemoved(StoreError::UnexpectedObject).to_string());
+
+                // Real outcomes: a wrong id, then a success.
+                shown.push(format!("{:?}", confirm(&mut bx, "wrong-id-LEAKMARK")));
+
+                let id_now = prepared(&mut bx);
+
+                shown.push(format!("{:?}", confirm(&mut bx, &id_now)));
+                shown.push(format!("{:?}", bx.session.binding_status(&bx.root)));
+
+                let needles = vec![
+                    bx.dir.path().to_string_lossy().into_owned(),
+                    bx.remote.to_string_lossy().into_owned(),
+                    bx.local.clone(),
+                    bx.target.locator().as_str().to_owned(),
+                    bx.vault_id.to_string(),
+                    bx.vault_id.simple().to_string(),
+                    id.clone(),
+                    Uuid::parse_str(&id).unwrap().simple().to_string(),
+                    id_now.clone(),
+                    key(&bx),
+                    EnvelopeFingerprint::of_bytes(&record).to_hex(),
+                    EnvelopeFingerprint::of_bytes(b"LEAKMARK-debris").to_hex(),
+                    STALE_TOKEN.to_owned(),
+                    "target.lvault".to_owned(),
+                    "vault.lvault".to_owned(),
+                    ".qa-local".to_owned(),
+                    "LEAKMARK".to_owned(),
+                    MASTER_PASSWORD.to_owned(),
+                ];
+
+                assert!(shown.len() > 40);
 
                 for output in &shown {
                     for needle in &needles {
