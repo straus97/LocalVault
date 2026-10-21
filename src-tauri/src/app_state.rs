@@ -92,6 +92,12 @@ pub enum AppStateError {
     #[error("system clock is invalid")]
     InvalidClock,
 
+    /// The unlocked session a sync-binding file selection began in is no longer
+    /// the live one (it was locked, expired or replaced while the native picker
+    /// was open). Nothing was prepared.
+    #[error("the vault session changed")]
+    SessionChanged,
+
     #[error("site hostname is not referenced by a vault entry")]
     SiteHostnameNotReferenced,
 
@@ -114,11 +120,30 @@ pub enum AppStateError {
     Lifecycle(#[from] VaultLifecycleError),
 }
 
+/// Identity of one live unlocked session, for an interaction that must not leave
+/// the session it began in (a native file picker that runs without the state
+/// mutex). Comes only from [`AppState::begin_sync_binding_selection`]; compares
+/// equal only to the session that issued it. Carries no secret, path or vault
+/// identifier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct SessionToken(u64);
+
+impl std::fmt::Debug for SessionToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionToken(<redacted>)")
+    }
+}
+
 #[derive(Default)]
 struct AppStateInner {
     session: Option<UnlockedVaultSession>,
     last_activity: Option<Instant>,
     expiry_notification_pending: bool,
+
+    // Advanced every time a session is placed in `session` (create, unlock), so
+    // two sessions never share a value, even for the same vault file locked and
+    // unlocked again. Never reset.
+    session_epoch: u64,
 }
 
 pub struct AppState {
@@ -172,6 +197,7 @@ impl AppState {
         let session = UnlockedVaultSession::create(path, master_password, now_ms)?;
 
         guard.session = Some(session);
+        guard.session_epoch = guard.session_epoch.wrapping_add(1);
         guard.last_activity = Some(Instant::now());
         guard.expiry_notification_pending = false;
 
@@ -194,6 +220,7 @@ impl AppState {
         let session = UnlockedVaultSession::unlock(path, master_password)?;
 
         guard.session = Some(session);
+        guard.session_epoch = guard.session_epoch.wrapping_add(1);
         guard.last_activity = Some(Instant::now());
         guard.expiry_notification_pending = false;
 
@@ -418,6 +445,68 @@ impl AppState {
 
         if let Some(session) = guard.session.as_mut() {
             session.cancel_initial_binding();
+        }
+
+        Ok(())
+    }
+
+    /// Start a sync-binding file selection (Stage 1U-4 B1j-1): confirm a live
+    /// session, void any pending initial-binding preparation of it, and return
+    /// the identity of that session. The caller then opens a native file picker
+    /// **without** holding the state mutex and passes the token back to
+    /// [`prepare_initial_binding_for_session`](Self::prepare_initial_binding_for_session).
+    ///
+    /// An explicit user action, so it counts as activity. Voiding first means a
+    /// selection that is cancelled, invalid or abandoned can never leave an older
+    /// approval usable.
+    pub fn begin_sync_binding_selection(&self) -> Result<SessionToken, AppStateError> {
+        let mut guard = self.active_session_guard()?;
+
+        let token = SessionToken(guard.session_epoch);
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        session.cancel_initial_binding();
+
+        Ok(token)
+    }
+
+    /// [`prepare_initial_binding`](Self::prepare_initial_binding), but only for
+    /// the session that issued `token`. The token is checked under the same lock
+    /// that runs the preparation, so a lock, expiry or a different vault unlocked
+    /// while the picker was open yields [`AppStateError::SessionChanged`] (or
+    /// `VaultLocked`/`SessionExpired`) and prepares nothing, for any session.
+    pub fn prepare_initial_binding_for_session(
+        &self,
+        token: SessionToken,
+        root: &SyncStateRoot,
+        target: &SyncFileTarget,
+    ) -> Result<Result<InitialBindingPreview, InitialBindingRefusal>, AppStateError> {
+        let mut guard = self.active_session_guard()?;
+
+        if SessionToken(guard.session_epoch) != token {
+            return Err(AppStateError::SessionChanged);
+        }
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.prepare_initial_binding(root, target))
+    }
+
+    /// Discard the pending initial-binding preparation, but only if `token` still
+    /// names the live session. Idempotent; neither observes expiry nor counts as
+    /// activity. Used when a selection ended without a prepared target, so a
+    /// different session's preparation is never touched.
+    pub fn cancel_initial_binding_for_session(
+        &self,
+        token: SessionToken,
+    ) -> Result<(), AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        if SessionToken(guard.session_epoch) == token {
+            if let Some(session) = guard.session.as_mut() {
+                session.cancel_initial_binding();
+            }
         }
 
         Ok(())
