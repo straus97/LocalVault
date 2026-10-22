@@ -6,9 +6,6 @@ pub(crate) mod password_health;
 pub(crate) mod passwords;
 pub(crate) mod recent_vaults;
 pub(crate) mod site_icons;
-// Stage 1U-4 B1j-1: deliberately not registered in `generate_handler!` yet, so
-// nothing here is reachable from the frontend. B1j-2 registers it and drops this.
-#[allow(dead_code)]
 pub(crate) mod sync_binding;
 pub(crate) mod totp;
 

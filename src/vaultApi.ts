@@ -12,6 +12,11 @@ import type {
   PasswordGeneratorInput,
   PasswordHealthReport,
   SiteIconSummary,
+  SyncBindingOutcome,
+  SyncBindingPreparation,
+  SyncBindingResetOutcome,
+  SyncBindingResetPreparation,
+  SyncBindingStatus,
   TotpCode,
   VaultStatus,
 } from "./types";
@@ -238,5 +243,81 @@ export function deleteCategory(
 export function touchVaultActivity(): Promise<void> {
   return invoke<void>(
     "touch_vault_activity",
+  );
+}
+
+/*
+ * Stage 1U-4 B1j-2: sync-binding commands. The native file picker is
+ * owned by Rust, so nothing here accepts a target path, and the two
+ * confirm commands take only the opaque preparation id.
+ */
+export function getSyncBindingStatus(): Promise<SyncBindingStatus> {
+  return invoke<SyncBindingStatus>(
+    "get_sync_binding_status",
+  );
+}
+
+/*
+ * attemptId is a caller-chosen label for ONE file selection. It lets
+ * Rust tell a closed dialog's late picker result or late cancel from
+ * a newer attempt's. It is not a path, not a preparation id and not
+ * consent: confirming still needs the Rust-issued preparationId.
+ */
+export function chooseAndPrepareSyncBinding(
+  attemptId: string,
+): Promise<SyncBindingPreparation> {
+  return invoke<SyncBindingPreparation>(
+    "choose_and_prepare_sync_binding",
+    { attemptId },
+  );
+}
+
+export function confirmSyncBinding(
+  preparationId: string,
+): Promise<SyncBindingOutcome> {
+  return invoke<SyncBindingOutcome>(
+    "confirm_sync_binding",
+    { preparationId },
+  );
+}
+
+export function cancelSyncBinding(
+  attemptId: string,
+): Promise<void> {
+  return invoke<void>(
+    "cancel_sync_binding",
+    { attemptId },
+  );
+}
+
+/*
+ * As for chooseAndPrepareSyncBinding, attemptId is only a label that
+ * lets Rust tell this reset attempt from an older one. It is not the
+ * preparation id and not consent.
+ */
+export function prepareSyncBindingReset(
+  attemptId: string,
+): Promise<SyncBindingResetPreparation> {
+  return invoke<SyncBindingResetPreparation>(
+    "prepare_sync_binding_reset",
+    { attemptId },
+  );
+}
+
+export function confirmSyncBindingReset(
+  preparationId: string,
+): Promise<SyncBindingResetOutcome> {
+  return invoke<SyncBindingResetOutcome>(
+    "confirm_sync_binding_reset",
+    { preparationId },
+  );
+}
+
+export function cancelSyncBindingReset(
+  attemptId: string,
+): Promise<void> {
+  return invoke<void>(
+    "cancel_sync_binding_reset",
+    { attemptId },
   );
 }

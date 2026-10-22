@@ -127,3 +127,112 @@ export interface EntryCommandInput {
 export interface CategoryCommandInput {
   name: string;
 }
+
+/*
+ * Stage 1U-4 B1j-2: DTOs of the sync-binding command boundary
+ * (src-tauri/src/commands/sync_binding.rs). Field and variant names
+ * are the serde camelCase forms. Nothing here carries a fingerprint,
+ * physical file id, key, salt or approval capability; a preparation id
+ * is an opaque, single-use handle that is only passed back to the
+ * matching confirm command.
+ */
+
+export type SyncPendingPush =
+  | "none"
+  | "pending"
+  | "unavailable";
+
+export type SyncBindingProblem =
+  | "corrupt"
+  | "unsupportedVersion"
+  | "unreadable"
+  | "mismatch"
+  | "unavailable";
+
+export type SyncBindingState =
+  | { kind: "notConfigured" }
+  | { kind: "linked"; targetPath: string }
+  | {
+      kind: "needsAttention";
+      problem: SyncBindingProblem;
+    };
+
+export interface SyncBindingStatus {
+  state: SyncBindingState;
+  pendingPush: SyncPendingPush;
+}
+
+export interface SyncBindingPreparation {
+  preparationId: string;
+  vaultFileName: string;
+  targetPath: string;
+}
+
+export type SyncBindingOutcome = "boundAndVerified";
+
+export type SyncBindingResetSubject =
+  | "verifiedBinding"
+  | "mismatchedRecord"
+  | "corruptRecord"
+  | "unsupportedRecord"
+  | "interruptedWriteRemnants";
+
+export type SyncBindingResetConsequence =
+  | "removesLocalBindingRecord"
+  | "removesTrustedSyncHistory"
+  | "mayDiscardPendingSyncIntent"
+  | "keepsVaultAndBackup"
+  | "keepsRemoteTarget"
+  | "doesNotProveRemoteContentAbsent"
+  | "doesNotEnablePublication";
+
+export type SyncBindingUntouched =
+  | "primaryVault"
+  | "vaultBackup"
+  | "vaultLockFile"
+  | "selectedTargetFile";
+
+export interface SyncBindingResetPreparation {
+  preparationId: string;
+  subject: SyncBindingResetSubject;
+  targetPath: string | null;
+  pendingPush: SyncPendingPush;
+  consequences: SyncBindingResetConsequence[];
+  untouched: SyncBindingUntouched[];
+}
+
+export type SyncBindingResetOutcome = "resetAndVerified";
+
+/*
+ * Every code the sync-binding commands can return: the fixed codes of
+ * sync_binding.rs plus the outer vault-state codes of
+ * CommandError::from(AppStateError) that can reach these commands.
+ */
+export type SyncBindingErrorCode =
+  | "vaultLocked"
+  | "vaultSessionExpired"
+  | "stateUnavailable"
+  | "vaultOperationFailed"
+  | "syncFileDialogCancelled"
+  | "syncFileDialogBusy"
+  | "syncAttemptInvalid"
+  | "syncAttemptSuperseded"
+  | "syncSessionChanged"
+  | "syncTargetInvalid"
+  | "syncPreparationMissing"
+  | "syncPreparationStale"
+  | "syncTargetAbsent"
+  | "syncTargetUnavailable"
+  | "syncTargetDiffers"
+  | "syncTargetIsVault"
+  | "syncFilesystemUnsupported"
+  | "syncLocalVaultChanged"
+  | "syncBindingExists"
+  | "syncBindingStateCorrupt"
+  | "syncBindingFailed"
+  | "syncBindingAmbiguous"
+  | "syncNothingToReset"
+  | "syncResetEvidenceChanged"
+  | "syncResetNotPermitted"
+  | "syncResetFailed"
+  | "syncResetAmbiguous";

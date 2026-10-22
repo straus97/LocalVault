@@ -5523,3 +5523,184 @@ select:focus-visible {
     grid-column: 1;
   }
 }
+
+/* ============================================================
+   LOCALVAULT 1U-4 B1j-2 ENCRYPTED COPY BINDING DIALOG
+   Reuses the backup-modal / editor-* light-theme styles; only
+   the layout specific to this dialog is defined here.
+   ============================================================ */
+
+.sync-binding-modal {
+  width: min(640px, 100%);
+  max-height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Heading and action footer stay put; only the body scrolls. */
+.sync-binding-modal > .backup-modal-header,
+.sync-binding-modal > .editor-footer {
+  flex: 0 0 auto;
+}
+
+.sync-binding-modal:focus {
+  outline: none;
+}
+
+.sync-binding-body {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  margin-top: 14px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 6px;
+  scrollbar-width: thin;
+}
+
+.sync-binding-body:focus-visible {
+  outline: 2px solid #2f73f2;
+  outline-offset: 2px;
+}
+
+.sync-binding-body h3,
+.sync-binding-body h4 {
+  margin: 0;
+  color: #10234b;
+  line-height: 1.35;
+}
+
+.sync-binding-body h3 {
+  font-size: 17px;
+}
+
+.sync-binding-body h4 {
+  font-size: 13px;
+}
+
+.sync-binding-body [data-phase-heading]:focus {
+  outline: none;
+}
+
+.sync-binding-subtitle {
+  margin-top: 4px !important;
+}
+
+.sync-binding-text {
+  margin: 0;
+  color: #34517e;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.sync-binding-body .editor-security-note,
+.sync-binding-body .crypto-progress-note {
+  margin-top: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.sync-binding-inline-error {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.sync-binding-facts {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 11px 13px;
+  border: 1px solid #dce5f0;
+  border-radius: 10px;
+  background: #f7f9fc;
+}
+
+.sync-binding-fact {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sync-binding-fact dt {
+  color: #687d99;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.sync-binding-fact dd {
+  margin: 0;
+  color: #17315d;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.sync-binding-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 20px;
+  color: #34517e;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.sync-binding-manage {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  margin-top: 4px;
+  padding: 12px 13px;
+  border: 1px solid #ecd0d3;
+  border-radius: 10px;
+  background: #fffafa;
+}
+
+.sync-binding-manage p {
+  margin: 0;
+  color: #6d5a5d;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.editor-secondary.sync-binding-danger {
+  color: #a9363e;
+  border-color: #e3b9bd;
+  background: #ffffff;
+}
+
+.editor-secondary.sync-binding-danger:hover:not(:disabled) {
+  color: #8f2830;
+  border-color: #d58e95;
+  background: #fff4f5;
+}
+
+.editor-primary.sync-binding-danger-solid {
+  color: #ffffff;
+  border-color: #c53b44;
+  background: linear-gradient(180deg, #d9505a, #c13640);
+}
+
+.sync-binding-modal button:focus-visible {
+  outline: 2px solid #2f73f2;
+  outline-offset: 2px;
+}
+
+.sync-binding-modal .editor-footer {
+  flex-wrap: wrap;
+}
+
+@media (max-width: 760px) {
+  .sync-binding-modal {
+    max-height: calc(100vh - 24px);
+  }
+
+  .sync-binding-modal .editor-footer button {
+    flex: 1 1 auto;
+  }
+}

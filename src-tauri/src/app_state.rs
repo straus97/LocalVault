@@ -98,6 +98,12 @@ pub enum AppStateError {
     #[error("the vault session changed")]
     SessionChanged,
 
+    /// The sync-binding attempt that opened a native file picker is no longer the
+    /// current one (its dialog was closed or a newer attempt began). Nothing was
+    /// prepared.
+    #[error("the sync binding attempt was superseded")]
+    AttemptSuperseded,
+
     #[error("site hostname is not referenced by a vault entry")]
     SiteHostnameNotReferenced,
 
@@ -134,6 +140,39 @@ impl std::fmt::Debug for SessionToken {
     }
 }
 
+/// Correlation handle of one sync-binding dialog attempt, supplied by the caller.
+///
+/// It exists only to tell two attempts within the SAME unlocked session apart
+/// (the session identity cannot): a picker that finishes late for a closed
+/// dialog, or a late cancel from one, must not prepare or discard what a newer
+/// attempt owns. It is NOT consent and NOT an approval: it is chosen by the
+/// caller, is never returned by Rust, and confirms nothing. Binding still needs
+/// the Rust-generated, one-time preparation id and its own explicit
+/// confirmation. Carries no path or vault data.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct BindingAttemptId(uuid::Uuid);
+
+impl BindingAttemptId {
+    /// Canonical hyphenated UUID text only.
+    pub fn parse(text: &str) -> Option<Self> {
+        if text.len() != 36 {
+            return None;
+        }
+
+        uuid::Uuid::parse_str(text).ok().map(Self)
+    }
+}
+
+impl std::fmt::Debug for BindingAttemptId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BindingAttemptId(<redacted>)")
+    }
+}
+
+/// How many cancelled attempt ids are remembered (see
+/// [`AppState::cancel_binding_attempt`]).
+const CANCELLED_ATTEMPTS_REMEMBERED: usize = 16;
+
 #[derive(Default)]
 struct AppStateInner {
     session: Option<UnlockedVaultSession>,
@@ -144,6 +183,36 @@ struct AppStateInner {
     // two sessions never share a value, even for the same vault file locked and
     // unlocked again. Never reset.
     session_epoch: u64,
+
+    // The one sync-binding attempt allowed to prepare, and to own, the pending
+    // initial-binding approval. Set by `begin_sync_binding_selection`, replaced by
+    // the next attempt, cleared by its own cancel and whenever a session is placed.
+    binding_attempt: Option<BindingAttemptId>,
+
+    // The one reset attempt that owns the pending reset preparation. Set only by a
+    // successful `prepare_binding_reset_for_attempt` (the session voids the older
+    // preparation whatever the outcome), cleared by its own cancel and whenever a
+    // session is placed.
+    reset_attempt: Option<BindingAttemptId>,
+
+    // Recently cancelled attempts (binding and reset share the list; an id names
+    // one attempt only), oldest first, so a cancel that overtakes the command it
+    // cancels still wins.
+    cancelled_binding_attempts: Vec<BindingAttemptId>,
+}
+
+impl AppStateInner {
+    fn remember_cancelled(&mut self, attempt: BindingAttemptId) {
+        if self.cancelled_binding_attempts.contains(&attempt) {
+            return;
+        }
+
+        if self.cancelled_binding_attempts.len() >= CANCELLED_ATTEMPTS_REMEMBERED {
+            self.cancelled_binding_attempts.remove(0);
+        }
+
+        self.cancelled_binding_attempts.push(attempt);
+    }
 }
 
 pub struct AppState {
@@ -198,6 +267,8 @@ impl AppState {
 
         guard.session = Some(session);
         guard.session_epoch = guard.session_epoch.wrapping_add(1);
+        guard.binding_attempt = None;
+        guard.reset_attempt = None;
         guard.last_activity = Some(Instant::now());
         guard.expiry_notification_pending = false;
 
@@ -221,6 +292,8 @@ impl AppState {
 
         guard.session = Some(session);
         guard.session_epoch = guard.session_epoch.wrapping_add(1);
+        guard.binding_attempt = None;
+        guard.reset_attempt = None;
         guard.last_activity = Some(Instant::now());
         guard.expiry_notification_pending = false;
 
@@ -459,14 +532,27 @@ impl AppState {
     /// An explicit user action, so it counts as activity. Voiding first means a
     /// selection that is cancelled, invalid or abandoned can never leave an older
     /// approval usable.
-    pub fn begin_sync_binding_selection(&self) -> Result<SessionToken, AppStateError> {
+    ///
+    /// `attempt` becomes THE current attempt, superseding any older one, unless it
+    /// was already cancelled (`AttemptSuperseded`: nothing is voided, no picker
+    /// should open). See [`BindingAttemptId`] for its limited purpose.
+    pub fn begin_sync_binding_selection(
+        &self,
+        attempt: BindingAttemptId,
+    ) -> Result<SessionToken, AppStateError> {
         let mut guard = self.active_session_guard()?;
+
+        if guard.cancelled_binding_attempts.contains(&attempt) {
+            return Err(AppStateError::AttemptSuperseded);
+        }
 
         let token = SessionToken(guard.session_epoch);
 
         let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
 
         session.cancel_initial_binding();
+
+        guard.binding_attempt = Some(attempt);
 
         Ok(token)
     }
@@ -476,9 +562,14 @@ impl AppState {
     /// that runs the preparation, so a lock, expiry or a different vault unlocked
     /// while the picker was open yields [`AppStateError::SessionChanged`] (or
     /// `VaultLocked`/`SessionExpired`) and prepares nothing, for any session.
+    ///
+    /// Within the session, only the current `attempt` may prepare: a picker that
+    /// finishes late for a cancelled or superseded attempt yields
+    /// `AttemptSuperseded` and prepares nothing. Checked under the same lock.
     pub fn prepare_initial_binding_for_session(
         &self,
         token: SessionToken,
+        attempt: BindingAttemptId,
         root: &SyncStateRoot,
         target: &SyncFileTarget,
     ) -> Result<Result<InitialBindingPreview, InitialBindingRefusal>, AppStateError> {
@@ -488,22 +579,29 @@ impl AppState {
             return Err(AppStateError::SessionChanged);
         }
 
+        if guard.binding_attempt != Some(attempt) {
+            return Err(AppStateError::AttemptSuperseded);
+        }
+
         let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
 
         Ok(session.prepare_initial_binding(root, target))
     }
 
-    /// Discard the pending initial-binding preparation, but only if `token` still
-    /// names the live session. Idempotent; neither observes expiry nor counts as
-    /// activity. Used when a selection ended without a prepared target, so a
-    /// different session's preparation is never touched.
-    pub fn cancel_initial_binding_for_session(
-        &self,
-        token: SessionToken,
-    ) -> Result<(), AppStateError> {
+    /// Cancel one sync-binding attempt: it can no longer prepare, and if it is the
+    /// current attempt its pending preparation (if any) is discarded. An attempt
+    /// that is not the current one discards nothing, so a late cancel from an old
+    /// dialog never touches what a newer attempt prepared. The id is remembered
+    /// (bounded) so a cancel that overtakes its own `begin_sync_binding_selection`
+    /// still wins. Idempotent; neither observes expiry nor counts as activity.
+    pub fn cancel_binding_attempt(&self, attempt: BindingAttemptId) -> Result<(), AppStateError> {
         let mut guard = self.inner_guard()?;
 
-        if SessionToken(guard.session_epoch) == token {
+        guard.remember_cancelled(attempt);
+
+        if guard.binding_attempt == Some(attempt) {
+            guard.binding_attempt = None;
+
             if let Some(session) = guard.session.as_mut() {
                 session.cancel_initial_binding();
             }
@@ -552,6 +650,34 @@ impl AppState {
         Ok(session.prepare_binding_reset(root))
     }
 
+    /// [`prepare_binding_reset`](Self::prepare_binding_reset) on behalf of one reset
+    /// `attempt`, which becomes the owner of the pending preparation if it
+    /// succeeds. An attempt cancelled before this call arrives (a closed dialog
+    /// whose request was still in flight) prepares nothing and voids nothing
+    /// (`AttemptSuperseded`). The check and the preparation share one lock. See
+    /// [`BindingAttemptId`] for the attempt's limited purpose: it is a label, not
+    /// an approval.
+    pub fn prepare_binding_reset_for_attempt(
+        &self,
+        attempt: BindingAttemptId,
+        root: &SyncStateRoot,
+    ) -> Result<Result<BindingResetPreview, BindingResetRefusal>, AppStateError> {
+        let mut guard = self.active_session_guard()?;
+
+        if guard.cancelled_binding_attempts.contains(&attempt) {
+            return Err(AppStateError::AttemptSuperseded);
+        }
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        let outcome = session.prepare_binding_reset(root);
+
+        // A failed preparation also voided the previous one, so nobody owns it.
+        guard.reset_attempt = outcome.is_ok().then_some(attempt);
+
+        Ok(outcome)
+    }
+
     /// Second half of the explicit binding reset (Stage 1U-4 B1i): spend the
     /// pending preparation and, if the stored state is still exactly what it
     /// examined, remove it. Internal: no command, event or UI is attached. See
@@ -583,6 +709,27 @@ impl AppState {
 
         if let Some(session) = guard.session.as_mut() {
             session.cancel_binding_reset();
+        }
+
+        Ok(())
+    }
+
+    /// Cancel one reset attempt: it can no longer prepare, and if it owns the
+    /// pending reset preparation that preparation is discarded. An attempt that
+    /// does not own it discards nothing, and an initial-binding approval or
+    /// attempt is never touched. Idempotent; neither observes expiry nor counts as
+    /// activity.
+    pub fn cancel_reset_attempt(&self, attempt: BindingAttemptId) -> Result<(), AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        guard.remember_cancelled(attempt);
+
+        if guard.reset_attempt == Some(attempt) {
+            guard.reset_attempt = None;
+
+            if let Some(session) = guard.session.as_mut() {
+                session.cancel_binding_reset();
+            }
         }
 
         Ok(())
@@ -1703,6 +1850,74 @@ mod tests {
             .to_owned()
     }
 
+    fn new_attempt() -> BindingAttemptId {
+        BindingAttemptId::parse(&uuid::Uuid::new_v4().to_string()).unwrap()
+    }
+
+    #[test]
+    fn only_the_current_attempt_may_prepare_and_an_expired_or_replaced_session_fails_closed() {
+        let unbound = unbound_vault("b1j2-appstate-attempts");
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        state
+            .unlock_vault(unbound.vault.clone(), password())
+            .unwrap();
+
+        let (a, b) = (new_attempt(), new_attempt());
+
+        let token_a = state.begin_sync_binding_selection(a).unwrap();
+        let token_b = state.begin_sync_binding_selection(b).unwrap();
+
+        // The session is the same; the attempt is not.
+        assert!(matches!(
+            state.prepare_initial_binding_for_session(token_a, a, &unbound.root, &unbound.target),
+            Err(AppStateError::AttemptSuperseded)
+        ));
+        assert!(!unbound.root.path().exists());
+
+        // A cancelled attempt cannot begin again, and cancelling is idempotent.
+        state.cancel_binding_attempt(a).unwrap();
+        state.cancel_binding_attempt(a).unwrap();
+        assert!(matches!(
+            state.begin_sync_binding_selection(a),
+            Err(AppStateError::AttemptSuperseded)
+        ));
+
+        // The current attempt prepares; a stale cancel leaves it pending.
+        let id = state
+            .prepare_initial_binding_for_session(token_b, b, &unbound.root, &unbound.target)
+            .unwrap()
+            .unwrap()
+            .preparation_id()
+            .to_owned();
+
+        state.cancel_binding_attempt(a).unwrap();
+
+        // Expiry while the old picker is open: reported as such, nothing prepared.
+        state.age_session_for_test(Duration::from_secs(31));
+
+        let c = new_attempt();
+        let late =
+            state.prepare_initial_binding_for_session(token_b, c, &unbound.root, &unbound.target);
+
+        assert!(matches!(late, Err(AppStateError::SessionExpired)));
+        assert!(matches!(
+            state.confirm_initial_binding(&unbound.root, &id),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        // A later session starts with no current attempt.
+        state
+            .unlock_vault(unbound.vault.clone(), password())
+            .unwrap();
+
+        assert!(matches!(
+            state.prepare_initial_binding_for_session(token_b, b, &unbound.root, &unbound.target),
+            Err(AppStateError::SessionChanged)
+        ));
+        assert!(!unbound.root.path().exists());
+    }
+
     fn no_pending() -> Result<InitialBindingOutcome, InitialBindingConfirmRefusal> {
         Err(InitialBindingConfirmRefusal::Stale(
             InitialBindingStale::NoPendingApproval,
@@ -2106,6 +2321,65 @@ mod tests {
         );
 
         drop(bound.scratch);
+    }
+
+    #[test]
+    fn a_reset_attempt_does_not_outlive_an_expired_or_replaced_session() {
+        let bound = bound_vault("b1j2-appstate-reset-attempts");
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+        let original = record_of(&bound);
+
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+
+        let a = new_attempt();
+
+        let shown = state
+            .prepare_binding_reset_for_attempt(a, &bound.root)
+            .unwrap()
+            .unwrap()
+            .preparation_id()
+            .to_owned();
+
+        // Expiry: the preparation dies with the session; nothing is removed.
+        state.age_session_for_test(Duration::from_secs(31));
+
+        assert!(matches!(
+            state.confirm_binding_reset(&bound.root, &shown),
+            Err(AppStateError::SessionExpired)
+        ));
+        assert!(matches!(
+            state.prepare_binding_reset_for_attempt(new_attempt(), &bound.root),
+            Err(AppStateError::VaultLocked)
+        ));
+        state.cancel_reset_attempt(a).unwrap();
+        assert_eq!(record_of(&bound), original);
+
+        // A new session starts owning nothing: the old attempt's late cancel
+        // cannot discard the new session's preparation.
+        state.unlock_vault(bound.vault.clone(), password()).unwrap();
+
+        let b = new_attempt();
+
+        let current = state
+            .prepare_binding_reset_for_attempt(b, &bound.root)
+            .unwrap()
+            .unwrap()
+            .preparation_id()
+            .to_owned();
+
+        state.cancel_reset_attempt(a).unwrap();
+
+        // The cancelled id cannot prepare again, in this or any session.
+        assert!(matches!(
+            state.prepare_binding_reset_for_attempt(a, &bound.root),
+            Err(AppStateError::AttemptSuperseded)
+        ));
+        assert_eq!(record_of(&bound), original);
+
+        assert!(matches!(
+            state.confirm_binding_reset(&bound.root, &current),
+            Ok(Ok(_))
+        ));
     }
 
     #[test]

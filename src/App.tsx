@@ -17,6 +17,7 @@ import ChangeMasterPasswordDialog from "./ChangeMasterPasswordDialog";
 import CategoryEditor from "./CategoryEditor";
 import EntryEditor from "./EntryEditor";
 import PasswordHealthPanel from "./PasswordHealthPanel";
+import SyncBindingDialog from "./SyncBindingDialog";
 import "./App.css";
 import type {
   CategoryCommandInput,
@@ -424,6 +425,11 @@ function App() {
   const [
     changePasswordDialogOpen,
     setChangePasswordDialogOpen,
+  ] = useState(false);
+
+  const [
+    syncBindingDialogOpen,
+    setSyncBindingDialogOpen,
   ] = useState(false);
 
   const [gateMode, setGateMode] =
@@ -896,6 +902,7 @@ const [
     setSearch("");
     setFilter({ type: "all" });
     setChangePasswordDialogOpen(false);
+    setSyncBindingDialogOpen(false);
   }
 
   function applyAutoLockedUi() {
@@ -918,6 +925,23 @@ const [
       "Хранилище автоматически заблокировано из-за бездействия.",
     );
   }
+  /*
+   * A sync-binding command reported that the vault session is gone
+   * or changed. Re-check Rust and, if it is no longer unlocked,
+   * remove all unlocked UI (which also closes the binding dialog).
+   */
+  function verifySyncBindingSession() {
+    void getVaultStatus()
+      .then((nextStatus) => {
+        if (!nextStatus.unlocked) {
+          applyAutoLockedUi();
+        }
+      })
+      .catch(() => {
+        applyAutoLockedUi();
+      });
+  }
+
   useEffect(() => {
     let active = true;
 
@@ -2576,6 +2600,22 @@ ${path}
           </button>
           <button
             type="button"
+            className="backup-button"
+            disabled={busy}
+            onClick={() => {
+              clearSecretView();
+              setErrorMessage(null);
+              setSuccessMessage(null);
+              setSyncBindingDialogOpen(true);
+            }}
+          >
+            <span aria-hidden="true">
+              ◈
+            </span>
+            Связь с копией
+          </button>
+          <button
+            type="button"
             className="lock-button"
             disabled={busy}
             onClick={() =>
@@ -3524,6 +3564,16 @@ ${path}
               "Мастер-пароль успешно изменён. Старые пользовательские .lvbackup по-прежнему открываются прежним паролем — рекомендуется создать новую резервную копию.",
             );
           }}
+        />
+      )}
+      {syncBindingDialogOpen && (
+        <SyncBindingDialog
+          onClose={() =>
+            setSyncBindingDialogOpen(false)
+          }
+          onSessionEnded={
+            verifySyncBindingSession
+          }
         />
       )}
       {categoryEditorMode && (

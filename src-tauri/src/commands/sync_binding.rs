@@ -1,8 +1,8 @@
 //! Tauri command boundary over the session-owned sync-binding workflow
 //! (Stage 1U-4 B1j-1).
 //!
-//! **These commands are deliberately not registered in `generate_handler!`**, so
-//! the frontend cannot reach them. B1j-2 registers them together with the UI.
+//! The seven commands are registered in `generate_handler!` (`lib.rs`) and are
+//! reached through the Windows binding dialog (Stage 1U-4 B1j-2).
 //!
 //! The module is a thin shell. Every rule (one-time consumption, the 120-second
 //! lifetime, stale-preview detection, repeat file validation, Core
@@ -33,6 +33,25 @@
 //! picker opens and the preparation re-checks it under the state mutex, so a path
 //! chosen for one session can never be prepared for another.
 //!
+//! # Attempt ownership
+//!
+//! The session identity cannot tell two dialog attempts of the SAME session
+//! apart: a dialog closed while its picker is open, then reopened, leaves a
+//! stale picker result and a stale cancel in flight. So the frontend labels each
+//! file selection with an attempt id, and `AppState` lets only the current
+//! attempt prepare, and only the current attempt cancel what it prepared. A late
+//! picker result of a cancelled or superseded attempt prepares nothing, and a
+//! late cancel of an old attempt discards nothing.
+//!
+//! The reset flow uses the same pattern: `prepare_sync_binding_reset` and
+//! `cancel_sync_binding_reset` carry a reset attempt id, and a cancel from an
+//! attempt that does not own the pending reset preparation discards nothing.
+//!
+//! The attempt id is a correlation label chosen by the caller. It is NOT the
+//! preparation id, is never returned, approves nothing and does not replace the
+//! Rust-generated one-time preparation id plus the separate explicit
+//! confirmation that binding still requires.
+//!
 //! Errors and `Debug` output never carry a path, password, key, fingerprint,
 //! salt, physical file identifier, raw store error or preparation id.
 
@@ -47,7 +66,7 @@ use tauri_plugin_dialog::{DialogExt, FilePath};
 
 use super::CommandError;
 use crate::{
-    app_state::{AppState, AppStateError, SessionToken},
+    app_state::{AppState, AppStateError, BindingAttemptId},
     vault::{
         session::{
             BindingAttention, BindingResetConfirmRefusal, BindingResetConsequence,
@@ -83,6 +102,14 @@ const FILE_DIALOG_BUSY: CommandError = error(
 const SESSION_CHANGED: CommandError = error(
     "syncSessionChanged",
     "The vault session changed during the file selection. Start again.",
+);
+
+const ATTEMPT_INVALID: CommandError =
+    error("syncAttemptInvalid", "The attempt identifier is invalid.");
+
+const ATTEMPT_SUPERSEDED: CommandError = error(
+    "syncAttemptSuperseded",
+    "The file selection belongs to an attempt that is no longer current. Start again.",
 );
 
 const TARGET_INVALID: CommandError = error(
@@ -178,6 +205,7 @@ const RESET_AMBIGUOUS: CommandError = error(
 fn app_error(error: AppStateError) -> CommandError {
     match error {
         AppStateError::SessionChanged => SESSION_CHANGED,
+        AppStateError::AttemptSuperseded => ATTEMPT_SUPERSEDED,
         other => CommandError::from(other),
     }
 }
@@ -585,29 +613,37 @@ fn status_in(state: &AppState, root: &SyncStateRoot) -> Result<SyncBindingStatus
         .map_err(app_error)
 }
 
-/// Void older approval, take the session identity, run `pick` with no lock held,
-/// then prepare the chosen file for that same session only.
+fn parse_attempt(text: &str) -> Result<BindingAttemptId, CommandError> {
+    BindingAttemptId::parse(text).ok_or(ATTEMPT_INVALID)
+}
+
+/// Void older approval, take the session identity and make `attempt` the current
+/// one, run `pick` with no lock held, then prepare the chosen file for that same
+/// session and that same attempt only.
 fn choose_and_prepare_in(
     state: &AppState,
     root: &SyncStateRoot,
+    attempt: BindingAttemptId,
     pick: impl FnOnce() -> Selection,
 ) -> Result<SyncBindingPreparationDto, CommandError> {
-    let token = state.begin_sync_binding_selection().map_err(app_error)?;
+    let token = state
+        .begin_sync_binding_selection(attempt)
+        .map_err(app_error)?;
 
-    let abandon = |token: SessionToken| {
-        // Idempotent and best effort: the older approval was already voided when
-        // the selection began; this only closes the window in between.
-        let _ = state.cancel_initial_binding_for_session(token);
+    let abandon = |attempt: BindingAttemptId| {
+        // Idempotent and best effort. It acts only if `attempt` is still the
+        // current one, so a newer attempt's approval is never discarded.
+        let _ = state.cancel_binding_attempt(attempt);
     };
 
     let path = match pick() {
         Selection::Chosen(path) => path,
         Selection::Cancelled => {
-            abandon(token);
+            abandon(attempt);
             return Err(FILE_DIALOG_CANCELLED);
         }
         Selection::Unusable => {
-            abandon(token);
+            abandon(attempt);
             return Err(TARGET_INVALID);
         }
     };
@@ -619,11 +655,11 @@ fn choose_and_prepare_in(
     };
 
     let Some(target) = target else {
-        abandon(token);
+        abandon(attempt);
         return Err(TARGET_INVALID);
     };
 
-    match state.prepare_initial_binding_for_session(token, root, &target) {
+    match state.prepare_initial_binding_for_session(token, attempt, root, &target) {
         Err(error) => Err(app_error(error)),
         Ok(Err(refusal)) => Err(initial_binding_error(refusal)),
         Ok(Ok(preview)) => Ok(SyncBindingPreparationDto::from(&preview)),
@@ -645,8 +681,9 @@ fn confirm_in(
 fn prepare_reset_in(
     state: &AppState,
     root: &SyncStateRoot,
+    attempt: BindingAttemptId,
 ) -> Result<SyncBindingResetPreparationDto, CommandError> {
-    match state.prepare_binding_reset(root) {
+    match state.prepare_binding_reset_for_attempt(attempt, root) {
         Err(error) => Err(app_error(error)),
         Ok(Err(refusal)) => Err(reset_error(refusal)),
         Ok(Ok(preview)) => Ok(SyncBindingResetPreparationDto::from(&preview)),
@@ -684,18 +721,22 @@ pub fn get_sync_binding_status(
 }
 
 /// Open the native picker for an existing `*.lvault` file and prepare it. Binds
-/// nothing: the selection is not consent.
+/// nothing: the selection is not consent. `attempt_id` labels this attempt (see
+/// the module comment); it is not a path and not an approval.
 #[tauri::command(async)]
 pub fn choose_and_prepare_sync_binding(
     app: AppHandle,
     window: WebviewWindow,
     state: State<'_, AppState>,
+    attempt_id: String,
 ) -> Result<SyncBindingPreparationDto, CommandError> {
+    let attempt = parse_attempt(&attempt_id)?;
+
     let root = trusted_root(&app, BINDING_FAILED)?;
 
     let _slot = PickerSlot::acquire().ok_or(FILE_DIALOG_BUSY)?;
 
-    choose_and_prepare_in(&state, &root, || pick_vault_file(&app, &window))
+    choose_and_prepare_in(&state, &root, attempt, || pick_vault_file(&app, &window))
 }
 
 #[tauri::command(async)]
@@ -709,19 +750,29 @@ pub fn confirm_sync_binding(
     confirm_in(&state, &root, &preparation_id)
 }
 
+/// Cancel one attempt: it can no longer prepare, and if it is the current attempt
+/// its pending preparation is discarded. A stale attempt discards nothing.
 #[tauri::command]
-pub fn cancel_sync_binding(state: State<'_, AppState>) -> Result<(), CommandError> {
-    state.cancel_initial_binding().map_err(app_error)
+pub fn cancel_sync_binding(
+    state: State<'_, AppState>,
+    attempt_id: String,
+) -> Result<(), CommandError> {
+    let attempt = parse_attempt(&attempt_id)?;
+
+    state.cancel_binding_attempt(attempt).map_err(app_error)
 }
 
 #[tauri::command(async)]
 pub fn prepare_sync_binding_reset(
     app: AppHandle,
     state: State<'_, AppState>,
+    attempt_id: String,
 ) -> Result<SyncBindingResetPreparationDto, CommandError> {
+    let attempt = parse_attempt(&attempt_id)?;
+
     let root = trusted_root(&app, RESET_FAILED)?;
 
-    prepare_reset_in(&state, &root)
+    prepare_reset_in(&state, &root, attempt)
 }
 
 #[tauri::command(async)]
@@ -735,9 +786,16 @@ pub fn confirm_sync_binding_reset(
     confirm_reset_in(&state, &root, &preparation_id)
 }
 
+/// Cancel one reset attempt: it can no longer prepare, and if it owns the pending
+/// reset preparation that is discarded. A stale attempt discards nothing.
 #[tauri::command]
-pub fn cancel_sync_binding_reset(state: State<'_, AppState>) -> Result<(), CommandError> {
-    state.cancel_binding_reset().map_err(app_error)
+pub fn cancel_sync_binding_reset(
+    state: State<'_, AppState>,
+    attempt_id: String,
+) -> Result<(), CommandError> {
+    let attempt = parse_attempt(&attempt_id)?;
+
+    state.cancel_reset_attempt(attempt).map_err(app_error)
 }
 
 #[cfg(test)]
@@ -830,7 +888,7 @@ mod tests {
 
     impl Fixture {
         fn choose(&self, path: &Path) -> Result<SyncBindingPreparationDto, CommandError> {
-            choose_and_prepare_in(&self.state, &self.root, || {
+            choose_and_prepare_in(&self.state, &self.root, attempt(), || {
                 Selection::Chosen(path.to_owned())
             })
         }
@@ -1075,7 +1133,7 @@ mod tests {
 
         let older = f.prepare();
 
-        let result = choose_and_prepare_in(&f.state, &f.root, || Selection::Cancelled);
+        let result = choose_and_prepare_in(&f.state, &f.root, attempt(), || Selection::Cancelled);
 
         assert_eq!(result, Err(FILE_DIALOG_CANCELLED));
 
@@ -1104,7 +1162,7 @@ mod tests {
             let older = f.prepare();
 
             assert_eq!(
-                choose_and_prepare_in(&f.state, &f.root, || selection),
+                choose_and_prepare_in(&f.state, &f.root, attempt(), || selection),
                 Err(TARGET_INVALID)
             );
 
@@ -1154,7 +1212,7 @@ mod tests {
 
         // Locking needs the state mutex. Were it held across the picker this
         // would deadlock instead of failing.
-        let result = choose_and_prepare_in(&f.state, &f.root, || {
+        let result = choose_and_prepare_in(&f.state, &f.root, attempt(), || {
             f.state.lock_vault().unwrap();
 
             Selection::Chosen(f.remote.clone())
@@ -1170,7 +1228,7 @@ mod tests {
         let f = fixture("b1j1-session-switch");
 
         // The same vault, locked and unlocked again: a different session.
-        let result = choose_and_prepare_in(&f.state, &f.root, || {
+        let result = choose_and_prepare_in(&f.state, &f.root, attempt(), || {
             f.relock_and_unlock();
 
             Selection::Chosen(f.remote.clone())
@@ -1192,7 +1250,7 @@ mod tests {
     fn a_session_locked_during_the_picker_fails_closed() {
         let f = fixture("b1j1-session-locked");
 
-        let result = choose_and_prepare_in(&f.state, &f.root, || {
+        let result = choose_and_prepare_in(&f.state, &f.root, attempt(), || {
             f.state.lock_vault().unwrap();
 
             Selection::Chosen(f.remote.clone())
@@ -1214,7 +1272,7 @@ mod tests {
 
         let mut new_session_id = String::new();
 
-        let result = choose_and_prepare_in(&f.state, &f.root, || {
+        let result = choose_and_prepare_in(&f.state, &f.root, attempt(), || {
             f.relock_and_unlock();
 
             // The new session prepares its own approval while the old picker is
@@ -1240,7 +1298,7 @@ mod tests {
 
         let mut opened = false;
 
-        let result = choose_and_prepare_in(&f.state, &f.root, || {
+        let result = choose_and_prepare_in(&f.state, &f.root, attempt(), || {
             opened = true;
 
             Selection::Cancelled
@@ -1406,7 +1464,7 @@ mod tests {
 
         f.bind();
 
-        let preparation = prepare_reset_in(&f.state, &f.root).unwrap();
+        let preparation = prepare_reset_in(&f.state, &f.root, attempt()).unwrap();
 
         assert_eq!(
             preparation.subject,
@@ -1460,7 +1518,10 @@ mod tests {
             confirm_reset_in(&f.state, &f.root, &preparation.preparation_id),
             Err(PREPARATION_MISSING)
         );
-        assert_eq!(prepare_reset_in(&f.state, &f.root), Err(NOTHING_TO_RESET));
+        assert_eq!(
+            prepare_reset_in(&f.state, &f.root, attempt()),
+            Err(NOTHING_TO_RESET)
+        );
     }
 
     #[test]
@@ -1469,7 +1530,7 @@ mod tests {
 
         f.bind();
 
-        let preparation = prepare_reset_in(&f.state, &f.root).unwrap();
+        let preparation = prepare_reset_in(&f.state, &f.root, attempt()).unwrap();
 
         assert_eq!(
             sorted_keys(&preparation),
@@ -1498,7 +1559,7 @@ mod tests {
         f.bind();
         f.corrupt_record();
 
-        let preparation = prepare_reset_in(&f.state, &f.root).unwrap();
+        let preparation = prepare_reset_in(&f.state, &f.root, attempt()).unwrap();
 
         assert_eq!(
             preparation.subject,
@@ -1521,7 +1582,7 @@ mod tests {
 
         f.bind();
 
-        let first = prepare_reset_in(&f.state, &f.root).unwrap();
+        let first = prepare_reset_in(&f.state, &f.root, attempt()).unwrap();
 
         assert_eq!(
             confirm_reset_in(&f.state, &f.root, SOME_ID),
@@ -1534,7 +1595,7 @@ mod tests {
             Err(PREPARATION_MISSING)
         );
 
-        let second = prepare_reset_in(&f.state, &f.root).unwrap();
+        let second = prepare_reset_in(&f.state, &f.root, attempt()).unwrap();
 
         f.state.cancel_binding_reset().unwrap();
         f.state.cancel_binding_reset().unwrap();
@@ -1553,7 +1614,7 @@ mod tests {
 
         f.bind();
 
-        let preparation = prepare_reset_in(&f.state, &f.root).unwrap();
+        let preparation = prepare_reset_in(&f.state, &f.root, attempt()).unwrap();
 
         f.corrupt_record();
 
@@ -1572,7 +1633,10 @@ mod tests {
 
         // Nothing is bound, so the reset is refused, but the attempt still
         // voids the approval.
-        assert_eq!(prepare_reset_in(&f.state, &f.root), Err(NOTHING_TO_RESET));
+        assert_eq!(
+            prepare_reset_in(&f.state, &f.root, attempt()),
+            Err(NOTHING_TO_RESET)
+        );
 
         assert_eq!(
             confirm_in(&f.state, &f.root, &binding.preparation_id),
@@ -1588,12 +1652,743 @@ mod tests {
 
         let locked = CommandError::from(AppStateError::VaultLocked);
 
-        assert_eq!(prepare_reset_in(&f.state, &f.root), Err(locked.clone()));
+        assert_eq!(
+            prepare_reset_in(&f.state, &f.root, attempt()),
+            Err(locked.clone())
+        );
         assert_eq!(confirm_reset_in(&f.state, &f.root, SOME_ID), Err(locked));
 
         // Cancelling is not an error, with or without a session.
         assert!(f.state.cancel_binding_reset().is_ok());
         assert!(f.state.cancel_initial_binding().is_ok());
+    }
+
+    // -- attempt ownership (B1j-2 follow-up) -----------------------------------
+    //
+    // Two dialog attempts of ONE unlocked session share a session identity, so
+    // each interleaving below is driven deterministically through the picker
+    // seam: the closure stands for "what else happens while the old picker is
+    // still open". No real dialog is involved.
+
+    fn attempt() -> BindingAttemptId {
+        BindingAttemptId::parse(&uuid::Uuid::new_v4().to_string()).unwrap()
+    }
+
+    impl Fixture {
+        fn choose_as(
+            &self,
+            attempt: BindingAttemptId,
+        ) -> Result<SyncBindingPreparationDto, CommandError> {
+            choose_and_prepare_in(&self.state, &self.root, attempt, || {
+                Selection::Chosen(self.remote.clone())
+            })
+        }
+
+        /// Nothing is pending (a confirmation finds nothing to spend) and nothing
+        /// was bound or written.
+        fn assert_nothing_pending_or_bound(&self) {
+            assert_eq!(
+                confirm_in(&self.state, &self.root, SOME_ID),
+                Err(PREPARATION_MISSING)
+            );
+            assert_eq!(self.status().state, SyncBindingStateDto::NotConfigured);
+            assert!(self.record_files().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_picker_finishing_late_for_a_closed_dialog_prepares_nothing() {
+        let f = fixture("b1j2-late-picker-closed");
+
+        let a = attempt();
+
+        let result = choose_and_prepare_in(&f.state, &f.root, a, || {
+            // Dialog A is closed while its picker is open.
+            f.state.cancel_binding_attempt(a).unwrap();
+
+            Selection::Chosen(f.remote.clone())
+        });
+
+        assert_eq!(result, Err(ATTEMPT_SUPERSEDED));
+
+        f.assert_nothing_pending_or_bound();
+    }
+
+    #[test]
+    fn a_late_picker_of_a_closed_dialog_cannot_prepare_or_cancel_the_next_dialogs_approval() {
+        let f = fixture("b1j2-late-picker-reopened");
+
+        let (a, b) = (attempt(), attempt());
+
+        let mut b_id = String::new();
+
+        let result = choose_and_prepare_in(&f.state, &f.root, a, || {
+            f.state.cancel_binding_attempt(a).unwrap();
+
+            // Dialog B opens and prepares while A's picker still hangs.
+            b_id = f.choose_as(b).unwrap().preparation_id;
+
+            Selection::Chosen(f.remote.clone())
+        });
+
+        // A neither prepared (it would have replaced B's approval) nor cancelled.
+        assert_eq!(result, Err(ATTEMPT_SUPERSEDED));
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &b_id),
+            Ok(SyncBindingOutcomeDto::BoundAndVerified)
+        );
+    }
+
+    #[test]
+    fn a_picker_superseded_by_a_newer_attempt_without_a_cancel_prepares_nothing() {
+        let f = fixture("b1j2-late-picker-superseded");
+
+        let (a, b) = (attempt(), attempt());
+
+        let mut b_id = String::new();
+
+        let result = choose_and_prepare_in(&f.state, &f.root, a, || {
+            b_id = f.choose_as(b).unwrap().preparation_id;
+
+            Selection::Chosen(f.remote.clone())
+        });
+
+        assert_eq!(result, Err(ATTEMPT_SUPERSEDED));
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &b_id),
+            Ok(SyncBindingOutcomeDto::BoundAndVerified)
+        );
+    }
+
+    #[test]
+    fn a_late_cancel_of_an_old_attempt_leaves_a_newer_preparation_valid() {
+        let f = fixture("b1j2-late-cancel");
+
+        let (a, b) = (attempt(), attempt());
+
+        let _older = f.choose_as(a).unwrap();
+        let newer = f.choose_as(b).unwrap();
+
+        // Cancellation A completes late, after B was prepared.
+        f.state.cancel_binding_attempt(a).unwrap();
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &newer.preparation_id),
+            Ok(SyncBindingOutcomeDto::BoundAndVerified)
+        );
+    }
+
+    #[test]
+    fn a_late_cancel_arriving_while_the_next_picker_is_open_is_harmless() {
+        let f = fixture("b1j2-late-cancel-during-picker");
+
+        let (a, b) = (attempt(), attempt());
+
+        let _older = f.choose_as(a).unwrap();
+
+        let prepared = choose_and_prepare_in(&f.state, &f.root, b, || {
+            f.state.cancel_binding_attempt(a).unwrap();
+
+            Selection::Chosen(f.remote.clone())
+        })
+        .unwrap();
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &prepared.preparation_id),
+            Ok(SyncBindingOutcomeDto::BoundAndVerified)
+        );
+    }
+
+    #[test]
+    fn a_cancel_that_overtakes_its_own_selection_still_wins() {
+        let f = fixture("b1j2-cancel-first");
+
+        let a = attempt();
+
+        f.state.cancel_binding_attempt(a).unwrap();
+
+        let mut opened = false;
+
+        let result = choose_and_prepare_in(&f.state, &f.root, a, || {
+            opened = true;
+
+            Selection::Chosen(f.remote.clone())
+        });
+
+        assert_eq!(result, Err(ATTEMPT_SUPERSEDED));
+        assert!(!opened, "a cancelled attempt must not open the picker");
+
+        f.assert_nothing_pending_or_bound();
+    }
+
+    #[test]
+    fn repeated_close_and_reopen_leaves_no_orphaned_approval() {
+        let f = fixture("b1j2-close-reopen");
+
+        for _ in 0..20 {
+            // Closed while the picker is open.
+            let a = attempt();
+
+            assert_eq!(
+                choose_and_prepare_in(&f.state, &f.root, a, || {
+                    f.state.cancel_binding_attempt(a).unwrap();
+
+                    Selection::Chosen(f.remote.clone())
+                }),
+                Err(ATTEMPT_SUPERSEDED)
+            );
+
+            f.assert_nothing_pending_or_bound();
+
+            // Closed with a preview showing.
+            let b = attempt();
+
+            let preview = f.choose_as(b).unwrap();
+
+            f.state.cancel_binding_attempt(b).unwrap();
+
+            assert_eq!(
+                confirm_in(&f.state, &f.root, &preview.preparation_id),
+                Err(PREPARATION_MISSING)
+            );
+
+            f.assert_nothing_pending_or_bound();
+        }
+    }
+
+    #[test]
+    fn a_correctly_owned_cancel_clears_its_own_preparation() {
+        let f = fixture("b1j2-owned-cancel");
+
+        let a = attempt();
+
+        let preview = f.choose_as(a).unwrap();
+
+        f.state.cancel_binding_attempt(a).unwrap();
+        f.state.cancel_binding_attempt(a).unwrap();
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &preview.preparation_id),
+            Err(PREPARATION_MISSING)
+        );
+    }
+
+    #[test]
+    fn cancelling_an_unrelated_attempt_discards_nothing() {
+        let f = fixture("b1j2-unrelated-cancel");
+
+        let preview = f.choose_as(attempt()).unwrap();
+
+        f.state.cancel_binding_attempt(attempt()).unwrap();
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &preview.preparation_id),
+            Ok(SyncBindingOutcomeDto::BoundAndVerified)
+        );
+    }
+
+    #[test]
+    fn an_attempt_id_is_not_an_approval_and_not_the_preparation_id() {
+        let f = fixture("b1j2-attempt-not-consent");
+
+        let text = uuid::Uuid::new_v4().to_string();
+
+        let a = BindingAttemptId::parse(&text).unwrap();
+
+        let preview = f.choose_as(a).unwrap();
+
+        // Rust generated its own id; it is not the caller's label.
+        assert_ne!(preview.preparation_id, text);
+
+        // Presenting the label as consent binds nothing, and (as any wrong id)
+        // spends the preparation.
+        assert_eq!(confirm_in(&f.state, &f.root, &text), Err(PREPARATION_STALE));
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &preview.preparation_id),
+            Err(PREPARATION_MISSING)
+        );
+
+        f.assert_nothing_pending_or_bound();
+    }
+
+    #[test]
+    fn confirmation_stays_one_time_and_needs_a_distinct_call_after_an_attempt() {
+        let f = fixture("b1j2-confirm-once");
+
+        let a = attempt();
+
+        let preview = f.choose_as(a).unwrap();
+
+        // Preparing alone published nothing.
+        assert!(f.record_files().is_empty());
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &preview.preparation_id),
+            Ok(SyncBindingOutcomeDto::BoundAndVerified)
+        );
+
+        // Neither a replay nor a late cancel of the same attempt changes that.
+        f.state.cancel_binding_attempt(a).unwrap();
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &preview.preparation_id),
+            Err(PREPARATION_MISSING)
+        );
+        assert!(matches!(
+            f.status().state,
+            SyncBindingStateDto::Linked { .. }
+        ));
+    }
+
+    #[test]
+    fn an_old_picker_after_a_session_replacement_still_fails_closed_and_spares_the_new_one() {
+        let f = fixture("b1j2-old-picker-new-session");
+
+        let (a, b) = (attempt(), attempt());
+
+        let mut b_id = String::new();
+
+        let result = choose_and_prepare_in(&f.state, &f.root, a, || {
+            // The same vault, locked and unlocked again, and a new attempt there.
+            f.relock_and_unlock();
+
+            b_id = f.choose_as(b).unwrap().preparation_id;
+
+            // The old dialog's cancel and picker both arrive late.
+            f.state.cancel_binding_attempt(a).unwrap();
+
+            Selection::Chosen(f.remote.clone())
+        });
+
+        assert_eq!(result, Err(SESSION_CHANGED));
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &b_id),
+            Ok(SyncBindingOutcomeDto::BoundAndVerified)
+        );
+    }
+
+    #[test]
+    fn an_old_picker_after_a_lock_fails_closed_and_leaves_nothing_for_the_next_unlock() {
+        let f = fixture("b1j2-old-picker-locked");
+
+        let a = attempt();
+
+        let result = choose_and_prepare_in(&f.state, &f.root, a, || {
+            f.state.lock_vault().unwrap();
+
+            Selection::Chosen(f.remote.clone())
+        });
+
+        assert_eq!(result, Err(CommandError::from(AppStateError::VaultLocked)));
+
+        f.state.unlock_vault(f.vault.clone(), password()).unwrap();
+
+        f.assert_nothing_pending_or_bound();
+    }
+
+    #[test]
+    fn an_attempt_id_must_be_a_canonical_uuid_and_is_redacted() {
+        for bad in [
+            "",
+            "not-an-id",
+            "00000000000040008000000000000000",
+            "{00000000-0000-4000-8000-000000000000}",
+            "urn:uuid:00000000-0000-4000-8000-000000000000",
+            "00000000-0000-4000-8000-00000000000g",
+        ] {
+            assert_eq!(parse_attempt(bad), Err(ATTEMPT_INVALID), "{bad:?}");
+        }
+
+        let text = uuid::Uuid::new_v4().to_string();
+        let parsed = parse_attempt(&text).unwrap();
+
+        assert!(!format!("{parsed:?}").contains(&text));
+        assert_eq!(format!("{parsed:?}"), "BindingAttemptId(<redacted>)");
+    }
+
+    // -- reset attempt ownership (B1j-2 final race hardening) --------------------
+    //
+    // The reset preparation is one atomic call, so the interleavings are the
+    // order in which a closed dialog's prepare and cancel reach Rust relative to
+    // a newer dialog's prepare. No real dialog is involved.
+
+    impl Fixture {
+        /// Every file below the scratch directory, with its bytes: the vault, its
+        /// backup and lock files, the remote target and the sync-state record.
+        fn snapshot(&self) -> Vec<(PathBuf, Vec<u8>)> {
+            fn walk(directory: &Path, into: &mut Vec<(PathBuf, Vec<u8>)>) {
+                let Ok(entries) = fs::read_dir(directory) else {
+                    return;
+                };
+
+                for entry in entries {
+                    let path = entry.unwrap().path();
+
+                    if path.is_dir() {
+                        walk(&path, into);
+                    } else {
+                        into.push((path.clone(), fs::read(&path).unwrap_or_default()));
+                    }
+                }
+            }
+
+            let mut files = Vec::new();
+
+            walk(self._scratch.path(), &mut files);
+
+            files.sort();
+
+            files
+        }
+
+        fn reset_as(
+            &self,
+            attempt: BindingAttemptId,
+        ) -> Result<SyncBindingResetPreparationDto, CommandError> {
+            prepare_reset_in(&self.state, &self.root, attempt)
+        }
+
+        fn assert_linked_and_nothing_pending_reset(&self) {
+            assert_eq!(
+                confirm_reset_in(&self.state, &self.root, SOME_ID),
+                Err(PREPARATION_MISSING)
+            );
+            assert!(matches!(
+                self.status().state,
+                SyncBindingStateDto::Linked { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn an_old_reset_prepare_arriving_after_its_cancel_prepares_nothing_and_spares_the_next() {
+        let f = fixture("b1j2-reset-closed-then-reopened");
+
+        f.bind();
+
+        let before = f.snapshot();
+        let records = f.record_files();
+
+        let (a, b) = (attempt(), attempt());
+
+        // Dialog A closed while its request was in flight: the cancel gets there
+        // first. Dialog B then prepares.
+        f.state.cancel_reset_attempt(a).unwrap();
+
+        let current = f.reset_as(b).unwrap();
+
+        // A's prepare finally arrives: refused, and B's preparation is untouched.
+        assert_eq!(f.reset_as(a), Err(ATTEMPT_SUPERSEDED));
+
+        // A's cancel arrives again, late: harmless.
+        f.state.cancel_reset_attempt(a).unwrap();
+
+        assert_eq!(
+            confirm_reset_in(&f.state, &f.root, &current.preparation_id),
+            Ok(SyncBindingResetOutcomeDto::ResetAndVerified)
+        );
+
+        assert_eq!(f.status().state, SyncBindingStateDto::NotConfigured);
+
+        // Only the sync-state record went; every other file is as it was.
+        let after = f.snapshot();
+
+        let removed: Vec<_> = before
+            .iter()
+            .filter(|entry| !after.contains(entry))
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        assert_eq!(removed, records);
+    }
+
+    #[test]
+    fn an_old_reset_cancel_arriving_after_the_next_preparation_leaves_it_valid() {
+        let f = fixture("b1j2-reset-late-cancel");
+
+        f.bind();
+
+        let (a, b) = (attempt(), attempt());
+
+        let _older = f.reset_as(a).unwrap();
+        let newer = f.reset_as(b).unwrap();
+
+        f.state.cancel_reset_attempt(a).unwrap();
+        f.state.cancel_reset_attempt(a).unwrap();
+
+        assert_eq!(
+            confirm_reset_in(&f.state, &f.root, &newer.preparation_id),
+            Ok(SyncBindingResetOutcomeDto::ResetAndVerified)
+        );
+    }
+
+    #[test]
+    fn a_reset_cancel_that_overtakes_its_prepare_still_wins() {
+        let f = fixture("b1j2-reset-cancel-first");
+
+        f.bind();
+
+        let before = f.snapshot();
+
+        let a = attempt();
+
+        f.state.cancel_reset_attempt(a).unwrap();
+
+        assert_eq!(f.reset_as(a), Err(ATTEMPT_SUPERSEDED));
+
+        f.assert_linked_and_nothing_pending_reset();
+
+        assert_eq!(f.snapshot(), before);
+    }
+
+    #[test]
+    fn a_current_reset_cancel_clears_exactly_its_own_preparation() {
+        let f = fixture("b1j2-reset-owned-cancel");
+
+        f.bind();
+
+        let before = f.snapshot();
+
+        let a = attempt();
+
+        let owned = f.reset_as(a).unwrap();
+
+        // Someone else's cancel changes nothing.
+        f.state.cancel_reset_attempt(attempt()).unwrap();
+        f.state.cancel_binding_attempt(attempt()).unwrap();
+
+        // The owner's cancel clears it, and repeating it is harmless.
+        f.state.cancel_reset_attempt(a).unwrap();
+        f.state.cancel_reset_attempt(a).unwrap();
+
+        assert_eq!(
+            confirm_reset_in(&f.state, &f.root, &owned.preparation_id),
+            Err(PREPARATION_MISSING)
+        );
+
+        // Cancelling deleted nothing.
+        assert_eq!(f.snapshot(), before);
+        f.assert_linked_and_nothing_pending_reset();
+    }
+
+    #[test]
+    fn repeated_reset_close_and_reopen_leaves_no_usable_approval() {
+        let f = fixture("b1j2-reset-close-reopen");
+
+        f.bind();
+
+        let before = f.snapshot();
+
+        for _ in 0..20 {
+            // Closed with a preview showing.
+            let a = attempt();
+
+            let shown = f.reset_as(a).unwrap();
+
+            f.state.cancel_reset_attempt(a).unwrap();
+
+            assert_eq!(
+                confirm_reset_in(&f.state, &f.root, &shown.preparation_id),
+                Err(PREPARATION_MISSING)
+            );
+
+            // Closed while the request was in flight.
+            let b = attempt();
+
+            f.state.cancel_reset_attempt(b).unwrap();
+
+            assert_eq!(f.reset_as(b), Err(ATTEMPT_SUPERSEDED));
+
+            f.assert_linked_and_nothing_pending_reset();
+        }
+
+        assert_eq!(f.snapshot(), before);
+    }
+
+    #[test]
+    fn locking_or_replacing_the_session_invalidates_old_reset_attempts() {
+        let f = fixture("b1j2-reset-session");
+
+        f.bind();
+
+        let a = attempt();
+
+        let old = f.reset_as(a).unwrap();
+
+        f.relock_and_unlock();
+
+        // The preparation died with the session; a late cancel of the old attempt
+        // does not touch a new session's preparation either.
+        let b = attempt();
+
+        let new = f.reset_as(b).unwrap();
+
+        f.state.cancel_reset_attempt(a).unwrap();
+
+        // The new session's preparation survived the late cancel...
+        assert_eq!(
+            confirm_reset_in(&f.state, &f.root, &new.preparation_id),
+            Ok(SyncBindingResetOutcomeDto::ResetAndVerified)
+        );
+
+        // ...and the old session's id confirms nothing.
+        assert_eq!(
+            confirm_reset_in(&f.state, &f.root, &old.preparation_id),
+            Err(PREPARATION_MISSING)
+        );
+
+        f.bind();
+
+        // A lock leaves nothing for an old attempt to confirm or cancel.
+        let c = attempt();
+
+        let third = f.reset_as(c).unwrap();
+
+        f.state.lock_vault().unwrap();
+
+        assert_eq!(
+            confirm_reset_in(&f.state, &f.root, &third.preparation_id),
+            Err(CommandError::from(AppStateError::VaultLocked))
+        );
+        assert!(f.state.cancel_reset_attempt(c).is_ok());
+        assert_eq!(
+            f.reset_as(attempt()),
+            Err(CommandError::from(AppStateError::VaultLocked))
+        );
+
+        f.state.unlock_vault(f.vault.clone(), password()).unwrap();
+
+        f.assert_linked_and_nothing_pending_reset();
+    }
+
+    #[test]
+    fn a_stale_reset_attempt_cannot_delete_anything() {
+        let f = fixture("b1j2-reset-stale-no-delete");
+
+        f.bind();
+
+        let before = f.snapshot();
+
+        let a = attempt();
+
+        let stale = f.reset_as(a).unwrap();
+
+        f.state.cancel_reset_attempt(a).unwrap();
+
+        // The cancelled attempt's id, replayed or presented under its own label,
+        // deletes nothing.
+        for id in [stale.preparation_id.as_str(), SOME_ID] {
+            assert_eq!(
+                confirm_reset_in(&f.state, &f.root, id),
+                Err(PREPARATION_MISSING)
+            );
+        }
+
+        assert_eq!(f.reset_as(a), Err(ATTEMPT_SUPERSEDED));
+
+        assert_eq!(f.snapshot(), before);
+        f.assert_linked_and_nothing_pending_reset();
+    }
+
+    #[test]
+    fn reset_confirmation_stays_explicit_single_use_and_unrelated_to_the_attempt_label() {
+        let f = fixture("b1j2-reset-confirm");
+
+        f.bind();
+
+        let text = uuid::Uuid::new_v4().to_string();
+
+        let a = BindingAttemptId::parse(&text).unwrap();
+
+        let shown = f.reset_as(a).unwrap();
+
+        assert_ne!(shown.preparation_id, text);
+
+        // Preparing removed nothing.
+        assert_eq!(f.record_files().len(), 1);
+
+        // The label is no consent: it is a wrong id and spends the preparation.
+        assert_eq!(
+            confirm_reset_in(&f.state, &f.root, &text),
+            Err(PREPARATION_STALE)
+        );
+        assert_eq!(f.record_files().len(), 1);
+
+        // A fresh preparation, confirmed once.
+        let b = attempt();
+
+        let fresh = f.reset_as(b).unwrap();
+
+        assert_eq!(
+            confirm_reset_in(&f.state, &f.root, &fresh.preparation_id),
+            Ok(SyncBindingResetOutcomeDto::ResetAndVerified)
+        );
+        assert_eq!(
+            confirm_reset_in(&f.state, &f.root, &fresh.preparation_id),
+            Err(PREPARATION_MISSING)
+        );
+
+        // A late cancel of the spent attempt changes nothing.
+        f.state.cancel_reset_attempt(b).unwrap();
+
+        assert_eq!(f.status().state, SyncBindingStateDto::NotConfigured);
+    }
+
+    #[test]
+    fn reset_and_binding_attempts_do_not_cancel_each_other() {
+        let f = fixture("b1j2-reset-vs-binding");
+
+        // A pending initial-binding approval survives a stale reset cancel.
+        let binding = f.prepare();
+
+        f.state.cancel_reset_attempt(attempt()).unwrap();
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &binding.preparation_id),
+            Ok(SyncBindingOutcomeDto::BoundAndVerified)
+        );
+
+        // A pending reset survives a stale binding cancel.
+        let reset = f.reset_as(attempt()).unwrap();
+
+        f.state.cancel_binding_attempt(attempt()).unwrap();
+
+        assert_eq!(
+            confirm_reset_in(&f.state, &f.root, &reset.preparation_id),
+            Ok(SyncBindingResetOutcomeDto::ResetAndVerified)
+        );
+    }
+
+    #[test]
+    fn the_initial_binding_flow_still_works_after_reset_attempts() {
+        let f = fixture("b1j2-binding-after-reset");
+
+        let a = attempt();
+
+        // Nothing to reset yet: refused, and no stale ownership remains.
+        assert_eq!(f.reset_as(a), Err(NOTHING_TO_RESET));
+        f.state.cancel_reset_attempt(a).unwrap();
+
+        let b = attempt();
+
+        let preview = f.choose_as(b).unwrap();
+
+        f.state.cancel_binding_attempt(b).unwrap();
+
+        assert_eq!(
+            confirm_in(&f.state, &f.root, &preview.preparation_id),
+            Err(PREPARATION_MISSING)
+        );
+
+        f.bind();
+
+        assert!(matches!(
+            f.status().state,
+            SyncBindingStateDto::Linked { .. }
+        ));
     }
 
     // -- error mapping ------------------------------------------------------
@@ -1840,7 +2635,7 @@ mod tests {
         assert!(!text.contains("target.lvault"));
         assert!(!text.contains("vault.lvault"));
 
-        let token = f.state.begin_sync_binding_selection().unwrap();
+        let token = f.state.begin_sync_binding_selection(attempt()).unwrap();
 
         assert_eq!(format!("{token:?}"), "SessionToken(<redacted>)");
 
@@ -1850,7 +2645,7 @@ mod tests {
 
         assert!(!format!("{linked:?}").contains("target.lvault"));
 
-        let reset = prepare_reset_in(&f.state, &f.root).unwrap();
+        let reset = prepare_reset_in(&f.state, &f.root, attempt()).unwrap();
 
         let text = format!("{reset:?}");
 

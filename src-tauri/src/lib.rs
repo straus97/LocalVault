@@ -84,6 +84,13 @@ pub fn run() {
             commands::recent_vaults::get_recent_vaults,
             commands::recent_vaults::remember_recent_vault,
             commands::recent_vaults::delete_closed_vault,
+            commands::sync_binding::get_sync_binding_status,
+            commands::sync_binding::choose_and_prepare_sync_binding,
+            commands::sync_binding::confirm_sync_binding,
+            commands::sync_binding::cancel_sync_binding,
+            commands::sync_binding::prepare_sync_binding_reset,
+            commands::sync_binding::confirm_sync_binding_reset,
+            commands::sync_binding::cancel_sync_binding_reset,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
