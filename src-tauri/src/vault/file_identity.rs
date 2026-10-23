@@ -6,9 +6,10 @@
 //! construction and would authenticate. Path strings cannot see that; the
 //! volume and the file identifier of an **open handle** can.
 //!
-//! This is the only module in the crate that contains `unsafe`: three small
-//! Windows FFI calls behind a safe, sealed interface. No raw handle, pointer or
-//! `unsafe fn` leaves it.
+//! This is one of two modules in the crate that contain `unsafe` (the other is
+//! `handle_ops`, which performs the handle-bound rename and delete of B2): three
+//! small Windows FFI calls behind a safe, sealed interface. No raw handle,
+//! pointer or `unsafe fn` leaves it.
 //!
 //! # What the facts are
 //!
@@ -111,6 +112,22 @@ impl HandleFacts {
         self.identity.volume != 0 && self.identity.id != [0u8; 16]
     }
 
+    /// Exactly the `NTFS` filesystem on a local, non-remote, non-virtual disk
+    /// device. Stricter than the binding policy ([`compare`] also accepts ReFS):
+    /// this is the B2 publication allowlist.
+    pub(crate) fn is_local_ntfs(&self) -> bool {
+        self.filesystem == FileSystemKind::Ntfs && self.local_device
+    }
+
+    /// Exactly one hard link (one name).
+    pub(crate) fn has_single_link(&self) -> bool {
+        self.links == 1
+    }
+
+    pub(crate) fn is_delete_pending(&self) -> bool {
+        self.delete_pending
+    }
+
     /// Local NTFS/ReFS, meaningful identifier, not delete-pending.
     fn is_trustworthy(&self) -> bool {
         matches!(self.filesystem, FileSystemKind::Ntfs | FileSystemKind::Refs)
@@ -142,6 +159,31 @@ impl HandleFacts {
             identity: FileIdentity { volume, id },
             links,
             delete_pending,
+            filesystem,
+            local_device,
+        }
+    }
+}
+
+/// What a directory (or any) handle says about its volume, and nothing about
+/// the object itself: no identifier is read, so a directory handle is fine.
+/// Carries no identifier, so a derived `Debug` is not a leak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VolumeFacts {
+    filesystem: FileSystemKind,
+    local_device: bool,
+}
+
+impl VolumeFacts {
+    /// Exactly `NTFS` on a local, non-remote, non-virtual disk device.
+    pub(crate) fn is_local_ntfs(&self) -> bool {
+        self.filesystem == FileSystemKind::Ntfs && self.local_device
+    }
+
+    /// Test-only constructor, for volumes this machine cannot produce.
+    #[cfg(test)]
+    pub(crate) fn for_test(filesystem: FileSystemKind, local_device: bool) -> Self {
+        Self {
             filesystem,
             local_device,
         }
@@ -186,6 +228,22 @@ pub(crate) fn facts_of(file: &File) -> Result<HandleFacts, IdentityError> {
     #[cfg(windows)]
     {
         windows::facts_of(file)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+
+        Err(IdentityError::Unsupported)
+    }
+}
+
+/// The volume facts of one open handle, which may be a directory handle. Any
+/// failed query is `Err(Lookup)`; non-Windows is `Err(Unsupported)`.
+pub(crate) fn volume_facts_of(file: &File) -> Result<VolumeFacts, IdentityError> {
+    #[cfg(windows)]
+    {
+        windows::volume_facts_of(file)
     }
 
     #[cfg(not(windows))]
@@ -243,7 +301,7 @@ mod windows {
         },
     };
 
-    use super::{FileIdentity, FileSystemKind, HandleFacts, IdentityError};
+    use super::{FileIdentity, FileSystemKind, HandleFacts, IdentityError, VolumeFacts};
 
     mod sealed {
         pub trait Sealed {}
@@ -283,6 +341,13 @@ mod windows {
             },
             links: standard.NumberOfLinks,
             delete_pending: standard.DeletePending,
+            filesystem: filesystem_kind(file)?,
+            local_device: local_device(file)?,
+        })
+    }
+
+    pub(super) fn volume_facts_of(file: &File) -> Result<VolumeFacts, IdentityError> {
+        Ok(VolumeFacts {
             filesystem: filesystem_kind(file)?,
             local_device: local_device(file)?,
         })
@@ -514,6 +579,51 @@ mod tests {
         }
     }
 
+    // ---- B2a. volume facts and the NTFS-only publication predicate --------------
+
+    #[test]
+    fn publication_accepts_only_local_ntfs() {
+        let handle =
+            |filesystem, local| HandleFacts::for_test(7, [1; 16], 1, false, filesystem, local);
+
+        assert!(handle(FileSystemKind::Ntfs, true).is_local_ntfs());
+        // Everything the binding policy may accept but publication must not.
+        assert!(!handle(FileSystemKind::Refs, true).is_local_ntfs());
+        assert!(!handle(FileSystemKind::Other, true).is_local_ntfs());
+        assert!(!handle(FileSystemKind::Ntfs, false).is_local_ntfs());
+        assert!(!handle(FileSystemKind::Refs, false).is_local_ntfs());
+        assert!(!handle(FileSystemKind::Other, false).is_local_ntfs());
+
+        let volume = |filesystem, local| VolumeFacts::for_test(filesystem, local);
+
+        assert!(volume(FileSystemKind::Ntfs, true).is_local_ntfs());
+        assert!(!volume(FileSystemKind::Refs, true).is_local_ntfs());
+        assert!(!volume(FileSystemKind::Other, true).is_local_ntfs());
+        assert!(!volume(FileSystemKind::Ntfs, false).is_local_ntfs());
+
+        // The binding policy (B1g) is unchanged: ReFS is still distinct-capable.
+        assert_eq!(
+            compare(
+                &handle(FileSystemKind::Refs, true),
+                &HandleFacts::for_test(7, [2; 16], 1, false, FileSystemKind::Refs, true)
+            ),
+            PhysicalVerdict::Distinct
+        );
+    }
+
+    #[test]
+    fn single_link_and_delete_pending_accessors_report_the_facts() {
+        let facts = |links, pending| {
+            HandleFacts::for_test(7, [1; 16], links, pending, FileSystemKind::Ntfs, true)
+        };
+
+        assert!(facts(1, false).has_single_link());
+        assert!(!facts(2, false).has_single_link());
+        assert!(!facts(0, false).has_single_link());
+        assert!(facts(1, true).is_delete_pending());
+        assert!(!facts(1, false).is_delete_pending());
+    }
+
     // ---- 12. redaction --------------------------------------------------------
 
     #[test]
@@ -646,6 +756,34 @@ mod tests {
 
             assert_eq!(b_again.links, 2);
             assert_eq!(compare(&a, &b_again), PhysicalVerdict::Uncertain);
+        }
+
+        #[test]
+        fn volume_facts_read_from_a_directory_handle_and_from_a_file() {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            let dir = scratch("volume-facts");
+            let path = dir.path().join("a.bin");
+
+            put(&path, b"content");
+
+            let directory = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(0x0200_0000)
+                .open(dir.path())
+                .unwrap();
+
+            // A directory handle has volume facts although it has no file identity.
+            let volume = volume_facts_of(&directory).expect("volume facts of a directory");
+
+            assert!(volume.is_local_ntfs());
+            assert_eq!(facts_of(&directory), Err(IdentityError::Lookup));
+
+            // A file on the same volume reports the same volume facts.
+            let from_file = volume_facts_of(&open(&path)).unwrap();
+
+            assert_eq!(from_file, volume);
+            assert!(facts_of(&open(&path)).unwrap().is_local_ntfs());
         }
 
         #[test]

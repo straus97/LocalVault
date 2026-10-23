@@ -1,6 +1,8 @@
 pub mod backup;
 pub(crate) mod file_identity;
+pub(crate) mod handle_ops;
 pub mod lifecycle;
+pub(crate) mod new_copy_file;
 pub mod session;
 pub mod storage;
 pub mod sync_file_adapter;

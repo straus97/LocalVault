@@ -1,6 +1,12 @@
 mod backups;
 mod categories;
 pub use categories::{CategoryInput, CategorySummary};
+mod copy_creation;
+use copy_creation::PendingCopyCreation;
+pub use copy_creation::{
+    CopyCreationConfirmRefusal, CopyCreationOutcome, CopyCreationPreview, CopyCreationRefusal,
+    CopyCreationStale, NotPublishedReason,
+};
 mod entries;
 mod master_password;
 pub use entries::{EntryDetails, EntryInput, EntrySummary, TotpUpdate};
@@ -858,6 +864,11 @@ pub struct UnlockedVaultSession {
     // time: preparing or confirming either one discards the other.
     pending_binding_reset: Option<PendingBindingReset>,
 
+    // Same lifetime rules (Stage 1U-4 B2a): the approval to create one new
+    // encrypted copy. At most one of the three pending values exists at a time:
+    // preparing or confirming any of them discards the other two.
+    pending_copy_creation: Option<PendingCopyCreation>,
+
     // Keeping this File alive keeps the OS-level exclusive
     // session lock alive. The file itself contains no secrets.
     _lock_file: File,
@@ -903,6 +914,7 @@ impl UnlockedVaultSession {
             dirty: false,
             pending_initial_binding: None,
             pending_binding_reset: None,
+            pending_copy_creation: None,
             _lock_file: lock_file,
         })
     }
@@ -941,6 +953,7 @@ impl UnlockedVaultSession {
             dirty: false,
             pending_initial_binding: None,
             pending_binding_reset: None,
+            pending_copy_creation: None,
             _lock_file: lock_file,
         })
     }
@@ -1678,6 +1691,7 @@ impl UnlockedVaultSession {
         // preparation is voided too: the two approvals exclude each other.
         self.pending_initial_binding = None;
         self.pending_binding_reset = None;
+        self.pending_copy_creation = None;
 
         let store = SyncStateStore::new(root.path())
             .map_err(|_| InitialBindingRefusal::Unavailable(SyncStateUnavailable::Root))?;
@@ -1706,6 +1720,7 @@ impl UnlockedVaultSession {
 
         self.pending_initial_binding = None;
         self.pending_binding_reset = None;
+        self.pending_copy_creation = None;
 
         let examined = self.examine_identical_target(store, target, read)?;
 
@@ -1800,6 +1815,7 @@ impl UnlockedVaultSession {
                 // Spent even though nothing could be checked.
                 self.pending_initial_binding = None;
                 self.pending_binding_reset = None;
+                self.pending_copy_creation = None;
 
                 return Err(InitialBindingConfirmRefusal::Binding(
                     InitialBindingRefusal::Unavailable(SyncStateUnavailable::Root),
@@ -1833,6 +1849,7 @@ impl UnlockedVaultSession {
         // A reset preparation is voided by any confirmation attempt, and this
         // one is spent first and unconditionally.
         self.pending_binding_reset = None;
+        self.pending_copy_creation = None;
 
         let Some(pending) = self.pending_initial_binding.take() else {
             return Err(Stale(InitialBindingStale::NoPendingApproval));
@@ -1982,6 +1999,7 @@ impl UnlockedVaultSession {
     ) -> Result<BindingResetPreview, BindingResetRefusal> {
         self.pending_initial_binding = None;
         self.pending_binding_reset = None;
+        self.pending_copy_creation = None;
 
         let store = SyncStateStore::new(root.path())
             .map_err(|_| BindingResetRefusal::Unavailable(SyncStateUnavailable::Root))?;
@@ -2004,6 +2022,7 @@ impl UnlockedVaultSession {
     ) -> Result<BindingResetPreview, BindingResetRefusal> {
         self.pending_initial_binding = None;
         self.pending_binding_reset = None;
+        self.pending_copy_creation = None;
 
         let (local_locator, class, evidence) = self.examine_binding_reset(store)?;
 
@@ -2080,6 +2099,7 @@ impl UnlockedVaultSession {
                 // Spent even though nothing could be checked.
                 self.pending_initial_binding = None;
                 self.pending_binding_reset = None;
+                self.pending_copy_creation = None;
 
                 return Err(BindingResetConfirmRefusal::Refused(
                     BindingResetRefusal::Unavailable(SyncStateUnavailable::Root),
@@ -2112,6 +2132,7 @@ impl UnlockedVaultSession {
         // A pending initial binding is voided by any reset confirmation attempt,
         // and the reset preparation is spent first and unconditionally.
         self.pending_initial_binding = None;
+        self.pending_copy_creation = None;
 
         let Some(pending) = self.pending_binding_reset.take() else {
             return Err(Stale(BindingResetStale::NoPendingReset));
