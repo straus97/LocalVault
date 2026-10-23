@@ -27,10 +27,11 @@ use crate::vault::{
     lifecycle::VaultLifecycleError,
     session::{
         BindingResetConfirmRefusal, BindingResetOutcome, BindingResetPreview, BindingResetRefusal,
-        BindingStatus, InitialBindingApproval, InitialBindingConfirmRefusal, InitialBindingOutcome,
-        InitialBindingPreview, InitialBindingRefusal, RemoteObservationOutcome,
-        RemoteObservationRefusal, RemoteTargetRefusal, SessionError, SessionSyncState,
-        UnlockedVaultSession,
+        BindingStatus, CopyCreationConfirmRefusal, CopyCreationOutcome, CopyCreationPreview,
+        CopyCreationRefusal, InitialBindingApproval, InitialBindingConfirmRefusal,
+        InitialBindingOutcome, InitialBindingPreview, InitialBindingRefusal,
+        RemoteObservationOutcome, RemoteObservationRefusal, RemoteTargetRefusal, SessionError,
+        SessionSyncState, UnlockedVaultSession,
     },
     sync_file_adapter::SyncFileTarget,
     sync_state_store::SyncStateRoot,
@@ -195,9 +196,16 @@ struct AppStateInner {
     // session is placed.
     reset_attempt: Option<BindingAttemptId>,
 
-    // Recently cancelled attempts (binding and reset share the list; an id names
-    // one attempt only), oldest first, so a cancel that overtakes the command it
-    // cancels still wins.
+    // The one copy-creation attempt allowed to prepare, and to own, the pending
+    // copy-creation approval (Stage 1U-4 B2b). Set by
+    // `begin_copy_creation_selection`, kept only by a successful preparation,
+    // cleared by its own cancel, by any confirmation and whenever a session is
+    // placed. An id is a label, never an approval.
+    copy_attempt: Option<BindingAttemptId>,
+
+    // Recently cancelled attempts (binding, reset and copy creation share the
+    // list; an id names one attempt only), oldest first, so a cancel that
+    // overtakes the command it cancels still wins.
     cancelled_binding_attempts: Vec<BindingAttemptId>,
 }
 
@@ -269,6 +277,7 @@ impl AppState {
         guard.session_epoch = guard.session_epoch.wrapping_add(1);
         guard.binding_attempt = None;
         guard.reset_attempt = None;
+        guard.copy_attempt = None;
         guard.last_activity = Some(Instant::now());
         guard.expiry_notification_pending = false;
 
@@ -294,6 +303,7 @@ impl AppState {
         guard.session_epoch = guard.session_epoch.wrapping_add(1);
         guard.binding_attempt = None;
         guard.reset_attempt = None;
+        guard.copy_attempt = None;
         guard.last_activity = Some(Instant::now());
         guard.expiry_notification_pending = false;
 
@@ -729,6 +739,131 @@ impl AppState {
 
             if let Some(session) = guard.session.as_mut() {
                 session.cancel_binding_reset();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Start a copy-creation destination selection (Stage 1U-4 B2b): confirm a
+    /// live session, void this flow's own pending preparation and return the
+    /// identity of that session. The caller then opens the native save dialog
+    /// **without** holding the state mutex and passes the token back to
+    /// [`prepare_copy_creation_for_session`](Self::prepare_copy_creation_for_session).
+    /// Internal: no command is registered yet.
+    ///
+    /// An explicit user action, so it counts as activity; nothing keeps the
+    /// session alive while the dialog is open, so a long-open dialog can end in
+    /// `SessionExpired`. Only the copy-creation preparation is voided here: a
+    /// binding or reset approval is untouched (the next preparation voids them,
+    /// as every B1h/B1i/B2a preparation does). `attempt` becomes THE current copy
+    /// attempt unless it was already cancelled (`AttemptSuperseded`: nothing is
+    /// voided, no dialog should open). See [`BindingAttemptId`].
+    pub fn begin_copy_creation_selection(
+        &self,
+        attempt: BindingAttemptId,
+    ) -> Result<SessionToken, AppStateError> {
+        let mut guard = self.active_session_guard()?;
+
+        if guard.cancelled_binding_attempts.contains(&attempt) {
+            return Err(AppStateError::AttemptSuperseded);
+        }
+
+        let token = SessionToken(guard.session_epoch);
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        session.cancel_copy_creation();
+
+        guard.copy_attempt = Some(attempt);
+
+        Ok(token)
+    }
+
+    /// [`UnlockedVaultSession::prepare_copy_creation`], but only for the session
+    /// that issued `token` and only for the current copy `attempt`. Both are
+    /// compared under the same lock that runs the preparation and **before** the
+    /// session is touched, because a preparation voids every other pending
+    /// approval: a late result of a closed, superseded or replaced dialog fails
+    /// with `SessionChanged` / `AttemptSuperseded` and voids nothing.
+    ///
+    /// The attempt keeps its authority only if the preparation succeeds (it then
+    /// owns the pending preparation); a refusal spends it. Internal. An explicit
+    /// user action, so it counts as activity. The state mutex is held for the
+    /// whole read-only examination.
+    pub fn prepare_copy_creation_for_session(
+        &self,
+        token: SessionToken,
+        attempt: BindingAttemptId,
+        root: &SyncStateRoot,
+        target: &SyncFileTarget,
+    ) -> Result<Result<CopyCreationPreview, CopyCreationRefusal>, AppStateError> {
+        let mut guard = self.active_session_guard()?;
+
+        if SessionToken(guard.session_epoch) != token {
+            return Err(AppStateError::SessionChanged);
+        }
+
+        if guard.copy_attempt != Some(attempt) {
+            return Err(AppStateError::AttemptSuperseded);
+        }
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        let outcome = session.prepare_copy_creation(root, target);
+
+        guard.copy_attempt = outcome.is_ok().then_some(attempt);
+
+        Ok(outcome)
+    }
+
+    /// Second half of the copy-creation consent (Stage 1U-4 B2b): spend the
+    /// pending preparation and, if it is still current, create the copy. Internal.
+    /// See [`UnlockedVaultSession::confirm_copy_creation`] for the checks, the
+    /// definite and the ambiguous outcomes, and why every call spends the
+    /// preparation.
+    ///
+    /// Takes only the Rust-issued preparation id: no path, no bytes, no flag. The
+    /// outer error is "no live session"; the preparation dies with the session.
+    /// An explicit user action, so it counts as activity. Every call that reaches
+    /// the session also ends the current copy attempt's authority, because the
+    /// preparation it owned is spent. The state mutex is held across the whole
+    /// creation.
+    pub fn confirm_copy_creation(
+        &self,
+        root: &SyncStateRoot,
+        preparation_id: &str,
+    ) -> Result<Result<CopyCreationOutcome, CopyCreationConfirmRefusal>, AppStateError> {
+        let mut guard = self.active_session_guard()?;
+
+        let session = guard.session.as_mut().ok_or(AppStateError::VaultLocked)?;
+
+        let outcome = session.confirm_copy_creation(root, preparation_id);
+
+        guard.copy_attempt = None;
+
+        Ok(outcome)
+    }
+
+    /// Cancel one copy-creation attempt: it can no longer begin or prepare, and if
+    /// it is the current attempt its pending preparation (if any) is discarded. An
+    /// attempt that is not the current one discards nothing, and a binding or
+    /// reset approval is never touched. The id is remembered (bounded) so a cancel
+    /// that overtakes its own `begin_copy_creation_selection` still wins.
+    /// Idempotent; neither observes expiry nor counts as activity.
+    pub fn cancel_copy_creation_attempt(
+        &self,
+        attempt: BindingAttemptId,
+    ) -> Result<(), AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        guard.remember_cancelled(attempt);
+
+        if guard.copy_attempt == Some(attempt) {
+            guard.copy_attempt = None;
+
+            if let Some(session) = guard.session.as_mut() {
+                session.cancel_copy_creation();
             }
         }
 
@@ -2418,5 +2553,277 @@ mod tests {
         );
 
         drop(bound.scratch);
+    }
+
+    // -- Stage 1U-4 B2b: copy-creation attempt ownership through the state --------
+    //
+    // The checks of the two B2a steps are tested next to the session, and the
+    // command-level flows next to the commands. Here: the live-session rule, that
+    // an attempt does not outlive an expired or replaced session, and the activity
+    // rules. Scratch lives under the git-ignored `.qa-local/sync-copy-b2-tests/`.
+
+    #[cfg(windows)]
+    mod copy_creation {
+        use super::*;
+        use crate::vault::session::{
+            CopyCreationConfirmRefusal, CopyCreationOutcome, CopyCreationStale,
+        };
+
+        struct Copying {
+            state: AppState,
+            vault: PathBuf,
+            root: SyncStateRoot,
+            target: SyncFileTarget,
+            target_path: PathBuf,
+            _scratch: tempfile::TempDir,
+        }
+
+        fn copying(name: &str, timeout: Duration) -> Copying {
+            let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(".qa-local")
+                .join("sync-copy-b2-tests");
+
+            std::fs::create_dir_all(&base).unwrap();
+
+            let scratch = tempfile::Builder::new()
+                .prefix(&format!("{name}-"))
+                .tempdir_in(&base)
+                .unwrap();
+
+            let vaults = scratch.path().join("vaults");
+            let dest = scratch.path().join("dest");
+
+            std::fs::create_dir_all(&vaults).unwrap();
+            std::fs::create_dir_all(&dest).unwrap();
+
+            let vault = vaults.join("vault.lvault");
+            let target_path = dest.join("copy.lvault");
+
+            UnlockedVaultSession::create(&vault, password(), 1_700_000_000_000)
+                .unwrap()
+                .lock();
+
+            let state = AppState::with_auto_lock_timeout(timeout);
+
+            state.unlock_vault(vault.clone(), password()).unwrap();
+
+            Copying {
+                root: SyncStateRoot::for_test(scratch.path().join("app-local")),
+                target: SyncFileTarget::from_path(&target_path).unwrap(),
+                state,
+                vault,
+                target_path,
+                _scratch: scratch,
+            }
+        }
+
+        fn no_pending() -> Result<CopyCreationOutcome, CopyCreationConfirmRefusal> {
+            Err(CopyCreationConfirmRefusal::Stale(
+                CopyCreationStale::NoPendingApproval,
+            ))
+        }
+
+        fn prepared_id(
+            c: &Copying,
+            token: SessionToken,
+            attempt: BindingAttemptId,
+        ) -> Result<String, AppStateError> {
+            c.state
+                .prepare_copy_creation_for_session(token, attempt, &c.root, &c.target)
+                .map(|prepared| prepared.unwrap().preparation_id().to_owned())
+        }
+
+        #[test]
+        fn only_the_current_attempt_may_prepare_and_an_expired_or_replaced_session_fails_closed() {
+            let c = copying("b2b-appstate-attempts", Duration::from_secs(30));
+            let state = &c.state;
+
+            let (a, b) = (new_attempt(), new_attempt());
+
+            let token_a = state.begin_copy_creation_selection(a).unwrap();
+            let token_b = state.begin_copy_creation_selection(b).unwrap();
+
+            // The session is the same; the attempt is not.
+            assert!(matches!(
+                prepared_id(&c, token_a, a),
+                Err(AppStateError::AttemptSuperseded)
+            ));
+            assert!(!c.target_path.exists());
+
+            // A cancelled attempt cannot begin again, and cancelling is idempotent.
+            state.cancel_copy_creation_attempt(a).unwrap();
+            state.cancel_copy_creation_attempt(a).unwrap();
+            assert!(matches!(
+                state.begin_copy_creation_selection(a),
+                Err(AppStateError::AttemptSuperseded)
+            ));
+
+            // The current attempt prepares; a stale cancel leaves it pending.
+            let id = prepared_id(&c, token_b, b).unwrap();
+
+            state.cancel_copy_creation_attempt(a).unwrap();
+
+            // Expiry while the old dialog is open: reported as such, nothing prepared.
+            state.age_session_for_test(Duration::from_secs(31));
+
+            assert!(matches!(
+                prepared_id(&c, token_b, new_attempt()),
+                Err(AppStateError::SessionExpired)
+            ));
+            assert!(matches!(
+                state.confirm_copy_creation(&c.root, &id),
+                Err(AppStateError::VaultLocked)
+            ));
+            assert!(!c.target_path.exists());
+
+            // A later session starts with no current attempt and no preparation.
+            state.unlock_vault(c.vault.clone(), password()).unwrap();
+
+            assert!(matches!(
+                prepared_id(&c, token_b, b),
+                Err(AppStateError::SessionChanged)
+            ));
+            assert_eq!(
+                state.confirm_copy_creation(&c.root, &id).unwrap(),
+                no_pending()
+            );
+            assert!(!c.target_path.exists());
+
+            // The old attempts' late cancels cannot discard the new session's
+            // preparation, and the cancelled id still cannot begin.
+            let d = new_attempt();
+            let token_d = state.begin_copy_creation_selection(d).unwrap();
+            let current = prepared_id(&c, token_d, d).unwrap();
+
+            state.cancel_copy_creation_attempt(a).unwrap();
+            state.cancel_copy_creation_attempt(b).unwrap();
+
+            assert!(matches!(
+                state.begin_copy_creation_selection(b),
+                Err(AppStateError::AttemptSuperseded)
+            ));
+
+            assert_eq!(
+                state.confirm_copy_creation(&c.root, &current).unwrap(),
+                Ok(CopyCreationOutcome::CreatedAndVerified)
+            );
+            assert!(c.target_path.is_file());
+        }
+
+        #[test]
+        fn a_session_replaced_while_the_dialog_is_open_is_refused_before_the_session_is_asked() {
+            let c = copying("b2b-appstate-replaced", Duration::from_secs(30));
+            let state = &c.state;
+
+            let a = new_attempt();
+            let token = state.begin_copy_creation_selection(a).unwrap();
+
+            // The same vault, locked and unlocked again: a different session. The
+            // old dialog's late result is refused on the session identity alone.
+            state.lock_vault().unwrap();
+            state.unlock_vault(c.vault.clone(), password()).unwrap();
+
+            assert!(matches!(
+                prepared_id(&c, token, a),
+                Err(AppStateError::SessionChanged)
+            ));
+            assert!(!c.target_path.exists());
+        }
+
+        #[test]
+        fn a_refused_obsolete_selection_voids_no_other_approval() {
+            let c = copying("b2b-appstate-obsolete", Duration::from_secs(30));
+            let state = &c.state;
+
+            // An older dialog's result arrives after a newer attempt prepared: it
+            // is refused on the attempt alone and the newer preparation survives.
+            let old = new_attempt();
+            let old_token = state.begin_copy_creation_selection(old).unwrap();
+
+            let current = new_attempt();
+            let current_token = state.begin_copy_creation_selection(current).unwrap();
+            let id = prepared_id(&c, current_token, current).unwrap();
+
+            // The obsolete selection finishes: refused before the session is touched.
+            assert!(matches!(
+                prepared_id(&c, old_token, old),
+                Err(AppStateError::AttemptSuperseded)
+            ));
+
+            assert_eq!(
+                state.confirm_copy_creation(&c.root, &id).unwrap(),
+                Ok(CopyCreationOutcome::CreatedAndVerified)
+            );
+        }
+
+        #[test]
+        fn begin_prepare_and_confirm_count_as_activity_and_cancel_does_not() {
+            let c = copying("b2b-appstate-activity", Duration::from_secs(30));
+            let state = &c.state;
+
+            let a = new_attempt();
+
+            state.age_session_for_test(Duration::from_secs(10));
+
+            let aged = state.last_activity_for_test().unwrap();
+            let token = state.begin_copy_creation_selection(a).unwrap();
+
+            assert!(
+                state.last_activity_for_test().unwrap() > aged,
+                "beginning did not refresh activity"
+            );
+
+            state.age_session_for_test(Duration::from_secs(10));
+
+            let aged = state.last_activity_for_test().unwrap();
+
+            // Cancelling observes nothing and refreshes nothing.
+            state.cancel_copy_creation_attempt(new_attempt()).unwrap();
+            assert_eq!(state.last_activity_for_test(), Some(aged));
+
+            let id = prepared_id(&c, token, a).unwrap();
+
+            assert!(
+                state.last_activity_for_test().unwrap() > aged,
+                "preparing did not refresh activity"
+            );
+
+            state.age_session_for_test(Duration::from_secs(10));
+
+            let aged = state.last_activity_for_test().unwrap();
+
+            assert_eq!(
+                state.confirm_copy_creation(&c.root, &id).unwrap(),
+                Ok(CopyCreationOutcome::CreatedAndVerified)
+            );
+            assert!(
+                state.last_activity_for_test().unwrap() > aged,
+                "confirming did not refresh activity"
+            );
+        }
+
+        #[test]
+        fn cancelling_without_a_session_is_not_an_error_and_confirming_needs_one() {
+            let c = copying("b2b-appstate-locked", Duration::from_secs(30));
+            let state = &c.state;
+
+            let a = new_attempt();
+
+            state.begin_copy_creation_selection(a).unwrap();
+            state.lock_vault().unwrap();
+
+            assert!(state.cancel_copy_creation_attempt(a).is_ok());
+            assert!(matches!(
+                state.begin_copy_creation_selection(new_attempt()),
+                Err(AppStateError::VaultLocked)
+            ));
+            assert!(matches!(
+                state.confirm_copy_creation(&c.root, "00000000-0000-4000-8000-000000000000"),
+                Err(AppStateError::VaultLocked)
+            ));
+            assert!(!c.target_path.exists());
+        }
     }
 }

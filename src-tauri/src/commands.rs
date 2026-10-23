@@ -1,5 +1,6 @@
 pub(crate) mod backups;
 pub(crate) mod categories;
+pub(crate) mod copy_creation;
 pub(crate) mod credentials;
 pub(crate) mod entries;
 pub(crate) mod password_health;

@@ -580,13 +580,15 @@ fn pick_vault_file(app: &AppHandle, window: &WebviewWindow) -> Selection {
     )
 }
 
-/// At most one picker at a time, released on every path out.
+/// At most one native picker at a time, released on every path out. Shared with
+/// the copy-creation save dialog (`commands::copy_creation`), so the two never
+/// open together; it carries no binding or consent logic.
 static PICKER_OPEN: AtomicBool = AtomicBool::new(false);
 
-struct PickerSlot;
+pub(super) struct PickerSlot;
 
 impl PickerSlot {
-    fn acquire() -> Option<Self> {
+    pub(super) fn acquire() -> Option<Self> {
         PICKER_OPEN
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -599,6 +601,11 @@ impl Drop for PickerSlot {
         PICKER_OPEN.store(false, Ordering::Release);
     }
 }
+
+/// Serializes every test that touches the process-wide picker slot, so tests in
+/// different modules cannot observe each other's slot.
+#[cfg(test)]
+pub(super) static PICKER_SLOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // -- Testable operations ----------------------------------------------------
 //
@@ -1310,6 +1317,10 @@ mod tests {
 
     #[test]
     fn only_one_picker_can_be_open() {
+        let _serial = PICKER_SLOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         let first = PickerSlot::acquire().expect("the slot starts free");
 
         assert!(PickerSlot::acquire().is_none());
