@@ -78,9 +78,9 @@ LocalVault is local-first. General vault operation has no network dependency.
 - **Master-password change does not rotate the Vault Key.** `rewrap_envelope_master_password` re-wraps the same Vault Key under a new password-derived key and leaves the encrypted payload (and its revision) untouched; only the raw envelope bytes change. Anyone holding a historical envelope *and* its old master password can still recover that Vault Key, so it remains relevant to any future ciphertext encrypted under it. Vault Key rotation is not implemented and was not approved as part of 1U-2.
 - User-facing synchronization does not exist; the core sync logic performs no I/O, and nothing in this section authorizes any sync action.
 
-## Sync binding (Stage 1U-4 through B1i; Windows, dormant internal code)
+## Sync binding (Stage 1U-4 through B1j; Windows)
 
-Nothing here is reachable by an end user yet (no Tauri command or UI; B1j adds initial-binding/status/reset commands only). It describes the guards that exist in Rust, not a working sync feature. Structure: `@docs/ARCHITECTURE.md`, "Sync binding architecture".
+Through B1i this was dormant internal code. Since B1j-2 the initial-binding, status and local-reset workflows are reachable on Windows through registered Tauri commands and a Russian-language dialog; they remain the only binding actions, and none of them synchronizes anything. This section describes the guards that exist in Rust, not a working sync feature. Structure: `@docs/ARCHITECTURE.md`, "Sync binding architecture". The separate encrypted-copy creation guarantees (B2) follow in the next section.
 
 **What is established**
 - **Identity.** Vault identity is authenticated by Core: a local and a candidate envelope must both open under the same Vault Key and carry the same vault id. A local path alone is never vault identity; the stored record refers to the vault only through a salted, domain-separated tag that is re-verified against the authenticated id in every unlocked session, and a record for another vault or location is reported as a mismatch and never used.
@@ -103,7 +103,38 @@ Nothing here is reachable by an end user yet (no Tauri command or UI; B1j adds i
 - **No cloud freshness or authoritative ancestry.** The high-water mark and revisions are local observations. Whether a candidate is the provider's latest, and its ancestry relative to other devices, are not proven.
 - **Placeholders and filesystems.** Cloud placeholder files (reparse points) may be refused rather than hydrated. FAT/exFAT, SMB and other network redirectors, virtual volumes and unidentified filesystems are refused for initial binding, including legitimate ones. ReFS acceptance rests on documentation and has not been exercised on a ReFS volume.
 - **Driver trust.** Filesystem name and device characteristics come from the driver stack and are not independently verified.
-- **No real sync.** No transport, provider authority, publication, push, pull, adoption, merge or automatic synchronization exists, and none of the above is a user-facing feature.
+- **No real sync.** No transport, provider authority, publication, push, pull, adoption, merge or automatic synchronization exists. Binding, status and local reset are user-facing (B1j); none of the others is.
+- **Existing B1j reset limitations carry over unchanged:** reset removes only the local record (the vault, backups, the encrypted files and the remote target are untouched and not proven absent), is guarded by evidence that is itself a narrowed read-then-act sequence, and an ambiguous removal is reported as ambiguous rather than retried.
+
+## Encrypted-copy creation (Stage 1U-4 B2a–B2c; Windows)
+
+Structure: `@docs/ARCHITECTURE.md`, "Encrypted-copy creation architecture". B2 writes one new, separate encrypted file. It is not synchronization, backup-to-cloud, binding or publication.
+
+**Implemented guarantees (checked against `vault/session/copy_creation.rs`, `vault/new_copy_file.rs`, `vault/handle_ops.rs`, `commands/copy_creation.rs`)**
+- **Explicit, Rust-owned consent.** Preparation (read-only) and confirmation are separate calls owned by the Rust session; the destination comes from a Rust-owned native save dialog, never from the frontend. A selection is never consent. The save dialog only returns a name and is not the no-clobber boundary.
+- **One-time, session-bound approval with TTL.** The approval is spent by every confirm call (taken out of the session before anything is checked), expires after 120 seconds, is dropped with the session (lock, expiry, vault switch) and is voided by a newer binding, reset or copy preparation. A stale or failed confirmation cannot be retried against the same preparation. Dialog-attempt ownership prevents an obsolete selection from voiding a newer approval.
+- **Authenticated source.** The vault must have no unsaved changes, be schema 3, and match the prepared fingerprint at confirmation; the sync state must be a confirmed `NotConfigured`. The copy holds the exact on-disk encrypted bytes.
+- **Local-NTFS-only destination.** The destination directory is pinned by handle and must be a plain, non-reparse directory on a local, non-remote, non-virtual NTFS volume. This is stricter than the B1g identity policy for existing copies (which also recognizes ReFS) and does not change it. UNC paths and the vault's own `.backup`, `.lock` and sync-state files are refused.
+- **An existing target is never overwritten.** The target must be absent at preparation and at confirmation, the rename is performed without replace, and the extension is checked. No directory is created.
+- **Handle-bound Windows publication.** A hidden staging file is written through its handle, flushed and synced, identity-checked, and renamed by handle into the pinned directory; there is no path-based delete, rename, copy or link.
+- **Exact encrypted-byte verification.** After publication an independent path read must return exactly the source bytes, and those bytes must authenticate under the session's Vault Key with the same fingerprint and revision as the vault.
+- **Independent physical-identity verification.** The read-back must be the same physical file (identity, one link, local NTFS) and distinct from the vault's own primary.
+- **No plaintext publication.** Only encrypted bytes are written; no plaintext, key or password touches the destination or the staging file.
+- **No implicit sync-state change and no automatic binding.** The sync state, remote baseline and high-water mark are untouched. Binding the copy remains the separate B1h/B1j flow with its own explicit consent.
+- **Definite and ambiguous outcomes are separate.** `Stale`/`Refused` (nothing written); `NotPublished` without leftovers; `NotPublished` with a possible hidden staging leftover; `PublicationUnknown` (the target may or may not exist; nothing was deleted); `CreatedUnverified` (the target exists or may exist and an independent check failed or could not run; it is kept). These keep different codes and messages.
+- **No automatic retry of an ambiguous publication.** After `PublicationUnknown` or `CreatedUnverified` there is no retry, cleanup of the target, binding or trust-state change; the user must inspect the location.
+- **Redaction.** Errors and `Debug` output carry no path, password, key, fingerprint, revision, file identifier, native status, preparation id or attempt id, except the exact target path returned to the user for display; nothing is logged.
+
+**Known limitations (not claimed away)**
+- **Remaining filesystem TOCTOU windows.** The sequence is check-then-use guarded by sharing modes, not an atomic transaction. The staging file is created by path in the pinned directory; a redirection installed between the post-pin ancestor check and that creation could place it elsewhere on the same volume (the handle-bound rename still lands in the pinned directory, and a different volume is refused). Ancestor renames while the pin is held are measured by tests, not assumed; if one occurs the result is `CreatedUnverified`, never success.
+- **Trust in Windows/driver-reported facts.** The filesystem name, local-disk and device characteristics come from the driver stack and are not independently verified.
+- **No universal guarantee against privileged or malicious interference.** Sharing modes bind ordinary processes only; administrators, backup-privileged processes, kernel components and filesystem filters can bypass them. After the handles close the published file is ordinary user data.
+- **Not proven durable.** The directory entry is not flushed; the published name is not claimed to survive sudden power loss.
+- **Possible encrypted staging leftover.** A crash or interruption (or an unconfirmed staging delete) can leave a hidden encrypted staging file, reported as `staging_remains` when known. It contains only encrypted bytes.
+- **The copy becomes stale.** It keeps the vault's current password wrapper and revision at creation; any later local save makes it stale (binding it would then be refused), and a later master-password change in the session does not update it.
+- **Restricted to local NTFS.** Other filesystems (ReFS, FAT/exFAT, SMB/network redirectors, removable or virtual volumes) are refused for creation. Their refusal was not manually tested on those volumes.
+- **No remote-provider authority.** A path in a synchronized folder is not evidence that a provider received, accepted or holds the file, or that it is current.
+- **No conflict resolution, push or pull.** B2 neither detects nor resolves divergence and transmits nothing.
 
 ## Known threat-model limitations
 

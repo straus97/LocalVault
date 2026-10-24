@@ -32,11 +32,14 @@ src-tauri/src/
                                        # lifecycle, master_password, password_health, site_icons, totp
   commands.rs, commands/              # Tauri command handlers (glue): backups, categories,
                                        # credentials, entries, password_health, passwords,
-                                       # recent_vaults, site_icons, totp
+                                       # recent_vaults, site_icons, totp, plus sync_binding (B1j) and
+                                       # copy_creation (B2b) command boundaries
   vault/                              # backup, lifecycle, session, storage — orchestration/filesystem,
                                        # NOT the format/data model, which now live in localvault-core;
-                                       # plus the dormant Windows sync adapters (1U-4): sync_state_store.rs,
-                                       # sync_file_adapter.rs, file_identity.rs (see "Sync binding architecture")
+                                       # plus the Windows sync adapters (1U-4): sync_state_store.rs,
+                                       # sync_file_adapter.rs, file_identity.rs, and for B2 new_copy_file.rs,
+                                       # handle_ops.rs, session/copy_creation.rs (see "Sync binding architecture"
+                                       # and "Encrypted-copy creation architecture")
   password_generator.rs
   recent_vaults.rs
   secure_clipboard.rs                 # Windows clipboard integration
@@ -80,9 +83,17 @@ Source authority: `crates/localvault-core/src/vault/data.rs`, `src-tauri/src/vau
 - The envelope format and cryptography are unchanged. Changing the master-password wrapper (`rewrap_envelope_master_password`) keeps the Vault Key and encrypted payload, so it does **not** bump the payload revision, but it does change the raw envelope bytes and therefore the envelope fingerprint.
 - `localvault_core::sync` began (1U-1) as **pure logic**: SHA-256 fingerprints of raw envelope bytes, a description-only classifier, and push-intent reconciliation. Since 1U-3 it also authenticates and inspects envelope bytes handed to it (including their `revision`) through `localvault_core::vault::format`; it still performs no I/O and reads no clock. No sync provider, remote adoption, automatic sync, network transport or sync UI exists; synchronization is not implemented. The 1U-4 layers built on it are described in the next section.
 
-## Sync binding architecture (Stage 1U-4, through B1i; Windows, dormant)
+## Sync binding architecture (Stage 1U-4, through B1j; Windows)
 
-Nothing in this section is reachable by an end user: no Tauri command, frontend code or startup path calls it yet (B1j adds the first commands/UI, initial-binding/status/reset only). It is infrastructure, not a sync feature. Source authority: `crates/localvault-core/src/sync.rs`, `sync_state.rs`, `src-tauri/src/vault/{sync_state_store,sync_file_adapter,file_identity,session}.rs`, `src-tauri/src/app_state.rs`.
+Through B1i this was dormant infrastructure. Since B1j-2 (`aa11d1d`) the binding workflows are reachable on Windows through seven registered Tauri commands and a Russian-language dialog, but only for initial binding of an **existing** encrypted copy, read-only status, and local reset. It is a binding feature, not a sync feature. Source authority: `crates/localvault-core/src/sync.rs`, `sync_state.rs`, `src-tauri/src/vault/{sync_state_store,sync_file_adapter,file_identity,session}.rs`, `src-tauri/src/app_state.rs`, `src-tauri/src/commands/sync_binding.rs`, `src/SyncBindingDialog.tsx`.
+
+Component boundaries, from the inside out:
+
+1. **Core authenticated revisions and transitions** (`localvault-core`: `sync`, `sync_state`) — pure, no I/O, no clock, no randomness.
+2. **Windows sync-state persistence** (`sync_state_store.rs`) — the guarded device-local record.
+3. **Existing-copy identity verification** (`sync_file_adapter.rs`, `file_identity.rs`) — read-only reads and physical-file identity.
+4. **Binding/reset consent and commands** (`UnlockedVaultSession` approvals; `AppState` attempt ownership; `commands/sync_binding.rs`, 7 commands) — a thin shell: DTOs, sanitized errors, the Rust-owned native file picker, session-token and attempt checks. No rule is repeated or relaxed in the command layer.
+5. **React** (`SyncBindingDialog.tsx`) — relays opaque ids and renders state; it never supplies a path, mints an approval or retries a confirmation.
 
 Distinct objects, deliberately kept separate:
 
@@ -92,11 +103,28 @@ Distinct objects, deliberately kept separate:
 - **Rust Core authenticated evidence and pure transitions** (`localvault-core`) — decides what is true. Authentication of local and candidate envelopes, vault identity, revisions and fingerprints, and the state transitions (bind an identical remote, record an observation) are computed in core and return *proposals*; core performs no I/O, reads no clock and generates no randomness.
 - **Windows session-scoped operations** (`UnlockedVaultSession`, `AppState`) — run only inside an unlocked session: verify the stored state against the authenticated vault identity, observe a bound target, and perform the guarded operations. Failure leaves the previous durable state as the source of truth.
 - **Read-only filesystem adapter** (`sync_file_adapter.rs`, `file_identity.rs`) — reads one regular, non-reparse file through one handle, never writes, and reports a local miss as `AbsentOnDisk`, which is deliberately not convertible to remote absence. `file_identity.rs` reads physical file identity (volume + 128-bit file id, hard-link count, delete-pending, filesystem name, local-disk check) so that an alias of the primary vault is not accepted as a target; only local NTFS/ReFS are recognized.
-- **Rust-owned approval and reset lifecycle** — initial binding and local reset each follow prepare → confirm/cancel inside the session: an opaque one-time preparation id, a 120-second expiry, dropped with the session (lock, expiry, vault switch) or by any newer preparation, and revalidated against fresh evidence at confirmation. The approval state lives only in Rust, so a future UI relays an id and cannot mint an approval. The two approvals exclude each other. `binding_status` is read-only and reveals no path, id, fingerprint or revision unless the binding is verified as linked.
+- **Rust-owned approval and reset lifecycle** — initial binding and local reset each follow prepare → confirm/cancel inside the session: an opaque one-time preparation id, a 120-second expiry, dropped with the session (lock, expiry, vault switch) or by any newer preparation, and revalidated against fresh evidence at confirmation. The approval state lives only in Rust, so the UI relays an id and cannot mint an approval. The two approvals exclude each other. `binding_status` is read-only and reveals no path, id, fingerprint or revision unless the binding is verified as linked.
 
 **A local synchronized folder is not an authoritative remote provider.** A file seen through the folder reflects only what this machine's sync client has materialized; it may be stale, delayed, offline, unhydrated or incomplete. The adapter therefore yields candidate bytes to be authenticated by core, never provider state, and no cloud-freshness or ancestry claim is made. Transport, provider authority, publication to an absent remote, push, pull and adoption are not built.
 
 Platform boundary: the state record, adapters and session wiring are Windows `src-tauri` code. Android has no sync state or adapter yet; core types (`sync`, `sync_state`) are platform-neutral and reusable when an Android adapter is built.
+
+## Encrypted-copy creation architecture (Stage 1U-4 B2a–B2c; Windows)
+
+Source authority: `src-tauri/src/vault/session/copy_creation.rs`, `vault/new_copy_file.rs`, `vault/handle_ops.rs`, `vault/file_identity.rs`, `src-tauri/src/commands/copy_creation.rs`, `src-tauri/src/app_state.rs`, `src/CopyCreationFlow.tsx`, `src/SyncBindingDialog.tsx`.
+
+**What B2 does.** It creates ONE new, separate encrypted file whose bytes are the authenticated on-disk bytes of the unlocked session's vault. **What it does not do:** it does not write the sync state, does not bind the new copy, does not update any remote baseline or high-water mark, does not call the publication/push planning functions, and does not configure automatic synchronization. Binding the copy is the separate, existing B1h/B1j explicit action, which re-reads and re-authenticates the file. A local filesystem path is not proof of cloud-provider authority or of cloud upload: a copy placed in a synchronized folder is only a local file.
+
+Components:
+
+1. **B2a source snapshot and session approval** (`session/copy_creation.rs`) — prepare (read-only) captures the fingerprint and authenticated revision of the vault's on-disk bytes and a random preparation id; confirm spends the one-time approval (120-second TTL, taken out of the session before any check), repeats every check with fresh evidence, publishes, then verifies. Preparing or confirming any of the three approvals (binding, reset, copy creation) discards the other two.
+2. **Native Windows handle-based publication** (`new_copy_file.rs`, safe code; `handle_ops.rs`, the only `unsafe`, two `NtSetInformationFile` calls) — pins the destination directory by handle, writes a hidden staging file, then renames the open staging handle into the pinned directory with no replace; the only cleanup is a handle-bound delete of the staging file, and only while it certainly still carries its staging name.
+3. **B2b command boundary** (`commands/copy_creation.rs`) — a thin shell with a Rust-owned native **save** dialog (the frontend never supplies a path; the dialog only returns a name and is not the no-clobber boundary), session-token and attempt-id ownership, fixed sanitized outcome codes from exhaustive matches.
+4. **B2c React user flow** (`CopyCreationFlow.tsx`, hosted inside the one `SyncBindingDialog` modal) — views and messages for each phase; creates nothing itself and never suggests binding, upload or synchronization.
+
+**Commands and their relationship to B1j.** B2 adds three commands — `choose_and_prepare_copy_creation`, `confirm_copy_creation`, `cancel_copy_creation` — registered beside the seven B1j binding commands (ten sync-related commands in total). They share the process-wide picker slot with the binding file picker (so the two native dialogs never open together; a second request gets a fixed busy error) and the bounded cancelled-attempt memory, and they use the same `SessionToken` and `BindingAttemptId` mechanisms. They share no approval state beyond mutual exclusion, and no command of one flow calls the other.
+
+**Destination policy.** B2 creation accepts only a local NTFS destination (stricter than the B1g binding identity policy, which also recognizes ReFS and is unchanged). The source session must have no unsaved changes, be schema 3 (a legacy vault is refused) and have a confirmed `NotConfigured` sync state.
 
 A pre-extraction compatibility safety net (1S-B1, `bcdb1ad`; `src-tauri/tests/compat_baseline.rs` plus committed schema-1/schema-2 fixtures) exercises real persisted-format compatibility — including the v1→v2 upgrade-on-write path and the fixed-time TOTP vector — through every extraction step. `src-tauri/tests/data_storage_integration.rs` separately covers the encrypted-storage round trip for the persisted data model against desktop storage.
 
@@ -116,7 +144,7 @@ The following are still implemented only in `src-tauri`. Some are genuine platfo
 - password-health orchestration and current implementation (`app_state/password_health.rs`, `commands/password_health.rs`) — placement undecided
 - password generator (`password_generator.rs`) — placement undecided
 - Android adapter (`crates/localvault-android-bridge/`, `android/`) — exists and, as of 1T-B5c-2 (`4d75bb81042dfcf339073240472b2129265f23e1`), supports vault creation, transactional SAF saves, entry/category CRUD and TOTP set/replace/remove — see `@docs/HANDOFF_1T_PROGRESS.md`
-- synchronization — not implemented. Core sync inspection/state types (`sync`, `sync_state`), the 1U-2 revision counter and dormant Windows binding infrastructure exist (see "Sync binding architecture"); there is no provider, transport, publication, push/pull or adoption logic (remaining 1U/1V work)
+- synchronization — not implemented. Core sync inspection/state types (`sync`, `sync_state`), the 1U-2 revision counter, Windows existing-copy binding (B1j) and independent encrypted-copy creation (B2) exist (see "Sync binding architecture" and "Encrypted-copy creation architecture"); there is no provider, transport, publication to a provider, push/pull, update of a bound target or adoption logic (remaining 1U/1V work)
 
 The subset of this list that is a permanent platform-adapter responsibility (not just "not yet extracted") is listed separately below in "What must stay outside the shared core."
 
@@ -206,4 +234,4 @@ Full toolchain pins (Rust/NDK/AGP/Gradle/Kotlin/UniFFI/JNA versions), the storag
 
 ## Future sync abstraction
 
-Sync (1U/1V) is a provider-abstracted transport for **encrypted** vault state only — see `@docs/SECURITY_MODEL.md` for what must never leave the device unencrypted. The sync layer needs, at minimum, before implementation: stable vault identity, revision/version semantics, device identity where required, conflict detection, atomic update rules, offline-first behavior, a recovery strategy, backup interaction, and migration/version compatibility. Of these, the revision semantics, a device-local binding state and authenticated inspection exist (1U-2 … 1U-4 B1i); the rest is open. This design work belongs in the core (sync metadata, merge/conflict semantics) with the actual transport (WebDAV, cloud-storage provider, OS-synced folder, etc.) implemented as a swappable adapter — not hard-coded into the core.
+Sync (1U/1V) is a provider-abstracted transport for **encrypted** vault state only — see `@docs/SECURITY_MODEL.md` for what must never leave the device unencrypted. The sync layer needs, at minimum, before implementation: stable vault identity, revision/version semantics, device identity where required, conflict detection, atomic update rules, offline-first behavior, a recovery strategy, backup interaction, and migration/version compatibility. Of these, the revision semantics, a device-local binding state and authenticated inspection exist (1U-2 … 1U-4 B1i), with user-reachable existing-copy binding (B1j) and separate encrypted-copy creation (B2); the rest, including safe update of an already bound target, is open. This design work belongs in the core (sync metadata, merge/conflict semantics) with the actual transport (WebDAV, cloud-storage provider, OS-synced folder, etc.) implemented as a swappable adapter — not hard-coded into the core.
