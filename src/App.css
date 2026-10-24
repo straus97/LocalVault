@@ -5704,3 +5704,30 @@ select:focus-visible {
     flex: 1 1 auto;
   }
 }
+
+/* ============================================================
+   LOCALVAULT 1U-4 B2c ENCRYPTED COPY CREATION
+   Option cards of the not-configured status view. The copy-creation
+   views reuse the facts, text and note styles above.
+   ============================================================ */
+
+.sync-binding-option {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+  padding: 12px 13px;
+  border: 1px solid #dce5f0;
+  border-radius: 10px;
+  background: #f7f9fc;
+}
+
+.sync-binding-option h4 {
+  margin: 0;
+}
+
+.sync-binding-option p {
+  margin: 0;
+  color: #34517e;
+  font-size: 13px;
+  line-height: 1.5;
+}

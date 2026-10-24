@@ -6,6 +6,8 @@ import type {
   DeleteVaultResult,
   GeneratedPassword,
   ClipboardCopyResult,
+  CopyCreationOutcome,
+  CopyCreationPreparation,
   EntryDetails,
   EntryCommandInput,
   EntrySummary,
@@ -318,6 +320,46 @@ export function cancelSyncBindingReset(
 ): Promise<void> {
   return invoke<void>(
     "cancel_sync_binding_reset",
+    { attemptId },
+  );
+}
+
+/*
+ * Stage 1U-4 B2c: encrypted-copy creation commands. The native SAVE
+ * dialog is owned by Rust, so nothing here accepts a destination path,
+ * bytes, a password, a key or a flag, and the confirm command takes only
+ * the opaque preparation id.
+ */
+
+/*
+ * attemptId is a caller-chosen label for ONE save-location selection.
+ * It lets Rust tell a closed dialog's late result or late cancel from a
+ * newer attempt's. It is not a path, not a preparation id and not
+ * consent: creating still needs the Rust-issued preparationId.
+ */
+export function chooseAndPrepareCopyCreation(
+  attemptId: string,
+): Promise<CopyCreationPreparation> {
+  return invoke<CopyCreationPreparation>(
+    "choose_and_prepare_copy_creation",
+    { attemptId },
+  );
+}
+
+export function confirmCopyCreation(
+  preparationId: string,
+): Promise<CopyCreationOutcome> {
+  return invoke<CopyCreationOutcome>(
+    "confirm_copy_creation",
+    { preparationId },
+  );
+}
+
+export function cancelCopyCreation(
+  attemptId: string,
+): Promise<void> {
+  return invoke<void>(
+    "cancel_copy_creation",
     { attemptId },
   );
 }

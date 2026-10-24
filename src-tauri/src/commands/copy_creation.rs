@@ -1,10 +1,8 @@
-//! Dormant Tauri command boundary over the session-owned creation of one new
-//! encrypted copy of the unlocked vault (Stage 1U-4 B2b).
+//! Tauri command boundary over the session-owned creation of one new encrypted
+//! copy of the unlocked vault (Stage 1U-4 B2b).
 //!
-//! The three commands here are NOT registered in `generate_handler!` (`lib.rs`):
-//! no frontend wrapper, dialog or button reaches them until B2c. The dead-code
-//! allowance below exists only for that interval and must be removed when they
-//! are registered.
+//! The three commands here are registered in `generate_handler!` (`lib.rs`) and
+//! are reached through the Windows binding dialog (Stage 1U-4 B2c).
 //!
 //! The module is a thin shell. Every rule (one-time consumption, the 120-second
 //! lifetime, the authenticated source snapshot, target absence, local-NTFS-only
@@ -73,9 +71,6 @@
 //! Errors and `Debug` output never carry a path, password, key, fingerprint,
 //! physical file identifier, raw I/O or native status, preparation id or attempt
 //! id. Nothing here is logged.
-
-// Dormant until B2c registers the commands (see the module comment).
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -467,7 +462,7 @@ fn trusted_root(app: &AppHandle) -> Result<SyncStateRoot, CommandError> {
     SyncStateRoot::from_app(app).map_err(|_| NOT_PREPARED)
 }
 
-// -- Commands (not registered) ----------------------------------------------
+// -- Commands ---------------------------------------------------------------
 
 /// Open the native save dialog for a NEW `*.lvault` name and prepare a copy
 /// there. Creates nothing: the selection is not consent. `attempt_id` labels this
@@ -1880,5 +1875,191 @@ mod tests {
             f.confirm(&preparation.preparation_id),
             Ok(CopyCreationOutcomeDto::CreatedAndVerified)
         );
+    }
+
+    // -- J. Frontend contract (Stage 1U-4 B2c) --------------------------------
+    //
+    // The UI has no test framework, so the contract between these commands and
+    // the TypeScript that calls them is pinned from this side by reading the
+    // sources. Nothing here opens a window.
+
+    const LIB_RS: &str = include_str!("../lib.rs");
+    const THIS_RS: &str = include_str!("copy_creation.rs");
+    const TYPES_TS: &str = include_str!("../../../src/types.ts");
+    const API_TS: &str = include_str!("../../../src/vaultApi.ts");
+    const DIALOG_TSX: &str = include_str!("../../../src/SyncBindingDialog.tsx");
+    const FLOW_TSX: &str = include_str!("../../../src/CopyCreationFlow.tsx");
+
+    fn squeezed(text: &str) -> String {
+        text.split_whitespace().collect()
+    }
+
+    fn registered_commands() -> Vec<&'static str> {
+        let start = LIB_RS.find("generate_handler![").unwrap();
+        let end = start + LIB_RS[start..].find("])").unwrap();
+
+        LIB_RS[start..end]
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("commands::"))
+            .map(|line| line.trim_end_matches(','))
+            .collect()
+    }
+
+    #[test]
+    fn exactly_the_three_copy_commands_are_registered_beside_the_seven_binding_commands() {
+        let commands = registered_commands();
+
+        let copy: Vec<_> = commands
+            .iter()
+            .filter(|name| name.starts_with("commands::copy_creation::"))
+            .copied()
+            .collect();
+
+        assert_eq!(
+            copy,
+            [
+                "commands::copy_creation::choose_and_prepare_copy_creation",
+                "commands::copy_creation::confirm_copy_creation",
+                "commands::copy_creation::cancel_copy_creation",
+            ]
+        );
+
+        let binding: Vec<_> = commands
+            .iter()
+            .filter(|name| name.starts_with("commands::sync_binding::"))
+            .copied()
+            .collect();
+
+        assert_eq!(
+            binding,
+            [
+                "commands::sync_binding::get_sync_binding_status",
+                "commands::sync_binding::choose_and_prepare_sync_binding",
+                "commands::sync_binding::confirm_sync_binding",
+                "commands::sync_binding::cancel_sync_binding",
+                "commands::sync_binding::prepare_sync_binding_reset",
+                "commands::sync_binding::confirm_sync_binding_reset",
+                "commands::sync_binding::cancel_sync_binding_reset",
+            ]
+        );
+
+        let mut unique = commands.clone();
+
+        unique.sort_unstable();
+        unique.dedup();
+
+        assert_eq!(
+            unique.len(),
+            commands.len(),
+            "a command is registered twice"
+        );
+    }
+
+    #[test]
+    fn the_temporary_dead_code_allowance_is_gone() {
+        let allowance = concat!("#![allow(", "dead_code", ")]");
+
+        assert!(!THIS_RS.contains(allowance));
+    }
+
+    #[test]
+    fn the_typescript_error_union_lists_exactly_the_codes_these_commands_can_return() {
+        let fixed = [
+            FILE_DIALOG_CANCELLED,
+            FILE_DIALOG_BUSY,
+            SESSION_CHANGED,
+            ATTEMPT_INVALID,
+            ATTEMPT_SUPERSEDED,
+            TARGET_INVALID,
+            TARGET_EXISTS,
+            TARGET_IS_VAULT_FILE,
+            LOCATION_UNSUPPORTED,
+            TARGET_UNAVAILABLE,
+            SOURCE_CHANGED,
+            SOURCE_UNVERIFIABLE,
+            UNSAVED_CHANGES,
+            LEGACY_VAULT,
+            BINDING_EXISTS,
+            BINDING_STATE_CORRUPT,
+            NOT_PREPARED,
+            PREPARATION_MISSING,
+            PREPARATION_STALE,
+            NOT_CREATED,
+            NOT_CREATED_STAGING_REMAINS,
+            PUBLICATION_UNKNOWN,
+            CREATED_UNVERIFIED,
+        ];
+
+        let mut expected: Vec<&str> = fixed.iter().map(|error| error.code).collect();
+
+        // The outer vault-state codes of `CommandError::from(AppStateError)`.
+        for outer in [
+            AppStateError::VaultLocked,
+            AppStateError::SessionExpired,
+            AppStateError::StateUnavailable,
+            AppStateError::InvalidClock,
+        ] {
+            expected.push(CommandError::from(outer).code);
+        }
+
+        expected.push("vaultOperationFailed");
+
+        let start = TYPES_TS.find("export type CopyCreationErrorCode").unwrap();
+        let end = start + TYPES_TS[start..].find(';').unwrap();
+
+        let mut declared: Vec<&str> = TYPES_TS[start..end].split('"').skip(1).step_by(2).collect();
+
+        expected.sort_unstable();
+        declared.sort_unstable();
+
+        assert_eq!(declared, expected);
+    }
+
+    #[test]
+    fn the_typescript_dtos_and_invoke_calls_match_the_serde_shapes() {
+        let types = squeezed(TYPES_TS);
+
+        // `CopyCreationPreparationDto` serializes exactly these camelCase keys
+        // (see the DTO test above) and the outcome as this one string.
+        assert!(types.contains(
+            "exportinterfaceCopyCreationPreparation{preparationId:string;vaultFileName:string;targetPath:string;}"
+        ));
+        assert!(types.contains("exporttypeCopyCreationOutcome=\"createdAndVerified\";"));
+
+        let api = squeezed(API_TS);
+
+        // Exact command names, and the exact (single) argument of each: the
+        // attempt label or the preparation id, never a path or a flag.
+        for call in [
+            "invoke<CopyCreationPreparation>(\"choose_and_prepare_copy_creation\",{attemptId},);",
+            "invoke<CopyCreationOutcome>(\"confirm_copy_creation\",{preparationId},);",
+            "invoke<void>(\"cancel_copy_creation\",{attemptId},);",
+        ] {
+            assert_eq!(api.matches(call).count(), 1, "{call}");
+        }
+
+        assert!(api.contains("exportfunctionchooseAndPrepareCopyCreation(attemptId:string,)"));
+        assert!(api.contains("exportfunctionconfirmCopyCreation(preparationId:string,)"));
+        assert!(api.contains("exportfunctioncancelCopyCreation(attemptId:string,)"));
+    }
+
+    #[test]
+    fn the_copy_ui_has_one_confirm_call_site_and_logs_or_stores_nothing() {
+        // Only the dialog talks to Rust; the view module cannot call a command.
+        assert!(!FLOW_TSX.contains("vaultApi"));
+        assert!(!FLOW_TSX.contains("invoke"));
+
+        assert_eq!(DIALOG_TSX.matches("confirmCopyCreation(").count(), 1);
+        assert_eq!(
+            DIALOG_TSX.matches("chooseAndPrepareCopyCreation(").count(),
+            1
+        );
+
+        for source in [DIALOG_TSX, FLOW_TSX] {
+            for forbidden in ["console.", "localStorage", "sessionStorage", "indexedDB"] {
+                assert!(!source.contains(forbidden), "{forbidden}");
+            }
+        }
     }
 }

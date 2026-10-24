@@ -8,6 +8,7 @@ import {
 
 import type {
   CommandError,
+  CopyCreationPreparation,
   SyncBindingErrorCode,
   SyncBindingPreparation,
   SyncBindingProblem,
@@ -20,9 +21,21 @@ import type {
 } from "./types";
 
 import {
+  type CopyCreationState,
+  copyDialogCancelledNotice,
+  copySessionRecheckCodes,
+  describeCopyError,
+  FactRow,
+  renderCopyCreationContent,
+} from "./CopyCreationFlow";
+
+import {
+  cancelCopyCreation,
   cancelSyncBinding,
   cancelSyncBindingReset,
+  chooseAndPrepareCopyCreation,
   chooseAndPrepareSyncBinding,
+  confirmCopyCreation,
   confirmSyncBinding,
   confirmSyncBindingReset,
   getSyncBindingStatus,
@@ -35,6 +48,11 @@ import {
  * This dialog records or removes a LOCAL binding record only. It
  * does not publish, push, pull, adopt or synchronize anything, and
  * no text here may suggest that it does.
+ *
+ * Stage 1U-4 B2c adds a second, separate action to the same dialog:
+ * creating a NEW encrypted copy (views in CopyCreationFlow.tsx).
+ * Creating a copy never binds it; binding stays the B1j flow with
+ * its own file selection and its own confirmation.
  *
  * Rust is authoritative for everything that matters: it owns the
  * native file picker, the session identity across the picker, the
@@ -97,7 +115,8 @@ type DialogState =
       status: SyncBindingStatus | null;
       refreshFailed: boolean;
     }
-  | { phase: "error"; error: ErrorView };
+  | { phase: "error"; error: ErrorView }
+  | CopyCreationState;
 
 type DialogPhase = DialogState["phase"];
 
@@ -107,6 +126,27 @@ const lockedPhases: ReadonlySet<DialogPhase> =
     "binding",
     "resetPreparing",
     "resetting",
+    "copyCreating",
+  ]);
+
+/* Copy-creation phases holding a pending approval Cancel must void. */
+const copyApprovalPhases: ReadonlySet<DialogPhase> =
+  new Set<DialogPhase>([
+    "copyPreview",
+    "copyConfirm",
+  ]);
+
+/*
+ * Phases in which this dialog owns a save-location attempt in Rust
+ * (save dialog open, or its preview not yet confirmed). Leaving one
+ * of them cancels that attempt, and only that attempt. copyCreating
+ * is deliberately absent: the confirmed write is never "cancelled".
+ */
+const copyAttemptPhases: ReadonlySet<DialogPhase> =
+  new Set<DialogPhase>([
+    "copySelecting",
+    "copyPreview",
+    "copyConfirm",
   ]);
 
 /* Phases holding a pending approval that Cancel must void. */
@@ -515,21 +555,6 @@ function PendingPushNote({
   );
 }
 
-function FactRow({
-  label,
-  value,
-}: {
-  label: string;
-  value: string;
-}) {
-  return (
-    <div className="sync-binding-fact">
-      <dt>{label}</dt>
-      <dd title={value}>{value}</dd>
-    </div>
-  );
-}
-
 export default function SyncBindingDialog({
   onClose,
   onSessionEnded,
@@ -564,6 +589,14 @@ export default function SyncBindingDialog({
 
   /* The same for this dialog's reset attempt. */
   const resetAttemptRef =
+    useRef<string | null>(null);
+
+  /*
+   * The same for this dialog's copy-creation attempt. It is a label
+   * only: the preparation id never lives in a ref, and a cancel
+   * always names this attempt, never a fresh id.
+   */
+  const copyAttemptRef =
     useRef<string | null>(null);
 
   /* Last status shown, so Cancel can return without a new read. */
@@ -601,6 +634,7 @@ export default function SyncBindingDialog({
       lastStatusRef.current = null;
       attemptRef.current = null;
       resetAttemptRef.current = null;
+      copyAttemptRef.current = null;
 
       setState({
         phase: "error",
@@ -610,6 +644,44 @@ export default function SyncBindingDialog({
       if (
         code !== null &&
         sessionRecheckCodes.has(code)
+      ) {
+        onSessionEndedRef.current();
+      }
+    },
+    [],
+  );
+
+  /*
+   * A failed copy-creation call. Rust has already spent or voided
+   * the attempt on every error, so no cancel is sent from here.
+   * targetPath is passed only for the confirm call, where an
+   * unclear outcome needs a folder to check.
+   */
+  const failCopy = useCallback(
+    (
+      error: unknown,
+      stage: "prepare" | "confirm",
+      targetPath: string | null,
+    ) => {
+      const code = errorCodeOf(error);
+
+      lastStatusRef.current = null;
+      attemptRef.current = null;
+      resetAttemptRef.current = null;
+      copyAttemptRef.current = null;
+
+      setState({
+        phase: "copyError",
+        error: describeCopyError(
+          code,
+          stage,
+          targetPath,
+        ),
+      });
+
+      if (
+        code !== null &&
+        copySessionRecheckCodes.has(code)
       ) {
         onSessionEndedRef.current();
       }
@@ -668,9 +740,12 @@ export default function SyncBindingDialog({
       const attemptId = attemptRef.current;
       const resetAttemptId =
         resetAttemptRef.current;
+      const copyAttemptId =
+        copyAttemptRef.current;
 
       attemptRef.current = null;
       resetAttemptRef.current = null;
+      copyAttemptRef.current = null;
 
       if (
         attemptId !== null &&
@@ -691,6 +766,20 @@ export default function SyncBindingDialog({
          */
         void cancelSyncBindingReset(
           resetAttemptId,
+        ).catch(() => undefined);
+      } else if (
+        copyAttemptId !== null &&
+        copyAttemptPhases.has(phase)
+      ) {
+        /*
+         * Leaving while the save dialog is open or its preview is
+         * unconfirmed cancels THIS dialog's copy attempt: a save
+         * dialog that returns later prepares nothing, and a preview
+         * is voided. A confirmation already running is never
+         * cancelled, and no text claims that it could be.
+         */
+        void cancelCopyCreation(
+          copyAttemptId,
         ).catch(() => undefined);
       }
 
@@ -747,6 +836,17 @@ export default function SyncBindingDialog({
 
     if (resetApprovalPhases.has(phase)) {
       cancelResetPreparation();
+      return;
+    }
+
+    if (copyApprovalPhases.has(phase)) {
+      cancelCopyPreparation();
+      return;
+    }
+
+    /* The intro owns nothing yet: Escape steps back to the choice. */
+    if (phase === "copyIntro") {
+      returnToStatus();
       return;
     }
 
@@ -883,6 +983,149 @@ export default function SyncBindingDialog({
     }
 
     returnToStatus();
+  }
+
+  /*
+   * Cancel only voids an unconfirmed copy preview. It does not claim
+   * to stop anything in flight: the file is created only by the
+   * separate final confirmation.
+   */
+  function cancelCopyPreparation() {
+    if (inFlightRef.current) {
+      return;
+    }
+
+    const attemptId = copyAttemptRef.current;
+
+    copyAttemptRef.current = null;
+
+    if (attemptId !== null) {
+      void cancelCopyCreation(attemptId).catch(
+        () => undefined,
+      );
+    }
+
+    returnToStatus();
+  }
+
+  function openCopyIntro() {
+    if (inFlightRef.current) {
+      return;
+    }
+
+    generationRef.current += 1;
+
+    setState({
+      phase: "copyIntro",
+      notice: null,
+    });
+  }
+
+  async function handleCopyChoose() {
+    if (inFlightRef.current) {
+      return;
+    }
+
+    inFlightRef.current = true;
+
+    const request = ++generationRef.current;
+
+    /* A fresh label for every attempt, reused only to cancel it. */
+    const attemptId = newAttemptId();
+
+    copyAttemptRef.current = attemptId;
+
+    setState({ phase: "copySelecting" });
+
+    try {
+      /*
+       * The save dialog is opened by Rust; no path is sent from
+       * here, only this attempt's label.
+       */
+      const preparation =
+        await chooseAndPrepareCopyCreation(
+          attemptId,
+        );
+
+      if (!isCurrent(request)) {
+        /*
+         * Closed, locked or superseded while the save dialog was
+         * open. Unmounting already cancelled this attempt; repeat
+         * it for this attempt only (a no-op in Rust if it no longer
+         * owns anything), so no usable approval is left behind.
+         */
+        void cancelCopyCreation(attemptId).catch(
+          () => undefined,
+        );
+        return;
+      }
+
+      setState({
+        phase: "copyPreview",
+        preparation,
+      });
+    } catch (error) {
+      if (!isCurrent(request)) {
+        return;
+      }
+
+      if (
+        errorCodeOf(error) ===
+        "copyFileDialogCancelled"
+      ) {
+        /* Dismissing the save dialog is not a failure. */
+        copyAttemptRef.current = null;
+
+        setState({
+          phase: "copyIntro",
+          notice: copyDialogCancelledNotice,
+        });
+        return;
+      }
+
+      failCopy(error, "prepare", null);
+    } finally {
+      inFlightRef.current = false;
+    }
+  }
+
+  async function handleCopyConfirm(
+    preparation: CopyCreationPreparation,
+  ) {
+    if (inFlightRef.current) {
+      return;
+    }
+
+    inFlightRef.current = true;
+
+    const request = ++generationRef.current;
+
+    /*
+     * Only the opaque id leaves React state, once. It is spent by
+     * this call whatever the result, and is never sent again.
+     */
+    const { preparationId, targetPath } =
+      preparation;
+
+    setState({ phase: "copyCreating", targetPath });
+
+    try {
+      await confirmCopyCreation(preparationId);
+
+      copyAttemptRef.current = null;
+
+      if (!isCurrent(request)) {
+        return;
+      }
+
+      setState({ phase: "copyDone", targetPath });
+    } catch (error) {
+      if (isCurrent(request)) {
+        failCopy(error, "confirm", targetPath);
+      }
+    } finally {
+      inFlightRef.current = false;
+    }
   }
 
   async function handleChoose() {
@@ -1186,35 +1429,69 @@ export default function SyncBindingDialog({
               </h3>
 
               <p className="sync-binding-text">
-                LocalVault может запомнить
-                расположение существующей
-                зашифрованной копии хранилища.
-                Это не включает автоматическую
+                Выберите действие. Ни одно из них
+                не включает автоматическую
                 синхронизацию.
               </p>
 
+              <section
+                className="sync-binding-option"
+                aria-labelledby="sync-binding-option-bind-title"
+              >
+                <h4 id="sync-binding-option-bind-title">
+                  Связать с существующей копией
+                </h4>
+
+                <p>
+                  Выберите уже существующий
+                  зашифрованный файл, чтобы проверить
+                  его и сохранить локальную связь с
+                  хранилищем.
+                </p>
+
+                <button
+                  type="button"
+                  className="editor-primary"
+                  onClick={() => void handleChoose()}
+                >
+                  Выбрать копию…
+                </button>
+              </section>
+
+              <section
+                className="sync-binding-option"
+                aria-labelledby="sync-binding-option-create-title"
+              >
+                <h4 id="sync-binding-option-create-title">
+                  Создать новую зашифрованную копию
+                </h4>
+
+                <p>
+                  Сохраните отдельную зашифрованную
+                  копию этого хранилища в выбранной
+                  папке. Существующие файлы не
+                  перезаписываются.
+                </p>
+
+                <button
+                  type="button"
+                  className="editor-secondary"
+                  onClick={openCopyIntro}
+                >
+                  Создать копию…
+                </button>
+              </section>
+
               <div className="editor-security-note">
                 Обмен данными между устройствами
-                пока не выполняется. Выбранная
-                копия должна быть отдельным
-                файлом .lvault, идентичным этому
-                хранилищу.
+                пока не выполняется. Для связи с
+                существующей копией выбранный файл
+                должен быть отдельным файлом .lvault,
+                идентичным этому хранилищу.
               </div>
             </>
           ),
-          footer: (
-            <>
-              {closeButton}
-
-              <button
-                type="button"
-                className="editor-primary"
-                onClick={() => void handleChoose()}
-              >
-                Выбрать копию…
-              </button>
-            </>
-          ),
+          footer: closeButton,
         };
 
       case "linked":
@@ -1988,6 +2265,23 @@ export default function SyncBindingDialog({
             </>
           ),
         };
+
+      default:
+        return renderCopyCreationContent(state, {
+          onBackToStatus: returnToStatus,
+          onChoose: () => void handleCopyChoose(),
+          onCancelPreparation: cancelCopyPreparation,
+          onContinueToConfirm: (preparation) =>
+            setState({
+              phase: "copyConfirm",
+              preparation,
+            }),
+          onConfirm: (preparation) =>
+            void handleCopyConfirm(preparation),
+          onRestart: openCopyIntro,
+          onShowStatus: () => void loadStatus(),
+          onClose: leaveWithoutAction,
+        });
     }
   }
 

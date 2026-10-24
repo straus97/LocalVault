@@ -91,6 +91,9 @@ pub fn run() {
             commands::sync_binding::prepare_sync_binding_reset,
             commands::sync_binding::confirm_sync_binding_reset,
             commands::sync_binding::cancel_sync_binding_reset,
+            commands::copy_creation::choose_and_prepare_copy_creation,
+            commands::copy_creation::confirm_copy_creation,
+            commands::copy_creation::cancel_copy_creation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

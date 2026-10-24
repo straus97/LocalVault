@@ -236,3 +236,54 @@ export type SyncBindingErrorCode =
   | "syncResetNotPermitted"
   | "syncResetFailed"
   | "syncResetAmbiguous";
+
+/*
+ * Stage 1U-4 B2c: DTOs of the encrypted-copy creation command boundary
+ * (src-tauri/src/commands/copy_creation.rs). Field and variant names
+ * are the serde camelCase forms. A preparation id is an opaque,
+ * single-use handle that is only passed back to confirm_copy_creation;
+ * it is not an attempt id. Neither is ever persisted.
+ */
+
+export interface CopyCreationPreparation {
+  preparationId: string;
+  vaultFileName: string;
+  targetPath: string;
+}
+
+export type CopyCreationOutcome = "createdAndVerified";
+
+/*
+ * Every code the copy-creation commands can return: the fixed codes of
+ * copy_creation.rs plus the outer vault-state codes of
+ * CommandError::from(AppStateError) that can reach these commands.
+ */
+export type CopyCreationErrorCode =
+  | "vaultLocked"
+  | "vaultSessionExpired"
+  | "stateUnavailable"
+  | "invalidSystemClock"
+  | "vaultOperationFailed"
+  | "syncSessionChanged"
+  | "copyFileDialogCancelled"
+  | "copyFileDialogBusy"
+  | "copyAttemptInvalid"
+  | "copyAttemptSuperseded"
+  | "copyTargetInvalid"
+  | "copyTargetExists"
+  | "copyTargetIsVaultFile"
+  | "copyLocationUnsupported"
+  | "copyTargetUnavailable"
+  | "copySourceChanged"
+  | "copySourceUnverifiable"
+  | "copyUnsavedChanges"
+  | "copyLegacyVault"
+  | "copyBindingExists"
+  | "copyBindingStateCorrupt"
+  | "copyNotPrepared"
+  | "copyPreparationMissing"
+  | "copyPreparationStale"
+  | "copyNotCreated"
+  | "copyNotCreatedStagingRemains"
+  | "copyPublicationUnknown"
+  | "copyCreatedUnverified";
