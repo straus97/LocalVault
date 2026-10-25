@@ -132,7 +132,10 @@ use std::{
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::windows::fs::{MetadataExt, OpenOptionsExt},
+    os::windows::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -261,6 +264,16 @@ impl ExchangeNames {
             retention,
         })
     }
+
+    /// The derived hidden staging leaf. Read-only: a caller still cannot choose one.
+    pub(crate) fn staging_leaf(&self) -> &OsStr {
+        &self.staging
+    }
+
+    /// The derived retention leaf. Read-only: a caller still cannot choose one.
+    pub(crate) fn retention_leaf(&self) -> &OsStr {
+        &self.retention
+    }
 }
 
 /// One plain file name that Windows will not reinterpret.
@@ -335,6 +348,129 @@ fn leaves_are_distinct(leaves: &[&OsStr]) -> bool {
                 && unicode_fold(first) != unicode_fold(second)
         })
     })
+}
+
+// ---- recognizing artifact names ------------------------------------------------
+
+/// Which family of exchange artifact a directory entry has the *shape* of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArtifactKind {
+    /// `"." + leaf + ".localvault-update-" + <uuid> + ".tmp"`.
+    StagingLike,
+    /// `"." + leaf + ".localvault-previous-" + <uuid> + ".lvprev"`.
+    RetentionLike,
+}
+
+const STAGING_KIND: (&str, &str) = (".localvault-update-", ".tmp");
+const RETENTION_KIND: (&str, &str) = (".localvault-previous-", ".lvprev");
+
+/// The textual length of a hyphenated UUID.
+const ID_TEXT_UNITS: usize = 36;
+
+/// Recognizes names that have the *shape* of an exchange artifact of one target
+/// leaf. Pure: no I/O and no identifier is parsed, returned or invented.
+///
+/// A match is an **indicator only**: never proof of ownership, authenticity or
+/// permission to touch the file. The B2 copy-creation pattern
+/// (`.localvault-copy-<id>.tmp`) belongs to a different flow and is deliberately
+/// not recognized. `Debug` is redacted.
+pub(crate) struct ArtifactPattern {
+    leaf: OsString,
+    leaf_units: usize,
+}
+
+impl fmt::Debug for ArtifactPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ArtifactPattern(<redacted>)")
+    }
+}
+
+impl ArtifactPattern {
+    /// The leaf of `target`, validated by the same rule as the derived names.
+    pub(crate) fn for_target(target: &SyncFileTarget) -> Result<Self, NameRefusal> {
+        let leaf = Path::new(target.locator().as_str())
+            .file_name()
+            .ok_or(NameRefusal::LocatorUnusable)?;
+
+        validate_leaf(leaf)?;
+
+        Ok(Self {
+            leaf: leaf.to_owned(),
+            leaf_units: leaf.encode_wide().count(),
+        })
+    }
+
+    /// Whether `entry` has the shape of an exchange artifact of this leaf. The
+    /// length in UTF-16 units is decided first, so a long name is rejected before
+    /// any comparison or case folding.
+    pub(crate) fn recognize(&self, entry: &OsStr) -> Option<ArtifactKind> {
+        // At most one unit past the limit is ever counted.
+        let units = entry.encode_wide().take(MAX_LEAF_UNITS + 1).count();
+
+        if units > MAX_LEAF_UNITS {
+            return None;
+        }
+
+        let text = entry.to_str()?;
+
+        if self.has_shape(text, units, STAGING_KIND) {
+            Some(ArtifactKind::StagingLike)
+        } else if self.has_shape(text, units, RETENTION_KIND) {
+            Some(ArtifactKind::RetentionLike)
+        } else {
+            None
+        }
+    }
+
+    /// Equal exactly, ASCII-case-insensitively or under Unicode uppercase folding:
+    /// the same rule that keeps the three leaves of an exchange distinct.
+    pub(crate) fn folds_equal(&self, first: &OsStr, second: &OsStr) -> bool {
+        first == second
+            || ascii_fold(first) == ascii_fold(second)
+            || unicode_fold(first) == unicode_fold(second)
+    }
+
+    fn has_shape(&self, text: &str, units: usize, (prefix, suffix): (&str, &str)) -> bool {
+        // The fixed part is ASCII, so its length in bytes is also its length in units.
+        let tail = prefix.len() + ID_TEXT_UNITS + suffix.len();
+
+        if units != 1 + self.leaf_units + tail {
+            return false;
+        }
+
+        let bytes = text.as_bytes();
+
+        if bytes.len() < 1 + tail || bytes[0] != b'.' {
+            return false;
+        }
+
+        let split = bytes.len() - tail;
+
+        // All ASCII, so `split` is a character boundary.
+        if !bytes[split..].is_ascii() {
+            return false;
+        }
+
+        let (kind, rest) = bytes[split..].split_at(prefix.len());
+        let (id, end) = rest.split_at(ID_TEXT_UNITS);
+
+        kind.eq_ignore_ascii_case(prefix.as_bytes())
+            && end.eq_ignore_ascii_case(suffix.as_bytes())
+            && is_uuid_text(id)
+            && self.folds_equal(OsStr::new(&text[1..split]), &self.leaf)
+    }
+}
+
+/// Exactly the hyphenated UUID shape, hexadecimal digits of either case.
+fn is_uuid_text(id: &[u8]) -> bool {
+    id.len() == ID_TEXT_UNITS
+        && id.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 // ---- refusal and reason categories ---------------------------------------------
@@ -596,13 +732,13 @@ fn is_plain_file(metadata: &fs::Metadata) -> bool {
     metadata.is_file() && !is_reparse(metadata)
 }
 
-fn is_plain_directory(metadata: &fs::Metadata) -> bool {
+pub(crate) fn is_plain_directory(metadata: &fs::Metadata) -> bool {
     metadata.is_dir() && !is_reparse(metadata)
 }
 
 /// Every ancestor of `path` (its parent up to the root) exists and is a plain
 /// directory. Local on purpose: the sibling modules' own checks are private.
-fn ancestors_are_plain(path: &Path) -> bool {
+pub(crate) fn ancestors_are_plain(path: &Path) -> bool {
     let mut confirmed = 0usize;
 
     for ancestor in path.ancestors().skip(1) {
@@ -1503,6 +1639,30 @@ impl Verified {
 }
 
 // ---- test-only code below this line (the production source ends here) ----------
+
+#[cfg(test)]
+impl Seams {
+    /// Test-only: runs `action` when the sequence reaches `stage`. Lets a sibling
+    /// module's tests stop a real exchange at a fixed point.
+    pub(crate) fn at_stage_for_test(stage: Stage, mut action: impl FnMut() + 'static) -> Self {
+        Self {
+            hook: Some(Box::new(move |hit| {
+                if hit == stage {
+                    action();
+                }
+            })),
+            ..Self::none()
+        }
+    }
+
+    /// Test-only: fails the staging write with `fault`.
+    pub(crate) fn with_stage_fault_for_test(fault: StageFault) -> Self {
+        Self {
+            stage_fault: Some(fault),
+            ..Self::none()
+        }
+    }
+}
 
 /// What [`Verified::release_previous_for_test`] established.
 #[cfg(test)]
@@ -3423,10 +3583,216 @@ mod tests {
         );
         found.sort();
 
+        // The read-only recovery classifier (B3b-2a) is the one dormant consumer.
         assert_eq!(
             found,
-            vec!["mod.rs".to_owned(), "target_exchange.rs".to_owned()]
+            vec![
+                "exchange_recovery.rs".to_owned(),
+                "mod.rs".to_owned(),
+                "target_exchange.rs".to_owned()
+            ]
         );
+    }
+
+    // ---- artifact-name recognition (pure) -------------------------------------------------------------
+
+    const SAMPLE_ID: &str = "0b3a0000-0000-4000-8000-0000000000ab";
+
+    fn pattern_for(leaf: &str) -> ArtifactPattern {
+        let target = SyncFileTarget::from_path(&Path::new(r"D:\folder").join(leaf)).unwrap();
+
+        ArtifactPattern::for_target(&target).unwrap()
+    }
+
+    fn staging_like(leaf: &str, id: &str) -> OsString {
+        OsString::from(format!(".{leaf}.localvault-update-{id}.tmp"))
+    }
+
+    fn retention_like(leaf: &str, id: &str) -> OsString {
+        OsString::from(format!(".{leaf}.localvault-previous-{id}.lvprev"))
+    }
+
+    #[test]
+    fn artifact_pattern_recognizes_exactly_the_derived_names_and_never_the_leaf() {
+        let target =
+            SyncFileTarget::from_path(&Path::new(r"D:\folder").join("copy.lvault")).unwrap();
+        let pattern = ArtifactPattern::for_target(&target).unwrap();
+
+        for _ in 0..8 {
+            let names = ExchangeNames::derive(&target, id()).unwrap();
+
+            assert_eq!(
+                pattern.recognize(names.staging_leaf()),
+                Some(ArtifactKind::StagingLike)
+            );
+            assert_eq!(
+                pattern.recognize(names.retention_leaf()),
+                Some(ArtifactKind::RetentionLike)
+            );
+        }
+
+        assert_eq!(pattern.recognize(OsStr::new("copy.lvault")), None);
+        assert_eq!(pattern.recognize(OsStr::new("")), None);
+    }
+
+    #[test]
+    fn artifact_pattern_shape_is_case_insensitive_but_otherwise_exact() {
+        let pattern = pattern_for("Copy.lvault");
+        let upper_id = SAMPLE_ID.to_uppercase();
+
+        for (name, kind) in [
+            (
+                staging_like("Copy.lvault", SAMPLE_ID),
+                ArtifactKind::StagingLike,
+            ),
+            (
+                staging_like("Copy.lvault", &upper_id),
+                ArtifactKind::StagingLike,
+            ),
+            (
+                staging_like("COPY.LVAULT", SAMPLE_ID),
+                ArtifactKind::StagingLike,
+            ),
+            (
+                OsString::from(format!(".copy.lvault.LOCALVAULT-UPDATE-{SAMPLE_ID}.TMP")),
+                ArtifactKind::StagingLike,
+            ),
+            (
+                retention_like("Copy.lvault", SAMPLE_ID),
+                ArtifactKind::RetentionLike,
+            ),
+            (
+                retention_like("copy.lvault", &upper_id),
+                ArtifactKind::RetentionLike,
+            ),
+            (
+                OsString::from(format!(
+                    ".Copy.lvault.LocalVault-Previous-{SAMPLE_ID}.LVPREV"
+                )),
+                ArtifactKind::RetentionLike,
+            ),
+        ] {
+            assert_eq!(pattern.recognize(&name), Some(kind), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn artifact_pattern_rejects_every_near_miss() {
+        let pattern = pattern_for("copy.lvault");
+        let id = SAMPLE_ID;
+
+        let rejected: Vec<(&str, OsString)> = vec![
+            ("another leaf", staging_like("other.lvault", id)),
+            ("a longer leaf", staging_like("copy.lvault2", id)),
+            ("a leaf prefix", staging_like("copy.lvaul", id)),
+            (
+                "no leading dot",
+                OsString::from(format!("copy.lvault.localvault-update-{id}.tmp")),
+            ),
+            (
+                "bad hex digit",
+                staging_like("copy.lvault", "0b3a0000-0000-4000-8000-0000000000ag"),
+            ),
+            (
+                "hyphen misplaced",
+                staging_like("copy.lvault", "0b3a00000-000-4000-8000-0000000000ab"),
+            ),
+            (
+                "hyphen missing",
+                staging_like("copy.lvault", "0b3a0000_0000-4000-8000-0000000000ab"),
+            ),
+            ("35 characters", staging_like("copy.lvault", &id[1..])),
+            (
+                "37 characters",
+                staging_like("copy.lvault", &format!("{id}0")),
+            ),
+            (
+                "braced",
+                staging_like("copy.lvault", &format!("{{{}}}", &id[..34])),
+            ),
+            (
+                "the B2 copy-creation pattern",
+                OsString::from(format!(".copy.lvault.localvault-copy-{id}.tmp")),
+            ),
+            (
+                "the B2 pattern without the leaf",
+                OsString::from(format!(".localvault-copy-{id}.tmp")),
+            ),
+            (
+                "the wrong suffix",
+                OsString::from(format!(".copy.lvault.localvault-update-{id}.lvprev")),
+            ),
+            (
+                "the other kind's suffix",
+                OsString::from(format!(".copy.lvault.localvault-previous-{id}.tmp")),
+            ),
+            (
+                "an extra suffix",
+                OsString::from(format!(".copy.lvault.localvault-update-{id}.tmp.bak")),
+            ),
+            (
+                "an extra prefix",
+                OsString::from(format!("x.copy.lvault.localvault-update-{id}.tmp")),
+            ),
+            ("leaf only", OsString::from("copy.lvault")),
+            ("a lone dot", OsString::from(".")),
+        ];
+
+        for (label, name) in rejected {
+            assert_eq!(pattern.recognize(&name), None, "{label}");
+        }
+    }
+
+    #[test]
+    fn artifact_pattern_rejects_non_unicode_and_overlong_names_before_comparing() {
+        let pattern = pattern_for("copy.lvault");
+
+        // A valid name with one unit replaced by an unpaired surrogate: the same
+        // length, so only the Unicode check can refuse it.
+        let mut wide: Vec<u16> = staging_like("copy.lvault", SAMPLE_ID)
+            .encode_wide()
+            .collect();
+
+        wide[3] = 0xD800;
+
+        let broken = OsString::from_wide(&wide);
+
+        assert!(broken.to_str().is_none());
+        assert_eq!(pattern.recognize(&broken), None);
+
+        // A name over the NTFS limit is refused by length alone, even when it is
+        // built from a leaf that is itself legal.
+        let long_leaf = "a".repeat(MAX_LEAF_UNITS - 1);
+        let long = pattern_for(&long_leaf);
+        let overlong = staging_like(&long_leaf, SAMPLE_ID);
+
+        assert!(overlong.encode_wide().count() > MAX_LEAF_UNITS);
+        assert_eq!(long.recognize(&overlong), None);
+
+        let huge = OsString::from("a".repeat(100_000));
+
+        assert_eq!(pattern.recognize(&huge), None);
+    }
+
+    #[test]
+    fn artifact_pattern_folds_are_the_rule_that_keeps_the_leaves_distinct() {
+        let pattern = pattern_for("copy.lvault");
+
+        assert!(pattern.folds_equal(OsStr::new("copy.lvault"), OsStr::new("copy.lvault")));
+        assert!(pattern.folds_equal(OsStr::new("copy.lvault"), OsStr::new("COPY.LvAuLt")));
+        assert!(pattern.folds_equal(OsStr::new("stra\u{df}e"), OsStr::new("STRASSE")));
+        assert!(!pattern.folds_equal(OsStr::new("copy.lvault"), OsStr::new("copy.lvaulT2")));
+        assert!(!pattern.folds_equal(OsStr::new("copy.lvault"), OsStr::new("")));
+    }
+
+    #[test]
+    fn artifact_pattern_and_names_reveal_nothing_in_debug_output() {
+        let target = SyncFileTarget::from_path(&Path::new(r"D:\folder").join(LEAF)).unwrap();
+        let pattern = ArtifactPattern::for_target(&target).unwrap();
+
+        let rendered = format!("{pattern:?} {:?}", ArtifactKind::StagingLike);
+
+        assert!(!rendered.contains("LEAKMARK") && !rendered.contains("folder"));
     }
 
     // ---- types: ownership, redaction, order ---------------------------------------------------------------

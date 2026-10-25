@@ -8,6 +8,8 @@ pub use copy_creation::{
     CopyCreationStale, NotPublishedReason,
 };
 mod entries;
+#[cfg(windows)]
+mod exchange_recovery;
 mod master_password;
 mod target_update;
 pub use entries::{EntryDetails, EntryInput, EntrySummary, TotpUpdate};
