@@ -9,7 +9,9 @@ pub use copy_creation::{
 };
 mod entries;
 mod master_password;
+mod target_update;
 pub use entries::{EntryDetails, EntryInput, EntrySummary, TotpUpdate};
+pub use target_update::{PendingPushObservation, UpdateBlock, UpdateReadiness};
 
 use std::{
     fs::{self, File, OpenOptions, TryLockError},

@@ -31,7 +31,7 @@ use crate::vault::{
         CopyCreationRefusal, InitialBindingApproval, InitialBindingConfirmRefusal,
         InitialBindingOutcome, InitialBindingPreview, InitialBindingRefusal,
         RemoteObservationOutcome, RemoteObservationRefusal, RemoteTargetRefusal, SessionError,
-        SessionSyncState, UnlockedVaultSession,
+        SessionSyncState, UnlockedVaultSession, UpdateReadiness,
     },
     sync_file_adapter::SyncFileTarget,
     sync_state_store::SyncStateRoot,
@@ -374,6 +374,33 @@ impl AppState {
         let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
 
         Ok(session.load_sync_state(root))
+    }
+
+    /// Read-only assessment of whether an update of the bound encrypted copy
+    /// would currently pass the core push rules (Stage 1U-4 B3a). Internal: no
+    /// command, event or UI is attached, so the frontend cannot reach it.
+    ///
+    /// Fails with `VaultLocked`/`SessionExpired` unless a session is live, and in
+    /// that case no file is opened. The application-state mutex (and with it the
+    /// session and its exclusive OS lock) is held for the whole assessment. Like
+    /// `load_sync_state` it observes expiry but does not count as user activity:
+    /// an internal check must never keep a vault unlocked. It takes no path and no
+    /// target (both come from the verified stored binding), creates or spends no
+    /// approval and writes nothing. The result is a diagnostic snapshot, **not an
+    /// authorization**: see `UnlockedVaultSession::assess_bound_target_update`.
+    pub fn assess_bound_target_update(
+        &self,
+        root: &SyncStateRoot,
+    ) -> Result<UpdateReadiness, AppStateError> {
+        let mut guard = self.inner_guard()?;
+
+        if self.expire_if_needed(&mut guard, Instant::now()) {
+            return Err(AppStateError::SessionExpired);
+        }
+
+        let session = guard.session.as_ref().ok_or(AppStateError::VaultLocked)?;
+
+        Ok(session.assess_bound_target_update(root))
     }
 
     /// Record a newly authenticated remote observation against the unlocked
@@ -1492,6 +1519,164 @@ mod tests {
         ));
 
         assert!(!root.path().exists());
+    }
+
+    // -- Stage 1U-4 B3a: read-only update-readiness assessment ------------------
+    //
+    // The decisions themselves are tested next to the session
+    // (`session/target_update.rs`). Here: the live-session, lock, expiry and
+    // activity rules, plus one real end-to-end assessment. Scratch lives under
+    // the git-ignored `.qa-local/sync-update-b3-tests/`, never `%TEMP%`.
+
+    fn b3_scratch(name: &str) -> tempfile::TempDir {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".qa-local")
+            .join("sync-update-b3-tests");
+
+        std::fs::create_dir_all(&base).unwrap();
+
+        tempfile::Builder::new()
+            .prefix(&format!("{name}-"))
+            .tempdir_in(&base)
+            .unwrap()
+    }
+
+    #[test]
+    fn update_assessment_requires_a_live_session_and_touches_nothing_otherwise() {
+        let scratch = b3_scratch("b3a-appstate-locked");
+
+        let app_local = scratch.path().join("app-local");
+
+        let root = SyncStateRoot::for_test(app_local.clone());
+
+        let state = AppState::default();
+
+        assert!(matches!(
+            state.assess_bound_target_update(&root),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        state
+            .create_vault(scratch.path().join("vault.lvault"), password())
+            .unwrap();
+
+        // A live session with no binding: classified, and nothing is created.
+        assert_eq!(
+            state.assess_bound_target_update(&root).unwrap(),
+            UpdateReadiness::Blocked(crate::vault::session::UpdateBlock::NotConfigured)
+        );
+
+        state.lock_vault().unwrap();
+
+        assert!(matches!(
+            state.assess_bound_target_update(&root),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        assert!(!app_local.exists());
+    }
+
+    #[test]
+    fn update_assessment_does_not_count_as_activity_and_fails_after_expiry() {
+        let scratch = b3_scratch("b3a-appstate-expiry");
+
+        let root = SyncStateRoot::for_test(scratch.path().join("app-local"));
+
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        state
+            .create_vault(scratch.path().join("vault.lvault"), password())
+            .unwrap();
+
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let before = state.last_activity_for_test();
+
+        assert_eq!(
+            state.assess_bound_target_update(&root).unwrap(),
+            UpdateReadiness::Blocked(crate::vault::session::UpdateBlock::NotConfigured)
+        );
+
+        assert_eq!(state.last_activity_for_test(), before);
+
+        state.age_session_for_test(Duration::from_secs(31));
+
+        assert!(matches!(
+            state.assess_bound_target_update(&root),
+            Err(AppStateError::SessionExpired)
+        ));
+
+        assert!(!state.status().unwrap().unlocked);
+
+        assert!(matches!(
+            state.assess_bound_target_update(&root),
+            Err(AppStateError::VaultLocked)
+        ));
+
+        assert!(!root.path().exists());
+    }
+
+    #[test]
+    fn update_assessment_of_a_real_binding_changes_no_file_and_no_activity() {
+        use crate::vault::{handle_ops::test_support::snapshot, session::UpdateBlock};
+
+        let scratch = b3_scratch("b3a-appstate-bound");
+
+        let root = SyncStateRoot::for_test(scratch.path().join("app-local"));
+        let vault = scratch.path().join("vault.lvault");
+        let copy = scratch.path().join("copy.lvault");
+
+        let state = AppState::with_auto_lock_timeout(Duration::from_secs(30));
+
+        state.create_vault(vault.clone(), password()).unwrap();
+
+        std::fs::copy(&vault, &copy).unwrap();
+
+        let target = SyncFileTarget::from_path(&copy).unwrap();
+
+        {
+            let guard = state.inner.lock().unwrap();
+
+            assert_eq!(
+                guard
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .bind_existing_identical_target(
+                        &root,
+                        &target,
+                        InitialBindingApproval::for_test(&target),
+                    ),
+                Ok(InitialBindingOutcome::BoundAndVerified)
+            );
+        }
+
+        state.age_session_for_test(Duration::from_secs(10));
+
+        let activity = state.last_activity_for_test();
+        let before = snapshot(scratch.path());
+
+        assert_eq!(
+            state.assess_bound_target_update(&root).unwrap(),
+            UpdateReadiness::UpToDate
+        );
+
+        // Unsaved changes are classified without touching any file.
+        {
+            let mut guard = state.inner.lock().unwrap();
+
+            guard.session.as_mut().unwrap().data_mut().updated_at_ms += 1;
+        }
+
+        assert_eq!(
+            state.assess_bound_target_update(&root).unwrap(),
+            UpdateReadiness::Blocked(UpdateBlock::UnsavedChanges)
+        );
+
+        assert_eq!(snapshot(scratch.path()), before);
+        assert_eq!(state.last_activity_for_test(), activity);
     }
 
     // -- Stage 1U-4 B1e: observing a local file target through the state --------
