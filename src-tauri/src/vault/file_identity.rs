@@ -57,6 +57,36 @@
 //! * Identity is an initial-binding guard only. Every vault save replaces the
 //!   primary file, so identifiers are never persisted.
 //!
+//! # Directory identity (Stage 1U-4, slice B3b-2p)
+//!
+//! [`directory_identity_of`] is a **separate** API for the identity of an open
+//! *directory* handle. [`facts_of`] is unchanged: it still refuses every directory
+//! handle (`Err(Lookup)`), so a directory can never become a candidate-file handle,
+//! and nothing about the candidate-file rules (local NTFS/ReFS, hard links,
+//! delete-pending, no-follow) is relaxed. The directory API
+//!
+//! * reads the same 128-bit `FileIdInfo` pair through the existing private
+//!   `query_by_handle` helper (no new FFI, no new `unsafe`, no new `windows-sys`
+//!   feature);
+//! * requires, on the supplied handle, a directory by both the standard-info
+//!   `Directory` flag and the handle's attributes, and refuses any reparse point
+//!   (so a junction or symlink directory is refused when the handle was opened
+//!   with `FILE_FLAG_OPEN_REPARSE_POINT`, as the caller must do; a handle that
+//!   already followed a link is the link *target* and cannot be told apart);
+//! * requires verifiable local NTFS (stricter than the binding policy: ReFS is
+//!   refused), a non-delete-pending directory and a non-degenerate identifier;
+//! * never opens, writes, renames or deletes anything: it only queries the handle
+//!   it is given, which needs ordinary read access and full (default) sharing;
+//!   write or `DELETE` access is neither required nor used.
+//!
+//! Directory identity comparison detects **observed** substitutions only. It does
+//! not eliminate time-of-check/time-of-use races: a directory replaced and put back
+//! between two observations (ABA) is not detected; file identifiers can be reused
+//! after deletion; the volume serial and identifier are driver-reported and trusted;
+//! and an equal identity says nothing about the directory's contents. It is not
+//! cloud-provider authority, does not authenticate any sync state and authorizes no
+//! file replacement.
+//!
 //! `Debug` output of every type here is redacted: volume serials and file
 //! identifiers are never printed.
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -74,6 +104,14 @@ pub(crate) struct FileIdentity {
 impl std::fmt::Debug for FileIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("FileIdentity(<redacted>)")
+    }
+}
+
+impl FileIdentity {
+    /// Whether the identifier is usable at all: a zero volume serial or an
+    /// all-zero file identifier is what an uninitialised answer looks like.
+    fn is_meaningful(&self) -> bool {
+        self.volume != 0 && self.id != [0u8; 16]
     }
 }
 
@@ -109,7 +147,7 @@ impl HandleFacts {
     /// Whether the identifier is usable at all: a zero volume serial or an
     /// all-zero file identifier is what an uninitialised answer looks like.
     fn identity_is_meaningful(&self) -> bool {
-        self.identity.volume != 0 && self.identity.id != [0u8; 16]
+        self.identity.is_meaningful()
     }
 
     /// Exactly the `NTFS` filesystem on a local, non-remote, non-virtual disk
@@ -254,6 +292,62 @@ pub(crate) fn volume_facts_of(file: &File) -> Result<VolumeFacts, IdentityError>
     }
 }
 
+/// The identity of one open **directory** handle, or why none can be given.
+///
+/// Separate from [`facts_of`], which keeps refusing directories. `directory` must
+/// have been opened by the caller with `FILE_FLAG_BACKUP_SEMANTICS` and
+/// `FILE_FLAG_OPEN_REPARSE_POINT` (so a link is judged as the link), read-only and
+/// with the default full sharing; this function only queries it. Every refusal is
+/// `Err(Lookup)`: the handle is not a plain directory (a regular file, a reparse
+/// point, anything uncertain), is delete-pending, is not on a verifiable local NTFS
+/// volume, a query failed, or the identifier is degenerate. A refusal never
+/// produces a value. Non-Windows is `Err(Unsupported)`.
+///
+/// Unused until the read-only exchange classifier (B3b-2a) calls it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn directory_identity_of(directory: &File) -> Result<FileIdentity, IdentityError> {
+    #[cfg(windows)]
+    {
+        windows::directory_observation_of(directory).and_then(judge_directory)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = directory;
+
+        Err(IdentityError::Unsupported)
+    }
+}
+
+/// What the directory decision looks at, gathered from one handle.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct DirectoryObservation {
+    /// A directory by both the handle's standard information and its attributes.
+    is_directory: bool,
+    /// Carries a reparse point (junction, symlink, mount point, placeholder, ...).
+    is_reparse_point: bool,
+    delete_pending: bool,
+    volume: VolumeFacts,
+    identity: FileIdentity,
+}
+
+/// The pure, fail-closed directory decision: a value only for a plain,
+/// live directory on a local NTFS volume with a meaningful identifier.
+#[cfg_attr(not(test), allow(dead_code))]
+fn judge_directory(observed: DirectoryObservation) -> Result<FileIdentity, IdentityError> {
+    if !observed.is_directory
+        || observed.is_reparse_point
+        || observed.delete_pending
+        || !observed.volume.is_local_ntfs()
+        || !observed.identity.is_meaningful()
+    {
+        return Err(IdentityError::Lookup);
+    }
+
+    Ok(observed.identity)
+}
+
 /// The pure, fail-closed decision. In order:
 ///
 /// 1. equal identity is `Same`, whatever else is known;
@@ -280,7 +374,13 @@ pub(crate) fn compare(primary: &HandleFacts, target: &HandleFacts) -> PhysicalVe
 mod windows {
     //! The FFI safety boundary. Three `unsafe` blocks, one per foreign function.
 
-    use std::{ffi::c_void, fs::File, mem::size_of, os::windows::io::AsRawHandle, ptr};
+    use std::{
+        ffi::c_void,
+        fs::File,
+        mem::size_of,
+        os::windows::{fs::MetadataExt, io::AsRawHandle},
+        ptr,
+    };
 
     use windows_sys::{
         Wdk::{
@@ -294,14 +394,17 @@ mod windows {
             Foundation::MAX_PATH,
             Storage::FileSystem::{
                 FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
-                GetVolumeInformationByHandleW, FILE_DEVICE_DISK, FILE_ID_INFO,
+                GetVolumeInformationByHandleW, FILE_ATTRIBUTE_DIRECTORY,
+                FILE_ATTRIBUTE_REPARSE_POINT, FILE_DEVICE_DISK, FILE_ID_INFO,
                 FILE_INFO_BY_HANDLE_CLASS, FILE_STANDARD_INFO,
             },
             System::IO::IO_STATUS_BLOCK,
         },
     };
 
-    use super::{FileIdentity, FileSystemKind, HandleFacts, IdentityError, VolumeFacts};
+    use super::{
+        DirectoryObservation, FileIdentity, FileSystemKind, HandleFacts, IdentityError, VolumeFacts,
+    };
 
     mod sealed {
         pub trait Sealed {}
@@ -350,6 +453,30 @@ mod windows {
         Ok(VolumeFacts {
             filesystem: filesystem_kind(file)?,
             local_device: local_device(file)?,
+        })
+    }
+
+    /// Everything the directory decision needs, read from ONE handle with the
+    /// same helpers as [`facts_of`]; any failed query fails the whole lookup.
+    pub(super) fn directory_observation_of(
+        file: &File,
+    ) -> Result<DirectoryObservation, IdentityError> {
+        let attributes = file
+            .metadata()
+            .map_err(|_| IdentityError::Lookup)?
+            .file_attributes();
+        let id = query_by_handle::<FILE_ID_INFO>(file)?;
+        let standard = query_by_handle::<FILE_STANDARD_INFO>(file)?;
+
+        Ok(DirectoryObservation {
+            is_directory: standard.Directory && attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+            is_reparse_point: attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+            delete_pending: standard.DeletePending,
+            volume: volume_facts_of(file)?,
+            identity: FileIdentity {
+                volume: id.VolumeSerialNumber,
+                id: id.FileId.Identifier,
+            },
         })
     }
 
@@ -818,5 +945,444 @@ mod tests {
             facts_of(&File::open(&path).unwrap()),
             Err(IdentityError::Unsupported)
         );
+    }
+}
+
+/// Directory identity (B3b-2p), tested on the developer machine's real local NTFS
+/// where stated; the pure decision is tested with injected observations, which
+/// prove decision logic only. Scratch lives under
+/// `.qa-local/sync-update-b3-tests/`, never `%TEMP%`.
+#[cfg(all(test, windows))]
+mod directory_identity {
+    use std::{
+        fs::{self, File, OpenOptions},
+        os::windows::fs::OpenOptionsExt,
+        path::Path,
+    };
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    use super::*;
+    use crate::vault::handle_ops::{
+        delete_by_handle,
+        test_support::{assert_local_ntfs, make_junction},
+    };
+
+    const LEAK_MARK: &str = "LEAKMARK-DIRIDENT";
+
+    fn scratch(name: &str) -> tempfile::TempDir {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".qa-local")
+            .join("sync-update-b3-tests");
+
+        fs::create_dir_all(&base).unwrap();
+
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("{name}-"))
+            .tempdir_in(&base)
+            .unwrap();
+
+        // Fails loudly (never skips) off a local NTFS volume.
+        assert_local_ntfs(dir.path());
+        assert!(!dir.path().starts_with(std::env::temp_dir()));
+
+        dir
+    }
+
+    /// The way the caller must open a directory: read-only, default (full)
+    /// sharing, never following a reparse point. No access or share mode is set.
+    fn open_directory(path: &Path) -> File {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .unwrap()
+    }
+
+    fn identity(path: &Path) -> FileIdentity {
+        directory_identity_of(&open_directory(path)).expect("a plain local NTFS directory")
+    }
+
+    // ---- A-B. equality and difference ------------------------------------------
+
+    #[test]
+    fn two_independent_handles_to_one_directory_agree() {
+        let dir = scratch("dirid-same");
+        let first = open_directory(dir.path());
+        let second = open_directory(dir.path());
+
+        let a = directory_identity_of(&first).unwrap();
+        let b = directory_identity_of(&second).unwrap();
+
+        assert_eq!(a, b);
+        // Stable over time on the same handle.
+        assert_eq!(directory_identity_of(&first).unwrap(), a);
+    }
+
+    #[test]
+    fn different_directories_on_one_volume_have_different_identities() {
+        let dir = scratch("dirid-different");
+        let one = dir.path().join("one");
+        let two = dir.path().join("two");
+        let child = one.join("child");
+
+        fs::create_dir(&one).unwrap();
+        fs::create_dir(&two).unwrap();
+        fs::create_dir(&child).unwrap();
+
+        let identities = [
+            identity(dir.path()),
+            identity(&one),
+            identity(&two),
+            identity(&child),
+        ];
+
+        for (index, first) in identities.iter().enumerate() {
+            for second in &identities[index + 1..] {
+                assert_ne!(first, second);
+            }
+        }
+    }
+
+    // ---- C-D. the file API is unchanged, the directory API refuses files ---------
+
+    #[test]
+    fn facts_of_still_refuses_a_directory_and_the_directory_api_accepts_it() {
+        let dir = scratch("dirid-facts-of");
+        let handle = open_directory(dir.path());
+
+        // The existing contract, unchanged.
+        assert_eq!(facts_of(&handle), Err(IdentityError::Lookup));
+
+        // The separate directory API on the very same handle.
+        assert!(directory_identity_of(&handle).is_ok());
+        assert!(volume_facts_of(&handle).unwrap().is_local_ntfs());
+    }
+
+    #[test]
+    fn a_regular_file_is_refused_and_still_has_file_facts() {
+        let dir = scratch("dirid-file");
+        let path = dir.path().join("a.bin");
+
+        fs::write(&path, b"content").unwrap();
+
+        let plain = File::open(&path).unwrap();
+        let flagged = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)
+            .unwrap();
+
+        assert_eq!(directory_identity_of(&plain), Err(IdentityError::Lookup));
+        assert_eq!(directory_identity_of(&flagged), Err(IdentityError::Lookup));
+
+        // The candidate-file API still accepts the same handle.
+        assert!(facts_of(&plain).unwrap().is_trustworthy());
+    }
+
+    #[test]
+    fn a_device_handle_is_refused() {
+        // REAL handle that is not a plain directory on a local NTFS volume.
+        let Ok(device) = File::open(r"\\.\NUL") else {
+            eprintln!("SKIPPED device handle case: \\\\.\\NUL could not be opened");
+
+            return;
+        };
+
+        assert_eq!(directory_identity_of(&device), Err(IdentityError::Lookup));
+    }
+
+    // ---- E-F. a held handle follows the object, not the name ---------------------
+
+    #[test]
+    fn a_renamed_directory_keeps_its_identity_and_a_new_one_at_the_old_name_differs() {
+        let dir = scratch("dirid-rename");
+        let old = dir.path().join("watched");
+        let moved = dir.path().join("moved-away");
+
+        fs::create_dir(&old).unwrap();
+
+        let held = open_directory(&old);
+        let before = directory_identity_of(&held).unwrap();
+
+        // The held handle was opened read-only with full sharing, so it does not
+        // prevent the rename.
+        fs::rename(&old, &moved).expect("a read-only, fully shared directory handle");
+
+        assert_eq!(directory_identity_of(&held).unwrap(), before);
+        assert_eq!(identity(&moved), before);
+        assert!(fs::symlink_metadata(&old).is_err());
+
+        // A new directory at the old pathname is another object.
+        fs::create_dir(&old).unwrap();
+
+        let replacement = identity(&old);
+
+        assert_ne!(replacement, before);
+        assert_eq!(directory_identity_of(&held).unwrap(), before);
+    }
+
+    // ---- G. reparse directories ---------------------------------------------------
+
+    #[test]
+    fn a_junction_directory_is_refused_when_opened_without_following() {
+        let dir = scratch("dirid-junction");
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+
+        fs::create_dir(&target).unwrap();
+        make_junction(&link, &target);
+
+        assert_eq!(
+            directory_identity_of(&open_directory(&link)),
+            Err(IdentityError::Lookup)
+        );
+
+        // Documented limit, observed: a handle that already followed the junction
+        // *is* the target directory and cannot be told apart. The caller must open
+        // with FILE_FLAG_OPEN_REPARSE_POINT.
+        let followed = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&link)
+            .unwrap();
+
+        assert_eq!(directory_identity_of(&followed).unwrap(), identity(&target));
+    }
+
+    #[test]
+    fn a_symlink_directory_is_refused_where_one_can_be_created() {
+        let dir = scratch("dirid-symlink");
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+
+        fs::create_dir(&target).unwrap();
+
+        if std::os::windows::fs::symlink_dir(&target, &link).is_err() {
+            // Needs a privilege this account may lack. Not run; not counted.
+            eprintln!("SKIPPED symlink directory case: the link could not be created");
+
+            return;
+        }
+
+        assert_eq!(
+            directory_identity_of(&open_directory(&link)),
+            Err(IdentityError::Lookup)
+        );
+    }
+
+    // ---- H. unavailable, degenerate or uncertain observations never yield a value --
+
+    fn good_observation() -> DirectoryObservation {
+        DirectoryObservation {
+            is_directory: true,
+            is_reparse_point: false,
+            delete_pending: false,
+            volume: VolumeFacts::for_test(FileSystemKind::Ntfs, true),
+            identity: FileIdentity {
+                volume: 7,
+                id: [1; 16],
+            },
+        }
+    }
+
+    #[test]
+    fn injected_observations_that_are_not_a_plain_live_local_ntfs_directory_are_refused() {
+        // INJECTED: decision logic only.
+        assert_eq!(
+            judge_directory(good_observation()),
+            Ok(good_observation().identity)
+        );
+
+        type Change = fn(&mut DirectoryObservation);
+
+        let bad: [(&str, Change); 9] = [
+            ("not a directory", |o| o.is_directory = false),
+            ("reparse point", |o| o.is_reparse_point = true),
+            ("delete pending", |o| o.delete_pending = true),
+            ("ReFS", |o| {
+                o.volume = VolumeFacts::for_test(FileSystemKind::Refs, true)
+            }),
+            ("other filesystem", |o| {
+                o.volume = VolumeFacts::for_test(FileSystemKind::Other, true)
+            }),
+            ("not a local device", |o| {
+                o.volume = VolumeFacts::for_test(FileSystemKind::Ntfs, false)
+            }),
+            ("zero volume serial", |o| o.identity.volume = 0),
+            ("zero file id", |o| o.identity.id = [0; 16]),
+            ("nothing at all", |o| {
+                o.is_directory = false;
+                o.volume = VolumeFacts::for_test(FileSystemKind::Other, false);
+                o.identity = FileIdentity {
+                    volume: 0,
+                    id: [0; 16],
+                };
+            }),
+        ];
+
+        for (name, change) in bad {
+            let mut observed = good_observation();
+
+            change(&mut observed);
+
+            assert_eq!(
+                judge_directory(observed),
+                Err(IdentityError::Lookup),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_delete_pending_directory_is_observed_and_refused() {
+        // REAL NTFS. A second handle with DELETE access marks the directory for
+        // deletion by handle; the first, read-only handle stays open.
+        let dir = scratch("dirid-delete-pending");
+        let doomed = dir.path().join("doomed");
+
+        fs::create_dir(&doomed).unwrap();
+
+        let observer = open_directory(&doomed);
+        let deleter = OpenOptions::new()
+            .read(true)
+            .access_mode(DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&doomed)
+            .unwrap();
+
+        assert!(directory_identity_of(&observer).is_ok());
+
+        delete_by_handle(&deleter).expect("the directory can be marked for deletion");
+
+        let observed = windows::directory_observation_of(&observer).unwrap();
+
+        eprintln!(
+            "OBSERVED delete-pending directory: delete_pending={}",
+            observed.delete_pending
+        );
+
+        assert!(observed.delete_pending);
+        assert_eq!(directory_identity_of(&observer), Err(IdentityError::Lookup));
+    }
+
+    // ---- I. read-only access, full sharing -------------------------------------------
+
+    #[test]
+    fn the_handle_is_read_only_fully_shared_and_never_blocks_others() {
+        let dir = scratch("dirid-sharing");
+        let watched = dir.path().join("watched");
+
+        fs::create_dir(&watched).unwrap();
+
+        let held = open_directory(&watched);
+        let before = directory_identity_of(&held).unwrap();
+
+        // With the handle held, others can open the directory again, create files
+        // and directories inside it, and remove them: nothing is pinned.
+        let second = open_directory(&watched);
+
+        fs::write(watched.join("inside.bin"), b"x").unwrap();
+        fs::create_dir(watched.join("inside-dir")).unwrap();
+        fs::remove_file(watched.join("inside.bin")).unwrap();
+        fs::remove_dir(watched.join("inside-dir")).unwrap();
+
+        assert_eq!(directory_identity_of(&held).unwrap(), before);
+        assert_eq!(directory_identity_of(&second).unwrap(), before);
+    }
+
+    /// The production half of this file: everything before the unit tests, without
+    /// comment lines.
+    fn production_code() -> String {
+        include_str!("file_identity.rs")
+            .split("mod tests {")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_production_code_opens_nothing_and_adds_no_unsafe() {
+        let code = production_code();
+
+        assert!(code.contains("pub(crate) fn directory_identity_of("));
+
+        // Still exactly the three original foreign calls.
+        assert_eq!(code.matches("unsafe {").count(), 3);
+
+        // The identity code never opens, writes, renames or deletes, and never
+        // asks for write or DELETE access or a restrictive share mode.
+        for forbidden in [
+            "OpenOptions",
+            "share_mode",
+            "access_mode",
+            "GENERIC_WRITE",
+            "DELETE",
+            "fs::rename",
+            "fs::write",
+            "remove_file",
+            "remove_dir",
+            "create_dir",
+            "hard_link",
+            "set_len",
+            "temp_dir",
+        ] {
+            assert!(!code.contains(forbidden), "{forbidden}");
+        }
+    }
+
+    // ---- J. redaction -------------------------------------------------------------------
+
+    #[test]
+    fn nothing_printed_reveals_a_directory_identity_or_path() {
+        let dir = scratch("dirid-redaction");
+        let named = dir.path().join(LEAK_MARK);
+
+        fs::create_dir(&named).unwrap();
+
+        let real = identity(&named);
+        let injected = judge_directory(DirectoryObservation {
+            identity: FileIdentity {
+                volume: 0xDEAD_BEEF_1234_5678,
+                id: [0xAB; 16],
+            },
+            ..good_observation()
+        })
+        .unwrap();
+
+        let shown = [
+            format!("{real:?}"),
+            format!("{real:#?}"),
+            format!("{injected:?}"),
+            format!("{:#?}", Ok::<_, IdentityError>(injected)),
+            format!("{:?}", Err::<FileIdentity, _>(IdentityError::Lookup)),
+        ];
+
+        for output in &shown {
+            for needle in [
+                "DEADBEEF",
+                "deadbeef",
+                "3735928559",
+                "1234",
+                "5678",
+                "abab",
+                "ABAB",
+                "171",
+                LEAK_MARK,
+                ".qa-local",
+            ] {
+                assert!(!output.contains(needle), "leaks {needle:?}: {output}");
+            }
+        }
+
+        assert_eq!(shown[0], "FileIdentity(<redacted>)");
+        assert_eq!(shown[2], "FileIdentity(<redacted>)");
     }
 }
