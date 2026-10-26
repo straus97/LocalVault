@@ -67,6 +67,29 @@
 //! **not** prove that two differently written paths or URIs cannot name the
 //! same file. Platform adapters must independently reject same-file bindings
 //! using safe platform-specific identity checks.
+//!
+//! # Dormant exchange records (slice B3c-1)
+//!
+//! A state may additionally carry an [`ExchangeIntent`] (the physical identity
+//! of an update target observed when an exchange was recorded) and a bounded
+//! list of [`RetainedPrevious`] entries, through
+//! [`SyncState::new_with_exchange_records`]. They are encoded only by the
+//! explicit version-[`SYNC_STATE_EXCHANGE_VERSION`] codec
+//! ([`SyncState::encode_exchange_record`] / [`SyncState::decode_exchange_record`]).
+//!
+//! This codec is **dormant**: the functions are compiled, public core APIs with
+//! no caller in any current production flow. [`SyncState::encode`] refuses a
+//! state that has exchange records, and [`SyncState::decode`] and
+//! [`SyncStateLoad::from_bytes`] still report any version-2 record as an
+//! unsupported version, so the existing storage adapter can neither load nor
+//! persist one. The transitions refuse such a state instead of silently
+//! dropping its records.
+//!
+//! The codec is **unauthenticated** (the checksum above is not a MAC) and
+//! **policy-neutral**: it decides nothing about message authentication,
+//! retention or cleanup. Object anchors are opaque observations and a retained
+//! entry only records that a previous version was retained at one instant; both
+//! are only ever descriptive, never authority for any action.
 
 use std::fmt;
 
@@ -84,8 +107,18 @@ use crate::sync::{
 
 pub const SYNC_STATE_FORMAT: &str = "localvault-sync-state";
 pub const SYNC_STATE_VERSION: u32 = 1;
+/// Dormant tag of the explicit exchange-record codec
+/// ([`SyncState::encode_exchange_record`]). [`SYNC_STATE_VERSION`] stays 1.
+/// [`SyncState::decode`] and [`SyncStateLoad::from_bytes`] do not accept it; the
+/// persisted version is decided when a later slice enables decoding.
+pub const SYNC_STATE_EXCHANGE_VERSION: u32 = 2;
 pub const MAX_SYNC_STATE_BYTES: usize = 65_536;
 pub const MAX_LOCATOR_BYTES: usize = 4_096;
+/// Longest accepted [`ObjectAnchor`], in bytes.
+pub const MAX_OBJECT_ANCHOR_BYTES: usize = 64;
+/// Most [`RetainedPrevious`] entries one state may carry. A technical size
+/// bound of the record, **not** a retention policy.
+pub const MAX_RETAINED_PREVIOUS: usize = 8;
 
 /// Length of the caller-supplied salt of a [`VaultBindingTag`].
 pub const BINDING_SALT_LEN: usize = 32;
@@ -123,6 +156,30 @@ pub enum SyncStateError {
     PendingRevisionNotAboveHighWater,
     #[error("pending push intent is invalid")]
     InvalidPushIntent,
+    #[error("object anchor must be between 1 and 64 bytes")]
+    InvalidObjectAnchor,
+    #[error("exchange id must not be nil")]
+    NilExchangeId,
+    #[error("an exchange intent requires a pending push")]
+    ExchangeWithoutPendingPush,
+    #[error("an exchange intent requires a based state")]
+    ExchangeOnUnbasedState,
+    #[error("retained previous versions require a based state")]
+    RetainedOnUnbasedState,
+    #[error("too many retained previous versions")]
+    RetainedLimitExceeded,
+    #[error("retained previous versions must have distinct exchange ids")]
+    DuplicateRetainedId,
+    #[error("a retained previous version must not reuse the pending intent id")]
+    RetainedIdIsPendingIntent,
+    #[error("a retained previous version must differ from the synced version")]
+    RetainedIsSyncedVersion,
+    #[error("a retained previous version must have a revision below the synced revision")]
+    RetainedRevisionNotBelowSynced,
+    #[error("a state with exchange records requires the exchange format")]
+    ExchangeRecordsRequireExchangeFormat,
+    #[error("a state with exchange records is not supported by this transition")]
+    ExchangeRecordsUnsupportedByTransition,
 }
 
 /// Which expected value did not match the stored binding. Categories only; the
@@ -374,6 +431,148 @@ impl PendingPush {
     }
 }
 
+/// An opaque, adapter-defined physical identity observed at one instant (for
+/// example a volume serial plus a file id): 1 to [`MAX_OBJECT_ANCHOR_BYTES`]
+/// bytes. It is **not** authenticated, **not** proof of ownership and **not**
+/// authority for any action. `Debug` never shows the bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ObjectAnchor(Vec<u8>);
+
+impl ObjectAnchor {
+    pub fn new(bytes: &[u8]) -> Result<Self, SyncStateError> {
+        if bytes.is_empty() || bytes.len() > MAX_OBJECT_ANCHOR_BYTES {
+            return Err(SyncStateError::InvalidObjectAnchor);
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ObjectAnchor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ObjectAnchor(<redacted>)")
+    }
+}
+
+/// How an exchange publishes a new target version.
+///
+/// Artifact names are derived, never stored:
+/// `"." + leaf + ".localvault-update-<id>.tmp"` and
+/// `"." + leaf + ".localvault-previous-<id>.lvprev"`, where `<id>` is the
+/// pending intent id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExchangeScheme {
+    /// Wire name `retain_and_publish_v1`.
+    RetainAndPublishV1,
+}
+
+impl ExchangeScheme {
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::RetainAndPublishV1 => "retain_and_publish_v1",
+        }
+    }
+
+    fn from_wire_name(name: &str) -> Option<Self> {
+        match name {
+            "retain_and_publish_v1" => Some(Self::RetainAndPublishV1),
+            _ => None,
+        }
+    }
+}
+
+/// The physical identities observed when an exchange was recorded, attached to
+/// a pending push. Descriptive only: the anchors are unauthenticated
+/// observations and never authority. `Debug` does not print anchor bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExchangeIntent {
+    scheme: ExchangeScheme,
+    target_anchor: ObjectAnchor,
+    directory_anchor: ObjectAnchor,
+}
+
+impl ExchangeIntent {
+    pub fn new(
+        scheme: ExchangeScheme,
+        target_anchor: ObjectAnchor,
+        directory_anchor: ObjectAnchor,
+    ) -> Self {
+        Self {
+            scheme,
+            target_anchor,
+            directory_anchor,
+        }
+    }
+
+    pub fn scheme(&self) -> ExchangeScheme {
+        self.scheme
+    }
+
+    pub fn target_anchor(&self) -> &ObjectAnchor {
+        &self.target_anchor
+    }
+
+    pub fn directory_anchor(&self) -> &ObjectAnchor {
+        &self.directory_anchor
+    }
+}
+
+/// A record that a previous version was retained at one instant. It is **not**
+/// a guarantee that the version is still present, readable, durable or held by
+/// any cloud provider. `Debug` does not print anchor bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedPrevious {
+    exchange_id: Uuid,
+    fingerprint: EnvelopeFingerprint,
+    revision: u64,
+    object_anchor: ObjectAnchor,
+    directory_anchor: ObjectAnchor,
+}
+
+impl RetainedPrevious {
+    pub fn new(
+        exchange_id: Uuid,
+        fingerprint: EnvelopeFingerprint,
+        revision: u64,
+        object_anchor: ObjectAnchor,
+        directory_anchor: ObjectAnchor,
+    ) -> Result<Self, SyncStateError> {
+        if exchange_id.is_nil() {
+            return Err(SyncStateError::NilExchangeId);
+        }
+        Ok(Self {
+            exchange_id,
+            fingerprint,
+            revision,
+            object_anchor,
+            directory_anchor,
+        })
+    }
+
+    pub fn exchange_id(&self) -> Uuid {
+        self.exchange_id
+    }
+
+    pub fn fingerprint(&self) -> &EnvelopeFingerprint {
+        &self.fingerprint
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn object_anchor(&self) -> &ObjectAnchor {
+        &self.object_anchor
+    }
+
+    pub fn directory_anchor(&self) -> &ObjectAnchor {
+        &self.directory_anchor
+    }
+}
+
 /// The persistent local binding of one vault to one synchronization target.
 ///
 /// Fields are private; every instance has passed [`SyncState::new`] (or a
@@ -386,6 +585,18 @@ impl PendingPush {
 /// 5. a pending push from an absent remote exists only in an unbased state;
 /// 6. in a based state a pending push starts from exactly the synced
 ///    fingerprint and intends a revision above `high_water`.
+///
+/// The dormant exchange records of [`SyncState::new_with_exchange_records`]
+/// (module documentation) add, and [`SyncState::new`] never produces them:
+///
+/// 7. an exchange intent requires a pending push;
+/// 8. an exchange intent requires a based state;
+/// 9. retained previous versions require a based state;
+/// 10. at most [`MAX_RETAINED_PREVIOUS`] retained entries;
+/// 11. retained exchange ids are pairwise distinct;
+/// 12. no retained exchange id equals the pending intent id;
+/// 13. no retained fingerprint equals the synced fingerprint;
+/// 14. every retained revision is below the synced revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncState {
     binding_id: BindingId,
@@ -394,6 +605,8 @@ pub struct SyncState {
     target_locator: Locator,
     base: SyncBase,
     pending_push: Option<PendingPush>,
+    exchange: Option<ExchangeIntent>,
+    retained: Vec<RetainedPrevious>,
 }
 
 impl SyncState {
@@ -412,6 +625,36 @@ impl SyncState {
             target_locator,
             base,
             pending_push,
+            exchange: None,
+            retained: Vec::new(),
+        };
+        state.validate()?;
+        Ok(state)
+    }
+
+    /// Like [`SyncState::new`], additionally carrying the dormant exchange
+    /// records. With `None` and an empty list it equals `new`. Such a state is
+    /// encoded only by [`SyncState::encode_exchange_record`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_exchange_records(
+        binding_id: BindingId,
+        vault_tag: VaultBindingTag,
+        local_locator: Locator,
+        target_locator: Locator,
+        base: SyncBase,
+        pending_push: Option<PendingPush>,
+        exchange: Option<ExchangeIntent>,
+        retained: Vec<RetainedPrevious>,
+    ) -> Result<Self, SyncStateError> {
+        let state = Self {
+            binding_id,
+            vault_tag,
+            local_locator,
+            target_locator,
+            base,
+            pending_push,
+            exchange,
+            retained,
         };
         state.validate()?;
         Ok(state)
@@ -441,6 +684,21 @@ impl SyncState {
         self.pending_push.as_ref()
     }
 
+    pub fn exchange_intent(&self) -> Option<&ExchangeIntent> {
+        self.exchange.as_ref()
+    }
+
+    pub fn retained_previous(&self) -> &[RetainedPrevious] {
+        &self.retained
+    }
+
+    /// Whether the state carries an exchange intent or any retained previous
+    /// version. Such a state is refused by [`SyncState::encode`] and by every
+    /// transition in this module.
+    pub fn has_exchange_records(&self) -> bool {
+        self.exchange.is_some() || !self.retained.is_empty()
+    }
+
     /// Read-only check that this state is bound to the authenticated vault and
     /// to exactly the expected locators (exact string comparison; adapters
     /// pass already-normalized locators). Reports the first mismatching
@@ -464,6 +722,57 @@ impl SyncState {
     }
 
     fn validate(&self) -> Result<(), SyncStateError> {
+        self.validate_base_invariants()?;
+        self.validate_exchange_records()
+    }
+
+    /// Invariants 7 to 14. They are checked after invariants 1 to 6 and add no
+    /// rule about coexistence of an exchange intent and retained entries.
+    fn validate_exchange_records(&self) -> Result<(), SyncStateError> {
+        if self.exchange.is_some() {
+            if self.pending_push.is_none() {
+                return Err(SyncStateError::ExchangeWithoutPendingPush);
+            }
+            if matches!(self.base, SyncBase::Unbased) {
+                return Err(SyncStateError::ExchangeOnUnbasedState);
+            }
+        }
+
+        if self.retained.is_empty() {
+            return Ok(());
+        }
+        let SyncBase::Based(checkpoint) = &self.base else {
+            return Err(SyncStateError::RetainedOnUnbasedState);
+        };
+        if self.retained.len() > MAX_RETAINED_PREVIOUS {
+            return Err(SyncStateError::RetainedLimitExceeded);
+        }
+
+        for (index, entry) in self.retained.iter().enumerate() {
+            if self.retained[..index]
+                .iter()
+                .any(|earlier| earlier.exchange_id == entry.exchange_id)
+            {
+                return Err(SyncStateError::DuplicateRetainedId);
+            }
+        }
+        for entry in &self.retained {
+            if let Some(pending) = &self.pending_push {
+                if entry.exchange_id == pending.intent_id {
+                    return Err(SyncStateError::RetainedIdIsPendingIntent);
+                }
+            }
+            if entry.fingerprint == checkpoint.synced {
+                return Err(SyncStateError::RetainedIsSyncedVersion);
+            }
+            if entry.revision >= checkpoint.synced_revision {
+                return Err(SyncStateError::RetainedRevisionNotBelowSynced);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_base_invariants(&self) -> Result<(), SyncStateError> {
         if self.binding_id.0.is_nil() {
             return Err(SyncStateError::NilBindingId);
         }
@@ -506,52 +815,29 @@ impl SyncState {
 
     /// Deterministic, versioned UTF-8 JSON. Revalidates the state first and
     /// enforces [`MAX_SYNC_STATE_BYTES`].
+    ///
+    /// A state with exchange records is refused
+    /// ([`SyncStateError::ExchangeRecordsRequireExchangeFormat`]): version 1
+    /// cannot represent them and must never silently drop them. Use
+    /// [`encode_exchange_record`](Self::encode_exchange_record).
     pub fn encode(&self) -> Result<Vec<u8>, SyncStateEncodeError> {
         self.validate()
             .map_err(SyncStateEncodeError::InvalidState)?;
+        if self.has_exchange_records() {
+            return Err(SyncStateEncodeError::InvalidState(
+                SyncStateError::ExchangeRecordsRequireExchangeFormat,
+            ));
+        }
 
         let body = self.encode_body()?;
-        let outer = OuterWire {
-            format: SYNC_STATE_FORMAT.to_owned(),
-            version: SYNC_STATE_VERSION,
-            body_sha256: HEXLOWER.encode(&Sha256::digest(body.as_bytes())),
-            body,
-        };
-
-        let bytes = serde_json::to_vec(&outer).map_err(|_| SyncStateEncodeError::Serialization)?;
-        if bytes.len() > MAX_SYNC_STATE_BYTES {
-            return Err(SyncStateEncodeError::TooLarge);
-        }
-        Ok(bytes)
+        seal_wrapper(SYNC_STATE_VERSION, body)
     }
 
     /// Strictly decode and fully revalidate. Fails closed: any deviation is an
     /// error, and nothing is silently corrected. See the module documentation
     /// for what the checksum does and does not establish.
     pub fn decode(bytes: &[u8]) -> Result<Self, SyncStateDecodeError> {
-        if bytes.len() > MAX_SYNC_STATE_BYTES {
-            return Err(SyncStateDecodeError::TooLarge);
-        }
-
-        // Format and version are judged before the rest of the wrapper, so a
-        // future version that adds fields is reported as unsupported rather
-        // than as corrupt.
-        let probe: Probe =
-            serde_json::from_slice(bytes).map_err(|_| SyncStateDecodeError::Malformed)?;
-        if probe.format != SYNC_STATE_FORMAT {
-            return Err(SyncStateDecodeError::UnsupportedFormat);
-        }
-        if probe.version != u64::from(SYNC_STATE_VERSION) {
-            return Err(SyncStateDecodeError::UnsupportedVersion);
-        }
-
-        let outer: OuterWire =
-            serde_json::from_slice(bytes).map_err(|_| SyncStateDecodeError::Malformed)?;
-        let claimed = decode_hex32(&outer.body_sha256).ok_or(SyncStateDecodeError::Malformed)?;
-        let actual: [u8; 32] = Sha256::digest(outer.body.as_bytes()).into();
-        if claimed != actual {
-            return Err(SyncStateDecodeError::ChecksumMismatch);
-        }
+        let outer = open_wrapper(bytes, SYNC_STATE_VERSION)?;
 
         let wire: BodyWire =
             serde_json::from_str(&outer.body).map_err(|_| SyncStateDecodeError::InvalidBody)?;
@@ -569,10 +855,95 @@ impl SyncState {
         Ok(state)
     }
 
+    /// Deterministic UTF-8 JSON of the dormant exchange-record format, always
+    /// [`SYNC_STATE_EXCHANGE_VERSION`], for any valid state (with or without
+    /// exchange records). Revalidates first and enforces
+    /// [`MAX_SYNC_STATE_BYTES`]. The checksum is not authentication.
+    pub fn encode_exchange_record(&self) -> Result<Vec<u8>, SyncStateEncodeError> {
+        self.validate()
+            .map_err(SyncStateEncodeError::InvalidState)?;
+
+        let body = self.encode_exchange_body()?;
+        seal_wrapper(SYNC_STATE_EXCHANGE_VERSION, body)
+    }
+
+    /// Strict inverse of [`encode_exchange_record`](Self::encode_exchange_record),
+    /// accepting version [`SYNC_STATE_EXCHANGE_VERSION`] only (a version-1
+    /// record is [`SyncStateDecodeError::UnsupportedVersion`] here, and
+    /// [`SyncState::decode`] likewise refuses version 2). Same strictness as
+    /// [`decode`](Self::decode): canonical body, full revalidation.
+    pub fn decode_exchange_record(bytes: &[u8]) -> Result<Self, SyncStateDecodeError> {
+        let outer = open_wrapper(bytes, SYNC_STATE_EXCHANGE_VERSION)?;
+
+        let wire: ExchangeBodyWire =
+            serde_json::from_str(&outer.body).map_err(|_| SyncStateDecodeError::InvalidBody)?;
+        let state = wire.into_state()?;
+
+        let canonical = state
+            .encode_exchange_body()
+            .map_err(|_| SyncStateDecodeError::InvalidBody)?;
+        if canonical != outer.body {
+            return Err(SyncStateDecodeError::InvalidBody);
+        }
+
+        Ok(state)
+    }
+
     fn encode_body(&self) -> Result<String, SyncStateEncodeError> {
         serde_json::to_string(&BodyWire::from(self))
             .map_err(|_| SyncStateEncodeError::Serialization)
     }
+
+    fn encode_exchange_body(&self) -> Result<String, SyncStateEncodeError> {
+        serde_json::to_string(&ExchangeBodyWire::from(self))
+            .map_err(|_| SyncStateEncodeError::Serialization)
+    }
+}
+
+/// Wrap an already-canonical `body` in the checksummed outer wrapper and
+/// enforce [`MAX_SYNC_STATE_BYTES`].
+fn seal_wrapper(version: u32, body: String) -> Result<Vec<u8>, SyncStateEncodeError> {
+    let outer = OuterWire {
+        format: SYNC_STATE_FORMAT.to_owned(),
+        version,
+        body_sha256: HEXLOWER.encode(&Sha256::digest(body.as_bytes())),
+        body,
+    };
+
+    let bytes = serde_json::to_vec(&outer).map_err(|_| SyncStateEncodeError::Serialization)?;
+    if bytes.len() > MAX_SYNC_STATE_BYTES {
+        return Err(SyncStateEncodeError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+/// Size gate, lenient format and version routing, strict wrapper parse and
+/// checksum comparison, in that order. The body is not looked at.
+fn open_wrapper(bytes: &[u8], expected_version: u32) -> Result<OuterWire, SyncStateDecodeError> {
+    if bytes.len() > MAX_SYNC_STATE_BYTES {
+        return Err(SyncStateDecodeError::TooLarge);
+    }
+
+    // Format and version are judged before the rest of the wrapper, so a
+    // future version that adds fields is reported as unsupported rather
+    // than as corrupt.
+    let probe: Probe =
+        serde_json::from_slice(bytes).map_err(|_| SyncStateDecodeError::Malformed)?;
+    if probe.format != SYNC_STATE_FORMAT {
+        return Err(SyncStateDecodeError::UnsupportedFormat);
+    }
+    if probe.version != u64::from(expected_version) {
+        return Err(SyncStateDecodeError::UnsupportedVersion);
+    }
+
+    let outer: OuterWire =
+        serde_json::from_slice(bytes).map_err(|_| SyncStateDecodeError::Malformed)?;
+    let claimed = decode_hex32(&outer.body_sha256).ok_or(SyncStateDecodeError::Malformed)?;
+    let actual: [u8; 32] = Sha256::digest(outer.body.as_bytes()).into();
+    if claimed != actual {
+        return Err(SyncStateDecodeError::ChecksumMismatch);
+    }
+    Ok(outer)
 }
 
 /// Outcome of loading the persisted state of a vault.
@@ -910,6 +1281,7 @@ pub fn record_remote_observation(
     expected_target: &Locator,
     observation: &BoundInspection,
 ) -> Result<HighWaterOutcome, TransitionRefusal> {
+    refuse_exchange_records(state)?;
     check_binding(
         state,
         Some(observation.authenticated_vault_id()),
@@ -982,6 +1354,7 @@ pub fn begin_push(
     remote: RemoteEvidence<'_>,
     intent_id: Uuid,
 ) -> Result<SyncState, TransitionRefusal> {
+    refuse_exchange_records(state)?;
     let vault_id = match remote {
         RemoteEvidence::Inspected(bound) => Some(bound.authenticated_vault_id()),
         RemoteEvidence::Absent | RemoteEvidence::Unavailable => None,
@@ -1089,6 +1462,7 @@ pub fn reconcile_pending_push(
     expected_target: &Locator,
     remote: RemoteEvidence<'_>,
 ) -> Result<PushResolution, TransitionRefusal> {
+    refuse_exchange_records(state)?;
     let vault_id = match remote {
         RemoteEvidence::Inspected(bound) => Some(bound.authenticated_vault_id()),
         RemoteEvidence::Absent | RemoteEvidence::Unavailable => None,
@@ -1162,6 +1536,11 @@ impl SyncState {
         base: SyncBase,
         pending_push: Option<PendingPush>,
     ) -> Result<SyncState, SyncStateError> {
+        // Defense in depth: this copy has no exchange records, so it must not
+        // be built from a state that has some.
+        if self.has_exchange_records() {
+            return Err(SyncStateError::ExchangeRecordsUnsupportedByTransition);
+        }
         SyncState::new(
             self.binding_id,
             self.vault_tag,
@@ -1175,6 +1554,17 @@ impl SyncState {
 
 fn invalid(error: SyncStateError) -> TransitionRefusal {
     TransitionRefusal::InvalidState(error)
+}
+
+/// The transitions of this module build new states without exchange records and
+/// must therefore never silently discard an existing intent or retained entry.
+fn refuse_exchange_records(state: &SyncState) -> Result<(), TransitionRefusal> {
+    if state.has_exchange_records() {
+        return Err(invalid(
+            SyncStateError::ExchangeRecordsUnsupportedByTransition,
+        ));
+    }
+    Ok(())
 }
 
 fn counter(revision: AuthenticatedRevision) -> Option<u64> {
@@ -1352,8 +1742,131 @@ impl From<&SyncState> for BodyWire {
     }
 }
 
+/// Body of the dormant version-2 record: every [`BodyWire`] field, unchanged
+/// and in the same order, plus the two required exchange-record fields.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExchangeBodyWire {
+    binding_id: String,
+    vault_tag: TagWire,
+    local_locator: String,
+    target_locator: String,
+    base: BaseWire,
+    #[serde(deserialize_with = "required_option")]
+    pending_push: Option<PendingWire>,
+    #[serde(deserialize_with = "required_option")]
+    exchange: Option<ExchangeWire>,
+    retained_previous: Vec<RetainedWire>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExchangeWire {
+    scheme: String,
+    target_anchor: String,
+    directory_anchor: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetainedWire {
+    exchange_id: String,
+    fingerprint: String,
+    revision: u64,
+    object_anchor: String,
+    directory_anchor: String,
+}
+
+impl From<&SyncState> for ExchangeBodyWire {
+    fn from(state: &SyncState) -> Self {
+        let BodyWire {
+            binding_id,
+            vault_tag,
+            local_locator,
+            target_locator,
+            base,
+            pending_push,
+        } = BodyWire::from(state);
+
+        Self {
+            binding_id,
+            vault_tag,
+            local_locator,
+            target_locator,
+            base,
+            pending_push,
+            exchange: state.exchange.as_ref().map(|exchange| ExchangeWire {
+                scheme: exchange.scheme.wire_name().to_owned(),
+                target_anchor: HEXLOWER.encode(&exchange.target_anchor.0),
+                directory_anchor: HEXLOWER.encode(&exchange.directory_anchor.0),
+            }),
+            retained_previous: state
+                .retained
+                .iter()
+                .map(|entry| RetainedWire {
+                    exchange_id: entry.exchange_id.hyphenated().to_string(),
+                    fingerprint: entry.fingerprint.to_hex(),
+                    revision: entry.revision,
+                    object_anchor: HEXLOWER.encode(&entry.object_anchor.0),
+                    directory_anchor: HEXLOWER.encode(&entry.directory_anchor.0),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl ExchangeBodyWire {
+    fn into_state(self) -> Result<SyncState, SyncStateDecodeError> {
+        use SyncStateDecodeError::{InvalidBody, InvalidState};
+
+        let exchange = self
+            .exchange
+            .map(|wire| -> Result<ExchangeIntent, SyncStateDecodeError> {
+                Ok(ExchangeIntent::new(
+                    ExchangeScheme::from_wire_name(&wire.scheme).ok_or(InvalidBody)?,
+                    decode_anchor(&wire.target_anchor).ok_or(InvalidBody)?,
+                    decode_anchor(&wire.directory_anchor).ok_or(InvalidBody)?,
+                ))
+            })
+            .transpose()?;
+
+        let retained = self
+            .retained_previous
+            .into_iter()
+            .map(|wire| {
+                RetainedPrevious::new(
+                    parse_canonical_uuid(&wire.exchange_id).ok_or(InvalidBody)?,
+                    EnvelopeFingerprint::from_hex(&wire.fingerprint).map_err(|_| InvalidBody)?,
+                    wire.revision,
+                    decode_anchor(&wire.object_anchor).ok_or(InvalidBody)?,
+                    decode_anchor(&wire.directory_anchor).ok_or(InvalidBody)?,
+                )
+                .map_err(InvalidState)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        BodyWire {
+            binding_id: self.binding_id,
+            vault_tag: self.vault_tag,
+            local_locator: self.local_locator,
+            target_locator: self.target_locator,
+            base: self.base,
+            pending_push: self.pending_push,
+        }
+        .into_state_with(exchange, retained)
+    }
+}
+
 impl BodyWire {
     fn into_state(self) -> Result<SyncState, SyncStateDecodeError> {
+        self.into_state_with(None, Vec::new())
+    }
+
+    fn into_state_with(
+        self,
+        exchange: Option<ExchangeIntent>,
+        retained: Vec<RetainedPrevious>,
+    ) -> Result<SyncState, SyncStateDecodeError> {
         use SyncStateDecodeError::{InvalidBody, InvalidState};
 
         let binding_id = BindingId::new(parse_canonical_uuid(&self.binding_id).ok_or(InvalidBody)?)
@@ -1402,16 +1915,29 @@ impl BodyWire {
             })
             .transpose()?;
 
-        SyncState::new(
+        SyncState::new_with_exchange_records(
             binding_id,
             vault_tag,
             local_locator,
             target_locator,
             base,
             pending_push,
+            exchange,
+            retained,
         )
         .map_err(InvalidState)
     }
+}
+
+/// An anchor as lowercase hexadecimal: even length, 2 to
+/// `2 * MAX_OBJECT_ANCHOR_BYTES` characters. Uppercase, odd lengths and any
+/// non-hex character are refused.
+fn decode_anchor(text: &str) -> Option<ObjectAnchor> {
+    if text.len() < 2 || text.len() > 2 * MAX_OBJECT_ANCHOR_BYTES {
+        return None;
+    }
+    let bytes = HEXLOWER.decode(text.as_bytes()).ok()?;
+    ObjectAnchor::new(&bytes).ok()
 }
 
 /// Exactly 64 lowercase hexadecimal characters.
@@ -1515,6 +2041,8 @@ mod tests {
             target_locator: Locator(TARGET.to_owned()),
             base,
             pending_push,
+            exchange: None,
+            retained: Vec::new(),
         }
     }
 
@@ -3085,6 +3613,1288 @@ mod tests {
             for (j, right) in outcomes.iter().enumerate() {
                 assert_eq!(left == right, i == j, "{} vs {}", label(left), label(right));
             }
+        }
+    }
+
+    // ---- B3c-1: dormant exchange records ---------------------------------------
+    //
+    // Everything below is synthetic. The anchors are arbitrary byte patterns, not
+    // identities of any real file or directory.
+
+    const RETAINED_A: Uuid = Uuid::from_u128(0xbbbb_bbbb_cccc_4ddd_8eee_ffff_ffff_ffff);
+    const RETAINED_A_TEXT: &str = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+
+    // Assembled by hand (Python `hashlib`/`json`) from the v1 golden body plus the
+    // two new keys; not taken from this module's encoder.
+    const GOLDEN_EXCHANGE: &str = r#"{"format":"localvault-sync-state","version":2,"body_sha256":"1101fdda533dfdfeeeda8a019186f050762dce64c199a6d45e9b06d4d8931777","body":"{\"binding_id\":\"11111111-2222-3333-4444-555555555555\",\"vault_tag\":{\"salt\":\"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\",\"digest\":\"533cfabc5ff2073b76dab8c6cb60289e44d95f9dbb67cdbdac12bdcf94025aa8\"},\"local_locator\":\"synthetic/local/LOCAL-MARKER.lvault\",\"target_locator\":\"synthetic/remote/TARGET-MARKER.lvault\",\"base\":{\"kind\":\"based\",\"synced\":\"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a\",\"synced_revision\":7,\"high_water\":9},\"pending_push\":{\"intent_id\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\",\"baseline\":{\"kind\":\"present\",\"fingerprint\":\"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a\"},\"intended\":\"dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986\",\"intended_revision\":10},\"exchange\":{\"scheme\":\"retain_and_publish_v1\",\"target_anchor\":\"1011121314151617\",\"directory_anchor\":\"a0a1a2a3\"},\"retained_previous\":[{\"exchange_id\":\"bbbbbbbb-cccc-4ddd-8eee-ffffffffffff\",\"fingerprint\":\"084fed08b978af4d7d196a7446a86b58009e636b611db16211b65a9aadff29c5\",\"revision\":5,\"object_anchor\":\"202122232425262728292a2b2c2d2e2f\",\"directory_anchor\":\"b0b1b2b3\"}]}"}"#;
+
+    fn anchor_of(bytes: &[u8]) -> ObjectAnchor {
+        ObjectAnchor::new(bytes).unwrap()
+    }
+
+    /// `len` bytes counting up from `start`.
+    fn anchor_run(start: u8, len: usize) -> ObjectAnchor {
+        let bytes: Vec<u8> = (0..len).map(|i| start.wrapping_add(i as u8)).collect();
+        anchor_of(&bytes)
+    }
+
+    fn exchange_intent() -> ExchangeIntent {
+        ExchangeIntent::new(
+            ExchangeScheme::RetainAndPublishV1,
+            anchor_run(0x10, 8),
+            anchor_of(&[0xa0, 0xa1, 0xa2, 0xa3]),
+        )
+    }
+
+    fn retained_a() -> RetainedPrevious {
+        RetainedPrevious::new(
+            RETAINED_A,
+            fp(3),
+            5,
+            anchor_run(0x20, 16),
+            anchor_of(&[0xb0, 0xb1, 0xb2, 0xb3]),
+        )
+        .unwrap()
+    }
+
+    /// Distinct, valid entries for the checkpoint of [`checkpoint`] (synced
+    /// revision 7): revisions stay below it.
+    fn retained_n(index: u8) -> RetainedPrevious {
+        RetainedPrevious::new(
+            Uuid::from_u128(0x7000_0000_0000_4000_8000_0000_0000_0000 + u128::from(index)),
+            fp(100 + index),
+            u64::from(index % 7),
+            anchor_run(index, MAX_OBJECT_ANCHOR_BYTES),
+            anchor_run(index.wrapping_add(0x80), MAX_OBJECT_ANCHOR_BYTES),
+        )
+        .unwrap()
+    }
+
+    fn with_records(
+        base: SyncBase,
+        pending_push: Option<PendingPush>,
+        exchange: Option<ExchangeIntent>,
+        retained: Vec<RetainedPrevious>,
+    ) -> Result<SyncState, SyncStateError> {
+        SyncState::new_with_exchange_records(
+            BindingId::new(BINDING).unwrap(),
+            tag(),
+            loc(LOCAL),
+            loc(TARGET),
+            base,
+            pending_push,
+            exchange,
+            retained,
+        )
+    }
+
+    fn based_base() -> SyncBase {
+        SyncBase::Based(checkpoint())
+    }
+
+    fn based_pending_push() -> Option<PendingPush> {
+        Some(pending(PushBaseline::Present(fp(1)), 2, 10))
+    }
+
+    fn unbased_pending_push() -> Option<PendingPush> {
+        Some(pending(PushBaseline::Absent, 2, 1))
+    }
+
+    /// [`pending_state`] plus an exchange intent and one retained entry.
+    fn exchange_state() -> SyncState {
+        with_records(
+            based_base(),
+            based_pending_push(),
+            Some(exchange_intent()),
+            vec![retained_a()],
+        )
+        .unwrap()
+    }
+
+    fn exchange_only_state() -> SyncState {
+        with_records(
+            based_base(),
+            based_pending_push(),
+            Some(exchange_intent()),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn retained_only_state() -> SyncState {
+        with_records(based_base(), None, None, vec![retained_a()]).unwrap()
+    }
+
+    fn forge_v2(body: &str) -> Vec<u8> {
+        serde_json::to_vec(&OuterWire {
+            format: SYNC_STATE_FORMAT.to_owned(),
+            version: SYNC_STATE_EXCHANGE_VERSION,
+            body_sha256: checksum_hex(body),
+            body: body.to_owned(),
+        })
+        .unwrap()
+    }
+
+    fn exchange_body_of(state: &SyncState) -> String {
+        outer_of(&state.encode_exchange_record().unwrap()).body
+    }
+
+    fn retained_wire(entry: &RetainedPrevious) -> RetainedWire {
+        RetainedWire {
+            exchange_id: entry.exchange_id.hyphenated().to_string(),
+            fingerprint: entry.fingerprint.to_hex(),
+            revision: entry.revision,
+            object_anchor: HEXLOWER.encode(&entry.object_anchor.0),
+            directory_anchor: HEXLOWER.encode(&entry.directory_anchor.0),
+        }
+    }
+
+    fn forge_exchange_with(mutate: impl FnOnce(&mut ExchangeBodyWire)) -> Vec<u8> {
+        let mut wire = ExchangeBodyWire::from(&exchange_state());
+        mutate(&mut wire);
+        forge_v2(&serde_json::to_string(&wire).unwrap())
+    }
+
+    fn decode_exchange_with(
+        mutate: impl FnOnce(&mut ExchangeBodyWire),
+    ) -> Result<SyncState, SyncStateDecodeError> {
+        SyncState::decode_exchange_record(&forge_exchange_with(mutate))
+    }
+
+    fn assert_exchange_round_trips(state: &SyncState) {
+        let bytes = state.encode_exchange_record().unwrap();
+        let decoded = SyncState::decode_exchange_record(&bytes).unwrap();
+
+        assert_eq!(&decoded, state);
+        assert_eq!(decoded.encode_exchange_record().unwrap(), bytes);
+    }
+
+    type ExchangeMutation = fn(&mut ExchangeBodyWire);
+    type ExchangeInvariantCase = (&'static str, ExchangeMutation, SyncStateError);
+
+    // ---- a. the v1 format is untouched ---------------------------------------------
+
+    #[test]
+    fn version_one_bytes_are_identical_with_the_new_fields_empty() {
+        assert_eq!(SYNC_STATE_VERSION, 1);
+        assert_eq!(SYNC_STATE_EXCHANGE_VERSION, 2);
+
+        for state in [based_state(), unbased_state(), pending_state()] {
+            let same =
+                with_records(*state.base(), state.pending_push().copied(), None, vec![]).unwrap();
+
+            assert_eq!(same, state);
+            assert!(!same.has_exchange_records());
+            assert!(same.exchange_intent().is_none());
+            assert!(same.retained_previous().is_empty());
+            assert_eq!(same.encode().unwrap(), state.encode().unwrap());
+        }
+
+        // The pinned v1 literals are still produced, byte for byte, through the
+        // new constructor.
+        let through_new = with_records(based_base(), based_pending_push(), None, vec![]).unwrap();
+        assert_eq!(
+            String::from_utf8(through_new.encode().unwrap()).unwrap(),
+            GOLDEN_PENDING
+        );
+        let through_new =
+            with_records(SyncBase::Unbased, unbased_pending_push(), None, vec![]).unwrap();
+        assert_eq!(
+            String::from_utf8(through_new.encode().unwrap()).unwrap(),
+            GOLDEN_UNBASED
+        );
+    }
+
+    #[test]
+    fn the_ordinary_constructor_never_produces_exchange_records() {
+        for state in [based_state(), unbased_state(), pending_state()] {
+            assert!(!state.has_exchange_records());
+            assert!(state.exchange_intent().is_none());
+            assert!(state.retained_previous().is_empty());
+        }
+
+        // Neither does decoding a version-1 record.
+        let decoded = SyncState::decode(GOLDEN_PENDING.as_bytes()).unwrap();
+        assert!(!decoded.has_exchange_records());
+    }
+
+    // ---- b. version 2 round trips ----------------------------------------------------
+
+    #[test]
+    fn exchange_records_round_trip() {
+        let exchange_only = exchange_only_state();
+        let decoded =
+            SyncState::decode_exchange_record(&exchange_only.encode_exchange_record().unwrap())
+                .unwrap();
+        assert_eq!(decoded, exchange_only);
+        assert_eq!(decoded.exchange_intent(), Some(&exchange_intent()));
+        assert!(decoded.retained_previous().is_empty());
+        assert!(decoded.has_exchange_records());
+
+        let one = retained_only_state();
+        let decoded =
+            SyncState::decode_exchange_record(&one.encode_exchange_record().unwrap()).unwrap();
+        assert_eq!(decoded, one);
+        assert_eq!(decoded.retained_previous(), &[retained_a()]);
+        assert!(decoded.exchange_intent().is_none());
+        assert!(decoded.has_exchange_records());
+
+        let both = exchange_state();
+        let decoded =
+            SyncState::decode_exchange_record(&both.encode_exchange_record().unwrap()).unwrap();
+        assert_eq!(decoded, both);
+        assert_eq!(decoded.exchange_intent(), Some(&exchange_intent()));
+        assert_eq!(decoded.retained_previous(), &[retained_a()]);
+
+        for state in [exchange_only, one, both] {
+            assert_exchange_round_trips(&state);
+        }
+    }
+
+    #[test]
+    fn eight_retained_entries_round_trip_in_the_given_order() {
+        assert_eq!(MAX_RETAINED_PREVIOUS, 8);
+
+        // Deliberately not sorted: the order is preserved exactly.
+        let entries: Vec<RetainedPrevious> = (0..8).rev().map(retained_n).collect();
+        let ids: Vec<Uuid> = entries.iter().map(RetainedPrevious::exchange_id).collect();
+
+        let state = with_records(based_base(), None, None, entries).unwrap();
+        let decoded =
+            SyncState::decode_exchange_record(&state.encode_exchange_record().unwrap()).unwrap();
+
+        assert_eq!(decoded, state);
+        assert_eq!(decoded.retained_previous().len(), 8);
+        assert_eq!(
+            decoded
+                .retained_previous()
+                .iter()
+                .map(RetainedPrevious::exchange_id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    #[test]
+    fn a_state_without_exchange_records_also_round_trips_through_the_exchange_codec() {
+        for state in [based_state(), unbased_state(), pending_state()] {
+            assert_exchange_round_trips(&state);
+
+            let bytes = state.encode_exchange_record().unwrap();
+            let outer = outer_of(&bytes);
+            assert_eq!(outer.version, SYNC_STATE_EXCHANGE_VERSION);
+            assert!(outer.body.contains("\"exchange\":null"));
+            assert!(outer.body.contains("\"retained_previous\":[]"));
+        }
+    }
+
+    #[test]
+    fn the_exchange_record_golden_is_pinned() {
+        let bytes = exchange_state().encode_exchange_record().unwrap();
+
+        assert_eq!(String::from_utf8(bytes).unwrap(), GOLDEN_EXCHANGE);
+        assert_eq!(
+            SyncState::decode_exchange_record(GOLDEN_EXCHANGE.as_bytes()).unwrap(),
+            exchange_state()
+        );
+
+        // Version 2 extends the version-1 body; the existing fields keep their
+        // exact bytes and order.
+        let v1_body = outer_of(GOLDEN_PENDING.as_bytes()).body;
+        let v2_body = outer_of(GOLDEN_EXCHANGE.as_bytes()).body;
+        assert!(v2_body.starts_with(&v1_body[..v1_body.len() - 1]));
+        assert!(v2_body.ends_with("}]}"));
+    }
+
+    // ---- i. determinism --------------------------------------------------------------
+
+    #[test]
+    fn exchange_encoding_is_deterministic() {
+        for state in [
+            exchange_state(),
+            exchange_only_state(),
+            retained_only_state(),
+        ] {
+            let first = state.encode_exchange_record().unwrap();
+            assert_eq!(state.encode_exchange_record().unwrap(), first);
+            assert_eq!(state.clone().encode_exchange_record().unwrap(), first);
+        }
+
+        // An independently built, equal state encodes identically.
+        assert_eq!(
+            exchange_state().encode_exchange_record().unwrap(),
+            exchange_state().encode_exchange_record().unwrap()
+        );
+    }
+
+    // ---- value types -----------------------------------------------------------------
+
+    #[test]
+    fn object_anchors_are_one_to_sixty_four_bytes() {
+        assert_eq!(MAX_OBJECT_ANCHOR_BYTES, 64);
+        assert_eq!(
+            ObjectAnchor::new(&[]),
+            Err(SyncStateError::InvalidObjectAnchor)
+        );
+        assert_eq!(
+            ObjectAnchor::new(&[0u8; MAX_OBJECT_ANCHOR_BYTES + 1]),
+            Err(SyncStateError::InvalidObjectAnchor)
+        );
+        assert_eq!(ObjectAnchor::new(&[0]).unwrap().as_bytes(), &[0]);
+        assert_eq!(
+            ObjectAnchor::new(&[7u8; MAX_OBJECT_ANCHOR_BYTES])
+                .unwrap()
+                .as_bytes(),
+            &[7u8; MAX_OBJECT_ANCHOR_BYTES]
+        );
+    }
+
+    #[test]
+    fn exchange_value_types_expose_what_they_were_built_from() {
+        let intent = exchange_intent();
+        assert_eq!(intent.scheme(), ExchangeScheme::RetainAndPublishV1);
+        assert_eq!(intent.target_anchor(), &anchor_run(0x10, 8));
+        assert_eq!(
+            intent.directory_anchor().as_bytes(),
+            &[0xa0, 0xa1, 0xa2, 0xa3]
+        );
+
+        let entry = retained_a();
+        assert_eq!(entry.exchange_id(), RETAINED_A);
+        assert_eq!(entry.fingerprint(), &fp(3));
+        assert_eq!(entry.revision(), 5);
+        assert_eq!(entry.object_anchor(), &anchor_run(0x20, 16));
+        assert_eq!(
+            entry.directory_anchor().as_bytes(),
+            &[0xb0, 0xb1, 0xb2, 0xb3]
+        );
+
+        assert_eq!(
+            RetainedPrevious::new(Uuid::nil(), fp(3), 5, anchor_run(0, 4), anchor_run(1, 4)),
+            Err(SyncStateError::NilExchangeId)
+        );
+    }
+
+    // ---- c. every new invariant, through the constructor ------------------------------
+
+    #[test]
+    fn constructors_reject_every_exchange_record_violation() {
+        let nine: Vec<_> = (0..9).map(retained_n).collect();
+        let entry = |id: Uuid, fingerprint: EnvelopeFingerprint, revision: u64| {
+            RetainedPrevious::new(
+                id,
+                fingerprint,
+                revision,
+                anchor_run(1, 4),
+                anchor_run(2, 4),
+            )
+            .unwrap()
+        };
+
+        let cases = [
+            (
+                "exchange without a pending push",
+                with_records(based_base(), None, Some(exchange_intent()), vec![]),
+                SyncStateError::ExchangeWithoutPendingPush,
+            ),
+            (
+                "exchange on an unbased state",
+                with_records(
+                    SyncBase::Unbased,
+                    unbased_pending_push(),
+                    Some(exchange_intent()),
+                    vec![],
+                ),
+                SyncStateError::ExchangeOnUnbasedState,
+            ),
+            (
+                "retained on an unbased state",
+                with_records(
+                    SyncBase::Unbased,
+                    unbased_pending_push(),
+                    None,
+                    vec![retained_a()],
+                ),
+                SyncStateError::RetainedOnUnbasedState,
+            ),
+            (
+                "nine retained entries",
+                with_records(based_base(), None, None, nine),
+                SyncStateError::RetainedLimitExceeded,
+            ),
+            (
+                "duplicate retained ids",
+                with_records(based_base(), None, None, vec![retained_a(), retained_a()]),
+                SyncStateError::DuplicateRetainedId,
+            ),
+            (
+                "retained id equals the pending intent id",
+                with_records(
+                    based_base(),
+                    based_pending_push(),
+                    None,
+                    vec![entry(INTENT, fp(3), 5)],
+                ),
+                SyncStateError::RetainedIdIsPendingIntent,
+            ),
+            (
+                "retained fingerprint equals the synced one",
+                with_records(based_base(), None, None, vec![entry(RETAINED_A, fp(1), 5)]),
+                SyncStateError::RetainedIsSyncedVersion,
+            ),
+            (
+                "retained revision equals the synced revision",
+                with_records(based_base(), None, None, vec![entry(RETAINED_A, fp(3), 7)]),
+                SyncStateError::RetainedRevisionNotBelowSynced,
+            ),
+            (
+                "retained revision above the synced revision",
+                with_records(
+                    based_base(),
+                    None,
+                    None,
+                    vec![entry(RETAINED_A, fp(3), u64::MAX)],
+                ),
+                SyncStateError::RetainedRevisionNotBelowSynced,
+            ),
+        ];
+
+        for (name, result, expected) in cases {
+            assert_eq!(result.unwrap_err(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_exchange_record_rules_add_no_other_restriction() {
+        // Exchange and retained entries may coexist, and neither is required.
+        assert!(with_records(based_base(), None, None, vec![]).is_ok());
+        assert!(with_records(
+            based_base(),
+            based_pending_push(),
+            Some(exchange_intent()),
+            vec![]
+        )
+        .is_ok());
+        // A pending push without an exchange intent, with retained entries.
+        assert!(with_records(based_base(), based_pending_push(), None, vec![retained_a()]).is_ok());
+        // Exactly the limit, and a retained revision one below the synced one.
+        let eight: Vec<_> = (0..8).map(retained_n).collect();
+        assert!(with_records(based_base(), None, None, eight).is_ok());
+        let boundary =
+            RetainedPrevious::new(RETAINED_A, fp(3), 6, anchor_run(1, 4), anchor_run(2, 4))
+                .unwrap();
+        assert!(with_records(based_base(), None, None, vec![boundary]).is_ok());
+        // The base-state rules still come first.
+        assert_eq!(
+            with_records(SyncBase::Unbased, None, None, vec![]).unwrap_err(),
+            SyncStateError::UnbasedRequiresInitialPublication
+        );
+    }
+
+    #[test]
+    fn encoding_revalidates_exchange_records() {
+        let mut no_pending = based_state();
+        no_pending.exchange = Some(exchange_intent());
+
+        let mut too_many = based_state();
+        too_many.retained = (0..9).map(retained_n).collect();
+
+        let mut duplicated = based_state();
+        duplicated.retained = vec![retained_a(), retained_a()];
+
+        for (name, state, expected) in [
+            (
+                "exchange without a pending push",
+                no_pending,
+                SyncStateError::ExchangeWithoutPendingPush,
+            ),
+            (
+                "nine retained entries",
+                too_many,
+                SyncStateError::RetainedLimitExceeded,
+            ),
+            (
+                "duplicate retained ids",
+                duplicated,
+                SyncStateError::DuplicateRetainedId,
+            ),
+        ] {
+            assert_eq!(
+                state.encode_exchange_record().unwrap_err(),
+                SyncStateEncodeError::InvalidState(expected),
+                "{name}"
+            );
+            // Invalid states stay invalid for the ordinary encoder as well.
+            assert_eq!(
+                state.encode().unwrap_err(),
+                SyncStateEncodeError::InvalidState(expected),
+                "{name}"
+            );
+        }
+    }
+
+    // ---- c. every new invariant, through the decoder ----------------------------------
+
+    #[test]
+    fn the_decoder_enforces_every_exchange_record_invariant() {
+        let cases: [ExchangeInvariantCase; 10] = [
+            (
+                "exchange without a pending push",
+                |w| w.pending_push = None,
+                SyncStateError::ExchangeWithoutPendingPush,
+            ),
+            (
+                "exchange on an unbased state",
+                |w| {
+                    w.base = BaseWire::Unbased {};
+                    w.pending_push.as_mut().unwrap().baseline = BaselineWire::Absent {};
+                },
+                SyncStateError::ExchangeOnUnbasedState,
+            ),
+            (
+                "retained on an unbased state",
+                |w| {
+                    w.base = BaseWire::Unbased {};
+                    w.pending_push.as_mut().unwrap().baseline = BaselineWire::Absent {};
+                    w.exchange = None;
+                },
+                SyncStateError::RetainedOnUnbasedState,
+            ),
+            (
+                "nine retained entries",
+                |w| w.retained_previous = (0..9).map(|i| retained_wire(&retained_n(i))).collect(),
+                SyncStateError::RetainedLimitExceeded,
+            ),
+            (
+                "duplicate retained ids",
+                |w| w.retained_previous.push(retained_wire(&retained_a())),
+                SyncStateError::DuplicateRetainedId,
+            ),
+            (
+                "retained id equals the pending intent id",
+                |w| w.retained_previous[0].exchange_id = INTENT_TEXT.to_owned(),
+                SyncStateError::RetainedIdIsPendingIntent,
+            ),
+            (
+                "retained fingerprint equals the synced one",
+                |w| w.retained_previous[0].fingerprint = fp(1).to_hex(),
+                SyncStateError::RetainedIsSyncedVersion,
+            ),
+            (
+                "retained revision equals the synced revision",
+                |w| w.retained_previous[0].revision = 7,
+                SyncStateError::RetainedRevisionNotBelowSynced,
+            ),
+            (
+                "retained revision above the synced revision",
+                |w| w.retained_previous[0].revision = u64::MAX,
+                SyncStateError::RetainedRevisionNotBelowSynced,
+            ),
+            (
+                "nil retained id",
+                |w| w.retained_previous[0].exchange_id = Uuid::nil().hyphenated().to_string(),
+                SyncStateError::NilExchangeId,
+            ),
+        ];
+
+        for (name, mutate, expected) in cases {
+            assert_eq!(
+                decode_exchange_with(mutate).unwrap_err(),
+                SyncStateDecodeError::InvalidState(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_existing_state_invariants_still_apply_to_exchange_records() {
+        let cases: [ExchangeInvariantCase; 3] = [
+            (
+                "pending baseline mismatch",
+                |w| {
+                    w.pending_push.as_mut().unwrap().baseline = BaselineWire::Present {
+                        fingerprint: fp(9).to_hex(),
+                    }
+                },
+                SyncStateError::PendingBaselineMismatch,
+            ),
+            (
+                "identical locators",
+                |w| w.target_locator = w.local_locator.clone(),
+                SyncStateError::IdenticalLocators,
+            ),
+            (
+                "nil binding id",
+                |w| w.binding_id = Uuid::nil().hyphenated().to_string(),
+                SyncStateError::NilBindingId,
+            ),
+        ];
+
+        for (name, mutate, expected) in cases {
+            assert_eq!(
+                decode_exchange_with(mutate).unwrap_err(),
+                SyncStateDecodeError::InvalidState(expected),
+                "{name}"
+            );
+        }
+    }
+
+    // ---- d. strictness ------------------------------------------------------------------
+
+    #[test]
+    fn every_missing_exchange_body_field_is_rejected_by_the_parser_itself() {
+        let body = exchange_body_of(&exchange_state());
+
+        let paths: &[(&str, &str)] = &[
+            ("", "exchange"),
+            ("", "retained_previous"),
+            ("/exchange", "scheme"),
+            ("/exchange", "target_anchor"),
+            ("/exchange", "directory_anchor"),
+            ("/retained_previous/0", "exchange_id"),
+            ("/retained_previous/0", "fingerprint"),
+            ("/retained_previous/0", "revision"),
+            ("/retained_previous/0", "object_anchor"),
+            ("/retained_previous/0", "directory_anchor"),
+        ];
+
+        for (parent, key) in paths {
+            let damaged = remove_at(&body, parent, key);
+
+            assert!(
+                serde_json::from_str::<ExchangeBodyWire>(&damaged).is_err(),
+                "parser accepted a body without {parent}/{key}"
+            );
+            assert_eq!(
+                SyncState::decode_exchange_record(&forge_v2(&damaged)).unwrap_err(),
+                SyncStateDecodeError::InvalidBody,
+                "{parent}/{key}"
+            );
+        }
+
+        // A version-1 body is not a version-2 body: the new keys are required.
+        assert_eq!(
+            SyncState::decode_exchange_record(&forge_v2(&body_of(&pending_state()))).unwrap_err(),
+            SyncStateDecodeError::InvalidBody
+        );
+    }
+
+    #[test]
+    fn unknown_exchange_body_fields_are_rejected_at_every_level() {
+        let body = exchange_body_of(&exchange_state());
+
+        let cases = [
+            ("{", "{\"extra\":1,"),
+            ("\"scheme\"", "\"extra\":1,\"scheme\""),
+            ("\"exchange_id\"", "\"extra\":1,\"exchange_id\""),
+            (
+                "\"directory_anchor\":\"b0b1b2b3\"",
+                "\"directory_anchor\":\"b0b1b2b3\",\"extra\":1",
+            ),
+        ];
+
+        for (from, to) in cases {
+            let widened = body.replacen(from, to, 1);
+            assert_ne!(widened, body, "{from}");
+
+            assert!(
+                serde_json::from_str::<ExchangeBodyWire>(&widened).is_err(),
+                "parser accepted an unknown field near {from}"
+            );
+            assert_eq!(
+                SyncState::decode_exchange_record(&forge_v2(&widened)).unwrap_err(),
+                SyncStateDecodeError::InvalidBody
+            );
+        }
+    }
+
+    #[test]
+    fn a_version_two_body_is_not_accepted_inside_a_version_one_wrapper() {
+        // The ordinary decoder keeps its deny_unknown_fields behavior.
+        assert_eq!(
+            SyncState::decode(&forge(&exchange_body_of(&exchange_state()))).unwrap_err(),
+            SyncStateDecodeError::InvalidBody
+        );
+        assert_eq!(
+            SyncState::decode(&forge(&exchange_body_of(&pending_state()))).unwrap_err(),
+            SyncStateDecodeError::InvalidBody
+        );
+    }
+
+    #[test]
+    fn an_unknown_exchange_scheme_is_rejected() {
+        let body = exchange_body_of(&exchange_state());
+
+        for scheme in [
+            "retain_and_publish_v2",
+            "RETAIN_AND_PUBLISH_V1",
+            "retain_and_publish_v1 ",
+            "",
+            "replace",
+        ] {
+            let damaged = replace_once(&body, "retain_and_publish_v1", scheme);
+
+            assert_eq!(
+                SyncState::decode_exchange_record(&forge_v2(&damaged)).unwrap_err(),
+                SyncStateDecodeError::InvalidBody,
+                "{scheme:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anchors_must_be_canonical_lowercase_hex_of_one_to_sixty_four_bytes() {
+        let too_long = "ab".repeat(MAX_OBJECT_ANCHOR_BYTES + 1);
+        assert_eq!(too_long.len(), 130);
+
+        let bad_values = [
+            String::new(),
+            "a".to_owned(),
+            "A0".to_owned(),
+            "aB".to_owned(),
+            "abc".to_owned(),
+            "zz".to_owned(),
+            "g0".to_owned(),
+            " a0".to_owned(),
+            "a0 ".to_owned(),
+            "0xa0".to_owned(),
+            "a0a0\n".to_owned(),
+            "é0".to_owned(),
+            too_long,
+        ];
+
+        for bad in &bad_values {
+            for name in [
+                "exchange target",
+                "exchange directory",
+                "retained object",
+                "retained directory",
+            ] {
+                let bytes = forge_exchange_with(|w| match name {
+                    "exchange target" => w.exchange.as_mut().unwrap().target_anchor = bad.clone(),
+                    "exchange directory" => {
+                        w.exchange.as_mut().unwrap().directory_anchor = bad.clone()
+                    }
+                    "retained object" => w.retained_previous[0].object_anchor = bad.clone(),
+                    _ => w.retained_previous[0].directory_anchor = bad.clone(),
+                });
+
+                assert_eq!(
+                    SyncState::decode_exchange_record(&bytes).unwrap_err(),
+                    SyncStateDecodeError::InvalidBody,
+                    "{name}: {bad:?}"
+                );
+            }
+        }
+
+        // The boundaries themselves are fine: 1 byte and 64 bytes.
+        for good in ["00".to_owned(), "ab".repeat(MAX_OBJECT_ANCHOR_BYTES)] {
+            let decoded = decode_exchange_with(|w| {
+                w.exchange.as_mut().unwrap().target_anchor = good.clone();
+                w.retained_previous[0].object_anchor = good.clone();
+            })
+            .unwrap();
+
+            assert_eq!(
+                HEXLOWER.encode(
+                    decoded
+                        .exchange_intent()
+                        .unwrap()
+                        .target_anchor()
+                        .as_bytes()
+                ),
+                good
+            );
+        }
+    }
+
+    #[test]
+    fn exchange_ids_must_be_canonical_lowercase_hyphenated_uuids() {
+        assert_ne!(RETAINED_A_TEXT.to_uppercase(), RETAINED_A_TEXT);
+
+        let variants = [
+            RETAINED_A_TEXT.to_uppercase(),
+            RETAINED_A_TEXT.replace('-', ""),
+            format!("{{{RETAINED_A_TEXT}}}"),
+            format!("urn:uuid:{RETAINED_A_TEXT}"),
+            format!(" {RETAINED_A_TEXT}"),
+            format!("{RETAINED_A_TEXT} "),
+            RETAINED_A_TEXT[..35].to_owned(),
+            "not-a-uuid".to_owned(),
+            String::new(),
+        ];
+
+        for variant in variants {
+            assert_eq!(
+                decode_exchange_with(|w| w.retained_previous[0].exchange_id = variant.clone())
+                    .unwrap_err(),
+                SyncStateDecodeError::InvalidBody,
+                "{variant:?}"
+            );
+        }
+
+        // The nil id is canonical text, so it reaches the model and is refused
+        // there (asserted with the other invariants as well).
+        assert_eq!(
+            decode_exchange_with(|w| {
+                w.retained_previous[0].exchange_id = Uuid::nil().hyphenated().to_string()
+            })
+            .unwrap_err(),
+            SyncStateDecodeError::InvalidState(SyncStateError::NilExchangeId)
+        );
+    }
+
+    #[test]
+    fn retained_fingerprints_and_revisions_follow_the_existing_rules() {
+        let good = fp(3).to_hex();
+
+        for bad in [
+            good.to_uppercase(),
+            good[..63].to_owned(),
+            format!("{good}0"),
+            format!("0x{}", &good[2..]),
+            format!("{}g", &good[..63]),
+            String::new(),
+        ] {
+            assert_eq!(
+                decode_exchange_with(|w| w.retained_previous[0].fingerprint = bad.clone())
+                    .unwrap_err(),
+                SyncStateDecodeError::InvalidBody,
+                "{bad:?}"
+            );
+        }
+
+        let body = exchange_body_of(&exchange_state());
+        for bad in [
+            "-1",
+            "1.5",
+            "5.0",
+            "\"5\"",
+            "null",
+            "05",
+            "18446744073709551616",
+        ] {
+            let damaged = replace_once(&body, "\"revision\":5", &format!("\"revision\":{bad}"));
+
+            assert_eq!(
+                SyncState::decode_exchange_record(&forge_v2(&damaged)).unwrap_err(),
+                SyncStateDecodeError::InvalidBody,
+                "revision {bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_canonical_exchange_body_is_rejected_even_with_a_valid_checksum() {
+        let body = exchange_body_of(&exchange_state());
+
+        let reordered =
+            serde_json::to_string(&serde_json::from_str::<serde_json::Value>(&body).unwrap())
+                .unwrap();
+        let pretty = serde_json::to_string_pretty(
+            &serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(reordered, body);
+
+        // `retained_previous` before `exchange`: same content, different order.
+        let swapped = {
+            let exchange_start = body.find(",\"exchange\":").unwrap();
+            let retained_start = body.find(",\"retained_previous\":").unwrap();
+            let exchange_part = &body[exchange_start..retained_start];
+            let retained_part = &body[retained_start..body.len() - 1];
+            format!(
+                "{}{}{}}}",
+                &body[..exchange_start],
+                retained_part,
+                exchange_part
+            )
+        };
+        assert_ne!(swapped, body);
+
+        for non_canonical in [
+            reordered,
+            pretty,
+            swapped,
+            format!(" {body}"),
+            format!("{body}\n"),
+        ] {
+            assert_eq!(
+                SyncState::decode_exchange_record(&forge_v2(&non_canonical)).unwrap_err(),
+                SyncStateDecodeError::InvalidBody
+            );
+        }
+    }
+
+    #[test]
+    fn flipping_any_protected_exchange_body_byte_is_a_checksum_mismatch() {
+        let bytes = exchange_state().encode_exchange_record().unwrap();
+        let outer = outer_of(&bytes);
+        assert!(outer.body.is_ascii());
+
+        for index in 0..outer.body.len() {
+            let mut corrupted = outer.body.clone().into_bytes();
+            corrupted[index] ^= 0x01;
+
+            let tampered = serde_json::to_vec(&OuterWire {
+                format: outer.format.clone(),
+                version: outer.version,
+                body_sha256: outer.body_sha256.clone(),
+                body: String::from_utf8(corrupted).unwrap(),
+            })
+            .unwrap();
+
+            assert_eq!(
+                SyncState::decode_exchange_record(&tampered).unwrap_err(),
+                SyncStateDecodeError::ChecksumMismatch,
+                "flip at body byte {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn exchange_wrapper_damage_is_classified_like_the_ordinary_one() {
+        let bytes = exchange_state().encode_exchange_record().unwrap();
+        let original = outer_of(&bytes).body_sha256;
+
+        let mut digits = original.clone().into_bytes();
+        digits[0] = if digits[0] == b'0' { b'1' } else { b'0' };
+        let changed = String::from_utf8(digits).unwrap();
+        assert_eq!(
+            SyncState::decode_exchange_record(
+                &with_outer(&bytes, |o| o.body_sha256 = changed.clone())
+            )
+            .unwrap_err(),
+            SyncStateDecodeError::ChecksumMismatch
+        );
+
+        for bad in [String::new(), original.to_uppercase(), "g".repeat(64)] {
+            assert_eq!(
+                SyncState::decode_exchange_record(
+                    &with_outer(&bytes, |o| o.body_sha256 = bad.clone())
+                )
+                .unwrap_err(),
+                SyncStateDecodeError::Malformed
+            );
+        }
+
+        let mut extra = json(&bytes);
+        extra["extra"] = serde_json::json!(1);
+        assert_eq!(
+            SyncState::decode_exchange_record(&serde_json::to_vec(&extra).unwrap()).unwrap_err(),
+            SyncStateDecodeError::Malformed
+        );
+
+        for length in 0..bytes.len() {
+            assert!(
+                SyncState::decode_exchange_record(&bytes[..length]).is_err(),
+                "a {length}-byte prefix was accepted"
+            );
+        }
+
+        assert_eq!(
+            SyncState::decode_exchange_record(&vec![b' '; MAX_SYNC_STATE_BYTES + 1]).unwrap_err(),
+            SyncStateDecodeError::TooLarge
+        );
+        assert_eq!(
+            SyncState::decode_exchange_record(&vec![b' '; MAX_SYNC_STATE_BYTES]).unwrap_err(),
+            SyncStateDecodeError::Malformed
+        );
+    }
+
+    // ---- e. version routing --------------------------------------------------------------
+
+    #[test]
+    fn the_ordinary_decoder_and_loader_still_refuse_version_two() {
+        for state in [exchange_state(), exchange_only_state(), based_state()] {
+            let bytes = state.encode_exchange_record().unwrap();
+
+            assert_eq!(
+                SyncState::decode(&bytes).unwrap_err(),
+                SyncStateDecodeError::UnsupportedVersion
+            );
+            assert_eq!(
+                SyncStateLoad::from_bytes(&bytes),
+                SyncStateLoad::UnsupportedVersion
+            );
+        }
+
+        assert_eq!(
+            SyncState::decode(GOLDEN_EXCHANGE.as_bytes()).unwrap_err(),
+            SyncStateDecodeError::UnsupportedVersion
+        );
+        assert_eq!(
+            SyncStateLoad::from_bytes(GOLDEN_EXCHANGE.as_bytes()),
+            SyncStateLoad::UnsupportedVersion
+        );
+    }
+
+    #[test]
+    fn the_exchange_decoder_accepts_version_two_only() {
+        let v2 = exchange_state().encode_exchange_record().unwrap();
+
+        // A genuine version-1 record.
+        assert_eq!(
+            SyncState::decode_exchange_record(&pending_state().encode().unwrap()).unwrap_err(),
+            SyncStateDecodeError::UnsupportedVersion
+        );
+        assert_eq!(
+            SyncState::decode_exchange_record(GOLDEN_PENDING.as_bytes()).unwrap_err(),
+            SyncStateDecodeError::UnsupportedVersion
+        );
+
+        for version in [
+            json_number(0),
+            json_number(1),
+            json_number(3),
+            json_number(1_000),
+            serde_json::json!(u64::MAX),
+        ] {
+            let mut value = json(&v2);
+            value["version"] = version.clone();
+
+            assert_eq!(
+                SyncState::decode_exchange_record(&serde_json::to_vec(&value).unwrap())
+                    .unwrap_err(),
+                SyncStateDecodeError::UnsupportedVersion,
+                "{version}"
+            );
+        }
+
+        // A future version may add fields; it is still "unsupported version".
+        let future =
+            br#"{"format":"localvault-sync-state","version":3,"anything":[1,2],"body":42}"#;
+        assert_eq!(
+            SyncState::decode_exchange_record(future).unwrap_err(),
+            SyncStateDecodeError::UnsupportedVersion
+        );
+
+        for version in [
+            serde_json::json!("2"),
+            serde_json::json!(-2),
+            serde_json::json!(2.0),
+            serde_json::json!(null),
+        ] {
+            let mut value = json(&v2);
+            value["version"] = version.clone();
+
+            assert_eq!(
+                SyncState::decode_exchange_record(&serde_json::to_vec(&value).unwrap())
+                    .unwrap_err(),
+                SyncStateDecodeError::Malformed,
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_format_is_unsupported_for_the_exchange_decoder_too() {
+        let v2 = exchange_state().encode_exchange_record().unwrap();
+
+        for format in ["", "localvault-vault", "LocalVault-Sync-State"] {
+            assert_eq!(
+                SyncState::decode_exchange_record(
+                    &with_outer(&v2, |o| o.format = format.to_owned())
+                )
+                .unwrap_err(),
+                SyncStateDecodeError::UnsupportedFormat,
+                "{format:?}"
+            );
+        }
+
+        // A wrong format outranks the version.
+        assert_eq!(
+            SyncState::decode_exchange_record(br#"{"format":"other","version":3}"#).unwrap_err(),
+            SyncStateDecodeError::UnsupportedFormat
+        );
+        assert_eq!(
+            SyncState::decode_exchange_record(br#"{"format":"other","version":2}"#).unwrap_err(),
+            SyncStateDecodeError::UnsupportedFormat
+        );
+    }
+
+    // ---- f. the ordinary encoder refuses states with exchange records --------------------
+
+    #[test]
+    fn the_ordinary_encoder_refuses_states_with_exchange_records() {
+        for (name, state) in [
+            ("exchange and retained", exchange_state()),
+            ("exchange only", exchange_only_state()),
+            ("retained only", retained_only_state()),
+        ] {
+            assert!(state.has_exchange_records(), "{name}");
+            assert_eq!(
+                state.encode().unwrap_err(),
+                SyncStateEncodeError::InvalidState(
+                    SyncStateError::ExchangeRecordsRequireExchangeFormat
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    // ---- h. worst-case size ----------------------------------------------------------------
+
+    #[test]
+    fn worst_case_exchange_record_fits_the_size_bound() {
+        // Every escaped character is the 4x worst case (escaped in the body, then
+        // again in the string that carries it); every number has 20 digits; every
+        // anchor is the longest allowed; the list is full.
+        let top = u64::MAX;
+        let checkpoint =
+            SyncCheckpoint::new(fp(1), top - 1, RemoteHighWater::new(top - 1)).unwrap();
+        let pending = PendingPush::new(
+            INTENT,
+            PushIntent::new(PushBaseline::Present(fp(1)), fp(2)).unwrap(),
+            top,
+        )
+        .unwrap();
+        let retained: Vec<RetainedPrevious> = (0..MAX_RETAINED_PREVIOUS as u8)
+            .map(|index| {
+                RetainedPrevious::new(
+                    Uuid::from_u128(0x7000_0000_0000_4000_8000_0000_0000_0000 + u128::from(index)),
+                    fp(100 + index),
+                    top - 2,
+                    anchor_run(index, MAX_OBJECT_ANCHOR_BYTES),
+                    anchor_run(index.wrapping_add(0x80), MAX_OBJECT_ANCHOR_BYTES),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        // Two different locators, both of the longest length, all escaped.
+        let local = "\\".repeat(MAX_LOCATOR_BYTES);
+        let target = format!("{}\"", "\\".repeat(MAX_LOCATOR_BYTES - 1));
+
+        let state = SyncState::new_with_exchange_records(
+            BindingId::new(BINDING).unwrap(),
+            tag(),
+            loc(&local),
+            loc(&target),
+            SyncBase::Based(checkpoint),
+            Some(pending),
+            Some(ExchangeIntent::new(
+                ExchangeScheme::RetainAndPublishV1,
+                anchor_run(0xc0, MAX_OBJECT_ANCHOR_BYTES),
+                anchor_run(0xd0, MAX_OBJECT_ANCHOR_BYTES),
+            )),
+            retained,
+        )
+        .unwrap();
+
+        let bytes = state.encode_exchange_record().unwrap();
+
+        assert!(bytes.len() <= MAX_SYNC_STATE_BYTES);
+        assert!(bytes.len() > 2 * MAX_LOCATOR_BYTES * 4, "escaping applied");
+        assert_eq!(state.retained_previous().len(), MAX_RETAINED_PREVIOUS);
+        assert_eq!(SyncState::decode_exchange_record(&bytes).unwrap(), state);
+    }
+
+    // ---- j. redaction -------------------------------------------------------------------------
+
+    #[test]
+    fn debug_output_never_shows_anchor_bytes() {
+        let target = ObjectAnchor::new(&[0xab; MAX_OBJECT_ANCHOR_BYTES]).unwrap();
+        let directory = ObjectAnchor::new(&[0xcd; MAX_OBJECT_ANCHOR_BYTES]).unwrap();
+        let object = ObjectAnchor::new(&[0xef; MAX_OBJECT_ANCHOR_BYTES]).unwrap();
+        let retained_directory = ObjectAnchor::new(&[0x9a; MAX_OBJECT_ANCHOR_BYTES]).unwrap();
+
+        let intent = ExchangeIntent::new(
+            ExchangeScheme::RetainAndPublishV1,
+            target.clone(),
+            directory.clone(),
+        );
+        let entry = RetainedPrevious::new(
+            RETAINED_A,
+            fp(3),
+            5,
+            object.clone(),
+            retained_directory.clone(),
+        )
+        .unwrap();
+        let state = with_records(
+            based_base(),
+            based_pending_push(),
+            Some(intent.clone()),
+            vec![entry.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(format!("{target:?}"), "ObjectAnchor(<redacted>)");
+
+        let anchors = [&target, &directory, &object, &retained_directory];
+        let renderings = [
+            format!("{target:?}"),
+            format!("{intent:?}"),
+            format!("{intent:#?}"),
+            format!("{entry:?}"),
+            format!("{entry:#?}"),
+            format!("{state:?}"),
+            format!("{state:#?}"),
+            format!("{:?}", SyncStateLoad::Loaded(Box::new(state.clone()))),
+        ];
+
+        for text in &renderings {
+            assert_redacted(text);
+            for anchor in anchors {
+                let lower = HEXLOWER.encode(anchor.as_bytes());
+                assert!(!text.contains(&lower), "{lower} leaked into {text}");
+                assert!(!text.contains(&lower.to_uppercase()));
+                // Neither as a byte list.
+                assert!(!text.contains(&format!("{}, {}", anchor.0[0], anchor.0[0])));
+            }
+        }
+
+        // The encoded record does carry them (it is a codec); Debug does not.
+        let encoded = String::from_utf8(state.encode_exchange_record().unwrap()).unwrap();
+        assert!(encoded.contains(&HEXLOWER.encode(target.as_bytes())));
+    }
+
+    #[test]
+    fn exchange_errors_never_echo_input() {
+        let secret = "SECRET-ANCHOR-TEXT".to_owned();
+        let mut texts: Vec<String> = Vec::new();
+
+        for result in [
+            decode_exchange_with(|w| w.exchange.as_mut().unwrap().target_anchor = secret.clone()),
+            decode_exchange_with(|w| w.exchange.as_mut().unwrap().scheme = secret.clone()),
+            decode_exchange_with(|w| w.retained_previous[0].exchange_id = secret.clone()),
+            decode_exchange_with(|w| w.retained_previous[0].fingerprint = secret.clone()),
+            SyncState::decode_exchange_record(
+                format!("{{\"format\":\"{secret}\",\"version\":2}}").as_bytes(),
+            ),
+            SyncState::decode_exchange_record(&with_outer(
+                &exchange_state().encode_exchange_record().unwrap(),
+                |o| o.body.push_str(&secret),
+            )),
+        ] {
+            let error = result.unwrap_err();
+            texts.push(format!("{error:?}"));
+            texts.push(error.to_string());
+        }
+
+        for error in [
+            SyncStateError::InvalidObjectAnchor,
+            SyncStateError::NilExchangeId,
+            SyncStateError::ExchangeWithoutPendingPush,
+            SyncStateError::ExchangeOnUnbasedState,
+            SyncStateError::RetainedOnUnbasedState,
+            SyncStateError::RetainedLimitExceeded,
+            SyncStateError::DuplicateRetainedId,
+            SyncStateError::RetainedIdIsPendingIntent,
+            SyncStateError::RetainedIsSyncedVersion,
+            SyncStateError::RetainedRevisionNotBelowSynced,
+            SyncStateError::ExchangeRecordsRequireExchangeFormat,
+            SyncStateError::ExchangeRecordsUnsupportedByTransition,
+        ] {
+            assert!(!error.to_string().is_empty());
+            texts.push(format!("{error:?}"));
+            texts.push(error.to_string());
+        }
+
+        for text in texts {
+            assert!(!text.contains("SECRET-ANCHOR-TEXT"), "{text}");
+            assert_redacted(&text);
         }
     }
 }
@@ -4727,5 +6537,170 @@ mod transition_tests {
 
         // And the vault key of another vault authenticates neither side.
         assert!(inspect_local_bytes(&foreign().key, VAULT_ID, &v().l8).is_err());
+    }
+
+    // ---- B3c-1: states with exchange records are never silently rewritten -----
+
+    fn exchange_anchor(seed: u8) -> ObjectAnchor {
+        ObjectAnchor::new(&[seed; 16]).unwrap()
+    }
+
+    /// Synced S (7), nothing pending, one retained entry below it.
+    fn retained_only() -> SyncState {
+        SyncState::new_with_exchange_records(
+            BindingId::new(BINDING).unwrap(),
+            tag(),
+            loc(LOCAL),
+            loc(TARGET),
+            SyncBase::Based(checkpoint(&v().s7, 7, 7)),
+            None,
+            None,
+            vec![retained_entry()],
+        )
+        .unwrap()
+    }
+
+    fn retained_entry() -> RetainedPrevious {
+        RetainedPrevious::new(
+            Uuid::from_u128(0xbbbb_bbbb_cccc_4ddd_8eee_ffff_ffff_ffff),
+            fp_of(&v().l5),
+            5,
+            exchange_anchor(1),
+            exchange_anchor(2),
+        )
+        .unwrap()
+    }
+
+    /// As [`based_pending`], plus an exchange intent and optionally a retained entry.
+    fn exchange_pending(with_retained: bool) -> SyncState {
+        SyncState::new_with_exchange_records(
+            BindingId::new(BINDING).unwrap(),
+            tag(),
+            loc(LOCAL),
+            loc(TARGET),
+            SyncBase::Based(checkpoint(&v().s7, 7, 7)),
+            Some(pending(PushBaseline::Present(fp_of(&v().s7)), &v().l8, 8)),
+            Some(ExchangeIntent::new(
+                ExchangeScheme::RetainAndPublishV1,
+                exchange_anchor(3),
+                exchange_anchor(4),
+            )),
+            if with_retained {
+                vec![retained_entry()]
+            } else {
+                Vec::new()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn transitions_refuse_states_with_exchange_records_and_never_drop_them() {
+        let refusal =
+            TransitionRefusal::InvalidState(SyncStateError::ExchangeRecordsUnsupportedByTransition);
+
+        // The same evidence is accepted on the same state without records, so
+        // the refusals below come from the records and from nothing else.
+        let begin_evidence = bound(&v().l8, &v().s7);
+        let finalize_evidence = bound(&v().l8, &v().l8);
+        let raise_evidence = bound(&v().s7, &v().r12);
+        assert!(push(&based(), RemoteEvidence::Inspected(&begin_evidence)).is_ok());
+        assert!(matches!(
+            reconcile(
+                &based_pending(),
+                RemoteEvidence::Inspected(&finalize_evidence)
+            ),
+            Ok(PushResolution::Finalize { .. })
+        ));
+        assert!(matches!(
+            observe(&based(), &raise_evidence),
+            Ok(HighWaterOutcome::Raised(_))
+        ));
+
+        for (name, state) in [
+            ("retained only", retained_only()),
+            ("exchange only", exchange_pending(false)),
+            ("exchange and retained", exchange_pending(true)),
+        ] {
+            let before = state.clone();
+            assert!(state.has_exchange_records(), "{name}");
+
+            assert_eq!(
+                push(&state, RemoteEvidence::Inspected(&begin_evidence)),
+                Err(refusal),
+                "begin_push / {name}"
+            );
+            assert_eq!(
+                push(&state, RemoteEvidence::Absent),
+                Err(refusal),
+                "begin_push absent / {name}"
+            );
+            assert_eq!(
+                reconcile(&state, RemoteEvidence::Inspected(&finalize_evidence)),
+                Err(refusal),
+                "reconcile finalize / {name}"
+            );
+            assert_eq!(
+                reconcile(&state, RemoteEvidence::Inspected(&begin_evidence)),
+                Err(refusal),
+                "reconcile clear / {name}"
+            );
+            assert_eq!(
+                reconcile(&state, RemoteEvidence::Unavailable),
+                Err(refusal),
+                "reconcile unavailable / {name}"
+            );
+            assert_eq!(
+                observe(&state, &raise_evidence).map(|_| ()),
+                Err(refusal),
+                "record_remote_observation / {name}"
+            );
+
+            // The private builder refuses as well (defense in depth).
+            assert_eq!(
+                state.with_parts(*state.base(), None),
+                Err(SyncStateError::ExchangeRecordsUnsupportedByTransition),
+                "with_parts / {name}"
+            );
+
+            // Nothing was mutated.
+            assert_eq!(state, before, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_state_with_exchange_records_is_an_existing_binding_for_the_initial_transitions() {
+        let local = snapshot(&v().l8);
+        let evidence = bound(&v().s7, &v().s7);
+
+        for state in [retained_only(), exchange_pending(true)] {
+            let prior = SyncStateLoad::Loaded(Box::new(state));
+
+            assert_eq!(
+                publish(
+                    &prior,
+                    UserApproval::Granted,
+                    RemoteObservation::Absent,
+                    &local
+                ),
+                Err(TransitionRefusal::ExistingBinding)
+            );
+            assert_eq!(
+                bind(
+                    &prior,
+                    UserApproval::Granted,
+                    RemoteEvidence::Inspected(&evidence)
+                ),
+                Err(TransitionRefusal::ExistingBinding)
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_refusal_is_free_of_content() {
+        let refusal =
+            TransitionRefusal::InvalidState(SyncStateError::ExchangeRecordsUnsupportedByTransition);
+
+        assert_free_of_content(&format!("{refusal} | {refusal:?}"));
     }
 }
