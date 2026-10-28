@@ -1,6 +1,7 @@
 pub mod cipher;
 pub mod kdf;
 pub mod keys;
+pub(crate) mod state_mac;
 
 use thiserror::Error;
 

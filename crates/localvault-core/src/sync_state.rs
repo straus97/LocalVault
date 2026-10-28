@@ -90,6 +90,39 @@
 //! retention or cleanup. Object anchors are opaque observations and a retained
 //! entry only records that a previous version was retained at one instant; both
 //! are only ever descriptive, never authority for any action.
+//!
+//! # Authenticated records (slice B3c-2a)
+//!
+//! [`SyncState::encode_authenticated`] / [`SyncState::decode_authenticated`]
+//! are a second **dormant** codec, version [`SYNC_STATE_AUTHENTICATED_VERSION`].
+//! The record carries the same canonical exchange body as version 2 and an
+//! HMAC-SHA256 tag instead of a checksum. The tag key is derived from the Vault
+//! Key with HKDF-SHA256 (no salt, info `LocalVault/sync-state-mac-key/v1`) by
+//! [`SyncStateMacKey::derive`], and the tag also covers the format, the version
+//! and the *authenticated* vault id, which is supplied by the caller and never
+//! read from the record. The MAC is verified before the body is parsed.
+//!
+//! What a valid tag establishes is **authenticity and integrity** only: the
+//! record was produced by a holder of the derived key and no byte changed. It
+//! is **not**:
+//!
+//! * replay protection, freshness or rollback resistance: an older valid record
+//!   of the same vault still verifies, and so does a whole older directory;
+//! * proof of causal ancestry between two states;
+//! * authorization to replace a target or to run any recovery step; those need
+//!   fresh authenticated evidence and explicit approval.
+//!
+//! Anyone holding the Vault Key can forge a record. The Vault Key is never
+//! rotated, so a former password holder who kept any envelope of the vault can
+//! recover it as well.
+//!
+//! Like version 2, this codec has no caller in any production flow:
+//! [`SyncState::decode`], [`SyncStateLoad::from_bytes`] and
+//! [`SyncState::decode_exchange_record`] report a version-3 record as an
+//! unsupported version, and the storage adapter can neither load nor write one.
+//! A version-1 or version-2 record is [`AuthenticatedDecodeError::LegacyUnauthenticated`]
+//! here: it is not a verified record, carries no authority and is never
+//! migrated or upgraded by this module.
 
 use std::fmt;
 
@@ -98,7 +131,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
+use crate::crypto::keys::SecretKey;
+use crate::crypto::state_mac;
 use crate::sync::{
     classify, AuthenticatedRevision, BoundInspection, EnvelopeFingerprint, LocalSnapshot,
     PayloadRelation, PushBaseline, PushIntent, PushReconciliation, RemoteHighWater,
@@ -112,6 +148,11 @@ pub const SYNC_STATE_VERSION: u32 = 1;
 /// [`SyncState::decode`] and [`SyncStateLoad::from_bytes`] do not accept it; the
 /// persisted version is decided when a later slice enables decoding.
 pub const SYNC_STATE_EXCHANGE_VERSION: u32 = 2;
+/// Dormant tag of the explicit authenticated codec
+/// ([`SyncState::encode_authenticated`]). Not accepted by
+/// [`SyncState::decode`], [`SyncStateLoad::from_bytes`] or
+/// [`SyncState::decode_exchange_record`].
+pub const SYNC_STATE_AUTHENTICATED_VERSION: u32 = 3;
 pub const MAX_SYNC_STATE_BYTES: usize = 65_536;
 pub const MAX_LOCATOR_BYTES: usize = 4_096;
 /// Longest accepted [`ObjectAnchor`], in bytes.
@@ -125,6 +166,7 @@ pub const BINDING_SALT_LEN: usize = 32;
 
 const BINDING_DIGEST_LEN: usize = 32;
 const BINDING_TAG_DOMAIN: &[u8] = b"LocalVault/sync-binding-tag/v1";
+const RECORD_MAC_DOMAIN: &[u8] = b"LocalVault/sync-state-record-mac/v1";
 
 /// Why a state, or one of its parts, was rejected. Fixed variants only: no
 /// locator, identity, salt, digest or deserializer detail is ever carried.
@@ -223,6 +265,101 @@ pub enum SyncStateDecodeError {
     InvalidBody,
     #[error("sync state is inconsistent: {0}")]
     InvalidState(SyncStateError),
+}
+
+/// Why a [`SyncStateMacKey`] could not be derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SyncStateAuthError {
+    #[error("vault id must not be nil")]
+    NilVaultId,
+    #[error("sync state authentication key derivation failed")]
+    KeyDerivation,
+}
+
+/// Why [`SyncState::encode_authenticated`] failed. Fixed categories only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AuthenticatedEncodeError {
+    #[error("sync state is invalid: {0}")]
+    InvalidState(SyncStateError),
+    #[error("the state is bound to a different vault than the authentication key")]
+    VaultMismatch,
+    #[error("encoded sync state exceeds the size limit")]
+    TooLarge,
+    #[error("sync state could not be serialized")]
+    Serialization,
+    #[error("sync state could not be authenticated")]
+    Authentication,
+}
+
+/// Why [`SyncState::decode_authenticated`] failed. None of these variants
+/// carries input content; raw deserializer messages are discarded. A wrong key,
+/// a wrong vault id and any modification of the authenticated content are
+/// deliberately one indistinguishable outcome,
+/// [`AuthenticationFailed`](Self::AuthenticationFailed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AuthenticatedDecodeError {
+    #[error("sync state exceeds the size limit")]
+    TooLarge,
+    #[error("sync state is not a well-formed wrapper")]
+    Malformed,
+    #[error("unsupported sync state format")]
+    UnsupportedFormat,
+    /// A version-1 or version-2 record: it has no MAC. It is **not** a verified
+    /// record and must never be treated as one.
+    #[error("sync state is a legacy unauthenticated record")]
+    LegacyUnauthenticated,
+    #[error("unsupported sync state version")]
+    UnsupportedVersion,
+    #[error("sync state is not in its canonical form")]
+    NonCanonical,
+    #[error("sync state authentication failed")]
+    AuthenticationFailed,
+    #[error("sync state body is malformed")]
+    InvalidBody,
+    #[error("sync state is inconsistent: {0}")]
+    InvalidState(SyncStateError),
+    #[error("the state is bound to a different vault than the authentication key")]
+    VaultMismatch,
+}
+
+/// The MAC key of authenticated sync-state records together with the
+/// authenticated vault identity the records are bound to.
+///
+/// Derived on demand from the Vault Key. It is deliberately not `Clone`, not
+/// `Copy`, not comparable, not serializable and has no accessor; its `Debug`
+/// output is redacted. The key buffer is zeroized on drop (the internal state
+/// of the HMAC implementation is not; see the module documentation).
+pub struct SyncStateMacKey {
+    key: Zeroizing<[u8; 32]>,
+    vault_id: Uuid,
+}
+
+impl SyncStateMacKey {
+    /// Derive the key with HKDF-SHA256 from the Vault Key. The vault id must be
+    /// the *authenticated* id of the vault that owns `vault_key` (for example
+    /// the id decrypted from the vault payload), and not nil.
+    pub fn derive(
+        vault_key: &SecretKey,
+        authenticated_vault_id: Uuid,
+    ) -> Result<Self, SyncStateAuthError> {
+        if authenticated_vault_id.is_nil() {
+            return Err(SyncStateAuthError::NilVaultId);
+        }
+
+        let key = state_mac::derive_state_mac_key(vault_key)
+            .map_err(|_| SyncStateAuthError::KeyDerivation)?;
+
+        Ok(Self {
+            key,
+            vault_id: authenticated_vault_id,
+        })
+    }
+}
+
+impl fmt::Debug for SyncStateMacKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SyncStateMacKey(<redacted>)")
+    }
 }
 
 /// Random per-binding identifier. Non-nil.
@@ -884,6 +1021,116 @@ impl SyncState {
             .map_err(|_| SyncStateDecodeError::InvalidBody)?;
         if canonical != outer.body {
             return Err(SyncStateDecodeError::InvalidBody);
+        }
+
+        Ok(state)
+    }
+
+    /// Deterministic UTF-8 JSON of the dormant authenticated format, always
+    /// [`SYNC_STATE_AUTHENTICATED_VERSION`], for any valid state (with or
+    /// without exchange records). The body is the canonical exchange body.
+    ///
+    /// Revalidates first, refuses a state whose binding tag does not match the
+    /// key's vault id (nothing is signed for another vault) and enforces
+    /// [`MAX_SYNC_STATE_BYTES`]. See the module documentation for what the tag
+    /// does and does not establish.
+    pub fn encode_authenticated(
+        &self,
+        key: &SyncStateMacKey,
+    ) -> Result<Vec<u8>, AuthenticatedEncodeError> {
+        self.validate()
+            .map_err(AuthenticatedEncodeError::InvalidState)?;
+        if !self.vault_tag.matches_vault(key.vault_id) {
+            return Err(AuthenticatedEncodeError::VaultMismatch);
+        }
+
+        let body = self
+            .encode_exchange_body()
+            .map_err(|_| AuthenticatedEncodeError::Serialization)?;
+        let tag = state_mac::state_mac(
+            &key.key,
+            &state_mac_input(SYNC_STATE_AUTHENTICATED_VERSION, &key.vault_id, &body),
+        )
+        .map_err(|_| AuthenticatedEncodeError::Authentication)?;
+
+        let outer = AuthenticatedOuterWire {
+            format: SYNC_STATE_FORMAT.to_owned(),
+            version: SYNC_STATE_AUTHENTICATED_VERSION,
+            body,
+            mac: HEXLOWER.encode(&tag),
+        };
+        let bytes =
+            serde_json::to_vec(&outer).map_err(|_| AuthenticatedEncodeError::Serialization)?;
+        if bytes.len() > MAX_SYNC_STATE_BYTES {
+            return Err(AuthenticatedEncodeError::TooLarge);
+        }
+        Ok(bytes)
+    }
+
+    /// Strict inverse of [`encode_authenticated`](Self::encode_authenticated).
+    ///
+    /// The checks run in a fixed order and the body is not parsed until its MAC
+    /// has verified: size, wrapper probe, format, version (1 and 2 are
+    /// [`AuthenticatedDecodeError::LegacyUnauthenticated`], anything but 3 is
+    /// unsupported), strict wrapper, canonical wrapper bytes, MAC, then the
+    /// body (parse, invariants, canonical form) and finally the vault identity.
+    /// There is no fallback to the unauthenticated decoders.
+    pub fn decode_authenticated(
+        bytes: &[u8],
+        key: &SyncStateMacKey,
+    ) -> Result<Self, AuthenticatedDecodeError> {
+        use AuthenticatedDecodeError as E;
+
+        if bytes.len() > MAX_SYNC_STATE_BYTES {
+            return Err(E::TooLarge);
+        }
+
+        // Format and version are judged before the rest of the wrapper, so a
+        // future version that adds fields is reported as unsupported rather
+        // than as corrupt.
+        let probe: Probe = serde_json::from_slice(bytes).map_err(|_| E::Malformed)?;
+        if probe.format != SYNC_STATE_FORMAT {
+            return Err(E::UnsupportedFormat);
+        }
+        if probe.version == u64::from(SYNC_STATE_VERSION)
+            || probe.version == u64::from(SYNC_STATE_EXCHANGE_VERSION)
+        {
+            return Err(E::LegacyUnauthenticated);
+        }
+        if probe.version != u64::from(SYNC_STATE_AUTHENTICATED_VERSION) {
+            return Err(E::UnsupportedVersion);
+        }
+
+        let outer: AuthenticatedOuterWire =
+            serde_json::from_slice(bytes).map_err(|_| E::Malformed)?;
+        let tag = decode_hex32(&outer.mac).ok_or(E::Malformed)?;
+
+        // Accepted bytes are exactly the written bytes: no outer malleability.
+        let canonical = serde_json::to_vec(&outer).map_err(|_| E::Malformed)?;
+        if canonical != bytes {
+            return Err(E::NonCanonical);
+        }
+
+        let message = state_mac_input(SYNC_STATE_AUTHENTICATED_VERSION, &key.vault_id, &outer.body);
+        if !state_mac::verify_state_mac(&key.key, &message, &tag) {
+            return Err(E::AuthenticationFailed);
+        }
+
+        // Authenticated from here on: the parsed body is the MACed string.
+        let wire: ExchangeBodyWire =
+            serde_json::from_str(&outer.body).map_err(|_| E::InvalidBody)?;
+        let state = wire.into_state().map_err(|error| match error {
+            SyncStateDecodeError::InvalidState(state_error) => E::InvalidState(state_error),
+            _ => E::InvalidBody,
+        })?;
+
+        let canonical_body = state.encode_exchange_body().map_err(|_| E::InvalidBody)?;
+        if canonical_body != outer.body {
+            return Err(E::InvalidBody);
+        }
+
+        if !state.vault_tag.matches_vault(key.vault_id) {
+            return Err(E::VaultMismatch);
         }
 
         Ok(state)
@@ -1651,6 +1898,39 @@ struct OuterWire {
     version: u32,
     body_sha256: String,
     body: String,
+}
+
+/// Outer wrapper of the dormant version-3 record. No `body_sha256`: the MAC
+/// replaces the checksum. Field order is the canonical serialization order.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatedOuterWire {
+    format: String,
+    version: u32,
+    body: String,
+    mac: String,
+}
+
+/// The exact bytes the version-3 tag authenticates. Every variable field is
+/// fixed-width or length-prefixed, so the encoding is injective:
+///
+/// ```text
+/// domain || 0x00 || u64_be(len(format)) || format || u32_be(version)
+///        || vault_id (16 raw bytes) || u64_be(len(body)) || body
+/// ```
+fn state_mac_input(version: u32, vault_id: &Uuid, body: &str) -> Vec<u8> {
+    let format = SYNC_STATE_FORMAT.as_bytes();
+
+    let mut message = Vec::with_capacity(RECORD_MAC_DOMAIN.len() + 37 + format.len() + body.len());
+    message.extend_from_slice(RECORD_MAC_DOMAIN);
+    message.push(0x00);
+    message.extend_from_slice(&(format.len() as u64).to_be_bytes());
+    message.extend_from_slice(format);
+    message.extend_from_slice(&version.to_be_bytes());
+    message.extend_from_slice(vault_id.as_bytes());
+    message.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    message.extend_from_slice(body.as_bytes());
+    message
 }
 
 #[derive(Serialize, Deserialize)]
@@ -4896,6 +5176,875 @@ mod tests {
             assert!(!text.contains("SECRET-ANCHOR-TEXT"), "{text}");
             assert_redacted(&text);
         }
+    }
+
+    // ---- B3c-2a: dormant authenticated records ---------------------------------------
+    //
+    // What is proven here, kept apart:
+    //  * cryptographic correctness: pinned vectors recomputed independently of this
+    //    encoder (Python `hmac`/`hashlib`), MAC-before-parse, key and vault-id binding;
+    //  * format and compatibility: strict wire, canonical bytes, version routing, the
+    //    untouched v1/v2 codecs;
+    //  * documented limitations, which are *not* protections: replay of an older valid
+    //    record verifies, and nothing here says anything about filesystem atomicity,
+    //    durability or rollback of a persisted record.
+
+    const FOREIGN_VAULT_ID: Uuid = Uuid::from_u128(0x0f0f_0f0f_0f0f_0f0f_0f0f_0f0f_0f0f_0f0f);
+
+    const K_STATE_HEX: &str = "a5d1adbbf9c6f329fce9f5a6bfede16fea8c873974f429bc6e48a4b8e67e2f98";
+    const K_STATE_BYTE0_HEX: &str =
+        "bdf9405483d6f38b878a869b8f7766cf485e8d04d99a5c84ae8a3a2d164ab8ed";
+    const GOLDEN_AUTHENTICATED_MAC: &str =
+        "a920cddc3bbe89527e3071aa4c433a9ea6c662f68cea40c7a7a5e61ccc9e08cd";
+    const GOLDEN_FOREIGN_MAC: &str =
+        "29eda42c70dc63b5d5dee8fd3440e7cd4257a594c43fa2b285a298eeac58301b";
+
+    // Assembled by hand (Python `hmac`/`hashlib`/`json`) from the v2 golden body: version
+    // 3, no `body_sha256`, `mac` = HMAC-SHA256(K_state(00..1f), M) appended; not taken
+    // from this module's encoder.
+    const GOLDEN_AUTHENTICATED: &str = r#"{"format":"localvault-sync-state","version":3,"body":"{\"binding_id\":\"11111111-2222-3333-4444-555555555555\",\"vault_tag\":{\"salt\":\"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\",\"digest\":\"533cfabc5ff2073b76dab8c6cb60289e44d95f9dbb67cdbdac12bdcf94025aa8\"},\"local_locator\":\"synthetic/local/LOCAL-MARKER.lvault\",\"target_locator\":\"synthetic/remote/TARGET-MARKER.lvault\",\"base\":{\"kind\":\"based\",\"synced\":\"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a\",\"synced_revision\":7,\"high_water\":9},\"pending_push\":{\"intent_id\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\",\"baseline\":{\"kind\":\"present\",\"fingerprint\":\"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a\"},\"intended\":\"dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986\",\"intended_revision\":10},\"exchange\":{\"scheme\":\"retain_and_publish_v1\",\"target_anchor\":\"1011121314151617\",\"directory_anchor\":\"a0a1a2a3\"},\"retained_previous\":[{\"exchange_id\":\"bbbbbbbb-cccc-4ddd-8eee-ffffffffffff\",\"fingerprint\":\"084fed08b978af4d7d196a7446a86b58009e636b611db16211b65a9aadff29c5\",\"revision\":5,\"object_anchor\":\"202122232425262728292a2b2c2d2e2f\",\"directory_anchor\":\"b0b1b2b3\"}]}","mac":"a920cddc3bbe89527e3071aa4c433a9ea6c662f68cea40c7a7a5e61ccc9e08cd"}"#;
+
+    /// `0x00 0x01 .. 0x1f`.
+    fn counting_vault_key() -> SecretKey {
+        Zeroizing::new(std::array::from_fn(|i| i as u8))
+    }
+
+    fn mac_key_for(vault_key: &SecretKey, vault_id: Uuid) -> SyncStateMacKey {
+        SyncStateMacKey::derive(vault_key, vault_id).unwrap()
+    }
+
+    fn mac_key() -> SyncStateMacKey {
+        mac_key_for(&counting_vault_key(), VAULT_ID)
+    }
+
+    fn decode_auth(bytes: &[u8]) -> Result<SyncState, AuthenticatedDecodeError> {
+        SyncState::decode_authenticated(bytes, &mac_key())
+    }
+
+    fn auth_outer_of(bytes: &[u8]) -> AuthenticatedOuterWire {
+        serde_json::from_slice(bytes).unwrap()
+    }
+
+    fn with_auth_outer(bytes: &[u8], mutate: impl FnOnce(&mut AuthenticatedOuterWire)) -> Vec<u8> {
+        let mut outer = auth_outer_of(bytes);
+        mutate(&mut outer);
+        serde_json::to_vec(&outer).unwrap()
+    }
+
+    /// What any holder of the key can do: seal an arbitrary body.
+    fn seal_auth(key: &SyncStateMacKey, body: &str) -> Vec<u8> {
+        let tag = state_mac::state_mac(
+            &key.key,
+            &state_mac_input(SYNC_STATE_AUTHENTICATED_VERSION, &key.vault_id, body),
+        )
+        .unwrap();
+
+        serde_json::to_vec(&AuthenticatedOuterWire {
+            format: SYNC_STATE_FORMAT.to_owned(),
+            version: SYNC_STATE_AUTHENTICATED_VERSION,
+            body: body.to_owned(),
+            mac: HEXLOWER.encode(&tag),
+        })
+        .unwrap()
+    }
+
+    fn golden_body() -> String {
+        auth_outer_of(GOLDEN_AUTHENTICATED.as_bytes()).body
+    }
+
+    fn based_state_with(
+        binding: Uuid,
+        local: &str,
+        target: &str,
+        synced: u8,
+        revision: u64,
+        high_water: u64,
+    ) -> SyncState {
+        SyncState::new(
+            BindingId::new(binding).unwrap(),
+            tag(),
+            loc(local),
+            loc(target),
+            SyncBase::Based(
+                SyncCheckpoint::new(fp(synced), revision, RemoteHighWater::new(high_water))
+                    .unwrap(),
+            ),
+            None,
+        )
+        .unwrap()
+    }
+
+    // ---- key derivation ------------------------------------------------------------
+
+    #[test]
+    fn the_mac_key_is_the_pinned_hkdf_output_and_independent_of_the_vault_id() {
+        assert_eq!(HEXLOWER.encode(&mac_key().key[..]), K_STATE_HEX);
+
+        let mut changed = counting_vault_key();
+        changed[0] = 0x01;
+        assert_eq!(
+            HEXLOWER.encode(&mac_key_for(&changed, VAULT_ID).key[..]),
+            K_STATE_BYTE0_HEX
+        );
+
+        // The vault id binds the *records*, not the key.
+        let foreign = mac_key_for(&counting_vault_key(), FOREIGN_VAULT_ID);
+        assert_eq!(foreign.key[..], mac_key().key[..]);
+        assert_ne!(foreign.key[..], counting_vault_key()[..]);
+    }
+
+    #[test]
+    fn a_nil_vault_id_is_refused() {
+        assert_eq!(
+            SyncStateMacKey::derive(&counting_vault_key(), Uuid::nil()).unwrap_err(),
+            SyncStateAuthError::NilVaultId
+        );
+    }
+
+    // ---- exact MAC input and golden ---------------------------------------------------
+
+    #[test]
+    fn the_mac_input_is_exactly_the_documented_framing() {
+        let body = golden_body();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"LocalVault/sync-state-record-mac/v1");
+        expected.push(0x00);
+        expected.extend_from_slice(&21u64.to_be_bytes());
+        expected.extend_from_slice(b"localvault-sync-state");
+        expected.extend_from_slice(&3u32.to_be_bytes());
+        expected.extend_from_slice(VAULT_ID.as_bytes());
+        expected.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        expected.extend_from_slice(body.as_bytes());
+
+        let actual = state_mac_input(SYNC_STATE_AUTHENTICATED_VERSION, &VAULT_ID, &body);
+        assert_eq!(actual, expected);
+        assert_eq!(body.len(), 1106);
+        assert_eq!(actual.len(), 1199);
+
+        // Every context element changes the message.
+        assert_ne!(actual, state_mac_input(2, &VAULT_ID, &body));
+        assert_ne!(
+            actual,
+            state_mac_input(SYNC_STATE_AUTHENTICATED_VERSION, &FOREIGN_VAULT_ID, &body)
+        );
+        assert_ne!(
+            actual,
+            state_mac_input(SYNC_STATE_AUTHENTICATED_VERSION, &VAULT_ID, &body[1..])
+        );
+    }
+
+    #[test]
+    fn the_authenticated_golden_is_pinned() {
+        let key = mac_key();
+
+        let bytes = exchange_state().encode_authenticated(&key).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), GOLDEN_AUTHENTICATED);
+        assert_eq!(
+            decode_auth(GOLDEN_AUTHENTICATED.as_bytes()).unwrap(),
+            exchange_state()
+        );
+
+        let outer = auth_outer_of(GOLDEN_AUTHENTICATED.as_bytes());
+        assert_eq!(outer.version, 3);
+        assert_eq!(outer.mac, GOLDEN_AUTHENTICATED_MAC);
+        assert!(!GOLDEN_AUTHENTICATED.contains("body_sha256"));
+
+        // Same canonical body as the version-2 golden; no second body schema.
+        assert_eq!(outer.body, outer_of(GOLDEN_EXCHANGE.as_bytes()).body);
+
+        // Same inputs under the foreign vault id give the other pinned tag.
+        let foreign = state_mac::state_mac(
+            &key.key,
+            &state_mac_input(3, &FOREIGN_VAULT_ID, &outer.body),
+        )
+        .unwrap();
+        assert_eq!(HEXLOWER.encode(&foreign), GOLDEN_FOREIGN_MAC);
+    }
+
+    // ---- key and vault-id binding -----------------------------------------------------
+
+    #[test]
+    fn a_wrong_vault_key_or_vault_id_is_an_authentication_failure() {
+        let record = GOLDEN_AUTHENTICATED.as_bytes();
+
+        let mut other_key = counting_vault_key();
+        other_key[0] = 0x01;
+        let wrong_key = mac_key_for(&other_key, VAULT_ID);
+        let wrong_id = mac_key_for(&counting_vault_key(), FOREIGN_VAULT_ID);
+        let both = mac_key_for(&other_key, FOREIGN_VAULT_ID);
+
+        for key in [wrong_key, wrong_id, both] {
+            assert_eq!(
+                SyncState::decode_authenticated(record, &key).unwrap_err(),
+                AuthenticatedDecodeError::AuthenticationFailed
+            );
+        }
+    }
+
+    #[test]
+    fn modified_format_version_body_and_mac_have_their_own_categories() {
+        let record = GOLDEN_AUTHENTICATED.as_bytes();
+
+        let format = with_auth_outer(record, |o| o.format = "localvault-sync-statf".to_owned());
+        assert_eq!(
+            decode_auth(&format).unwrap_err(),
+            AuthenticatedDecodeError::UnsupportedFormat
+        );
+
+        for legacy in [1, 2] {
+            let bytes = with_auth_outer(record, |o| o.version = legacy);
+            assert_eq!(
+                decode_auth(&bytes).unwrap_err(),
+                AuthenticatedDecodeError::LegacyUnauthenticated
+            );
+        }
+        for unknown in [0, 4, u32::MAX] {
+            let bytes = with_auth_outer(record, |o| o.version = unknown);
+            assert_eq!(
+                decode_auth(&bytes).unwrap_err(),
+                AuthenticatedDecodeError::UnsupportedVersion
+            );
+        }
+
+        let body = with_auth_outer(record, |o| {
+            o.body = replace_once(&o.body, "LOCAL-MARKER", "LOCAL-MARKEQ");
+        });
+        assert_eq!(
+            decode_auth(&body).unwrap_err(),
+            AuthenticatedDecodeError::AuthenticationFailed
+        );
+
+        let mac = with_auth_outer(record, |o| {
+            let last = o.mac.pop().unwrap();
+            o.mac.push(if last == '0' { '1' } else { '0' });
+        });
+        assert_eq!(
+            decode_auth(&mac).unwrap_err(),
+            AuthenticatedDecodeError::AuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn flipping_any_single_byte_of_a_valid_record_never_decodes() {
+        let record = GOLDEN_AUTHENTICATED.as_bytes();
+
+        for index in 0..record.len() {
+            let mut damaged = record.to_vec();
+            damaged[index] ^= 0x01;
+            assert!(decode_auth(&damaged).is_err(), "byte {index}");
+        }
+    }
+
+    // ---- wrapper strictness -----------------------------------------------------------
+
+    #[test]
+    fn missing_extra_and_malformed_members_are_malformed() {
+        let record = GOLDEN_AUTHENTICATED.as_bytes();
+        let value: serde_json::Value = serde_json::from_slice(record).unwrap();
+
+        for member in ["mac", "body", "format", "version"] {
+            let mut missing = value.clone();
+            missing.as_object_mut().unwrap().remove(member).unwrap();
+            assert_eq!(
+                decode_auth(&serde_json::to_vec(&missing).unwrap()).unwrap_err(),
+                AuthenticatedDecodeError::Malformed,
+                "missing {member}"
+            );
+        }
+
+        for (name, extra) in [
+            (
+                "body_sha256",
+                serde_json::json!(checksum_hex(&golden_body())),
+            ),
+            ("algorithm", serde_json::json!("hmac-sha256")),
+            ("extra", serde_json::json!(1)),
+        ] {
+            let mut extended = value.clone();
+            extended
+                .as_object_mut()
+                .unwrap()
+                .insert(name.to_owned(), extra);
+            assert_eq!(
+                decode_auth(&serde_json::to_vec(&extended).unwrap()).unwrap_err(),
+                AuthenticatedDecodeError::Malformed,
+                "extra {name}"
+            );
+        }
+
+        let mut not_a_string = value.clone();
+        not_a_string["mac"] = serde_json::json!(7);
+        assert_eq!(
+            decode_auth(&serde_json::to_vec(&not_a_string).unwrap()).unwrap_err(),
+            AuthenticatedDecodeError::Malformed
+        );
+
+        let bad_macs: [fn(&mut String); 7] = [
+            |m| *m = m.to_uppercase(),
+            |m| {
+                m.pop();
+            },
+            |m| m.push('0'),
+            |m| m.replace_range(0..1, "g"),
+            |m| m.clear(),
+            |m| *m = format!("0x{}", &m[2..]),
+            |m| *m = format!("{} ", &m[1..]),
+        ];
+        for (index, corrupt) in bad_macs.into_iter().enumerate() {
+            let bytes = with_auth_outer(record, |o| corrupt(&mut o.mac));
+            assert_eq!(
+                decode_auth(&bytes).unwrap_err(),
+                AuthenticatedDecodeError::Malformed,
+                "mac variant {index}"
+            );
+        }
+
+        for garbage in [&b""[..], b"null", b"[]", b"{}", b"not json"] {
+            assert_eq!(
+                decode_auth(garbage).unwrap_err(),
+                AuthenticatedDecodeError::Malformed
+            );
+        }
+    }
+
+    #[test]
+    fn every_truncation_is_rejected() {
+        let record = GOLDEN_AUTHENTICATED.as_bytes();
+
+        for length in 0..record.len() {
+            assert!(decode_auth(&record[..length]).is_err(), "prefix {length}");
+        }
+    }
+
+    #[test]
+    fn a_non_canonical_outer_representation_is_refused() {
+        let record = GOLDEN_AUTHENTICATED;
+        let outer = auth_outer_of(record.as_bytes());
+
+        let reordered = format!(
+            r#"{{"version":3,"format":"localvault-sync-state","body":{},"mac":"{}"}}"#,
+            serde_json::to_string(&outer.body).unwrap(),
+            outer.mac
+        );
+        let escaped = record.replacen("binding_id", "\\u0062inding_id", 1);
+        assert_ne!(escaped, record);
+
+        let variants = [
+            format!(" {record}"),
+            format!("{record}\n"),
+            record.replacen('{', "{ ", 1),
+            reordered,
+            escaped,
+        ];
+        for (index, variant) in variants.iter().enumerate() {
+            assert_eq!(
+                decode_auth(variant.as_bytes()).unwrap_err(),
+                AuthenticatedDecodeError::NonCanonical,
+                "variant {index}"
+            );
+        }
+    }
+
+    // ---- authenticated body: parsing happens after the MAC ------------------------------
+
+    #[test]
+    fn a_validly_authenticated_but_malformed_or_non_canonical_body_is_an_invalid_body() {
+        let key = mac_key();
+        let body = golden_body();
+        let wire = ExchangeBodyWire::from(&exchange_state());
+
+        let mut uppercase_id = ExchangeBodyWire::from(&exchange_state());
+        uppercase_id.retained_previous[0].exchange_id =
+            uppercase_id.retained_previous[0].exchange_id.to_uppercase();
+
+        let bodies = [
+            String::new(),
+            "not json".to_owned(),
+            "{}".to_owned(),
+            body.replacen('{', "{ ", 1),
+            body.replacen(
+                "\"retained_previous\"",
+                "\"extra\":1,\"retained_previous\"",
+                1,
+            ),
+            serde_json::to_string_pretty(&wire).unwrap(),
+            serde_json::to_string(&uppercase_id).unwrap(),
+        ];
+        for (index, candidate) in bodies.iter().enumerate() {
+            assert_eq!(
+                SyncState::decode_authenticated(&seal_auth(&key, candidate), &key).unwrap_err(),
+                AuthenticatedDecodeError::InvalidBody,
+                "body {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_validly_authenticated_invalid_state_is_refused_with_its_category() {
+        let key = mac_key();
+
+        let mut retained_not_below = ExchangeBodyWire::from(&exchange_state());
+        retained_not_below.retained_previous[0].revision = 7;
+
+        let mut nil_binding = ExchangeBodyWire::from(&exchange_state());
+        nil_binding.binding_id = Uuid::nil().hyphenated().to_string();
+
+        let cases = [
+            (
+                retained_not_below,
+                SyncStateError::RetainedRevisionNotBelowSynced,
+            ),
+            (nil_binding, SyncStateError::NilBindingId),
+        ];
+        for (wire, expected) in cases {
+            let sealed = seal_auth(&key, &serde_json::to_string(&wire).unwrap());
+            assert_eq!(
+                SyncState::decode_authenticated(&sealed, &key).unwrap_err(),
+                AuthenticatedDecodeError::InvalidState(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn a_state_bound_to_another_vault_is_never_signed_and_never_accepted() {
+        let foreign_tag = VaultBindingTag::derive(salt(0), FOREIGN_VAULT_ID).unwrap();
+        let foreign_state = SyncState::new(
+            BindingId::new(BINDING).unwrap(),
+            foreign_tag,
+            loc(LOCAL),
+            loc(TARGET),
+            SyncBase::Based(checkpoint()),
+            None,
+        )
+        .unwrap();
+        let key = mac_key();
+
+        // Sign time.
+        assert_eq!(
+            foreign_state.encode_authenticated(&key).unwrap_err(),
+            AuthenticatedEncodeError::VaultMismatch
+        );
+
+        // Verify time (defence in depth): a key holder sealed it anyway.
+        let sealed = seal_auth(&key, &foreign_state.encode_exchange_body().unwrap());
+        assert_eq!(
+            SyncState::decode_authenticated(&sealed, &key).unwrap_err(),
+            AuthenticatedDecodeError::VaultMismatch
+        );
+
+        // Under the matching key it is an ordinary record.
+        let foreign_key = mac_key_for(&counting_vault_key(), FOREIGN_VAULT_ID);
+        let bytes = foreign_state.encode_authenticated(&foreign_key).unwrap();
+        assert_eq!(
+            SyncState::decode_authenticated(&bytes, &foreign_key).unwrap(),
+            foreign_state
+        );
+        assert_eq!(
+            decode_auth(&bytes).unwrap_err(),
+            AuthenticatedDecodeError::AuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn encoding_revalidates_the_state() {
+        assert_eq!(
+            raw(SyncBase::Unbased, None)
+                .encode_authenticated(&mac_key())
+                .unwrap_err(),
+            AuthenticatedEncodeError::InvalidState(
+                SyncStateError::UnbasedRequiresInitialPublication
+            )
+        );
+    }
+
+    // ---- size ------------------------------------------------------------------------
+
+    #[test]
+    fn the_size_bound_applies() {
+        assert_eq!(
+            decode_auth(&vec![b' '; MAX_SYNC_STATE_BYTES + 1]).unwrap_err(),
+            AuthenticatedDecodeError::TooLarge
+        );
+        // Exactly at the bound the size gate passes; the bytes are simply not a record.
+        assert_eq!(
+            decode_auth(&vec![b'{'; MAX_SYNC_STATE_BYTES]).unwrap_err(),
+            AuthenticatedDecodeError::Malformed
+        );
+    }
+
+    #[test]
+    fn a_maximal_valid_record_fits_and_round_trips() {
+        let long_local = "\\".repeat(MAX_LOCATOR_BYTES);
+        let mut long_target = "\\".repeat(MAX_LOCATOR_BYTES - 1);
+        long_target.push('x');
+
+        let state = SyncState::new_with_exchange_records(
+            BindingId::new(BINDING).unwrap(),
+            tag(),
+            Locator::new(&long_local).unwrap(),
+            Locator::new(&long_target).unwrap(),
+            based_base(),
+            based_pending_push(),
+            Some(ExchangeIntent::new(
+                ExchangeScheme::RetainAndPublishV1,
+                anchor_run(0x10, MAX_OBJECT_ANCHOR_BYTES),
+                anchor_run(0x90, MAX_OBJECT_ANCHOR_BYTES),
+            )),
+            (0..8).map(retained_n).collect(),
+        )
+        .unwrap();
+
+        let key = mac_key();
+        let bytes = state.encode_authenticated(&key).unwrap();
+
+        assert!(bytes.len() <= MAX_SYNC_STATE_BYTES);
+        assert!(bytes.len() > MAX_SYNC_STATE_BYTES / 2, "{}", bytes.len());
+        assert_eq!(
+            SyncState::decode_authenticated(&bytes, &key).unwrap(),
+            state
+        );
+    }
+
+    // ---- determinism and distinctness ------------------------------------------------------
+
+    #[test]
+    fn encoding_is_deterministic_and_every_state_shape_round_trips() {
+        let key = mac_key();
+
+        for state in [
+            based_state(),
+            unbased_state(),
+            pending_state(),
+            exchange_state(),
+            exchange_only_state(),
+            retained_only_state(),
+        ] {
+            let bytes = state.encode_authenticated(&key).unwrap();
+
+            assert_eq!(state.encode_authenticated(&key).unwrap(), bytes);
+            assert_eq!(state.clone().encode_authenticated(&key).unwrap(), bytes);
+            assert_eq!(
+                SyncState::decode_authenticated(&bytes, &key).unwrap(),
+                state
+            );
+            assert_eq!(auth_outer_of(&bytes).version, 3);
+        }
+    }
+
+    #[test]
+    fn distinct_bindings_and_locators_give_distinct_tags_that_do_not_transplant() {
+        let key = mac_key();
+        let states = [
+            based_state_with(BINDING, LOCAL, TARGET, 1, 7, 9),
+            based_state_with(Uuid::from_u128(2), LOCAL, TARGET, 1, 7, 9),
+            based_state_with(BINDING, OTHER, TARGET, 1, 7, 9),
+            based_state_with(BINDING, LOCAL, OTHER, 1, 7, 9),
+        ];
+        let records: Vec<Vec<u8>> = states
+            .iter()
+            .map(|state| state.encode_authenticated(&key).unwrap())
+            .collect();
+
+        for (i, left) in records.iter().enumerate() {
+            assert_eq!(
+                SyncState::decode_authenticated(left, &key).unwrap(),
+                states[i]
+            );
+            for (j, right) in records.iter().enumerate().filter(|(j, _)| *j != i) {
+                assert_ne!(auth_outer_of(left).mac, auth_outer_of(right).mac);
+
+                // One record's tag over another record's body does not verify.
+                let transplanted = with_auth_outer(left, |o| o.mac = auth_outer_of(right).mac);
+                assert_eq!(
+                    decode_auth(&transplanted).unwrap_err(),
+                    AuthenticatedDecodeError::AuthenticationFailed,
+                    "{i} <- {j}"
+                );
+            }
+        }
+    }
+
+    // ---- documented limitations ----------------------------------------------------------
+
+    #[test]
+    fn replay_of_an_older_authenticated_record_is_not_detected() {
+        // DOCUMENTED LIMITATION, not a protection. The tag proves who made a record,
+        // not how recent it is: an older valid record of the same vault and key still
+        // verifies and decodes, including one with a lower remote high-water mark.
+        let key = mac_key();
+        let older = based_state_with(BINDING, LOCAL, TARGET, 1, 7, 9);
+        let newer = based_state_with(BINDING, LOCAL, TARGET, 2, 8, 12);
+
+        let older_bytes = older.encode_authenticated(&key).unwrap();
+        let newer_bytes = newer.encode_authenticated(&key).unwrap();
+
+        // The newer record exists, yet the replayed older one is accepted as valid.
+        assert_eq!(
+            SyncState::decode_authenticated(&newer_bytes, &key).unwrap(),
+            newer
+        );
+        let replayed = SyncState::decode_authenticated(&older_bytes, &key).unwrap();
+        assert_eq!(replayed, older);
+        assert_ne!(replayed, newer);
+    }
+
+    // ---- master password ------------------------------------------------------------------
+
+    #[test]
+    fn a_master_password_change_keeps_the_mac_key_and_old_records_verify() {
+        use crate::vault::format::{
+            create_envelope_with_key, open_envelope_with_key, rewrap_envelope_master_password,
+        };
+
+        let (envelope, vault_key) =
+            create_envelope_with_key("b3c2a-test-only-old-password", b"synthetic payload").unwrap();
+        let old_key = mac_key_for(&vault_key, VAULT_ID);
+        let record = exchange_state().encode_authenticated(&old_key).unwrap();
+
+        let rewrapped =
+            rewrap_envelope_master_password(&envelope, &vault_key, "b3c2a-test-only-new-password")
+                .unwrap();
+        let (reopened_key, _payload) =
+            open_envelope_with_key("b3c2a-test-only-new-password", &rewrapped).unwrap();
+        assert_eq!(reopened_key[..], vault_key[..]);
+
+        let new_key = mac_key_for(&reopened_key, VAULT_ID);
+        assert_eq!(new_key.key[..], old_key.key[..]);
+        assert_eq!(
+            SyncState::decode_authenticated(&record, &new_key).unwrap(),
+            exchange_state()
+        );
+    }
+
+    #[test]
+    fn a_wrong_master_password_yields_no_vault_key_and_so_no_mac_key() {
+        use crate::vault::format::{create_envelope_with_key, open_envelope_with_key};
+
+        let (envelope, _vault_key) =
+            create_envelope_with_key("b3c2a-test-only-password", b"synthetic payload").unwrap();
+
+        assert!(open_envelope_with_key("b3c2a-test-only-wrong", &envelope).is_err());
+    }
+
+    // ---- redaction ---------------------------------------------------------------------------
+
+    #[test]
+    fn the_key_and_every_error_are_redacted_and_fixed() {
+        let key = mac_key();
+        assert_eq!(format!("{key:?}"), "SyncStateMacKey(<redacted>)");
+
+        let mut texts = vec![format!("{key:?}")];
+        for error in [
+            SyncStateAuthError::NilVaultId,
+            SyncStateAuthError::KeyDerivation,
+        ] {
+            texts.push(format!("{error} | {error:?}"));
+        }
+        for error in [
+            AuthenticatedEncodeError::InvalidState(SyncStateError::NilBindingId),
+            AuthenticatedEncodeError::VaultMismatch,
+            AuthenticatedEncodeError::TooLarge,
+            AuthenticatedEncodeError::Serialization,
+            AuthenticatedEncodeError::Authentication,
+        ] {
+            texts.push(format!("{error} | {error:?}"));
+        }
+        for error in [
+            AuthenticatedDecodeError::TooLarge,
+            AuthenticatedDecodeError::Malformed,
+            AuthenticatedDecodeError::UnsupportedFormat,
+            AuthenticatedDecodeError::LegacyUnauthenticated,
+            AuthenticatedDecodeError::UnsupportedVersion,
+            AuthenticatedDecodeError::NonCanonical,
+            AuthenticatedDecodeError::AuthenticationFailed,
+            AuthenticatedDecodeError::InvalidBody,
+            AuthenticatedDecodeError::InvalidState(SyncStateError::NilBindingId),
+            AuthenticatedDecodeError::VaultMismatch,
+        ] {
+            texts.push(format!("{error} | {error:?}"));
+        }
+
+        let forbidden = [
+            K_STATE_HEX,
+            K_STATE_BYTE0_HEX,
+            GOLDEN_AUTHENTICATED_MAC,
+            GOLDEN_FOREIGN_MAC,
+            "11111111-2222-3333-4444-555555555555",
+            INTENT_TEXT,
+        ];
+        for text in &texts {
+            assert_redacted(text);
+            for secret in forbidden {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+    }
+
+    // ---- legacy and downgrade ---------------------------------------------------------------------
+
+    #[test]
+    fn version_one_and_two_records_are_legacy_unauthenticated_never_verified() {
+        for legacy in [GOLDEN_PENDING, GOLDEN_UNBASED, GOLDEN_EXCHANGE] {
+            assert_eq!(
+                decode_auth(legacy.as_bytes()).unwrap_err(),
+                AuthenticatedDecodeError::LegacyUnauthenticated
+            );
+        }
+
+        // Even a freshly encoded ordinary record has no standing here.
+        for bytes in [
+            based_state().encode().unwrap(),
+            exchange_state().encode_exchange_record().unwrap(),
+        ] {
+            assert_eq!(
+                decode_auth(&bytes).unwrap_err(),
+                AuthenticatedDecodeError::LegacyUnauthenticated
+            );
+        }
+
+        // Version and format are judged before the rest of the wrapper.
+        assert_eq!(
+            decode_auth(br#"{"format":"localvault-sync-state","version":1}"#).unwrap_err(),
+            AuthenticatedDecodeError::LegacyUnauthenticated
+        );
+        assert_eq!(
+            decode_auth(br#"{"format":"localvault-sync-state","version":4,"future":1}"#)
+                .unwrap_err(),
+            AuthenticatedDecodeError::UnsupportedVersion
+        );
+        assert_eq!(
+            decode_auth(br#"{"format":"other","version":1}"#).unwrap_err(),
+            AuthenticatedDecodeError::UnsupportedFormat
+        );
+    }
+
+    #[test]
+    fn stripping_the_mac_and_relabelling_downgrades_to_legacy_never_to_verified() {
+        let body = golden_body();
+
+        // Relabelled version 1 with a recomputed checksum: the ordinary decoder
+        // refuses the exchange-shaped body; the authenticated decoder calls it legacy.
+        let as_v1 = forge(&body);
+        assert_eq!(
+            SyncState::decode(&as_v1).unwrap_err(),
+            SyncStateDecodeError::InvalidBody
+        );
+        assert_eq!(
+            decode_auth(&as_v1).unwrap_err(),
+            AuthenticatedDecodeError::LegacyUnauthenticated
+        );
+
+        // Relabelled version 2 is a valid *unauthenticated* record: an actor who can
+        // write the file can always produce one. It must not gain any standing.
+        let as_v2 = forge_v2(&body);
+        assert_eq!(
+            SyncState::decode_exchange_record(&as_v2).unwrap(),
+            exchange_state()
+        );
+        assert_eq!(
+            decode_auth(&as_v2).unwrap_err(),
+            AuthenticatedDecodeError::LegacyUnauthenticated
+        );
+    }
+
+    // ---- compatibility and isolation --------------------------------------------------------------
+
+    #[test]
+    fn the_ordinary_and_exchange_decoders_refuse_version_three() {
+        assert_eq!(SYNC_STATE_VERSION, 1);
+        assert_eq!(SYNC_STATE_EXCHANGE_VERSION, 2);
+        assert_eq!(SYNC_STATE_AUTHENTICATED_VERSION, 3);
+
+        let record = GOLDEN_AUTHENTICATED.as_bytes();
+        assert_eq!(
+            SyncState::decode(record).unwrap_err(),
+            SyncStateDecodeError::UnsupportedVersion
+        );
+        assert_eq!(
+            SyncState::decode_exchange_record(record).unwrap_err(),
+            SyncStateDecodeError::UnsupportedVersion
+        );
+        assert_eq!(
+            SyncStateLoad::from_bytes(record),
+            SyncStateLoad::UnsupportedVersion
+        );
+    }
+
+    #[test]
+    fn the_existing_encoders_never_produce_version_three_and_the_goldens_are_unchanged() {
+        let state = based_state();
+        assert_eq!(outer_of(&state.encode().unwrap()).version, 1);
+        assert_eq!(
+            outer_of(&exchange_state().encode_exchange_record().unwrap()).version,
+            2
+        );
+
+        assert_eq!(
+            SyncState::decode(GOLDEN_PENDING.as_bytes()).unwrap(),
+            pending_state()
+        );
+        assert_eq!(
+            SyncState::decode(GOLDEN_UNBASED.as_bytes()).unwrap(),
+            unbased_state()
+        );
+        assert_eq!(
+            SyncState::decode_exchange_record(GOLDEN_EXCHANGE.as_bytes()).unwrap(),
+            exchange_state()
+        );
+    }
+
+    #[test]
+    fn no_production_code_references_the_authenticated_apis() {
+        const SYMBOLS: [&str; 7] = [
+            "SyncStateMacKey",
+            "encode_authenticated",
+            "decode_authenticated",
+            "SYNC_STATE_AUTHENTICATED_VERSION",
+            "derive_state_mac_key",
+            "verify_state_mac",
+            "state_mac::",
+        ];
+
+        fn scan(dir: &std::path::Path, own: &[std::path::PathBuf], hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    scan(&path, own, hits);
+                } else if path.extension().is_some_and(|ext| ext == "rs") && !own.contains(&path) {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for symbol in SYMBOLS {
+                        if text.contains(symbol) {
+                            hits.push(format!("{} uses {symbol}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = core.parent().unwrap().parent().unwrap();
+        let core_src = core.join("src");
+        let own = [
+            core_src.join("sync_state.rs"),
+            core_src.join("crypto").join("state_mac.rs"),
+        ];
+
+        let mut hits = Vec::new();
+        for dir in [
+            core_src.clone(),
+            workspace.join("src-tauri").join("src"),
+            workspace.join("src-tauri").join("tests"),
+            workspace
+                .join("crates")
+                .join("localvault-android-bridge")
+                .join("src"),
+        ] {
+            assert!(dir.is_dir(), "{} must exist", dir.display());
+            scan(&dir, &own, &mut hits);
+        }
+
+        assert!(hits.is_empty(), "{hits:#?}");
     }
 }
 
