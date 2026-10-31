@@ -123,6 +123,50 @@
 //! A version-1 or version-2 record is [`AuthenticatedDecodeError::LegacyUnauthenticated`]
 //! here: it is not a verified record, carries no authority and is never
 //! migrated or upgraded by this module.
+//!
+//! # Exchange transitions (slice B3c-2)
+//!
+//! [`begin_exchange`], [`finalize_exchange`] and [`clear_exchange`] are
+//! **dormant, pure** transitions over states that carry exchange records. They
+//! move a bound copy between three record shapes: clean (`P0`), exchange
+//! recorded (`P1`: a pending push plus an [`ExchangeIntent`]) and finalized
+//! (`P2`: a clean state with one more [`RetainedPrevious`] entry). They have no
+//! production caller, perform no I/O, read no clock and generate no randomness.
+//!
+//! Every input state is an [`AuthenticatedSyncState`]. That type proves that the
+//! supplied version-3 record passed MAC verification for the given Vault Key. It
+//! does **not** prove that the record was persisted to disk, read back from a
+//! store, is the latest record, resists rollback, represents user consent or
+//! corresponds to the current state of any file system. A record signed in
+//! memory and never written anywhere yields one just the same. That is
+//! acceptable for a dormant pure model and is **not** production authorization;
+//! a future store/session boundary must enforce persistence, read-back,
+//! freshness and authority before it hands one to a transition.
+//!
+//! Every successful transition returns an ordinary, unauthenticated
+//! [`SyncState`] *proposal*, never an [`AuthenticatedSyncState`]: a proposal has
+//! no authority until a platform adapter has persisted its encoded bytes, read
+//! them back and verified them again. A refusal changes nothing.
+//!
+//! The core verifies the internal consistency of the evidence, not its physical
+//! origin. [`ObjectAnchor`] values are opaque and [`ArtifactObservation::Absent`]
+//! and [`RetainedVersionEvidence::Absent`] are assertions of a future platform
+//! adapter, not proof that the core enumerated a directory. A [`BoundInspection`]
+//! authenticates the supplied encrypted bytes, not the path or handle they came
+//! from. The adapter must separately provide fresh reads, verified file and
+//! directory identity, single-link, no-follow and alias checks, safe handling of
+//! foreign artifacts, session-bound approval, a verified persisted pending
+//! intent, a fresh MAC-verified read-back and crash-recovery authority. No
+//! transition establishes any of that, and a successful one is never permission
+//! to write, rename, delete, retry or release a file.
+//!
+//! [`finalize_exchange`] never succeeds without an observed retained previous
+//! version whose bytes, revision and identities agree with the record. It
+//! appends exactly one [`RetainedPrevious`] and never releases or reorders an
+//! existing one; the technical bound [`MAX_RETAINED_PREVIOUS`] is the only
+//! capacity rule, and the product retention policy is undecided. Acknowledging a
+//! missing previous version and releasing retained entries are not implemented.
+//! The persisted store stays version 1 and cannot hold these states.
 
 use std::fmt;
 
@@ -1622,6 +1666,20 @@ pub fn begin_push(
         RemoteEvidence::Unavailable => return Err(TransitionRefusal::RemoteUnavailable),
     };
 
+    let pending = plan_based_push(&checkpoint, bound, intent_id)?;
+
+    state.with_parts(state.base, Some(pending)).map_err(invalid)
+}
+
+/// The acceptance rules of [`begin_push`] for a based state without a pending
+/// push, shared with [`begin_exchange`]: judge the fresh `bound` evidence
+/// against `checkpoint` and build the pending push it justifies. It checks no
+/// binding and no state shape; its callers do that first. Pure and read-only.
+fn plan_based_push(
+    checkpoint: &SyncCheckpoint,
+    bound: &BoundInspection,
+    intent_id: Uuid,
+) -> Result<PendingPush, TransitionRefusal> {
     let inspection = bound.inspection();
     let local_revision =
         counter(inspection.local_revision()).ok_or(TransitionRefusal::LocalUnversioned)?;
@@ -1680,9 +1738,8 @@ pub fn begin_push(
         *bound.local_fingerprint(),
     )
     .map_err(|_| invalid(SyncStateError::InvalidPushIntent))?;
-    let pending = PendingPush::new(intent_id, intent, local_revision).map_err(invalid)?;
 
-    state.with_parts(state.base, Some(pending)).map_err(invalid)
+    PendingPush::new(intent_id, intent, local_revision).map_err(invalid)
 }
 
 /// Judge a persisted pending push against a fresh remote observation, using the
@@ -1774,6 +1831,669 @@ pub fn reconcile_pending_push(
         PushReconciliation::Unknown => still_pending,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Exchange transitions (Stage 1U-4, slice B3c-2)
+// ---------------------------------------------------------------------------
+//
+// Dormant and pure: nothing here has a production caller, performs I/O, reads a
+// clock or generates randomness. See the module documentation for the trust
+// boundaries. In short:
+//
+// * `AuthenticatedSyncState` proves that the supplied version-3 record passed
+//   MAC verification for one Vault Key and vault id. It does **not** prove that
+//   the record was ever persisted, was read back from a store, is the latest
+//   record, resists rollback, represents user consent or matches the file
+//   system. A record that was signed in memory and never written yields one just
+//   the same, which is acceptable for this pure model and is not production
+//   authorization.
+// * Every anchor, `Absent` and `Unavailable` value is an assertion of a future
+//   platform adapter. The core checks the assertions only for consistency with
+//   the recorded exchange and never treats them as proof of a physical fact.
+// * Every transition returns an ordinary, unauthenticated `SyncState` proposal
+//   or a refusal. No transition authorizes a write, rename, deletion, release or
+//   retry.
+
+/// A state decoded from a MAC-verified version-3 record of one vault.
+///
+/// Built only by [`decode`](Self::decode), which uses the existing
+/// [`SyncState::decode_authenticated`]. It proves that the supplied bytes
+/// verified under the given [`SyncStateMacKey`] and are bound to that key's
+/// vault id, and nothing else. It does **not** prove that the record:
+///
+/// * was persisted to disk;
+/// * was read back from a store;
+/// * is the latest record;
+/// * is resistant to rollback or replay;
+/// * represents user consent;
+/// * corresponds to the current state of any file or directory.
+///
+/// A record that was signed in memory and never written anywhere, or one that a
+/// later record has long superseded, produces exactly the same type. That is
+/// acceptable for the dormant, pure transition model of this module and is
+/// **not** production authorization: a future store and session boundary must
+/// enforce persistence, read-back, freshness and authority before it hands one
+/// to a transition.
+///
+/// There is no constructor from a [`SyncState`], no `From`, no `Default`, no
+/// mutable access and no public field. Version-1 and version-2 records can
+/// never become one. A transition returns an ordinary [`SyncState`], never an
+/// `AuthenticatedSyncState`: a proposal has no authority until it has been
+/// persisted, read back and verified again. `Debug` shows the state (itself
+/// redacted) and never the vault id.
+///
+/// ```compile_fail,E0451
+/// use localvault_core::sync_state::{AuthenticatedSyncState, SyncState};
+/// use uuid::Uuid;
+///
+/// fn forge(state: SyncState, vault_id: Uuid) -> AuthenticatedSyncState {
+///     AuthenticatedSyncState { state, vault_id }
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
+/// use localvault_core::sync_state::{AuthenticatedSyncState, SyncState};
+///
+/// fn forge(state: SyncState) -> AuthenticatedSyncState {
+///     AuthenticatedSyncState::from(state)
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use localvault_core::sync_state::AuthenticatedSyncState;
+///
+/// fn forge() -> AuthenticatedSyncState {
+///     AuthenticatedSyncState::default()
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use localvault_core::sync_state::{AuthenticatedSyncState, SyncState};
+///
+/// fn tamper(authenticated: &mut AuthenticatedSyncState) -> &mut SyncState {
+///     authenticated.state_mut()
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use localvault_core::sync_state::{
+///     begin_exchange, AuthenticatedSyncState, ExchangeRefusal, ExchangeTargetEvidence, Locator,
+/// };
+/// use uuid::Uuid;
+///
+/// // A transition returns a plain proposal, never an `AuthenticatedSyncState`.
+/// let _: fn(
+///     &AuthenticatedSyncState,
+///     &Locator,
+///     &Locator,
+///     &ExchangeTargetEvidence<'_>,
+///     Uuid,
+/// ) -> Result<AuthenticatedSyncState, ExchangeRefusal> = begin_exchange;
+/// ```
+///
+/// ```compile_fail,E0308
+/// use localvault_core::sync_state::{begin_exchange, ExchangeTargetEvidence, Locator, SyncState};
+/// use uuid::Uuid;
+///
+/// // A plain `SyncState` (for example a proposal) is not accepted as input.
+/// fn feed(
+///     state: &SyncState,
+///     local: &Locator,
+///     target: &Locator,
+///     evidence: &ExchangeTargetEvidence<'_>,
+///     id: Uuid,
+/// ) {
+///     let _ = begin_exchange(state, local, target, evidence, id);
+/// }
+/// ```
+#[derive(Clone, PartialEq, Eq)]
+pub struct AuthenticatedSyncState {
+    state: SyncState,
+    vault_id: Uuid,
+}
+
+impl AuthenticatedSyncState {
+    /// Verify `bytes` as a version-3 record of the vault `key` is bound to,
+    /// through [`SyncState::decode_authenticated`] (same checks, same errors; a
+    /// version-1 or version-2 record is
+    /// [`AuthenticatedDecodeError::LegacyUnauthenticated`]).
+    ///
+    /// Success proves MAC provenance for this vault only. It proves nothing
+    /// about persistence, freshness or consent; see the type documentation.
+    pub fn decode(bytes: &[u8], key: &SyncStateMacKey) -> Result<Self, AuthenticatedDecodeError> {
+        let state = SyncState::decode_authenticated(bytes, key)?;
+
+        Ok(Self {
+            state,
+            vault_id: key.vault_id,
+        })
+    }
+
+    /// The decoded state. Read-only.
+    pub fn state(&self) -> &SyncState {
+        &self.state
+    }
+}
+
+// The vault id is never printed.
+impl fmt::Debug for AuthenticatedSyncState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthenticatedSyncState")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The bytes read at the target name, together with the physical observations
+/// of an adapter.
+///
+/// `inspection` is the authenticated view of those bytes (its candidate side is
+/// the target). The two anchors are assertions of the adapter that observed the
+/// target under its own held handles; the core only checks them for consistency
+/// with the recorded exchange and cannot tell where they came from.
+pub struct ExchangeTargetEvidence<'a> {
+    /// Authenticated inspection; the candidate side is the bytes at the target.
+    pub inspection: &'a BoundInspection,
+    /// Adapter assertion: the identity of the object that held those bytes.
+    pub object_anchor: &'a ObjectAnchor,
+    /// Adapter assertion: the identity of the directory that contains it.
+    pub directory_anchor: &'a ObjectAnchor,
+}
+
+// Written out field by field so that a field added later cannot reach the
+// output through a derive. The anchors redact themselves.
+impl fmt::Debug for ExchangeTargetEvidence<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExchangeTargetEvidence")
+            .field("inspection", self.inspection)
+            .field("object_anchor", self.object_anchor)
+            .field("directory_anchor", self.directory_anchor)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What an adapter established about the retained previous version at one point
+/// in time.
+///
+/// `Absent` and `Unavailable` are adapter assertions, like
+/// [`RemoteEvidence::Absent`]; a read failure, an uncertain identity or a
+/// dehydrated file is `Unavailable`, never `Absent`. [`finalize_exchange`]
+/// accepts only `Observed`.
+pub enum RetainedVersionEvidence<'a> {
+    /// Adapter assertion: positively confirmed absent.
+    Absent,
+    /// Unreadable, dehydrated, identity uncertain or otherwise not established.
+    Unavailable,
+    /// The retained file was read and authenticated.
+    Observed {
+        /// Authenticated inspection; the candidate side is the retained bytes.
+        inspection: &'a BoundInspection,
+        /// Adapter assertion: the identity of the retained object.
+        object_anchor: &'a ObjectAnchor,
+        /// Adapter assertion: the identity of the directory that holds it.
+        directory_anchor: &'a ObjectAnchor,
+    },
+}
+
+impl fmt::Debug for RetainedVersionEvidence<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => f.write_str("Absent"),
+            Self::Unavailable => f.write_str("Unavailable"),
+            Self::Observed {
+                inspection,
+                object_anchor,
+                directory_anchor,
+            } => f
+                .debug_struct("Observed")
+                .field("inspection", inspection)
+                .field("object_anchor", object_anchor)
+                .field("directory_anchor", directory_anchor)
+                .finish(),
+        }
+    }
+}
+
+/// What an adapter established about one auxiliary artifact (the staging file or
+/// the retained previous file).
+///
+/// `Absent` is an adapter assertion that the artifact was positively confirmed
+/// missing; it is not proof that the core enumerated a directory. `Unavailable`
+/// is never `Absent`. `Present` covers every artifact that exists, whether it is
+/// ours, readable or foreign: a present artifact is never treated as absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactObservation {
+    Absent,
+    Present,
+    Unavailable,
+}
+
+/// Which auxiliary artifact of an exchange a refusal is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ExchangeArtifact {
+    #[error("staging file")]
+    Staging,
+    #[error("retained previous file")]
+    Previous,
+}
+
+/// Why the retained previous version was not verified by [`finalize_exchange`].
+/// Fixed categories only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum PreviousFault {
+    #[error("it is missing")]
+    Missing,
+    #[error("it could not be observed")]
+    Unavailable,
+    #[error("it is not the recorded baseline")]
+    Differs,
+    #[error("it authenticates to a different revision than recorded")]
+    RevisionMismatch,
+    #[error("it is not the object recorded when the exchange began")]
+    AnchorMismatch,
+    #[error("it is not in the recorded directory")]
+    DirectoryMismatch,
+}
+
+/// Why an exchange transition was refused.
+///
+/// Fixed variants only. A refusal never carries (and its `Display`/`Debug`
+/// never show) a vault id, locator, path, anchor, fingerprint, key or content.
+/// A refusal changes nothing and authorizes nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ExchangeRefusal {
+    /// A check shared with the ordinary transitions: binding, base, push
+    /// preconditions or an invalid resulting state.
+    #[error("{0}")]
+    Transition(TransitionRefusal),
+    #[error("the state records no exchange")]
+    NoExchangeIntent,
+    #[error("the exchange id is not the recorded exchange")]
+    ExchangeIdMismatch,
+    #[error("no room for another retained previous version")]
+    RetainedCapacityExhausted,
+    #[error("the target is not the intended version")]
+    TargetNotIntended,
+    #[error("the target is not the recorded baseline")]
+    TargetNotBaseline,
+    #[error("the target authenticates to a different revision than recorded")]
+    TargetRevisionMismatch,
+    #[error("the target is still the object recorded when the exchange began")]
+    TargetNotReplaced,
+    #[error("the target is not the object recorded when the exchange began")]
+    TargetAnchorMismatch,
+    #[error("the target is not in the recorded directory")]
+    DirectoryAnchorMismatch,
+    #[error("the supplied evidence is inconsistent")]
+    EvidenceMismatch,
+    #[error("the {0} is present")]
+    ArtifactPresent(ExchangeArtifact),
+    #[error("the {0} could not be observed")]
+    ArtifactUnavailable(ExchangeArtifact),
+    #[error("the retained previous version is not verified: {0}")]
+    PreviousNotVerified(PreviousFault),
+}
+
+/// Propose recording an exchange for a push that is about to start: a state
+/// with a pending push **and** an [`ExchangeIntent`] holding the physical
+/// identities the adapter observed at the target. `P0` → `P1`.
+///
+/// Nothing is written and nothing is authorized. The returned state is an
+/// ordinary proposal: the adapter must persist it, read it back and verify it
+/// (through [`AuthenticatedSyncState::decode`]) before it touches any file.
+///
+/// Accepted only when all of these hold, checked in this order: every
+/// evidence vault identity equals the authenticated record's, the state is
+/// bound to that vault and to exactly the expected locators; the state is based
+/// ([`TransitionRefusal::NotBased`]); it has no pending push
+/// ([`TransitionRefusal::PendingIntentExists`], so an exchange can never be
+/// reset or replaced); it has room for one more retained entry
+/// ([`ExchangeRefusal::RetainedCapacityExhausted`]; a technical bound, not a
+/// retention policy); and the target evidence satisfies exactly the acceptance
+/// rules of [`begin_push`] (fresh read equals the synchronized bytes at the
+/// recorded revision, local is the only side that changed with a genuine payload
+/// change, local revision strictly above the high-water mark, valid non-nil
+/// intent id that no retained entry uses).
+///
+/// The checkpoint and the high-water mark are not changed, existing retained
+/// entries are carried over unchanged and in order, and the anchors are stored
+/// as the adapter's unauthenticated observations. An [`ObjectAnchor`] is not an
+/// authenticated file identity.
+pub fn begin_exchange(
+    state: &AuthenticatedSyncState,
+    expected_local: &Locator,
+    expected_target: &Locator,
+    target: &ExchangeTargetEvidence<'_>,
+    intent_id: Uuid,
+) -> Result<SyncState, ExchangeRefusal> {
+    bind_exchange(state, expected_local, expected_target, target, None)?;
+
+    let record = &state.state;
+    let SyncBase::Based(checkpoint) = record.base else {
+        return Err(ExchangeRefusal::Transition(TransitionRefusal::NotBased));
+    };
+    if record.pending_push.is_some() {
+        return Err(ExchangeRefusal::Transition(
+            TransitionRefusal::PendingIntentExists,
+        ));
+    }
+    if record.retained.len() >= MAX_RETAINED_PREVIOUS {
+        return Err(ExchangeRefusal::RetainedCapacityExhausted);
+    }
+
+    let pending = plan_based_push(&checkpoint, target.inspection, intent_id)
+        .map_err(ExchangeRefusal::Transition)?;
+    let exchange = ExchangeIntent::new(
+        ExchangeScheme::RetainAndPublishV1,
+        target.object_anchor.clone(),
+        target.directory_anchor.clone(),
+    );
+
+    record
+        .with_exchange_parts(
+            record.base,
+            Some(pending),
+            Some(exchange),
+            record.retained.clone(),
+        )
+        .map_err(invalid_result)
+}
+
+/// Propose completing a recorded exchange once the adapter asserts that the
+/// target holds the intended version and that the previous version is retained
+/// next to it. `P1` → `P2`.
+///
+/// Nothing is written and nothing is authorized; in particular this does not
+/// authorize releasing or deleting the retained file, and it makes no claim
+/// about durability on any file system. The returned state is an ordinary
+/// proposal that must be persisted, read back and verified before it matters.
+///
+/// Checked in this order: binding (as for [`begin_exchange`], also for the
+/// retained evidence when it is `Observed`); a recorded exchange and pending
+/// push on a based state; `exchange_id` equal to the recorded one; room for one
+/// more retained entry; the target (intended bytes, intended authenticated
+/// revision, recorded directory, an object that is **not** the one recorded when
+/// the exchange began); the staging file positively absent; and the retained
+/// previous version.
+///
+/// **This never succeeds without [`RetainedVersionEvidence::Observed`]**: an
+/// absent, unavailable, changed or misplaced retained version is
+/// [`ExchangeRefusal::PreviousNotVerified`] and leaves the recorded exchange
+/// authoritative. The observed retained version must hold the original baseline
+/// bytes at the old synchronized revision, in the recorded object (the identity
+/// survives the renames) and directory, and must have been inspected together
+/// with the same local bytes as the target.
+///
+/// On success the checkpoint becomes the intended version, the high-water mark
+/// becomes `max(old, intended)` and never decreases, the pending push and the
+/// exchange are cleared, and exactly one [`RetainedPrevious`] built from the
+/// **recorded** fields is appended after the existing entries, which are kept
+/// as they are.
+pub fn finalize_exchange(
+    state: &AuthenticatedSyncState,
+    expected_local: &Locator,
+    expected_target: &Locator,
+    exchange_id: Uuid,
+    target: &ExchangeTargetEvidence<'_>,
+    staging: ArtifactObservation,
+    previous: RetainedVersionEvidence<'_>,
+) -> Result<SyncState, ExchangeRefusal> {
+    let observed = match &previous {
+        RetainedVersionEvidence::Observed { inspection, .. } => Some(*inspection),
+        RetainedVersionEvidence::Absent | RetainedVersionEvidence::Unavailable => None,
+    };
+    bind_exchange(state, expected_local, expected_target, target, observed)?;
+
+    let record = &state.state;
+    let (exchange, pending, checkpoint) = recorded_exchange(record, exchange_id)?;
+    if record.retained.len() >= MAX_RETAINED_PREVIOUS {
+        return Err(ExchangeRefusal::RetainedCapacityExhausted);
+    }
+
+    let inspected = target.inspection;
+    if inspected.candidate_fingerprint() != pending.intent.intended() {
+        return Err(ExchangeRefusal::TargetNotIntended);
+    }
+    if counter(inspected.inspection().candidate_revision()) != Some(pending.intended_revision) {
+        return Err(ExchangeRefusal::TargetRevisionMismatch);
+    }
+    if target.directory_anchor != &exchange.directory_anchor {
+        return Err(ExchangeRefusal::DirectoryAnchorMismatch);
+    }
+    if target.object_anchor == &exchange.target_anchor {
+        return Err(ExchangeRefusal::TargetNotReplaced);
+    }
+
+    require_artifact_absent(staging, ExchangeArtifact::Staging)?;
+
+    match previous {
+        RetainedVersionEvidence::Absent => {
+            return Err(ExchangeRefusal::PreviousNotVerified(PreviousFault::Missing));
+        }
+        RetainedVersionEvidence::Unavailable => {
+            return Err(ExchangeRefusal::PreviousNotVerified(
+                PreviousFault::Unavailable,
+            ));
+        }
+        RetainedVersionEvidence::Observed {
+            inspection,
+            object_anchor,
+            directory_anchor,
+        } => {
+            if inspection.local_fingerprint() != inspected.local_fingerprint() {
+                return Err(ExchangeRefusal::EvidenceMismatch);
+            }
+            if inspection.candidate_fingerprint() != &checkpoint.synced {
+                return Err(ExchangeRefusal::PreviousNotVerified(PreviousFault::Differs));
+            }
+            if counter(inspection.inspection().candidate_revision())
+                != Some(checkpoint.synced_revision)
+            {
+                return Err(ExchangeRefusal::PreviousNotVerified(
+                    PreviousFault::RevisionMismatch,
+                ));
+            }
+            if object_anchor != &exchange.target_anchor {
+                return Err(ExchangeRefusal::PreviousNotVerified(
+                    PreviousFault::AnchorMismatch,
+                ));
+            }
+            if directory_anchor != &exchange.directory_anchor {
+                return Err(ExchangeRefusal::PreviousNotVerified(
+                    PreviousFault::DirectoryMismatch,
+                ));
+            }
+        }
+    }
+
+    let advanced = SyncCheckpoint::new(
+        *pending.intent.intended(),
+        pending.intended_revision,
+        RemoteHighWater::new(
+            checkpoint
+                .high_water
+                .revision()
+                .max(pending.intended_revision),
+        ),
+    )
+    .map_err(invalid_result)?;
+    let appended = RetainedPrevious::new(
+        pending.intent_id,
+        checkpoint.synced,
+        checkpoint.synced_revision,
+        exchange.target_anchor.clone(),
+        exchange.directory_anchor.clone(),
+    )
+    .map_err(invalid_result)?;
+
+    let mut retained = record.retained.clone();
+    retained.push(appended);
+
+    record
+        .with_exchange_parts(SyncBase::Based(advanced), None, None, retained)
+        .map_err(invalid_result)
+}
+
+/// Propose discarding a recorded exchange whose target is still the original
+/// baseline: the exchange never started, or the adapter verifiably rolled it
+/// back. `P1` → `P0`.
+///
+/// Nothing is written and nothing is authorized. It never restores a file,
+/// removes staging or retained files, renames anything or retries the exchange;
+/// the intent id disappears from the state with this proposal, so the adapter
+/// must itself have made sure that no artifact named after it is left behind.
+/// The returned state is an ordinary proposal that must be persisted, read back
+/// and verified before it matters.
+///
+/// Checked in this order: binding (as for [`begin_exchange`]); a recorded
+/// exchange and pending push on a based state; `exchange_id` equal to the
+/// recorded one; the target (the original baseline bytes at the old
+/// synchronized revision, in the object and directory recorded when the
+/// exchange began); the staging file and the retained previous file both
+/// positively absent. `Unavailable` is not `Absent`, and a present artifact
+/// (even a readable or foreign one) is never treated as absent.
+///
+/// The checkpoint, the high-water mark and every retained entry are unchanged.
+pub fn clear_exchange(
+    state: &AuthenticatedSyncState,
+    expected_local: &Locator,
+    expected_target: &Locator,
+    exchange_id: Uuid,
+    target: &ExchangeTargetEvidence<'_>,
+    staging: ArtifactObservation,
+    previous: ArtifactObservation,
+) -> Result<SyncState, ExchangeRefusal> {
+    bind_exchange(state, expected_local, expected_target, target, None)?;
+
+    let record = &state.state;
+    let (exchange, _pending, checkpoint) = recorded_exchange(record, exchange_id)?;
+
+    let inspected = target.inspection;
+    if inspected.candidate_fingerprint() != &checkpoint.synced {
+        return Err(ExchangeRefusal::TargetNotBaseline);
+    }
+    if counter(inspected.inspection().candidate_revision()) != Some(checkpoint.synced_revision) {
+        return Err(ExchangeRefusal::TargetRevisionMismatch);
+    }
+    if target.object_anchor != &exchange.target_anchor {
+        return Err(ExchangeRefusal::TargetAnchorMismatch);
+    }
+    if target.directory_anchor != &exchange.directory_anchor {
+        return Err(ExchangeRefusal::DirectoryAnchorMismatch);
+    }
+
+    require_artifact_absent(staging, ExchangeArtifact::Staging)?;
+    require_artifact_absent(previous, ExchangeArtifact::Previous)?;
+
+    record
+        .with_exchange_parts(record.base, None, None, record.retained.clone())
+        .map_err(invalid_result)
+}
+
+/// Every supplied inspection must have been authenticated for the vault of the
+/// MAC-verified record; then the record's own binding and both locators are
+/// checked against the target evidence. The first mismatch is reported as a
+/// category.
+fn bind_exchange(
+    state: &AuthenticatedSyncState,
+    expected_local: &Locator,
+    expected_target: &Locator,
+    target: &ExchangeTargetEvidence<'_>,
+    previous: Option<&BoundInspection>,
+) -> Result<(), ExchangeRefusal> {
+    let target_vault = target.inspection.authenticated_vault_id();
+    let foreign = |vault_id: Uuid| vault_id != state.vault_id;
+
+    if foreign(target_vault)
+        || previous.is_some_and(|bound| foreign(bound.authenticated_vault_id()))
+    {
+        return Err(ExchangeRefusal::Transition(
+            TransitionRefusal::BindingMismatch(BindingMismatch::VaultIdentity),
+        ));
+    }
+
+    check_binding(
+        &state.state,
+        Some(target_vault),
+        expected_local,
+        expected_target,
+    )
+    .map_err(ExchangeRefusal::Transition)
+}
+
+/// The recorded exchange, its pending push and the checkpoint of a based state,
+/// for the exchange id the caller names. The scheme is matched exhaustively so
+/// that a future scheme forces a review of every transition.
+fn recorded_exchange(
+    record: &SyncState,
+    exchange_id: Uuid,
+) -> Result<(&ExchangeIntent, &PendingPush, SyncCheckpoint), ExchangeRefusal> {
+    let exchange = record
+        .exchange
+        .as_ref()
+        .ok_or(ExchangeRefusal::NoExchangeIntent)?;
+    let pending = record
+        .pending_push
+        .as_ref()
+        .ok_or(ExchangeRefusal::Transition(
+            TransitionRefusal::NoPendingPush,
+        ))?;
+    let SyncBase::Based(checkpoint) = record.base else {
+        return Err(ExchangeRefusal::Transition(TransitionRefusal::NotBased));
+    };
+
+    match exchange.scheme {
+        ExchangeScheme::RetainAndPublishV1 => {}
+    }
+
+    if pending.intent_id != exchange_id {
+        return Err(ExchangeRefusal::ExchangeIdMismatch);
+    }
+    Ok((exchange, pending, checkpoint))
+}
+
+fn require_artifact_absent(
+    observation: ArtifactObservation,
+    artifact: ExchangeArtifact,
+) -> Result<(), ExchangeRefusal> {
+    match observation {
+        ArtifactObservation::Absent => Ok(()),
+        ArtifactObservation::Present => Err(ExchangeRefusal::ArtifactPresent(artifact)),
+        ArtifactObservation::Unavailable => Err(ExchangeRefusal::ArtifactUnavailable(artifact)),
+    }
+}
+
+fn invalid_result(error: SyncStateError) -> ExchangeRefusal {
+    ExchangeRefusal::Transition(invalid(error))
+}
+
+impl SyncState {
+    /// A copy with a different base, pending push, exchange intent and retained
+    /// list, revalidated by [`SyncState::new_with_exchange_records`]. The
+    /// binding identity and locators are carried over. Unlike
+    /// [`SyncState::with_parts`] it accepts exchange records on purpose: only
+    /// the exchange transitions call it.
+    fn with_exchange_parts(
+        &self,
+        base: SyncBase,
+        pending_push: Option<PendingPush>,
+        exchange: Option<ExchangeIntent>,
+        retained: Vec<RetainedPrevious>,
+    ) -> Result<SyncState, SyncStateError> {
+        SyncState::new_with_exchange_records(
+            self.binding_id,
+            self.vault_tag,
+            self.local_locator.clone(),
+            self.target_locator.clone(),
+            base,
+            pending_push,
+            exchange,
+            retained,
+        )
+    }
+}
+
+// End of the exchange transitions (slice B3c-2).
 
 impl SyncState {
     /// A copy with a different base and pending push, revalidated by
@@ -7851,5 +8571,1629 @@ mod transition_tests {
             TransitionRefusal::InvalidState(SyncStateError::ExchangeRecordsUnsupportedByTransition);
 
         assert_free_of_content(&format!("{refusal} | {refusal:?}"));
+    }
+
+    // ---- B3c-2: guarded exchange transitions (dormant, pure) --------------------
+    //
+    // Everything below is synthetic. "The evidence agrees with the record" means
+    // that the supplied values are consistent with the recorded exchange; no test
+    // observes, renames, retains or persists a file, and none claims that a
+    // record was ever persisted, read back, current or approved.
+
+    const INTENT_2: Uuid = Uuid::from_u128(0xcccc_cccc_dddd_4eee_8fff_0000_0000_0001);
+
+    fn auth_key() -> SyncStateMacKey {
+        SyncStateMacKey::derive(&rig().key, VAULT_ID).unwrap()
+    }
+
+    /// Signs `state` in memory and verifies the bytes again. Nothing is written
+    /// anywhere, so this is exactly a MAC-valid record that was never persisted.
+    fn authed(state: &SyncState) -> AuthenticatedSyncState {
+        let key = auth_key();
+
+        AuthenticatedSyncState::decode(&state.encode_authenticated(&key).unwrap(), &key).unwrap()
+    }
+
+    /// An inspection plus the assertions an adapter would make about it.
+    struct Seen {
+        inspection: BoundInspection,
+        object: ObjectAnchor,
+        directory: ObjectAnchor,
+    }
+
+    impl Seen {
+        fn new(local: &[u8], candidate: &[u8], object: u8, directory: u8) -> Self {
+            Self::of(bound(local, candidate), object, directory)
+        }
+
+        fn of(inspection: BoundInspection, object: u8, directory: u8) -> Self {
+            Self {
+                inspection,
+                object: exchange_anchor(object),
+                directory: exchange_anchor(directory),
+            }
+        }
+
+        /// Evidence authenticated for another vault.
+        fn foreign(
+            local_revision: u64,
+            candidate_revision: u64,
+            object: u8,
+            directory: u8,
+        ) -> Self {
+            let other = foreign();
+            let inspection = inspect_remote_bytes(
+                &other.key,
+                FOREIGN_VAULT_ID,
+                &other.raw_at(local_revision),
+                &other.raw_at(candidate_revision),
+                None,
+            )
+            .unwrap();
+
+            Self::of(inspection, object, directory)
+        }
+
+        fn target(&self) -> ExchangeTargetEvidence<'_> {
+            ExchangeTargetEvidence {
+                inspection: &self.inspection,
+                object_anchor: &self.object,
+                directory_anchor: &self.directory,
+            }
+        }
+
+        fn retained(&self) -> RetainedVersionEvidence<'_> {
+            RetainedVersionEvidence::Observed {
+                inspection: &self.inspection,
+                object_anchor: &self.object,
+                directory_anchor: &self.directory,
+            }
+        }
+    }
+
+    /// The target as `begin_exchange` sees it: the synchronized bytes (S) in the
+    /// recorded object 3 and directory 4, with L as the local file.
+    fn seen_before() -> Seen {
+        Seen::new(&v().l8, &v().s7, 3, 4)
+    }
+
+    /// The target after the exchange: the intended bytes (L) in a new object 5.
+    fn seen_after() -> Seen {
+        Seen::new(&v().l8, &v().l8, 5, 4)
+    }
+
+    /// The retained previous version: S, still in the recorded object 3.
+    fn seen_retained() -> Seen {
+        Seen::new(&v().l8, &v().s7, 3, 4)
+    }
+
+    fn begin(state: &AuthenticatedSyncState, seen: &Seen) -> Result<SyncState, ExchangeRefusal> {
+        begin_with(state, seen, INTENT)
+    }
+
+    fn begin_with(
+        state: &AuthenticatedSyncState,
+        seen: &Seen,
+        intent_id: Uuid,
+    ) -> Result<SyncState, ExchangeRefusal> {
+        let (l, t) = locs();
+
+        begin_exchange(state, &l, &t, &seen.target(), intent_id)
+    }
+
+    fn finalize(
+        state: &AuthenticatedSyncState,
+        exchange_id: Uuid,
+        seen: &Seen,
+        staging: ArtifactObservation,
+        previous: RetainedVersionEvidence<'_>,
+    ) -> Result<SyncState, ExchangeRefusal> {
+        let (l, t) = locs();
+
+        finalize_exchange(
+            state,
+            &l,
+            &t,
+            exchange_id,
+            &seen.target(),
+            staging,
+            previous,
+        )
+    }
+
+    fn clear(
+        state: &AuthenticatedSyncState,
+        exchange_id: Uuid,
+        seen: &Seen,
+        staging: ArtifactObservation,
+        previous: ArtifactObservation,
+    ) -> Result<SyncState, ExchangeRefusal> {
+        let (l, t) = locs();
+
+        clear_exchange(
+            state,
+            &l,
+            &t,
+            exchange_id,
+            &seen.target(),
+            staging,
+            previous,
+        )
+    }
+
+    /// The regular finalize call: intended target, staging absent, S retained.
+    fn finalize_regular(state: &AuthenticatedSyncState) -> Result<SyncState, ExchangeRefusal> {
+        finalize(
+            state,
+            INTENT,
+            &seen_after(),
+            ArtifactObservation::Absent,
+            seen_retained().retained(),
+        )
+    }
+
+    /// The regular clear call: baseline target, staging and previous absent.
+    fn clear_regular(state: &AuthenticatedSyncState) -> Result<SyncState, ExchangeRefusal> {
+        clear(
+            state,
+            INTENT,
+            &seen_before(),
+            ArtifactObservation::Absent,
+            ArtifactObservation::Absent,
+        )
+    }
+
+    fn transition(refusal: TransitionRefusal) -> ExchangeRefusal {
+        ExchangeRefusal::Transition(refusal)
+    }
+
+    fn p0() -> AuthenticatedSyncState {
+        authed(&based())
+    }
+
+    fn p1() -> AuthenticatedSyncState {
+        authed(&exchange_pending(false))
+    }
+
+    /// The state `finalize_regular` is expected to propose from `p1`, with
+    /// `prior` as the entries that were retained before.
+    fn finalized(prior: Vec<RetainedPrevious>) -> SyncState {
+        let mut retained = prior;
+        retained.push(
+            RetainedPrevious::new(
+                INTENT,
+                fp_of(&v().s7),
+                7,
+                exchange_anchor(3),
+                exchange_anchor(4),
+            )
+            .unwrap(),
+        );
+
+        SyncState::new_with_exchange_records(
+            BindingId::new(BINDING).unwrap(),
+            tag(),
+            loc(LOCAL),
+            loc(TARGET),
+            SyncBase::Based(checkpoint(&v().l8, 8, 8)),
+            None,
+            None,
+            retained,
+        )
+        .unwrap()
+    }
+
+    /// A recorded exchange (anchors 3 and 4) over an arbitrary checkpoint.
+    fn exchange_over(
+        base: SyncCheckpoint,
+        pending_push: PendingPush,
+        retained: Vec<RetainedPrevious>,
+    ) -> SyncState {
+        SyncState::new_with_exchange_records(
+            BindingId::new(BINDING).unwrap(),
+            tag(),
+            loc(LOCAL),
+            loc(TARGET),
+            SyncBase::Based(base),
+            Some(pending_push),
+            Some(ExchangeIntent::new(
+                ExchangeScheme::RetainAndPublishV1,
+                exchange_anchor(3),
+                exchange_anchor(4),
+            )),
+            retained,
+        )
+        .unwrap()
+    }
+
+    /// `count` unrelated retained entries, all valid below the synced S (7).
+    fn fillers(count: usize) -> Vec<RetainedPrevious> {
+        (0..count)
+            .map(|n| {
+                RetainedPrevious::new(
+                    Uuid::from_u128(0x1000 + n as u128),
+                    fp_of(&[n as u8, 0xee]),
+                    n as u64 % 6,
+                    exchange_anchor(0x40 + n as u8),
+                    exchange_anchor(0x50 + n as u8),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn clean_with(retained: Vec<RetainedPrevious>) -> SyncState {
+        SyncState::new_with_exchange_records(
+            BindingId::new(BINDING).unwrap(),
+            tag(),
+            loc(LOCAL),
+            loc(TARGET),
+            SyncBase::Based(checkpoint(&v().s7, 7, 7)),
+            None,
+            None,
+            retained,
+        )
+        .unwrap()
+    }
+
+    fn recorded_with(retained: Vec<RetainedPrevious>) -> SyncState {
+        exchange_over(
+            checkpoint(&v().s7, 7, 7),
+            pending(PushBaseline::Present(fp_of(&v().s7)), &v().l8, 8),
+            retained,
+        )
+    }
+
+    fn high_water_of(state: &SyncState) -> u64 {
+        checkpoint_of(state).high_water().revision()
+    }
+
+    // ---- allowed transitions ------------------------------------------------------
+
+    #[test]
+    fn begin_proposes_a_pending_push_with_the_observed_anchors_and_nothing_else() {
+        let start = p0();
+        let proposal = begin(&start, &seen_before()).unwrap();
+
+        assert_eq!(proposal, exchange_pending(false));
+
+        let pending = proposal.pending_push().unwrap();
+        assert_eq!(pending.intent_id(), INTENT);
+        assert_eq!(
+            pending.intent().baseline(),
+            &PushBaseline::Present(fp_of(&v().s7))
+        );
+        assert_eq!(pending.intent().intended(), &fp_of(&v().l8));
+        assert_eq!(pending.intended_revision(), 8);
+
+        let exchange = proposal.exchange_intent().unwrap();
+        assert_eq!(exchange.scheme(), ExchangeScheme::RetainAndPublishV1);
+        assert_eq!(exchange.target_anchor(), &exchange_anchor(3));
+        assert_eq!(exchange.directory_anchor(), &exchange_anchor(4));
+
+        // The checkpoint, including the high-water mark, is untouched.
+        assert_eq!(checkpoint_of(&proposal), checkpoint_of(start.state()));
+        assert!(proposal.retained_previous().is_empty());
+    }
+
+    #[test]
+    fn begin_carries_existing_retained_entries_unchanged_and_in_order() {
+        let proposal = begin(&authed(&retained_only()), &seen_before()).unwrap();
+        assert_eq!(proposal, exchange_pending(true));
+
+        let prior = fillers(4);
+        let proposal = begin(&authed(&clean_with(prior.clone())), &seen_before()).unwrap();
+        assert_eq!(proposal.retained_previous(), prior.as_slice());
+        assert_eq!(proposal, recorded_with(prior));
+    }
+
+    #[test]
+    fn finalize_advances_the_checkpoint_and_appends_exactly_one_entry_from_the_record() {
+        let proposal = finalize_regular(&p1()).unwrap();
+
+        assert_eq!(proposal, finalized(Vec::new()));
+        assert_eq!(checkpoint_of(&proposal), checkpoint(&v().l8, 8, 8));
+        assert!(proposal.pending_push().is_none());
+        assert!(proposal.exchange_intent().is_none());
+
+        // The entry is built from the recorded fields (the old synchronized
+        // version and the anchors recorded by `begin_exchange`), never from the
+        // evidence the caller passes to `finalize_exchange`.
+        let [entry] = proposal.retained_previous() else {
+            panic!("exactly one retained entry");
+        };
+        assert_eq!(entry.exchange_id(), INTENT);
+        assert_eq!(entry.fingerprint(), &fp_of(&v().s7));
+        assert_eq!(entry.revision(), 7);
+        assert_eq!(entry.object_anchor(), &exchange_anchor(3));
+        assert_eq!(entry.directory_anchor(), &exchange_anchor(4));
+    }
+
+    #[test]
+    fn finalize_keeps_existing_retained_entries_in_front_of_the_new_one() {
+        let proposal = finalize_regular(&authed(&exchange_pending(true))).unwrap();
+
+        assert_eq!(proposal, finalized(vec![retained_entry()]));
+        assert_eq!(proposal.retained_previous()[0], retained_entry());
+        assert_eq!(proposal.retained_previous().len(), 2);
+    }
+
+    #[test]
+    fn clear_returns_the_original_state_when_the_evidence_agrees_with_the_baseline() {
+        assert_eq!(clear_regular(&p1()).unwrap(), based());
+        assert_eq!(
+            clear_regular(&authed(&exchange_pending(true))).unwrap(),
+            retained_only()
+        );
+
+        let prior = fillers(5);
+        assert_eq!(
+            clear_regular(&authed(&recorded_with(prior.clone()))).unwrap(),
+            clean_with(prior)
+        );
+    }
+
+    #[test]
+    fn two_complete_exchanges_accumulate_two_entries_in_order() {
+        let first =
+            finalize_regular(&begin(&p0(), &seen_before()).map(|s| authed(&s)).unwrap()).unwrap();
+        assert_eq!(first, finalized(Vec::new()));
+
+        // The second exchange starts from the first result, as read back: the
+        // target is now the new object 5, and the local file is revision 10.
+        let second_begin = begin_with(
+            &authed(&first),
+            &Seen::new(&v().l10, &v().l8, 5, 4),
+            INTENT_2,
+        )
+        .unwrap();
+        assert_eq!(second_begin.pending_push().unwrap().intent_id(), INTENT_2);
+        assert_eq!(second_begin.pending_push().unwrap().intended_revision(), 10);
+        assert_eq!(
+            second_begin.exchange_intent().unwrap().target_anchor(),
+            &exchange_anchor(5)
+        );
+        assert_eq!(second_begin.retained_previous(), first.retained_previous());
+
+        let second = finalize(
+            &authed(&second_begin),
+            INTENT_2,
+            &Seen::new(&v().l10, &v().l10, 6, 4),
+            ArtifactObservation::Absent,
+            Seen::new(&v().l10, &v().l8, 5, 4).retained(),
+        )
+        .unwrap();
+
+        assert_eq!(checkpoint_of(&second), checkpoint(&v().l10, 10, 10));
+
+        let [older, newer] = second.retained_previous() else {
+            panic!("exactly two retained entries");
+        };
+        assert_eq!(older, &first.retained_previous()[0]);
+        assert_eq!(newer.exchange_id(), INTENT_2);
+        assert_eq!(newer.fingerprint(), &fp_of(&v().l8));
+        assert_eq!(newer.revision(), 8);
+        assert_eq!(newer.object_anchor(), &exchange_anchor(5));
+        assert_eq!(newer.directory_anchor(), &exchange_anchor(4));
+    }
+
+    #[test]
+    fn the_transitions_are_deterministic() {
+        let start = p0();
+        assert_eq!(begin(&start, &seen_before()), begin(&start, &seen_before()));
+        assert_eq!(finalize_regular(&p1()), finalize_regular(&p1()));
+        assert_eq!(clear_regular(&p1()), clear_regular(&p1()));
+    }
+
+    // ---- begin: refusals ------------------------------------------------------------
+
+    #[test]
+    fn begin_refuses_every_push_precondition_exactly_like_begin_push() {
+        let high_water_9 = build(SyncBase::Based(checkpoint(&v().s7, 7, 9)), None);
+        let wrong_revision = build(SyncBase::Based(checkpoint(&v().s7, 5, 5)), None);
+
+        let cases = vec![
+            (
+                "no change",
+                based(),
+                bound(&v().s7, &v().s7),
+                TransitionRefusal::NoLocalChanges,
+            ),
+            (
+                "rewrapped",
+                based(),
+                bound(&v().s7_rewrapped, &v().s7),
+                TransitionRefusal::WrapperChangeBlocked,
+            ),
+            (
+                "resealed",
+                based(),
+                bound(&v().s7_resealed, &v().s7),
+                TransitionRefusal::WrapperChangeBlocked,
+            ),
+            (
+                "pretty",
+                based(),
+                bound(&v().s7_pretty, &v().s7),
+                TransitionRefusal::WrapperChangeBlocked,
+            ),
+            (
+                "same revision",
+                based(),
+                bound(&v().s7_conflict, &v().s7),
+                TransitionRefusal::SameRevisionConflict,
+            ),
+            (
+                "local not above the mark",
+                based(),
+                bound(&v().l6, &v().s7),
+                TransitionRefusal::NotStrictlyAboveHighWater,
+            ),
+            (
+                "remote below the mark",
+                high_water_9,
+                bound(&v().l10, &v().s7),
+                TransitionRefusal::KnownRegression,
+            ),
+            (
+                "remote ahead",
+                based(),
+                bound(&v().s7, &v().t9),
+                TransitionRefusal::RemoteAhead,
+            ),
+            (
+                "diverged",
+                based(),
+                bound(&v().l8, &v().t9),
+                TransitionRefusal::Diverged,
+            ),
+            (
+                "converged",
+                based(),
+                bound(&v().l8, &v().l8),
+                TransitionRefusal::Converged,
+            ),
+            (
+                "unversioned local",
+                based(),
+                bound(&v().legacy, &v().s7),
+                TransitionRefusal::LocalUnversioned,
+            ),
+            (
+                "unversioned remote",
+                based(),
+                bound(&v().l8, &v().legacy),
+                TransitionRefusal::RemoteUnversioned,
+            ),
+            (
+                "baseline revision",
+                wrong_revision,
+                bound(&v().l8, &v().s7),
+                TransitionRefusal::BaselineRevisionMismatch,
+            ),
+            (
+                "pending push",
+                based_pending(),
+                bound(&v().l8, &v().s7),
+                TransitionRefusal::PendingIntentExists,
+            ),
+            (
+                "unbased",
+                unbased_pending(),
+                bound(&v().l8, &v().s7),
+                TransitionRefusal::NotBased,
+            ),
+        ];
+
+        for (name, state, evidence, expected) in &cases {
+            assert_eq!(
+                push(state, RemoteEvidence::Inspected(evidence)),
+                Err(*expected),
+                "begin_push / {name}"
+            );
+            assert_eq!(
+                begin(&authed(state), &Seen::of(*evidence, 3, 4)),
+                Err(transition(*expected)),
+                "begin_exchange / {name}"
+            );
+        }
+
+        assert_eq!(
+            begin_with(&p0(), &seen_before(), Uuid::nil()),
+            Err(transition(TransitionRefusal::InvalidState(
+                SyncStateError::NilIntentId
+            )))
+        );
+    }
+
+    #[test]
+    fn begin_refuses_a_recorded_exchange_or_a_plain_pending_push() {
+        for (name, state) in [
+            ("exchange", exchange_pending(false)),
+            ("exchange and retained", exchange_pending(true)),
+            ("plain pending push", based_pending()),
+        ] {
+            assert_eq!(
+                begin(&authed(&state), &seen_before()),
+                Err(transition(TransitionRefusal::PendingIntentExists)),
+                "{name}"
+            );
+        }
+
+        assert_eq!(
+            begin(&authed(&unbased_pending()), &seen_before()),
+            Err(transition(TransitionRefusal::NotBased))
+        );
+    }
+
+    #[test]
+    fn begin_refuses_only_at_the_technical_retained_bound() {
+        let full = authed(&clean_with(fillers(MAX_RETAINED_PREVIOUS)));
+
+        assert_eq!(
+            begin(&full, &seen_before()),
+            Err(ExchangeRefusal::RetainedCapacityExhausted)
+        );
+        // The capacity is judged before the target evidence.
+        assert_eq!(
+            begin(&full, &Seen::new(&v().s7, &v().s7, 3, 4)),
+            Err(ExchangeRefusal::RetainedCapacityExhausted)
+        );
+
+        let one_left = authed(&clean_with(fillers(MAX_RETAINED_PREVIOUS - 1)));
+        let proposal = begin(&one_left, &seen_before()).unwrap();
+        assert_eq!(
+            proposal.retained_previous().len(),
+            MAX_RETAINED_PREVIOUS - 1
+        );
+    }
+
+    #[test]
+    fn begin_refuses_an_intent_id_that_a_retained_entry_already_uses() {
+        assert_eq!(
+            begin_with(
+                &authed(&retained_only()),
+                &seen_before(),
+                retained_entry().exchange_id()
+            ),
+            Err(transition(TransitionRefusal::InvalidState(
+                SyncStateError::RetainedIdIsPendingIntent
+            )))
+        );
+    }
+
+    // ---- finalize: refusals ---------------------------------------------------------
+
+    #[test]
+    fn finalize_and_clear_refuse_states_that_record_no_exchange() {
+        let settled = authed(&finalize_regular(&p1()).unwrap());
+        let cleared = authed(&clear_regular(&p1()).unwrap());
+
+        for (name, state) in [
+            ("clean", p0()),
+            ("finalized", settled),
+            ("cleared", cleared),
+            ("retained only", authed(&retained_only())),
+            ("plain pending push", authed(&based_pending())),
+            ("unbased initial publication", authed(&unbased_pending())),
+        ] {
+            assert_eq!(
+                finalize_regular(&state),
+                Err(ExchangeRefusal::NoExchangeIntent),
+                "finalize / {name}"
+            );
+            assert_eq!(
+                clear_regular(&state),
+                Err(ExchangeRefusal::NoExchangeIntent),
+                "clear / {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_and_clear_refuse_a_different_exchange_id() {
+        for other in [INTENT_2, Uuid::nil()] {
+            assert_eq!(
+                finalize(
+                    &p1(),
+                    other,
+                    &seen_after(),
+                    ArtifactObservation::Absent,
+                    seen_retained().retained()
+                ),
+                Err(ExchangeRefusal::ExchangeIdMismatch)
+            );
+            assert_eq!(
+                clear(
+                    &p1(),
+                    other,
+                    &seen_before(),
+                    ArtifactObservation::Absent,
+                    ArtifactObservation::Absent
+                ),
+                Err(ExchangeRefusal::ExchangeIdMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_refuses_a_target_that_is_not_the_intended_version() {
+        let retained = seen_retained();
+
+        // Still the baseline bytes, and a third version.
+        for (name, target) in [
+            ("baseline", Seen::new(&v().l8, &v().s7, 5, 4)),
+            ("third version", Seen::new(&v().l8, &v().t9, 5, 4)),
+        ] {
+            assert_eq!(
+                finalize(
+                    &p1(),
+                    INTENT,
+                    &target,
+                    ArtifactObservation::Absent,
+                    retained.retained()
+                ),
+                Err(ExchangeRefusal::TargetNotIntended),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_refuses_an_intended_revision_that_disagrees_with_the_record() {
+        // The record claims revision 9 for bytes that authenticate to revision 8.
+        let state = authed(&exchange_over(
+            checkpoint(&v().s7, 7, 7),
+            pending(PushBaseline::Present(fp_of(&v().s7)), &v().l8, 9),
+            Vec::new(),
+        ));
+
+        assert_eq!(
+            finalize_regular(&state),
+            Err(ExchangeRefusal::TargetRevisionMismatch)
+        );
+    }
+
+    #[test]
+    fn finalize_refuses_a_target_object_that_is_still_the_recorded_one() {
+        let retained = seen_retained();
+
+        // Right bytes, but the object recorded when the exchange began: the
+        // adapter asserts no replacement happened.
+        assert_eq!(
+            finalize(
+                &p1(),
+                INTENT,
+                &Seen::new(&v().l8, &v().l8, 3, 4),
+                ArtifactObservation::Absent,
+                retained.retained()
+            ),
+            Err(ExchangeRefusal::TargetNotReplaced)
+        );
+
+        // Another directory is judged first.
+        for (target, expected) in [
+            (
+                Seen::new(&v().l8, &v().l8, 5, 9),
+                ExchangeRefusal::DirectoryAnchorMismatch,
+            ),
+            (
+                Seen::new(&v().l8, &v().l8, 3, 9),
+                ExchangeRefusal::DirectoryAnchorMismatch,
+            ),
+        ] {
+            assert_eq!(
+                finalize(
+                    &p1(),
+                    INTENT,
+                    &target,
+                    ArtifactObservation::Absent,
+                    retained.retained()
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_refuses_staging_that_is_present_or_unobserved() {
+        let retained = seen_retained();
+
+        for (staging, expected) in [
+            (
+                ArtifactObservation::Present,
+                ExchangeRefusal::ArtifactPresent(ExchangeArtifact::Staging),
+            ),
+            (
+                ArtifactObservation::Unavailable,
+                ExchangeRefusal::ArtifactUnavailable(ExchangeArtifact::Staging),
+            ),
+        ] {
+            assert_eq!(
+                finalize(&p1(), INTENT, &seen_after(), staging, retained.retained()),
+                Err(expected)
+            );
+            // Staging is judged before the retained version.
+            assert_eq!(
+                finalize(
+                    &p1(),
+                    INTENT,
+                    &seen_after(),
+                    staging,
+                    RetainedVersionEvidence::Absent
+                ),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_never_succeeds_without_observed_retained_evidence() {
+        for (previous, fault) in [
+            (RetainedVersionEvidence::Absent, PreviousFault::Missing),
+            (
+                RetainedVersionEvidence::Unavailable,
+                PreviousFault::Unavailable,
+            ),
+        ] {
+            assert_eq!(
+                finalize(
+                    &p1(),
+                    INTENT,
+                    &seen_after(),
+                    ArtifactObservation::Absent,
+                    previous
+                ),
+                Err(ExchangeRefusal::PreviousNotVerified(fault))
+            );
+        }
+
+        // The target is judged first, so a wrong target is never masked.
+        assert_eq!(
+            finalize(
+                &p1(),
+                INTENT,
+                &Seen::new(&v().l8, &v().s7, 5, 4),
+                ArtifactObservation::Absent,
+                RetainedVersionEvidence::Absent
+            ),
+            Err(ExchangeRefusal::TargetNotIntended)
+        );
+
+        // A refused P1 stays authoritative: nothing can begin over it.
+        assert_eq!(
+            begin(&p1(), &seen_before()),
+            Err(transition(TransitionRefusal::PendingIntentExists))
+        );
+    }
+
+    #[test]
+    fn finalize_names_each_retained_fault_exactly() {
+        let wrong_recorded_revision = authed(&exchange_over(
+            checkpoint(&v().s7, 6, 6),
+            pending(PushBaseline::Present(fp_of(&v().s7)), &v().l8, 8),
+            Vec::new(),
+        ));
+
+        let cases = vec![
+            (
+                "other bytes",
+                p1(),
+                Seen::new(&v().l8, &v().t9, 3, 4),
+                PreviousFault::Differs,
+            ),
+            (
+                "the intended bytes",
+                p1(),
+                Seen::new(&v().l8, &v().l8, 3, 4),
+                PreviousFault::Differs,
+            ),
+            (
+                "revision",
+                wrong_recorded_revision,
+                Seen::new(&v().l8, &v().s7, 3, 4),
+                PreviousFault::RevisionMismatch,
+            ),
+            (
+                "object",
+                p1(),
+                Seen::new(&v().l8, &v().s7, 9, 4),
+                PreviousFault::AnchorMismatch,
+            ),
+            (
+                "directory",
+                p1(),
+                Seen::new(&v().l8, &v().s7, 3, 9),
+                PreviousFault::DirectoryMismatch,
+            ),
+        ];
+
+        for (name, state, previous, fault) in &cases {
+            assert_eq!(
+                finalize(
+                    state,
+                    INTENT,
+                    &seen_after(),
+                    ArtifactObservation::Absent,
+                    previous.retained()
+                ),
+                Err(ExchangeRefusal::PreviousNotVerified(*fault)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_refuses_retained_evidence_inspected_against_other_local_bytes() {
+        // The target and the retained version must be judged against one local
+        // file; evidence from two different local files does not agree.
+        for previous in [
+            Seen::new(&v().l10, &v().s7, 3, 4),
+            Seen::new(&v().l10, &v().t9, 9, 9),
+        ] {
+            assert_eq!(
+                finalize(
+                    &p1(),
+                    INTENT,
+                    &seen_after(),
+                    ArtifactObservation::Absent,
+                    previous.retained()
+                ),
+                Err(ExchangeRefusal::EvidenceMismatch)
+            );
+        }
+    }
+
+    #[test]
+    fn finalize_refuses_when_no_retained_slot_is_left() {
+        assert_eq!(
+            finalize_regular(&authed(&recorded_with(fillers(MAX_RETAINED_PREVIOUS)))),
+            Err(ExchangeRefusal::RetainedCapacityExhausted)
+        );
+
+        let proposal =
+            finalize_regular(&authed(&recorded_with(fillers(MAX_RETAINED_PREVIOUS - 1)))).unwrap();
+        assert_eq!(proposal.retained_previous().len(), MAX_RETAINED_PREVIOUS);
+        assert_eq!(
+            proposal.retained_previous().last().unwrap().exchange_id(),
+            INTENT
+        );
+    }
+
+    #[test]
+    fn finalize_refuses_a_result_that_would_break_the_retained_invariants() {
+        // An earlier retained entry already has the fingerprint the checkpoint
+        // would advance to.
+        let clash = RetainedPrevious::new(
+            Uuid::from_u128(0x2000),
+            fp_of(&v().l8),
+            5,
+            exchange_anchor(1),
+            exchange_anchor(2),
+        )
+        .unwrap();
+        let state = authed(&recorded_with(vec![clash]));
+
+        assert_eq!(
+            finalize_regular(&state),
+            Err(transition(TransitionRefusal::InvalidState(
+                SyncStateError::RetainedIsSyncedVersion
+            )))
+        );
+    }
+
+    // ---- clear: refusals ------------------------------------------------------------
+
+    #[test]
+    fn clear_refuses_a_target_that_is_not_the_original_baseline() {
+        let wrong_recorded_revision = authed(&exchange_over(
+            checkpoint(&v().s7, 6, 6),
+            pending(PushBaseline::Present(fp_of(&v().s7)), &v().l8, 8),
+            Vec::new(),
+        ));
+        let absent = ArtifactObservation::Absent;
+
+        let cases = vec![
+            (
+                "intended bytes",
+                p1(),
+                Seen::new(&v().l8, &v().l8, 3, 4),
+                ExchangeRefusal::TargetNotBaseline,
+            ),
+            (
+                "third version",
+                p1(),
+                Seen::new(&v().l8, &v().t9, 3, 4),
+                ExchangeRefusal::TargetNotBaseline,
+            ),
+            (
+                "revision",
+                wrong_recorded_revision,
+                Seen::new(&v().l8, &v().s7, 3, 4),
+                ExchangeRefusal::TargetRevisionMismatch,
+            ),
+            (
+                "other object",
+                p1(),
+                Seen::new(&v().l8, &v().s7, 5, 4),
+                ExchangeRefusal::TargetAnchorMismatch,
+            ),
+            (
+                "other directory",
+                p1(),
+                Seen::new(&v().l8, &v().s7, 3, 9),
+                ExchangeRefusal::DirectoryAnchorMismatch,
+            ),
+        ];
+
+        for (name, state, target, expected) in &cases {
+            assert_eq!(
+                clear(state, INTENT, target, absent, absent),
+                Err(*expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn clear_refuses_artifacts_that_are_present_or_unobserved() {
+        use ArtifactObservation::{Absent, Present, Unavailable};
+
+        let target = seen_before();
+
+        let cases = [
+            (
+                Present,
+                Absent,
+                ExchangeRefusal::ArtifactPresent(ExchangeArtifact::Staging),
+            ),
+            (
+                Unavailable,
+                Absent,
+                ExchangeRefusal::ArtifactUnavailable(ExchangeArtifact::Staging),
+            ),
+            (
+                Absent,
+                Present,
+                ExchangeRefusal::ArtifactPresent(ExchangeArtifact::Previous),
+            ),
+            (
+                Absent,
+                Unavailable,
+                ExchangeRefusal::ArtifactUnavailable(ExchangeArtifact::Previous),
+            ),
+            // Staging is judged before the retained previous file.
+            (
+                Present,
+                Present,
+                ExchangeRefusal::ArtifactPresent(ExchangeArtifact::Staging),
+            ),
+            (
+                Unavailable,
+                Present,
+                ExchangeRefusal::ArtifactUnavailable(ExchangeArtifact::Staging),
+            ),
+        ];
+
+        for (staging, previous, expected) in cases {
+            assert_eq!(
+                clear(&p1(), INTENT, &target, staging, previous),
+                Err(expected),
+                "{staging:?} / {previous:?}"
+            );
+        }
+    }
+
+    // ---- identity and binding ---------------------------------------------------------
+
+    #[test]
+    fn evidence_of_another_vault_is_refused_by_every_transition() {
+        let vault = transition(TransitionRefusal::BindingMismatch(
+            BindingMismatch::VaultIdentity,
+        ));
+        let foreign_target = Seen::foreign(8, 7, 3, 4);
+        let foreign_after = Seen::foreign(8, 8, 5, 4);
+        let foreign_previous = Seen::foreign(8, 7, 3, 4);
+
+        assert_eq!(begin(&p0(), &foreign_target), Err(vault));
+        assert_eq!(
+            finalize(
+                &p1(),
+                INTENT,
+                &foreign_after,
+                ArtifactObservation::Absent,
+                seen_retained().retained()
+            ),
+            Err(vault)
+        );
+        assert_eq!(
+            finalize(
+                &p1(),
+                INTENT,
+                &seen_after(),
+                ArtifactObservation::Absent,
+                foreign_previous.retained()
+            ),
+            Err(vault)
+        );
+        assert_eq!(
+            clear(
+                &p1(),
+                INTENT,
+                &foreign_target,
+                ArtifactObservation::Absent,
+                ArtifactObservation::Absent
+            ),
+            Err(vault)
+        );
+
+        // The binding is judged before the recorded exchange is looked at.
+        assert_eq!(
+            finalize(
+                &p0(),
+                INTENT,
+                &foreign_after,
+                ArtifactObservation::Absent,
+                RetainedVersionEvidence::Absent
+            ),
+            Err(vault)
+        );
+    }
+
+    #[test]
+    fn a_wrong_locator_is_refused_by_every_transition() {
+        let other = loc(OTHER);
+        let (l, t) = locs();
+        let before = seen_before();
+        let after = seen_after();
+        let retained = seen_retained();
+        let absent = ArtifactObservation::Absent;
+
+        let local = transition(TransitionRefusal::BindingMismatch(
+            BindingMismatch::LocalLocator,
+        ));
+        let target = transition(TransitionRefusal::BindingMismatch(
+            BindingMismatch::TargetLocator,
+        ));
+
+        assert_eq!(
+            begin_exchange(&p0(), &other, &t, &before.target(), INTENT),
+            Err(local)
+        );
+        assert_eq!(
+            begin_exchange(&p0(), &l, &other, &before.target(), INTENT),
+            Err(target)
+        );
+        assert_eq!(
+            finalize_exchange(
+                &p1(),
+                &other,
+                &t,
+                INTENT,
+                &after.target(),
+                absent,
+                retained.retained()
+            ),
+            Err(local)
+        );
+        assert_eq!(
+            finalize_exchange(
+                &p1(),
+                &l,
+                &other,
+                INTENT,
+                &after.target(),
+                absent,
+                retained.retained()
+            ),
+            Err(target)
+        );
+        assert_eq!(
+            clear_exchange(&p1(), &other, &t, INTENT, &before.target(), absent, absent),
+            Err(local)
+        );
+        assert_eq!(
+            clear_exchange(&p1(), &l, &other, INTENT, &before.target(), absent, absent),
+            Err(target)
+        );
+    }
+
+    // ---- what AuthenticatedSyncState does and does not establish ----------------------
+
+    #[test]
+    fn a_foreign_key_or_vault_id_cannot_authenticate_a_record() {
+        let bytes = based().encode_authenticated(&auth_key()).unwrap();
+
+        // Another vault's Vault Key.
+        let other_key = SyncStateMacKey::derive(&foreign().key, VAULT_ID).unwrap();
+        assert_eq!(
+            AuthenticatedSyncState::decode(&bytes, &other_key),
+            Err(AuthenticatedDecodeError::AuthenticationFailed)
+        );
+
+        // The right Vault Key, bound to another vault id.
+        let other_id = SyncStateMacKey::derive(&rig().key, FOREIGN_VAULT_ID).unwrap();
+        assert_eq!(
+            AuthenticatedSyncState::decode(&bytes, &other_id),
+            Err(AuthenticatedDecodeError::AuthenticationFailed)
+        );
+        assert_eq!(
+            based().encode_authenticated(&other_id),
+            Err(AuthenticatedEncodeError::VaultMismatch)
+        );
+
+        // A modified record.
+        let mut tampered = bytes.clone();
+        let last = tampered.len() - 3;
+        tampered[last] ^= 0x01;
+        assert!(AuthenticatedSyncState::decode(&tampered, &auth_key()).is_err());
+    }
+
+    #[test]
+    fn legacy_records_cannot_construct_an_authenticated_state() {
+        let key = auth_key();
+        let legacy = [
+            ("v1 pending", based_pending().encode().unwrap()),
+            ("v1 unbased", unbased_pending().encode().unwrap()),
+            ("v1 clean", based().encode().unwrap()),
+            ("v2 clean", based().encode_exchange_record().unwrap()),
+            (
+                "v2 exchange",
+                exchange_pending(true).encode_exchange_record().unwrap(),
+            ),
+        ];
+
+        for (name, bytes) in &legacy {
+            assert_eq!(
+                AuthenticatedSyncState::decode(bytes, &key),
+                Err(AuthenticatedDecodeError::LegacyUnauthenticated),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mac_valid_record_that_was_never_persisted_still_authenticates() {
+        // `authed` signs in memory and decodes the bytes; nothing is written to
+        // a file or a store. The resulting type therefore proves MAC provenance
+        // for this vault and nothing about persistence. Production authority
+        // needs a store/session boundary that reads the record back.
+        let never_persisted = authed(&exchange_pending(true));
+
+        assert_eq!(never_persisted.state(), &exchange_pending(true));
+        assert!(finalize_regular(&never_persisted).is_ok());
+    }
+
+    #[test]
+    fn an_older_valid_record_authenticates_exactly_like_the_latest() {
+        // The type proves no freshness and no rollback resistance: a superseded
+        // record is as authenticated as the newest one.
+        let stale = p0();
+        let latest = authed(&finalize_regular(&p1()).unwrap());
+
+        assert_ne!(stale.state(), latest.state());
+        assert!(begin(&stale, &seen_before()).is_ok());
+        // The newer record judges the same evidence on its own merits.
+        assert_eq!(
+            begin(&latest, &seen_before()),
+            Err(transition(TransitionRefusal::RemoteAhead))
+        );
+    }
+
+    #[test]
+    fn exchange_transitions_return_unauthenticated_proposals() {
+        // The signatures are part of the contract: a proposal is a plain
+        // `SyncState`, and only `AuthenticatedSyncState::decode` can produce an
+        // `AuthenticatedSyncState`.
+        let _: fn(
+            &AuthenticatedSyncState,
+            &Locator,
+            &Locator,
+            &ExchangeTargetEvidence<'_>,
+            Uuid,
+        ) -> Result<SyncState, ExchangeRefusal> = begin_exchange;
+        type Finalize = for<'a, 'b, 'c> fn(
+            &'a AuthenticatedSyncState,
+            &'b Locator,
+            &'b Locator,
+            Uuid,
+            &'c ExchangeTargetEvidence<'_>,
+            ArtifactObservation,
+            RetainedVersionEvidence<'_>,
+        ) -> Result<SyncState, ExchangeRefusal>;
+        type Clear = for<'a, 'b, 'c> fn(
+            &'a AuthenticatedSyncState,
+            &'b Locator,
+            &'b Locator,
+            Uuid,
+            &'c ExchangeTargetEvidence<'_>,
+            ArtifactObservation,
+            ArtifactObservation,
+        ) -> Result<SyncState, ExchangeRefusal>;
+
+        let _: Finalize = finalize_exchange;
+        let _: Clear = clear_exchange;
+    }
+
+    // ---- serialization -----------------------------------------------------------------
+
+    #[test]
+    fn proposals_round_trip_through_the_authenticated_codec_and_stay_out_of_the_v1_store() {
+        let key = auth_key();
+        let proposals = [
+            ("recorded", begin(&p0(), &seen_before()).unwrap()),
+            ("finalized", finalize_regular(&p1()).unwrap()),
+            ("cleared", clear_regular(&p1()).unwrap()),
+        ];
+
+        for (name, proposal) in &proposals {
+            let decoded =
+                AuthenticatedSyncState::decode(&proposal.encode_authenticated(&key).unwrap(), &key)
+                    .unwrap();
+            assert_eq!(decoded.state(), proposal, "{name}");
+        }
+
+        // The version-1 store cannot represent exchange records and still
+        // refuses them; a state without records is as before.
+        for name in ["recorded", "finalized"] {
+            let proposal = &proposals.iter().find(|(n, _)| *n == name).unwrap().1;
+
+            assert_eq!(
+                proposal.encode(),
+                Err(SyncStateEncodeError::InvalidState(
+                    SyncStateError::ExchangeRecordsRequireExchangeFormat
+                )),
+                "{name}"
+            );
+            assert_eq!(
+                SyncStateLoad::from_bytes(&proposal.encode_authenticated(&key).unwrap()),
+                SyncStateLoad::UnsupportedVersion,
+                "{name}"
+            );
+        }
+        assert_eq!(proposals[2].1.encode().unwrap(), based().encode().unwrap());
+    }
+
+    // ---- state invariants --------------------------------------------------------------
+
+    #[test]
+    fn every_refusal_leaves_the_input_unchanged() {
+        let absent = ArtifactObservation::Absent;
+        let present = ArtifactObservation::Present;
+
+        for state in [
+            p0(),
+            p1(),
+            authed(&exchange_pending(true)),
+            authed(&clean_with(fillers(MAX_RETAINED_PREVIOUS))),
+            authed(&recorded_with(fillers(MAX_RETAINED_PREVIOUS))),
+        ] {
+            let before = state.clone();
+
+            // Evidence that matches none of the three transitions' needs.
+            let nothing_changed = Seen::new(&v().s7, &v().s7, 9, 9);
+            let (l, t) = locs();
+
+            assert!(begin_exchange(&state, &l, &t, &nothing_changed.target(), INTENT).is_err());
+            assert!(finalize_exchange(
+                &state,
+                &l,
+                &t,
+                INTENT_2,
+                &nothing_changed.target(),
+                present,
+                RetainedVersionEvidence::Unavailable
+            )
+            .is_err());
+            assert!(clear_exchange(
+                &state,
+                &l,
+                &t,
+                INTENT_2,
+                &nothing_changed.target(),
+                present,
+                absent
+            )
+            .is_err());
+
+            assert_eq!(state, before);
+            assert_eq!(state.state(), before.state());
+        }
+    }
+
+    #[test]
+    fn outputs_never_lose_or_reorder_retained_entries_and_never_lower_the_high_water() {
+        for prior in [Vec::new(), vec![retained_entry()], fillers(3)] {
+            let start = authed(&clean_with(prior.clone()));
+            let start_mark = high_water_of(start.state());
+
+            // begin: the checkpoint and the retained list are exactly as before.
+            let recorded = begin(&start, &seen_before()).unwrap();
+            assert_eq!(recorded.retained_previous(), prior.as_slice());
+            assert_eq!(checkpoint_of(&recorded), checkpoint_of(start.state()));
+
+            // clear: back to the start, nothing lost.
+            let cleared = clear_regular(&authed(&recorded)).unwrap();
+            assert_eq!(&cleared, start.state());
+
+            // finalize: the old list is a prefix, plus exactly one new entry.
+            let settled = finalize_regular(&authed(&recorded)).unwrap();
+            let kept = settled.retained_previous();
+            assert_eq!(&kept[..prior.len()], prior.as_slice());
+            assert_eq!(kept.len(), prior.len() + 1);
+            assert!(high_water_of(&settled) >= start_mark);
+            assert_eq!(high_water_of(&settled), 8);
+
+            let mut ids: Vec<Uuid> = kept.iter().map(RetainedPrevious::exchange_id).collect();
+            ids.sort();
+            ids.dedup();
+            assert_eq!(ids.len(), kept.len(), "no duplicate retained id");
+        }
+    }
+
+    #[test]
+    fn finalize_raises_the_high_water_to_the_intended_revision_and_never_lowers_it() {
+        // The mark is 7 and the intended revision 8; a mark above the synced
+        // revision is carried to the intended revision as well.
+        let state = authed(&exchange_over(
+            checkpoint(&v().s7, 7, 7),
+            pending(PushBaseline::Present(fp_of(&v().s7)), &v().l8, 8),
+            Vec::new(),
+        ));
+        let proposal = finalize_regular(&state).unwrap();
+
+        assert_eq!(high_water_of(&proposal), 8);
+        assert!(high_water_of(&proposal) >= high_water_of(state.state()));
+        assert_eq!(checkpoint_of(&proposal).synced_revision(), 8);
+    }
+
+    #[test]
+    fn repeating_a_finalized_or_cleared_exchange_is_refused() {
+        let settled = authed(&finalize_regular(&p1()).unwrap());
+        let cleared = authed(&clear_regular(&p1()).unwrap());
+
+        assert_eq!(
+            finalize_regular(&settled),
+            Err(ExchangeRefusal::NoExchangeIntent)
+        );
+        assert_eq!(
+            clear_regular(&settled),
+            Err(ExchangeRefusal::NoExchangeIntent)
+        );
+        assert_eq!(
+            finalize_regular(&cleared),
+            Err(ExchangeRefusal::NoExchangeIntent)
+        );
+        assert_eq!(
+            clear_regular(&cleared),
+            Err(ExchangeRefusal::NoExchangeIntent)
+        );
+        assert_eq!(
+            begin(&p1(), &seen_before()),
+            Err(transition(TransitionRefusal::PendingIntentExists))
+        );
+    }
+
+    #[test]
+    fn the_ordinary_transitions_still_refuse_exchange_states() {
+        let refusal =
+            TransitionRefusal::InvalidState(SyncStateError::ExchangeRecordsUnsupportedByTransition);
+        let recorded = begin(&p0(), &seen_before()).unwrap();
+        let settled = finalize_regular(&p1()).unwrap();
+
+        let intended = bound(&v().l8, &v().l8);
+        let begin_evidence = bound(&v().l8, &v().s7);
+        let raise_evidence = bound(&v().s7, &v().r12);
+
+        for (name, state) in [("recorded", recorded), ("finalized", settled)] {
+            let before = state.clone();
+
+            assert_eq!(
+                push(&state, RemoteEvidence::Inspected(&begin_evidence)),
+                Err(refusal),
+                "begin_push / {name}"
+            );
+            // Never a `Finalize`, even though the target holds the intended bytes.
+            assert_eq!(
+                reconcile(&state, RemoteEvidence::Inspected(&intended)),
+                Err(refusal),
+                "reconcile_pending_push / {name}"
+            );
+            assert_eq!(
+                observe(&state, &raise_evidence).map(|_| ()),
+                Err(refusal),
+                "record_remote_observation / {name}"
+            );
+            assert_eq!(state, before, "{name}");
+        }
+    }
+
+    // ---- redaction ---------------------------------------------------------------------
+
+    #[test]
+    fn new_refusals_evidence_and_states_never_show_identities_locators_content_or_anchors() {
+        let refusals = [
+            transition(TransitionRefusal::BindingMismatch(
+                BindingMismatch::VaultIdentity,
+            )),
+            transition(TransitionRefusal::PendingIntentExists),
+            transition(TransitionRefusal::InvalidState(
+                SyncStateError::RetainedIdIsPendingIntent,
+            )),
+            ExchangeRefusal::NoExchangeIntent,
+            ExchangeRefusal::ExchangeIdMismatch,
+            ExchangeRefusal::RetainedCapacityExhausted,
+            ExchangeRefusal::TargetNotIntended,
+            ExchangeRefusal::TargetNotBaseline,
+            ExchangeRefusal::TargetRevisionMismatch,
+            ExchangeRefusal::TargetNotReplaced,
+            ExchangeRefusal::TargetAnchorMismatch,
+            ExchangeRefusal::DirectoryAnchorMismatch,
+            ExchangeRefusal::EvidenceMismatch,
+            ExchangeRefusal::ArtifactPresent(ExchangeArtifact::Staging),
+            ExchangeRefusal::ArtifactPresent(ExchangeArtifact::Previous),
+            ExchangeRefusal::ArtifactUnavailable(ExchangeArtifact::Staging),
+            ExchangeRefusal::ArtifactUnavailable(ExchangeArtifact::Previous),
+            ExchangeRefusal::PreviousNotVerified(PreviousFault::Missing),
+            ExchangeRefusal::PreviousNotVerified(PreviousFault::Unavailable),
+            ExchangeRefusal::PreviousNotVerified(PreviousFault::Differs),
+            ExchangeRefusal::PreviousNotVerified(PreviousFault::RevisionMismatch),
+            ExchangeRefusal::PreviousNotVerified(PreviousFault::AnchorMismatch),
+            ExchangeRefusal::PreviousNotVerified(PreviousFault::DirectoryMismatch),
+        ];
+
+        let mut rendered: Vec<String> = refusals
+            .iter()
+            .map(|refusal| format!("{refusal} | {refusal:?}"))
+            .collect();
+        rendered.extend(
+            [PreviousFault::Missing, PreviousFault::Differs]
+                .iter()
+                .map(|fault| format!("{fault} | {fault:?}")),
+        );
+        rendered.extend(
+            [ExchangeArtifact::Staging, ExchangeArtifact::Previous]
+                .iter()
+                .map(|artifact| format!("{artifact} | {artifact:?}")),
+        );
+        rendered.extend(
+            [
+                ArtifactObservation::Absent,
+                ArtifactObservation::Present,
+                ArtifactObservation::Unavailable,
+            ]
+            .iter()
+            .map(|observation| format!("{observation:?}")),
+        );
+
+        // Evidence with anchors that would be easy to recognize if printed.
+        let marked = Seen::new(&v().l8, &v().s7, 0xab, 0xcd);
+        rendered.push(format!("{:?}", marked.target()));
+        rendered.push(format!("{:?}", marked.retained()));
+        rendered.push(format!("{:?}", RetainedVersionEvidence::Absent));
+        rendered.push(format!("{:?}", RetainedVersionEvidence::Unavailable));
+
+        // Authenticated states and proposals, also over marked anchors.
+        let recorded = begin(&p0(), &marked).unwrap();
+        rendered.push(format!("{:?}", p0()));
+        rendered.push(format!("{:?}", p1()));
+        rendered.push(format!("{recorded:?}"));
+        rendered.push(format!("{:?}", authed(&recorded)));
+        rendered.push(format!("{:?}", finalize_regular(&p1())));
+        rendered.push(format!("{:?}", clear_regular(&p1())));
+
+        for text in &rendered {
+            assert_free_of_content(text);
+            for forbidden in [
+                "ab".repeat(16),
+                "AB".repeat(16),
+                "cd".repeat(16),
+                "CD".repeat(16),
+                "171, 171".to_owned(),
+                "205, 205".to_owned(),
+            ] {
+                assert!(!text.contains(&forbidden), "{forbidden:?} leaked: {text}");
+            }
+        }
+    }
+
+    // ---- isolation ---------------------------------------------------------------------
+
+    fn contains_word(text: &str, word: &str) -> bool {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+
+        text.match_indices(word).any(|(index, _)| {
+            let before = text[..index].chars().next_back();
+            let after = text[index + word.len()..].chars().next();
+
+            !before.is_some_and(is_word) && !after.is_some_and(is_word)
+        })
+    }
+
+    #[test]
+    fn no_production_code_references_the_exchange_transitions() {
+        const SYMBOLS: [&str; 10] = [
+            "AuthenticatedSyncState",
+            "begin_exchange",
+            "finalize_exchange",
+            "clear_exchange",
+            "ExchangeRefusal",
+            "ExchangeTargetEvidence",
+            "RetainedVersionEvidence",
+            "ArtifactObservation",
+            "ExchangeArtifact",
+            "PreviousFault",
+        ];
+
+        fn scan(dir: &std::path::Path, own: &std::path::Path, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    scan(&path, own, hits);
+                } else if path.extension().is_some_and(|ext| ext == "rs") && path != own {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for symbol in SYMBOLS {
+                        if contains_word(&text, symbol) {
+                            hits.push(format!("{} uses {symbol}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = core.parent().unwrap().parent().unwrap();
+        let core_src = core.join("src");
+        let own = core_src.join("sync_state.rs");
+
+        let mut hits = Vec::new();
+        for dir in [
+            core_src.clone(),
+            workspace.join("src-tauri").join("src"),
+            workspace.join("src-tauri").join("tests"),
+            workspace
+                .join("crates")
+                .join("localvault-android-bridge")
+                .join("src"),
+        ] {
+            assert!(dir.is_dir(), "{} must exist", dir.display());
+            scan(&dir, &own, &mut hits);
+        }
+
+        assert!(hits.is_empty(), "{hits:#?}");
+    }
+
+    #[test]
+    fn the_exchange_transitions_use_no_io_clock_randomness_unsafe_or_lint_override() {
+        let source = include_str!("sync_state.rs");
+        let start = source
+            .find("// Exchange transitions (Stage 1U-4, slice B3c-2)")
+            .unwrap();
+        let end = source
+            .find("// End of the exchange transitions (slice B3c-2).")
+            .unwrap();
+        assert!(start < end);
+
+        let section = &source[start..end];
+        for forbidden in [
+            "std::fs",
+            "std::io",
+            "std::env",
+            "std::time",
+            "std::thread",
+            "std::process",
+            "SystemTime",
+            "Instant",
+            "getrandom",
+            "rand::",
+            "unsafe",
+            "#[allow",
+            "println!",
+        ] {
+            assert!(
+                !section.contains(forbidden),
+                "{forbidden:?} in the exchange transitions"
+            );
+        }
     }
 }
