@@ -271,6 +271,77 @@ impl fmt::Debug for StateLoad {
     }
 }
 
+/// Whether recognized recovery artifacts (`<key>.<token>.tmp`) were seen beside a
+/// primary record that was read. A diagnostic indicator only.
+///
+/// Neither [`Present`](Self::Present) nor [`Unknown`](Self::Unknown) is ever a
+/// clean-persistence condition and neither is permission for anything: a caller
+/// must not treat either value as "safe to proceed", and [`None`](Self::None) is
+/// only what one directory scan reported at one instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactPresence {
+    /// The scan completed and found no recognized artifact.
+    None,
+    /// The scan completed and found at least one recognized artifact. Its
+    /// contents were not read and are never adopted.
+    Present,
+    /// The scan could not be completed (I/O failure or too many entries), so
+    /// nothing is known about artifacts. Never reported as [`None`](Self::None).
+    Unknown,
+}
+
+/// The exact bytes of a primary record, as read once, with the artifact
+/// indicator. Not `Clone`: the bytes are the raw record and stay with the one
+/// reader. `Debug` reveals nothing.
+pub struct PresentRecord {
+    bytes: Vec<u8>,
+    artifacts: ArtifactPresence,
+}
+
+impl PresentRecord {
+    /// The exact bounded bytes read from the primary record (`1..=
+    /// MAX_SYNC_STATE_BYTES`). Not decoded and not authenticated.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn artifacts(&self) -> ArtifactPresence {
+        self.artifacts
+    }
+}
+
+impl fmt::Debug for PresentRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PresentRecord(<redacted>)")
+    }
+}
+
+/// Typed result of [`SyncStateStore::read_record`]: the raw outcome of reading
+/// one record, before any decoding. The same categories as [`StateLoad`], except
+/// that a primary that was read is returned as bytes
+/// ([`Present`](Self::Present)) instead of being decoded.
+pub enum RecordRead {
+    /// Confirmed absent, including recovery artifacts.
+    NotConfigured,
+    Unreadable(UnreadableReason),
+    /// Only [`CorruptReason::Empty`] or [`CorruptReason::TooLarge`]: the store
+    /// never decodes, so nothing else can be established here.
+    Corrupt(CorruptReason),
+    Present(PresentRecord),
+}
+
+// The bytes are not printed.
+impl fmt::Debug for RecordRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotConfigured => f.write_str("NotConfigured"),
+            Self::Unreadable(reason) => write!(f, "Unreadable({reason:?})"),
+            Self::Corrupt(reason) => write!(f, "Corrupt({reason:?})"),
+            Self::Present(_) => f.write_str("Present(<redacted>)"),
+        }
+    }
+}
+
 /// Which filesystem step failed. A category only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IoStage {
@@ -584,6 +655,59 @@ impl SyncStateStore {
                     StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts)
                 }
                 Ok(_) => StateLoad::NotConfigured,
+            },
+        }
+    }
+
+    /// Strictly read the raw bytes of the record of `local_locator`, without
+    /// decoding them.
+    ///
+    /// Same guarded order and helpers as [`load`](Self::load): every existing
+    /// ancestor and the directory must be plain directories (absent directory:
+    /// `NotConfigured`), the primary is read through the bounded no-follow path
+    /// (`Empty` and `TooLarge` are reported, never read past the limit), and an
+    /// absent primary is `NotConfigured` only when no recognized recovery
+    /// artifact exists (otherwise `Unreadable(UnresolvedArtifacts)`). A failure,
+    /// an unexpected object or an unscannable directory is `Unreadable`, never
+    /// absence.
+    ///
+    /// When the primary is present its exact bytes are returned, together with an
+    /// [`ArtifactPresence`] from one extra scan; a scan failure there makes it
+    /// `Unknown` and never fails the read. A recovery artifact is never read,
+    /// adopted or preferred over the primary.
+    ///
+    /// This is crypto-agnostic: it neither decodes nor verifies nor produces any
+    /// MAC, and it never creates, repairs, replaces or removes anything. The bytes
+    /// are what the filesystem returned at one instant; this is not a lock and not
+    /// compare-and-swap, and a caller that needs more than that must say so itself.
+    pub fn read_record(&self, local_locator: &Locator) -> RecordRead {
+        let key = record_key(local_locator);
+
+        match self.inspect_directory() {
+            Ok(DirState::Absent) => return RecordRead::NotConfigured,
+            Ok(DirState::Present) => {}
+            Err(fault) => return RecordRead::Unreadable(fault.into()),
+        }
+
+        match self.read_primary(&self.record_path(&key)) {
+            Err(fault) => RecordRead::Unreadable(fault.into()),
+            Ok(Primary::Empty) => RecordRead::Corrupt(CorruptReason::Empty),
+            Ok(Primary::TooLarge) => RecordRead::Corrupt(CorruptReason::TooLarge),
+            Ok(Primary::Bytes(bytes)) => {
+                let artifacts = match self.scan_artifacts(&key) {
+                    Ok(found) if found.is_empty() => ArtifactPresence::None,
+                    Ok(_) => ArtifactPresence::Present,
+                    Err(_) => ArtifactPresence::Unknown,
+                };
+
+                RecordRead::Present(PresentRecord { bytes, artifacts })
+            }
+            Ok(Primary::Absent) => match self.scan_artifacts(&key) {
+                Err(fault) => RecordRead::Unreadable(fault.into()),
+                Ok(artifacts) if !artifacts.is_empty() => {
+                    RecordRead::Unreadable(UnreadableReason::UnresolvedArtifacts)
+                }
+                Ok(_) => RecordRead::NotConfigured,
             },
         }
     }
@@ -5472,5 +5596,455 @@ mod tests {
         // The other record is intact, and our staging file is gone.
         assert_eq!(fs::read(i.record()).unwrap(), planted);
         assert_eq!(names(&i.state_dir()).len(), 1);
+    }
+}
+
+/// Stage 1U-4 B3c-3a tests for the raw, crypto-agnostic [`SyncStateStore::read_record`].
+/// Synthetic bytes only; every test owns a uniquely named scratch directory under
+/// the git-ignored `<repo>/.qa-local/sync-state-b3c3a-tests/` (never `%TEMP%`) and
+/// removes only that directory. Nothing here decodes with a MAC or writes through
+/// the store: the fixtures are plain files, as an interrupted write or another
+/// process would leave them.
+#[cfg(all(test, windows))]
+mod read_record_tests {
+    use std::{fs, path::PathBuf};
+
+    use localvault_core::{
+        sync::{PushBaseline, PushIntent},
+        sync_state::{BindingId, PendingPush, VaultBindingTag, BINDING_SALT_LEN},
+    };
+
+    use super::*;
+    use crate::vault::handle_ops::test_support::{make_junction, snapshot};
+
+    const LOCAL: &str = r"\\?\C:\Synthetic\Vaults\LOCAL-MARKER.lvault";
+    const OTHER_LOCAL: &str = r"\\?\C:\Synthetic\Vaults\OTHER-MARKER.lvault";
+    const TARGET: &str = r"\\?\D:\Synthetic\Remote\TARGET-MARKER.lvault";
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    const V3_SHAPED: &[u8] =
+        br#"{"format":"localvault-sync-state","version":3,"body":"x","mac":"00"}"#;
+
+    struct Scratch {
+        dir: tempfile::TempDir,
+    }
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(".qa-local")
+                .join("sync-state-b3c3a-tests");
+            fs::create_dir_all(&base).unwrap();
+
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("{name}-"))
+                .tempdir_in(&base)
+                .unwrap();
+
+            assert!(!dir.path().starts_with(std::env::temp_dir()));
+
+            Self { dir }
+        }
+
+        fn root(&self) -> PathBuf {
+            self.dir.path().to_path_buf()
+        }
+
+        fn state_dir(&self) -> PathBuf {
+            self.root().join(SYNC_STATE_DIRECTORY)
+        }
+
+        fn store(&self) -> SyncStateStore {
+            SyncStateStore::new(&self.root()).unwrap()
+        }
+
+        fn record(&self, local: &str) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.json", record_key(&loc(local))))
+        }
+
+        fn artifact(&self, local: &str, token: &str) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.{token}.tmp", record_key(&loc(local))))
+        }
+
+        fn put(&self, path: &Path, bytes: &[u8]) {
+            fs::create_dir_all(self.state_dir()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+    }
+
+    fn loc(value: &str) -> Locator {
+        Locator::new(value).unwrap()
+    }
+
+    fn state(local: &str) -> SyncState {
+        let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+        let intent =
+            PushIntent::new(PushBaseline::Absent, EnvelopeFingerprint::of_bytes(&[2])).unwrap();
+        let intent_id = Uuid::from_u128(0xaaaa_aaaa_bbbb_4ccc_8ddd_eeee_eeee_eeee);
+
+        SyncState::new(
+            BindingId::new(Uuid::from_u128(0x1111_1111_2222_3333_4444_5555_5555_5555)).unwrap(),
+            VaultBindingTag::derive(
+                salt,
+                Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+            )
+            .unwrap(),
+            loc(local),
+            loc(TARGET),
+            SyncBase::Unbased,
+            Some(PendingPush::new(intent_id, intent, 1).unwrap()),
+        )
+        .unwrap()
+    }
+
+    /// The bytes and artifact indicator of `read`, which must be a present record.
+    fn bytes_of(read: RecordRead) -> (Vec<u8>, ArtifactPresence) {
+        match read {
+            RecordRead::Present(record) => (record.bytes().to_vec(), record.artifacts()),
+            other => panic!("expected a present record, got {other:?}"),
+        }
+    }
+
+    // ---- every variant -----------------------------------------------------------
+
+    #[test]
+    fn a_missing_directory_and_an_empty_directory_are_not_configured() {
+        let scratch = Scratch::new("rr-absent");
+        let store = scratch.store();
+
+        assert!(matches!(
+            store.read_record(&loc(LOCAL)),
+            RecordRead::NotConfigured
+        ));
+        // Reading created nothing.
+        assert!(!scratch.state_dir().exists());
+
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+        assert!(matches!(
+            store.read_record(&loc(LOCAL)),
+            RecordRead::NotConfigured
+        ));
+    }
+
+    #[test]
+    fn a_staging_artifact_without_a_primary_is_unresolved() {
+        let scratch = Scratch::new("rr-temp-only");
+
+        scratch.put(&scratch.artifact(LOCAL, TOKEN), b"leftover");
+
+        assert!(matches!(
+            scratch.store().read_record(&loc(LOCAL)),
+            RecordRead::Unreadable(UnreadableReason::UnresolvedArtifacts)
+        ));
+    }
+
+    #[test]
+    fn empty_and_oversized_records_are_reported_not_returned() {
+        let scratch = Scratch::new("rr-sizes");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), b"");
+        assert!(matches!(
+            store.read_record(&loc(LOCAL)),
+            RecordRead::Corrupt(CorruptReason::Empty)
+        ));
+
+        scratch.put(
+            &scratch.record(LOCAL),
+            &vec![b'a'; MAX_SYNC_STATE_BYTES + 1],
+        );
+        assert!(matches!(
+            store.read_record(&loc(LOCAL)),
+            RecordRead::Corrupt(CorruptReason::TooLarge)
+        ));
+
+        // Exactly the limit is still returned, in full.
+        let exact = vec![b'a'; MAX_SYNC_STATE_BYTES];
+        scratch.put(&scratch.record(LOCAL), &exact);
+        assert_eq!(bytes_of(store.read_record(&loc(LOCAL))).0, exact);
+    }
+
+    #[test]
+    fn a_primary_is_returned_as_the_exact_bytes_without_being_decoded() {
+        let scratch = Scratch::new("rr-raw");
+        let store = scratch.store();
+
+        let v1 = state(LOCAL).encode().unwrap();
+        let v2 = state(LOCAL).encode_exchange_record().unwrap();
+
+        for bytes in [
+            v1.as_slice(),
+            v2.as_slice(),
+            V3_SHAPED,
+            b"not a record at all".as_slice(),
+            &[0xff, 0xfe, 0x00, 0x01],
+        ] {
+            scratch.put(&scratch.record(LOCAL), bytes);
+
+            let (read, artifacts) = bytes_of(store.read_record(&loc(LOCAL)));
+
+            assert_eq!(read, bytes);
+            assert_eq!(artifacts, ArtifactPresence::None);
+        }
+    }
+
+    #[test]
+    fn artifact_presence_is_none_present_or_unknown_and_never_adopted() {
+        let scratch = Scratch::new("rr-artifacts");
+        let store = scratch.store();
+        let primary = state(LOCAL).encode().unwrap();
+
+        scratch.put(&scratch.record(LOCAL), &primary);
+
+        // Files that merely share the prefix, or belong to another location, are
+        // not this record's artifacts.
+        scratch.put(&scratch.artifact(OTHER_LOCAL, TOKEN), b"other");
+        scratch.put(
+            &scratch
+                .state_dir()
+                .join(format!("{}.not-a-token.tmp", record_key(&loc(LOCAL)))),
+            b"unrelated",
+        );
+        assert_eq!(
+            bytes_of(store.read_record(&loc(LOCAL))).1,
+            ArtifactPresence::None
+        );
+
+        // A candidate beside the primary is reported, never read in its place.
+        let candidate = state(LOCAL).encode_exchange_record().unwrap();
+        scratch.put(&scratch.artifact(LOCAL, TOKEN), &candidate);
+
+        let (read, artifacts) = bytes_of(store.read_record(&loc(LOCAL)));
+        assert_eq!(read, primary);
+        assert_ne!(read, candidate);
+        assert_eq!(artifacts, ArtifactPresence::Present);
+    }
+
+    #[test]
+    fn an_artifact_scan_that_cannot_finish_is_unknown_and_does_not_fail_the_read() {
+        let scratch = Scratch::new("rr-unknown");
+        let store = scratch.store();
+        let primary = state(LOCAL).encode().unwrap();
+
+        scratch.put(&scratch.record(LOCAL), &primary);
+
+        // More entries than the scan will visit.
+        for index in 0..=MAX_SCANNED_ENTRIES {
+            fs::write(
+                scratch.state_dir().join(format!("unrelated-{index}.dat")),
+                b"x",
+            )
+            .unwrap();
+        }
+
+        let (read, artifacts) = bytes_of(store.read_record(&loc(LOCAL)));
+
+        assert_eq!(read, primary);
+        assert_eq!(artifacts, ArtifactPresence::Unknown);
+
+        // The same overflow with no primary is an unreadable directory, never
+        // absence.
+        fs::remove_file(scratch.record(LOCAL)).unwrap();
+        assert!(matches!(
+            store.read_record(&loc(LOCAL)),
+            RecordRead::Unreadable(UnreadableReason::EntryLimit)
+        ));
+    }
+
+    // ---- unsafe objects ----------------------------------------------------------
+
+    #[test]
+    fn a_directory_or_junction_where_a_record_belongs_is_an_unexpected_object() {
+        let scratch = Scratch::new("rr-objects");
+        let store = scratch.store();
+        let record = scratch.record(LOCAL);
+
+        fs::create_dir_all(&record).unwrap();
+        assert!(matches!(
+            store.read_record(&loc(LOCAL)),
+            RecordRead::Unreadable(UnreadableReason::UnexpectedObject)
+        ));
+        fs::remove_dir(&record).unwrap();
+
+        let behind = scratch.root().join("behind");
+        fs::create_dir_all(&behind).unwrap();
+        make_junction(&record, &behind);
+        assert!(matches!(
+            store.read_record(&loc(LOCAL)),
+            RecordRead::Unreadable(UnreadableReason::UnexpectedObject)
+        ));
+    }
+
+    #[test]
+    fn a_junction_for_the_state_directory_or_an_ancestor_is_never_followed() {
+        let scratch = Scratch::new("rr-junctions");
+        let bytes = state(LOCAL).encode().unwrap();
+
+        // The state directory itself.
+        let moved = scratch.root().join("moved");
+        fs::create_dir_all(&moved).unwrap();
+        fs::write(
+            moved.join(scratch.record(LOCAL).file_name().unwrap()),
+            &bytes,
+        )
+        .unwrap();
+        make_junction(&scratch.state_dir(), &moved);
+        assert!(matches!(
+            scratch.store().read_record(&loc(LOCAL)),
+            RecordRead::Unreadable(UnreadableReason::UnexpectedObject)
+        ));
+
+        // An ancestor of the root.
+        let real = scratch.root().join("real");
+        let link = scratch.root().join("link");
+        fs::create_dir_all(real.join("app-local").join(SYNC_STATE_DIRECTORY)).unwrap();
+        make_junction(&link, &real);
+
+        let through = SyncStateStore::new(&link.join("app-local")).unwrap();
+        assert!(matches!(
+            through.read_record(&loc(LOCAL)),
+            RecordRead::Unreadable(UnreadableReason::UnexpectedObject)
+        ));
+    }
+
+    // ---- agreement with load, read-only, redaction ---------------------------------
+
+    fn agrees(read: &RecordRead, load: &StateLoad) -> bool {
+        match (read, load) {
+            (RecordRead::NotConfigured, StateLoad::NotConfigured) => true,
+            (RecordRead::Unreadable(left), StateLoad::Unreadable(right)) => left == right,
+            (RecordRead::Corrupt(left), StateLoad::Corrupt(right)) => {
+                left == right && matches!(left, CorruptReason::Empty | CorruptReason::TooLarge)
+            }
+            (
+                RecordRead::Present(_),
+                StateLoad::Loaded(_)
+                | StateLoad::UnsupportedVersion
+                | StateLoad::Corrupt(CorruptReason::Undecodable | CorruptReason::LocatorMismatch),
+            ) => true,
+            _ => false,
+        }
+    }
+
+    fn damaged_v1_checksum() -> Vec<u8> {
+        let mut bytes = state(LOCAL).encode().unwrap();
+        let marker = "\"body_sha256\":\"";
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        let at = text.find(marker).unwrap() + marker.len();
+
+        bytes[at] = if bytes[at] == b'0' { b'1' } else { b'0' };
+        bytes
+    }
+
+    #[test]
+    fn read_record_agrees_with_load_for_every_fixture_and_changes_nothing() {
+        type Setup = fn(&Scratch);
+
+        fn record(scratch: &Scratch, bytes: &[u8]) {
+            scratch.put(&scratch.record(LOCAL), bytes);
+        }
+
+        let fixtures: [(&str, Setup); 13] = [
+            ("no directory", |_| {}),
+            ("empty directory", |s| {
+                fs::create_dir_all(s.state_dir()).unwrap();
+            }),
+            ("temp only", |s| s.put(&s.artifact(LOCAL, TOKEN), b"x")),
+            ("empty record", |s| record(s, b"")),
+            ("oversized record", |s| {
+                record(s, &vec![b'a'; MAX_SYNC_STATE_BYTES + 1]);
+            }),
+            ("junk", |s| record(s, b"junk")),
+            ("version 1", |s| record(s, &state(LOCAL).encode().unwrap())),
+            ("version 1, other location", |s| {
+                record(s, &state(OTHER_LOCAL).encode().unwrap());
+            }),
+            ("version 1, damaged checksum", |s| {
+                record(s, &damaged_v1_checksum());
+            }),
+            ("version 2", |s| {
+                record(s, &state(LOCAL).encode_exchange_record().unwrap());
+            }),
+            ("version 3 shaped", |s| record(s, V3_SHAPED)),
+            ("version 4", |s| {
+                record(s, br#"{"format":"localvault-sync-state","version":4}"#);
+            }),
+            ("record is a directory", |s| {
+                fs::create_dir_all(s.record(LOCAL)).unwrap();
+            }),
+        ];
+
+        for (label, setup) in fixtures {
+            let scratch = Scratch::new("rr-agree");
+            setup(&scratch);
+
+            let store = scratch.store();
+            let before = snapshot(scratch.dir.path());
+
+            let read = store.read_record(&loc(LOCAL));
+            let load = store.load(&loc(LOCAL));
+
+            assert!(agrees(&read, &load), "{label}: {read:?} vs {load:?}");
+            assert_eq!(
+                snapshot(scratch.dir.path()),
+                before,
+                "{label}: the read changed the filesystem"
+            );
+
+            if let RecordRead::Present(present) = &read {
+                assert_eq!(present.bytes(), fs::read(scratch.record(LOCAL)).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn a_case_variant_locator_reads_the_same_record() {
+        let scratch = Scratch::new("rr-case");
+        let bytes = state(LOCAL).encode().unwrap();
+
+        scratch.put(&scratch.record(LOCAL), &bytes);
+
+        let shouting = loc(&LOCAL.to_ascii_uppercase());
+        assert_ne!(shouting, loc(LOCAL));
+        assert_eq!(bytes_of(scratch.store().read_record(&shouting)).0, bytes);
+    }
+
+    #[test]
+    fn the_debug_output_of_a_read_reveals_nothing() {
+        let scratch = Scratch::new("rr-debug");
+        let bytes = state(LOCAL).encode().unwrap();
+
+        scratch.put(&scratch.record(LOCAL), &bytes);
+
+        let read = scratch.store().read_record(&loc(LOCAL));
+        let RecordRead::Present(present) = &read else {
+            panic!("expected a present record");
+        };
+
+        let rendered = [
+            format!("{read:?}"),
+            format!("{present:?}"),
+            format!("{:?}", ArtifactPresence::Present),
+            format!("{:?}", RecordRead::NotConfigured),
+            format!("{:?}", RecordRead::Corrupt(CorruptReason::Empty)),
+            format!(
+                "{:?}",
+                RecordRead::Unreadable(UnreadableReason::Io(io::ErrorKind::PermissionDenied))
+            ),
+        ];
+
+        assert_eq!(rendered[0], "Present(<redacted>)");
+        assert_eq!(rendered[1], "PresentRecord(<redacted>)");
+
+        let text = String::from_utf8(bytes).unwrap();
+        for output in &rendered {
+            assert!(!output.contains("localvault-sync-state"));
+            assert!(!output.contains(&text[..16]));
+            assert!(!output.contains("MARKER"));
+            assert!(!output.contains(&record_key(&loc(LOCAL))));
+        }
     }
 }

@@ -1,3 +1,7 @@
+mod authenticated_state;
+pub use authenticated_state::{
+    AuthenticatedStateLoad, LegacyRecord, RecordFingerprint, StoredAuthenticatedRecord,
+};
 mod backups;
 mod categories;
 pub use categories::{CategoryInput, CategorySummary};

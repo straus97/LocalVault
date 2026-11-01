@@ -6726,17 +6726,55 @@ mod tests {
             "state_mac::",
         ];
 
-        fn scan(dir: &std::path::Path, own: &[std::path::PathBuf], hits: &mut Vec<String>) {
+        /// The text before the first test attribute, in either spelling. A file with
+        /// no test attribute at all is scanned in full.
+        fn production_half(text: &str) -> &str {
+            let end = ["#[cfg(test)]", "#[cfg(all(test"]
+                .iter()
+                .filter_map(|marker| text.find(marker))
+                .min()
+                .unwrap_or(text.len());
+
+            &text[..end]
+        }
+
+        /// The symbols `text` may not mention. The one allow-listed session module
+        /// (Stage 1U-4 B3c-3a) is judged on its production half only, and may name
+        /// `SyncStateMacKey` and nothing else from this list.
+        fn forbidden_in(text: &str, allow_listed: bool) -> Vec<&'static str> {
+            let scanned = if allow_listed {
+                production_half(text)
+            } else {
+                text
+            };
+
+            SYMBOLS
+                .iter()
+                .copied()
+                .filter(|symbol| !(allow_listed && *symbol == "SyncStateMacKey"))
+                .filter(|symbol| scanned.contains(symbol))
+                .collect()
+        }
+
+        fn scan(
+            dir: &std::path::Path,
+            own: &[std::path::PathBuf],
+            allowed: &std::path::Path,
+            allowed_seen: &mut usize,
+            hits: &mut Vec<String>,
+        ) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
-                    scan(&path, own, hits);
+                    scan(&path, own, allowed, allowed_seen, hits);
                 } else if path.extension().is_some_and(|ext| ext == "rs") && !own.contains(&path) {
                     let text = std::fs::read_to_string(&path).unwrap();
-                    for symbol in SYMBOLS {
-                        if text.contains(symbol) {
-                            hits.push(format!("{} uses {symbol}", path.display()));
-                        }
+                    let allow_listed = path == allowed;
+                    if allow_listed {
+                        *allowed_seen += 1;
+                    }
+                    for symbol in forbidden_in(&text, allow_listed) {
+                        hits.push(format!("{} uses {symbol}", path.display()));
                     }
                 }
             }
@@ -6749,8 +6787,20 @@ mod tests {
             core_src.join("sync_state.rs"),
             core_src.join("crypto").join("state_mac.rs"),
         ];
+        let allowed = workspace
+            .join("src-tauri")
+            .join("src")
+            .join("vault")
+            .join("session")
+            .join("authenticated_state.rs");
+
+        assert!(
+            allowed.is_file(),
+            "the allow-listed session module must exist"
+        );
 
         let mut hits = Vec::new();
+        let mut allowed_seen = 0;
         for dir in [
             core_src.clone(),
             workspace.join("src-tauri").join("src"),
@@ -6761,10 +6811,49 @@ mod tests {
                 .join("src"),
         ] {
             assert!(dir.is_dir(), "{} must exist", dir.display());
-            scan(&dir, &own, &mut hits);
+            scan(&dir, &own, &allowed, &mut allowed_seen, &mut hits);
         }
 
         assert!(hits.is_empty(), "{hits:#?}");
+        // Exactly one file was treated as allow-listed.
+        assert_eq!(allowed_seen, 1);
+
+        // Negative self-check: the allow-list admits that one file and, in it, that
+        // one symbol. The other six stay forbidden in its production half, in every
+        // other file nothing is admitted, its test half is not judged, and a file
+        // without a test attribute is judged in full.
+        assert!(forbidden_in("use SyncStateMacKey;", true).is_empty());
+        assert_eq!(
+            forbidden_in("use SyncStateMacKey;", false),
+            ["SyncStateMacKey"]
+        );
+        for symbol in SYMBOLS
+            .iter()
+            .filter(|symbol| **symbol != "SyncStateMacKey")
+        {
+            assert_eq!(forbidden_in(symbol, true), [*symbol]);
+            assert_eq!(forbidden_in(symbol, false), [*symbol]);
+        }
+        assert!(forbidden_in(
+            "fn a() {}\n#[cfg(all(test, windows))]\nuse encode_authenticated;",
+            true
+        )
+        .is_empty());
+        assert!(
+            forbidden_in("fn a() {}\n#[cfg(test)]\nuse encode_authenticated;", true).is_empty()
+        );
+        assert_eq!(
+            forbidden_in("use encode_authenticated;\n#[cfg(test)]\nfn a() {}", true),
+            ["encode_authenticated"]
+        );
+        assert_eq!(
+            forbidden_in("use encode_authenticated;", true),
+            ["encode_authenticated"]
+        );
+        assert_eq!(
+            forbidden_in("fn a() {}\n#[cfg(test)]\nuse encode_authenticated;", false),
+            ["encode_authenticated"]
+        );
     }
 }
 
@@ -10125,17 +10214,37 @@ mod transition_tests {
             "PreviousFault",
         ];
 
-        fn scan(dir: &std::path::Path, own: &std::path::Path, hits: &mut Vec<String>) {
+        /// The symbols `text` may not mention. The one allow-listed session module
+        /// (Stage 1U-4 B3c-3a) is judged on its whole file, and may name
+        /// `AuthenticatedSyncState` and nothing else from this list.
+        fn forbidden_in(text: &str, allow_listed: bool) -> Vec<&'static str> {
+            SYMBOLS
+                .iter()
+                .copied()
+                .filter(|symbol| !(allow_listed && *symbol == "AuthenticatedSyncState"))
+                .filter(|symbol| contains_word(text, symbol))
+                .collect()
+        }
+
+        fn scan(
+            dir: &std::path::Path,
+            own: &std::path::Path,
+            allowed: &std::path::Path,
+            allowed_seen: &mut usize,
+            hits: &mut Vec<String>,
+        ) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
-                    scan(&path, own, hits);
+                    scan(&path, own, allowed, allowed_seen, hits);
                 } else if path.extension().is_some_and(|ext| ext == "rs") && path != own {
                     let text = std::fs::read_to_string(&path).unwrap();
-                    for symbol in SYMBOLS {
-                        if contains_word(&text, symbol) {
-                            hits.push(format!("{} uses {symbol}", path.display()));
-                        }
+                    let allow_listed = path == allowed;
+                    if allow_listed {
+                        *allowed_seen += 1;
+                    }
+                    for symbol in forbidden_in(&text, allow_listed) {
+                        hits.push(format!("{} uses {symbol}", path.display()));
                     }
                 }
             }
@@ -10145,8 +10254,20 @@ mod transition_tests {
         let workspace = core.parent().unwrap().parent().unwrap();
         let core_src = core.join("src");
         let own = core_src.join("sync_state.rs");
+        let allowed = workspace
+            .join("src-tauri")
+            .join("src")
+            .join("vault")
+            .join("session")
+            .join("authenticated_state.rs");
+
+        assert!(
+            allowed.is_file(),
+            "the allow-listed session module must exist"
+        );
 
         let mut hits = Vec::new();
+        let mut allowed_seen = 0;
         for dir in [
             core_src.clone(),
             workspace.join("src-tauri").join("src"),
@@ -10157,10 +10278,35 @@ mod transition_tests {
                 .join("src"),
         ] {
             assert!(dir.is_dir(), "{} must exist", dir.display());
-            scan(&dir, &own, &mut hits);
+            scan(&dir, &own, &allowed, &mut allowed_seen, &mut hits);
         }
 
         assert!(hits.is_empty(), "{hits:#?}");
+        // Exactly one file was treated as allow-listed.
+        assert_eq!(allowed_seen, 1);
+
+        // Negative self-check: the allow-list admits that one file and, in it, that
+        // one symbol. The other nine stay forbidden anywhere in it, and in every
+        // other file nothing is admitted.
+        assert!(forbidden_in("use AuthenticatedSyncState;", true).is_empty());
+        assert_eq!(
+            forbidden_in("use AuthenticatedSyncState;", false),
+            ["AuthenticatedSyncState"]
+        );
+        for symbol in SYMBOLS
+            .iter()
+            .filter(|symbol| **symbol != "AuthenticatedSyncState")
+        {
+            assert_eq!(forbidden_in(symbol, true), [*symbol]);
+            assert_eq!(forbidden_in(symbol, false), [*symbol]);
+        }
+        // The whole file is judged, test code included.
+        assert_eq!(
+            forbidden_in("#[cfg(test)]\nuse begin_exchange;", true),
+            ["begin_exchange"]
+        );
+        // A longer identifier is not the symbol.
+        assert!(forbidden_in("use AuthenticatedSyncStates;", false).is_empty());
     }
 
     #[test]
