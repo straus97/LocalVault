@@ -1,6 +1,7 @@
 mod authenticated_state;
 pub use authenticated_state::{
-    AuthenticatedStateLoad, LegacyRecord, RecordFingerprint, StoredAuthenticatedRecord,
+    AuthenticatedStateLoad, LegacyRecord, NonAuthoritativePrimary, RecordFingerprint,
+    SiblingReport, SiblingVerdict, StateAssessment, StoredAuthenticatedRecord,
 };
 mod backups;
 mod categories;

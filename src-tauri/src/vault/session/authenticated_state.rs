@@ -74,6 +74,36 @@
 //!
 //! Every type here is a fixed category: no `Debug` output contains a path,
 //! locator, identifier, fingerprint, MAC or record body.
+//!
+//! # Layout assessment (Stage 1U-4 B3c-3b-1)
+//!
+//! [`UnlockedVaultSession::assess_authenticated_sync_state`] is a second, equally
+//! dormant and read-only entry point. Instead of the raw record alone it asks the
+//! store for the whole v3 layout of this vault's record key (the primary, any
+//! `.tmp` and `.retired` siblings, and suspicious key-prefixed entries) and sorts
+//! every file it holds with the same classifier as above. Its purpose is narrow: a
+//! missing primary beside any sibling, or an incomplete observation, can never be
+//! mistaken for absence.
+//!
+//! * [`StateAssessment::ConfirmedAbsent`] needs a complete observation, no primary,
+//!   no sibling and no suspicious entry.
+//! * An absent primary beside anything is [`StateAssessment::PrimaryMissing`].
+//! * An incomplete, ambiguous or self-contradicting observation is
+//!   [`StateAssessment::Uncertain`], never absence.
+//! * A sibling is classified and reported. It is never adopted, never preferred
+//!   over the primary, never read as a recovery source, and a valid newer sibling
+//!   beside an older primary leaves the primary's classification unchanged.
+//!
+//! [`SiblingVerdict::AuthenticatedForVaultAndLocator`] and
+//! [`StateAssessment::PrimaryAuthenticatedForVaultAndLocator`] prove exactly what
+//! `Authenticated` proves above: a valid MAC under the key of this session's vault,
+//! the vault tag of this vault, and this session's normalized local location (the
+//! target comparison is vacuous). They do **not** establish the binding a caller
+//! expects, the identity of any target file, the current authority over a target,
+//! causal ancestry between two records, ownership of an operation, freshness,
+//! durability or user approval. Nothing here is a readiness verdict, a permission
+//! or a recovery or cleanup authority, and no such accessor exists. The observation
+//! is one pass narrowed by a second one, not a lock.
 
 use std::fmt;
 
@@ -89,7 +119,10 @@ use super::{
     effective_local_locator, load_envelope, path_identity_eq, CorruptReason, SyncStateRoot,
     SyncStateStore, SyncStateUnavailable, UnlockedVaultSession, UnreadableReason,
 };
-use crate::vault::sync_state_store::{ArtifactPresence, RecordRead};
+use crate::vault::sync_state_store::{
+    ArtifactPresence, LayoutPrimary, LayoutUncertainty, RecordRead, SiblingContent, SiblingKind,
+    V3LayoutInspection,
+};
 
 /// Length and SHA-256 of the exact bytes of one record, as read.
 ///
@@ -427,6 +460,310 @@ impl UnlockedVaultSession {
         state.verify_binding(self.data.vault_id, &expected_local, state.target_locator())
     }
 }
+
+// ---- layout assessment (read-only) -------------------------------------------
+
+/// What one file beside the primary (a `.tmp` or `.retired` sibling) turned out to
+/// be, by the same classifier as the primary.
+///
+/// A report, not an authority. `AuthenticatedForVaultAndLocator` means the bytes
+/// carry a valid MAC under this session's vault key, name this vault and name this
+/// session's location, and nothing more: not the binding id a caller expects, not a
+/// target, not lineage, ownership, freshness or durability, and not permission to
+/// adopt, prefer, recover from, release or remove the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiblingVerdict {
+    /// MAC, vault tag and local location only. Equal fingerprints mean equal bytes.
+    AuthenticatedForVaultAndLocator(RecordFingerprint),
+    /// A version-1 record: a checksum, not a MAC.
+    LegacyV1Unauthenticated,
+    /// A version-1 record bound to another vault.
+    LegacyBoundElsewhere,
+    /// A version-2 record: no MAC.
+    UnauthenticatedExchangeFormat,
+    /// A version-3 record whose MAC does not verify under this session's key.
+    NotAuthentic,
+    BoundToOtherVault,
+    WrongLocator,
+    Corrupt,
+    Empty,
+    TooLarge,
+    UnsupportedVersion,
+    /// The file could not be read.
+    Unreadable,
+    /// Not a plain file.
+    UnexpectedObject,
+    /// Listed, then gone when it was read.
+    Vanished,
+}
+
+/// The siblings of one assessment, by kind, in a stable order, plus how many other
+/// key-prefixed entries were seen. Verdicts and counts only: no name, token or path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SiblingReport {
+    staging: Vec<SiblingVerdict>,
+    retired: Vec<SiblingVerdict>,
+    unrecognized: usize,
+}
+
+impl SiblingReport {
+    pub fn staging(&self) -> &[SiblingVerdict] {
+        &self.staging
+    }
+
+    pub fn retired(&self) -> &[SiblingVerdict] {
+        &self.retired
+    }
+
+    /// Key-prefixed entries that match no recognized shape.
+    pub fn unrecognized(&self) -> usize {
+        self.unrecognized
+    }
+
+    /// Nothing beside the primary: no sibling of either kind and no suspicious entry.
+    pub fn is_empty(&self) -> bool {
+        self.staging.is_empty() && self.retired.is_empty() && self.unrecognized == 0
+    }
+}
+
+/// Why a primary record that exists carries no authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonAuthoritativePrimary {
+    LegacyV1,
+    LegacyBoundElsewhere,
+    UnauthenticatedExchangeFormat,
+    NotAuthentic,
+    BoundToOtherVault,
+    WrongLocator,
+    Corrupt,
+    Empty,
+    TooLarge,
+    UnsupportedVersion,
+    UnexpectedObject,
+}
+
+impl From<NonAuthoritativePrimary> for SiblingVerdict {
+    fn from(class: NonAuthoritativePrimary) -> Self {
+        match class {
+            NonAuthoritativePrimary::LegacyV1 => Self::LegacyV1Unauthenticated,
+            NonAuthoritativePrimary::LegacyBoundElsewhere => Self::LegacyBoundElsewhere,
+            NonAuthoritativePrimary::UnauthenticatedExchangeFormat => {
+                Self::UnauthenticatedExchangeFormat
+            }
+            NonAuthoritativePrimary::NotAuthentic => Self::NotAuthentic,
+            NonAuthoritativePrimary::BoundToOtherVault => Self::BoundToOtherVault,
+            NonAuthoritativePrimary::WrongLocator => Self::WrongLocator,
+            NonAuthoritativePrimary::Corrupt => Self::Corrupt,
+            NonAuthoritativePrimary::Empty => Self::Empty,
+            NonAuthoritativePrimary::TooLarge => Self::TooLarge,
+            NonAuthoritativePrimary::UnsupportedVersion => Self::UnsupportedVersion,
+            NonAuthoritativePrimary::UnexpectedObject => Self::UnexpectedObject,
+        }
+    }
+}
+
+/// The result of one layout assessment. Exactly one variant; none grants anything.
+#[must_use]
+#[derive(Debug)]
+pub enum StateAssessment {
+    /// A complete observation found no primary, no sibling and no suspicious entry.
+    /// One observation at one instant; not a lock and not a permission.
+    ConfirmedAbsent,
+    /// The primary carries a valid MAC for this vault and location. See
+    /// [`SiblingVerdict::AuthenticatedForVaultAndLocator`] for what that does and
+    /// does not prove. The siblings are reported, never adopted.
+    PrimaryAuthenticatedForVaultAndLocator {
+        record: Box<StoredAuthenticatedRecord>,
+        siblings: SiblingReport,
+    },
+    /// No primary, but at least one sibling or suspicious entry. Never absence.
+    PrimaryMissing { siblings: SiblingReport },
+    /// A primary exists and carries no authority.
+    PrimaryNotAuthenticated {
+        class: NonAuthoritativePrimary,
+        siblings: SiblingReport,
+    },
+    /// The observation was incomplete, ambiguous or contradicted itself. Never
+    /// absence.
+    Uncertain(LayoutUncertainty),
+    /// The session's vault, its location or the state root could not anchor the
+    /// check, so the store was not consulted.
+    Unavailable(SyncStateUnavailable),
+    /// The MAC key could not be derived for this session.
+    KeyUnavailable,
+}
+
+/// A classified file, before it becomes a verdict or a primary assessment.
+enum Judged {
+    Authenticated(Box<StoredAuthenticatedRecord>),
+    Weak(NonAuthoritativePrimary),
+    /// An outcome the content classifier cannot produce for bytes it was given;
+    /// treated as unreadable, never as authority.
+    Unusable,
+    KeyUnavailable,
+}
+
+/// Every classifier outcome, matched without a wildcard so that a new variant
+/// cannot be routed silently.
+fn judge(load: AuthenticatedStateLoad) -> Judged {
+    use AuthenticatedStateLoad as Load;
+    use NonAuthoritativePrimary as Weak;
+
+    match load {
+        Load::Authenticated(record) => Judged::Authenticated(record),
+        Load::Legacy(_) => Judged::Weak(Weak::LegacyV1),
+        Load::LegacyMismatch(_) => Judged::Weak(Weak::LegacyBoundElsewhere),
+        Load::UnauthenticatedExchangeFormat => Judged::Weak(Weak::UnauthenticatedExchangeFormat),
+        Load::NotAuthentic => Judged::Weak(Weak::NotAuthentic),
+        Load::BindingMismatch(BindingMismatch::VaultIdentity) => {
+            Judged::Weak(Weak::BoundToOtherVault)
+        }
+        Load::BindingMismatch(BindingMismatch::LocalLocator | BindingMismatch::TargetLocator) => {
+            Judged::Weak(Weak::WrongLocator)
+        }
+        Load::Corrupt(CorruptReason::Empty) => Judged::Weak(Weak::Empty),
+        Load::Corrupt(CorruptReason::TooLarge) => Judged::Weak(Weak::TooLarge),
+        Load::Corrupt(CorruptReason::Undecodable) => Judged::Weak(Weak::Corrupt),
+        Load::Corrupt(CorruptReason::LocatorMismatch) => Judged::Weak(Weak::WrongLocator),
+        Load::UnsupportedVersion => Judged::Weak(Weak::UnsupportedVersion),
+        Load::KeyUnavailable => Judged::KeyUnavailable,
+        Load::NotConfigured | Load::Unreadable(_) | Load::Unavailable(_) => Judged::Unusable,
+    }
+}
+
+impl UnlockedVaultSession {
+    /// Assess this vault's whole stored layout: the primary record and every
+    /// sibling beside it. Strictly read-only and dormant; see the module
+    /// documentation for what the result does and does not mean. The root comes
+    /// from the trusted application context, never the UI.
+    ///
+    /// Takes `&self`, so the session, and with it the exclusive OS lock, outlives
+    /// the whole call.
+    pub fn assess_authenticated_sync_state(&self, root: &SyncStateRoot) -> StateAssessment {
+        let Ok(store) = SyncStateStore::new(root.path()) else {
+            return StateAssessment::Unavailable(SyncStateUnavailable::Root);
+        };
+
+        self.assess_authenticated_sync_state_in(&store)
+    }
+
+    /// [`assess_authenticated_sync_state`](Self::assess_authenticated_sync_state)
+    /// over an explicit store. Crate-private so only the crate's own tests can
+    /// supply one.
+    ///
+    /// In order: the vault file at the session's path must still hold the envelope
+    /// this session unlocked, and must have a normalized location, both **before
+    /// the store is touched**; then the layout is observed; then the primary and
+    /// every sibling are classified.
+    pub(crate) fn assess_authenticated_sync_state_in(
+        &self,
+        store: &SyncStateStore,
+    ) -> StateAssessment {
+        match load_envelope(&self.path) {
+            Ok(on_disk) if on_disk == self.envelope => {}
+            _ => return StateAssessment::Unavailable(SyncStateUnavailable::LocalVaultChanged),
+        }
+
+        let Some(local_locator) = self.local_locator() else {
+            return StateAssessment::Unavailable(SyncStateUnavailable::LocalLocator);
+        };
+
+        let layout = match store.inspect_v3_layout(&local_locator) {
+            V3LayoutInspection::Observed(layout) => layout,
+            V3LayoutInspection::Uncertain(reason) => return StateAssessment::Uncertain(reason),
+        };
+
+        let mut siblings = SiblingReport {
+            staging: Vec::new(),
+            retired: Vec::new(),
+            unrecognized: layout.unrecognized(),
+        };
+
+        for sibling in layout.siblings() {
+            let Some(verdict) = self.verdict_of(&local_locator, sibling.content()) else {
+                return StateAssessment::KeyUnavailable;
+            };
+
+            match sibling.kind() {
+                SiblingKind::Staging => siblings.staging.push(verdict),
+                SiblingKind::Retired => siblings.retired.push(verdict),
+            }
+        }
+
+        let primary_class = match layout.primary() {
+            LayoutPrimary::Absent => {
+                return if siblings.is_empty() {
+                    StateAssessment::ConfirmedAbsent
+                } else {
+                    StateAssessment::PrimaryMissing { siblings }
+                };
+            }
+            LayoutPrimary::Empty => NonAuthoritativePrimary::Empty,
+            LayoutPrimary::TooLarge => NonAuthoritativePrimary::TooLarge,
+            LayoutPrimary::Unexpected => NonAuthoritativePrimary::UnexpectedObject,
+            LayoutPrimary::Bytes(bytes) => {
+                // Anything beside the primary, of any kind, is reported as present;
+                // the indicator is never "none" when the observation saw something.
+                let artifacts = if siblings.is_empty() {
+                    ArtifactPresence::None
+                } else {
+                    ArtifactPresence::Present
+                };
+
+                match judge(self.classify_present(&local_locator, bytes, artifacts)) {
+                    Judged::Authenticated(record) => {
+                        return StateAssessment::PrimaryAuthenticatedForVaultAndLocator {
+                            record,
+                            siblings,
+                        };
+                    }
+                    Judged::Weak(class) => class,
+                    Judged::Unusable => {
+                        return StateAssessment::Uncertain(LayoutUncertainty::Io(
+                            std::io::ErrorKind::Other,
+                        ));
+                    }
+                    Judged::KeyUnavailable => return StateAssessment::KeyUnavailable,
+                }
+            }
+        };
+
+        StateAssessment::PrimaryNotAuthenticated {
+            class: primary_class,
+            siblings,
+        }
+    }
+
+    /// The verdict for one sibling's content, or `None` when no MAC key can be
+    /// derived for this session.
+    fn verdict_of(
+        &self,
+        local_locator: &Locator,
+        content: &SiblingContent,
+    ) -> Option<SiblingVerdict> {
+        match content {
+            SiblingContent::Bytes(bytes) => {
+                // The artifact indicator belongs to a primary; it is not used here.
+                match judge(self.classify_present(local_locator, bytes, ArtifactPresence::Unknown))
+                {
+                    Judged::Authenticated(record) => Some(
+                        SiblingVerdict::AuthenticatedForVaultAndLocator(record.fingerprint()),
+                    ),
+                    Judged::Weak(class) => Some(class.into()),
+                    Judged::Unusable => Some(SiblingVerdict::Unreadable),
+                    Judged::KeyUnavailable => None,
+                }
+            }
+            SiblingContent::Empty => Some(SiblingVerdict::Empty),
+            SiblingContent::TooLarge => Some(SiblingVerdict::TooLarge),
+            SiblingContent::Unreadable(_) => Some(SiblingVerdict::Unreadable),
+            SiblingContent::Unexpected => Some(SiblingVerdict::UnexpectedObject),
+            SiblingContent::Vanished => Some(SiblingVerdict::Vanished),
+        }
+    }
+}
+
+// ---- end layout assessment ---------------------------------------------------
 
 // ---- test-only code below this line ------------------------------------------
 
@@ -1806,5 +2143,1534 @@ mod tests {
             .path()
             .components()
             .any(|part| { part.as_os_str() == "sync-state-b3c3a-tests" }));
+    }
+}
+
+// ---- layout assessment tests (Stage 1U-4 B3c-3b-1) ---------------------------
+
+/// Tests of [`UnlockedVaultSession::assess_authenticated_sync_state`] over real
+/// sessions, real MACs and real NTFS layouts. Synthetic vaults only; every test
+/// owns a uniquely named scratch directory under the git-ignored
+/// `<repo>/.qa-local/sync-state-b3c3b1-tests/` (never `%TEMP%`) and removes only
+/// that directory. The assessment is read-only: every no-mutation proof builds a
+/// stable fixture, snapshots the whole scratch tree, calls **only** the
+/// assessment, and requires the same snapshot. The concurrency test changes the
+/// tree on purpose and so asserts safe outcomes, never whole-tree equality.
+#[cfg(all(test, windows))]
+mod assessment_tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    use uuid::Uuid;
+    use zeroize::Zeroizing;
+
+    use localvault_core::{
+        sync::{PushBaseline, PushIntent, RemoteHighWater},
+        sync_state::{
+            BindingId, ExchangeIntent, ExchangeScheme, ObjectAnchor, PendingPush, SyncBase,
+            SyncCheckpoint, VaultBindingTag, BINDING_SALT_LEN, MAX_SYNC_STATE_BYTES,
+        },
+    };
+
+    use super::*;
+    use crate::vault::{
+        handle_ops::test_support::{assert_local_ntfs, make_junction, snapshot},
+        session::{
+            BindingResetOutcome, BindingResetSubject, InitialBindingApproval, InitialBindingOutcome,
+        },
+        sync_file_adapter::SyncFileTarget,
+        sync_state_store::SYNC_STATE_DIRECTORY,
+    };
+
+    const NOW_MS: i64 = 1_700_000_000_000;
+    const MASTER_PASSWORD: &str = "b3c3b1-master-password-test-only";
+    const NEW_PASSWORD: &str = "b3c3b1-new-master-password-test-only";
+    const OTHER_LOCAL: &str = r"\\?\C:\Synthetic\Vaults\OTHER-MARKER.lvault";
+    const TARGET: &str = r"\\?\D:\Synthetic\Remote\TARGET-MARKER.lvault";
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    const RETIRED_TOKEN: &str = "fedcba9876543210fedcba9876543210";
+
+    fn password() -> Zeroizing<String> {
+        Zeroizing::new(MASTER_PASSWORD.to_owned())
+    }
+
+    /// A unique, test-owned directory under the B3c-3b-1 scratch base, never
+    /// `%TEMP%`. Removed only by its `TempDir` guard. Fails loudly unless on a
+    /// local NTFS volume.
+    fn scratch(name: &str) -> tempfile::TempDir {
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".qa-local")
+            .join("sync-state-b3c3b1-tests");
+
+        fs::create_dir_all(&base).unwrap();
+
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("{name}-"))
+            .tempdir_in(&base)
+            .unwrap();
+
+        assert!(!dir.path().starts_with(std::env::temp_dir()));
+        assert_local_ntfs(dir.path());
+
+        dir
+    }
+
+    fn new_session(path: &Path) -> UnlockedVaultSession {
+        UnlockedVaultSession::create(path, password(), NOW_MS).unwrap()
+    }
+
+    fn mac_key(session: &UnlockedVaultSession) -> SyncStateMacKey {
+        SyncStateMacKey::derive(&session.vault_key, session.data.vault_id).unwrap()
+    }
+
+    fn v3_of(session: &UnlockedVaultSession, state: &SyncState) -> Vec<u8> {
+        state.encode_authenticated(&mac_key(session)).unwrap()
+    }
+
+    /// The record key, recomputed independently of the store's own helper.
+    fn key_of(locator: &Locator) -> String {
+        EnvelopeFingerprint::of_bytes(locator.as_str().to_ascii_lowercase().as_bytes()).to_hex()
+    }
+
+    fn state_for(vault_id: Uuid, local: &Locator, high_water: u64) -> SyncState {
+        let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+        let checkpoint = SyncCheckpoint::new(
+            EnvelopeFingerprint::of_bytes(&[1]),
+            1,
+            RemoteHighWater::new(high_water),
+        )
+        .unwrap();
+
+        SyncState::new(
+            BindingId::new(Uuid::from_u128(0xB3C3B1)).unwrap(),
+            VaultBindingTag::derive(salt, vault_id).unwrap(),
+            local.clone(),
+            Locator::new(TARGET).unwrap(),
+            SyncBase::Based(checkpoint),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The byte right after `marker`, turned into a different hex digit.
+    fn flip_hex_after(bytes: &[u8], marker: &str) -> Vec<u8> {
+        let text = std::str::from_utf8(bytes).unwrap();
+        let at = text.find(marker).expect("marker present") + marker.len();
+
+        let mut out = bytes.to_vec();
+        out[at] = if out[at] == b'0' { b'1' } else { b'0' };
+        out
+    }
+
+    /// One lowercase letter inside the `body` string changed to another letter, so
+    /// the wrapper stays canonical and only the MAC can notice.
+    fn change_a_body_letter(bytes: &[u8]) -> Vec<u8> {
+        let text = std::str::from_utf8(bytes).unwrap();
+        let start = text.find("\"body\":\"").expect("body present") + "\"body\":\"".len();
+
+        let mut out = bytes.to_vec();
+        let at = start
+            + out[start..]
+                .iter()
+                .position(u8::is_ascii_lowercase)
+                .expect("a letter in the body");
+        out[at] = if out[at] == b'a' { b'b' } else { b'a' };
+        out
+    }
+
+    /// A synthetic vault and an application root, inside one scratch tree.
+    /// `session` is declared first so that it (and its exclusive lock file) drops
+    /// before the scratch directory is removed.
+    struct Rig {
+        session: UnlockedVaultSession,
+        root: SyncStateRoot,
+        vault: PathBuf,
+        dir: tempfile::TempDir,
+    }
+
+    impl Rig {
+        fn new(name: &str) -> Self {
+            let dir = scratch(name);
+            let vaults = dir.path().join("vaults");
+
+            fs::create_dir_all(&vaults).unwrap();
+
+            let vault = vaults.join("vault.lvault");
+            let session = new_session(&vault);
+            let root = SyncStateRoot::for_test(dir.path().join("app-local"));
+
+            Self {
+                session,
+                root,
+                vault,
+                dir,
+            }
+        }
+
+        /// Bound through the real, unchanged initial-binding operation, which writes
+        /// a version-1 record.
+        fn bound(name: &str) -> Self {
+            let rig = Self::new(name);
+            let dest = rig.dir.path().join("dest");
+
+            fs::create_dir_all(&dest).unwrap();
+
+            let copy = dest.join("copy.lvault");
+            fs::copy(&rig.vault, &copy).unwrap();
+
+            let target = SyncFileTarget::from_path(&copy).unwrap();
+
+            assert_eq!(
+                rig.session.bind_existing_identical_target_in(
+                    &rig.store(),
+                    &target,
+                    InitialBindingApproval::for_test(&target),
+                    &mut SyncFileTarget::read,
+                    &mut |buffer| getrandom::fill(buffer).is_ok(),
+                ),
+                Ok(InitialBindingOutcome::BoundAndVerified)
+            );
+
+            rig
+        }
+
+        fn store(&self) -> SyncStateStore {
+            SyncStateStore::new(self.root.path()).unwrap()
+        }
+
+        fn state_dir(&self) -> PathBuf {
+            self.root.path().join(SYNC_STATE_DIRECTORY)
+        }
+
+        fn locator(&self) -> Locator {
+            self.session.local_locator().unwrap()
+        }
+
+        fn primary_path(&self) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.json", key_of(&self.locator())))
+        }
+
+        fn staging_path(&self, token: &str) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.{token}.tmp", key_of(&self.locator())))
+        }
+
+        fn retired_path(&self, token: &str) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.{token}.retired", key_of(&self.locator())))
+        }
+
+        fn put(&self, path: &Path, bytes: &[u8]) {
+            fs::create_dir_all(self.state_dir()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+
+        fn put_primary(&self, bytes: &[u8]) {
+            self.put(&self.primary_path(), bytes);
+        }
+
+        /// Remove everything this test put in the state directory.
+        fn clear(&self) {
+            if self.state_dir().exists() {
+                fs::remove_dir_all(self.state_dir()).unwrap();
+            }
+        }
+
+        /// A state of this vault and location.
+        fn mine(&self, high_water: u64) -> SyncState {
+            state_for(self.session.data.vault_id, &self.locator(), high_water)
+        }
+
+        fn v3(&self, state: &SyncState) -> Vec<u8> {
+            v3_of(&self.session, state)
+        }
+
+        /// A second, independent vault in the same scratch tree.
+        fn foreign(&self) -> UnlockedVaultSession {
+            let folder = self.dir.path().join("foreign");
+
+            fs::create_dir_all(&folder).unwrap();
+
+            new_session(&folder.join("foreign.lvault"))
+        }
+
+        /// A state with an exchange intent, as the dormant exchange records allow.
+        fn exchange_state(&self) -> SyncState {
+            let current = self.mine(1);
+            let SyncBase::Based(checkpoint) = current.base() else {
+                panic!("a based state is required");
+            };
+
+            let intent = PushIntent::new(
+                PushBaseline::Present(*checkpoint.synced()),
+                EnvelopeFingerprint::of_bytes(b"b3c3b1-intended"),
+            )
+            .unwrap();
+            let pending = PendingPush::new(
+                Uuid::from_u128(0xE1),
+                intent,
+                checkpoint.high_water().revision() + 1,
+            )
+            .unwrap();
+
+            SyncState::new_with_exchange_records(
+                current.binding_id(),
+                *current.vault_tag(),
+                current.local_locator().clone(),
+                current.target_locator().clone(),
+                *current.base(),
+                Some(pending),
+                Some(ExchangeIntent::new(
+                    ExchangeScheme::RetainAndPublishV1,
+                    ObjectAnchor::new(&[1; 8]).unwrap(),
+                    ObjectAnchor::new(&[2; 8]).unwrap(),
+                )),
+                Vec::new(),
+            )
+            .unwrap()
+        }
+
+        /// One assessment of a **stable** fixture: the whole scratch tree (names,
+        /// kinds, lengths, times and content hashes; the `.lock` by name only) is
+        /// snapshotted before and after, and only the assessment runs in between.
+        fn assess(&self) -> StateAssessment {
+            self.assess_in(&self.store())
+        }
+
+        fn assess_in(&self, store: &SyncStateStore) -> StateAssessment {
+            let before = snapshot(self.dir.path());
+            let result = self.session.assess_authenticated_sync_state_in(store);
+
+            assert_eq!(
+                snapshot(self.dir.path()),
+                before,
+                "the assessment changed the filesystem"
+            );
+
+            result
+        }
+    }
+
+    fn fingerprint_of(bytes: &[u8]) -> RecordFingerprint {
+        RecordFingerprint::of(bytes)
+    }
+
+    /// What a classified fixture must come out as.
+    #[derive(Clone, Copy, Debug)]
+    enum Expect {
+        Authenticated,
+        Weak(NonAuthoritativePrimary),
+    }
+
+    impl Expect {
+        fn verdict(self, bytes: &[u8]) -> SiblingVerdict {
+            match self {
+                Self::Authenticated => {
+                    SiblingVerdict::AuthenticatedForVaultAndLocator(fingerprint_of(bytes))
+                }
+                Self::Weak(class) => class.into(),
+            }
+        }
+    }
+
+    /// Every kind of content the classifier distinguishes, as real bytes.
+    fn fixtures(rig: &Rig) -> Vec<(&'static str, Vec<u8>, Expect)> {
+        use NonAuthoritativePrimary as Weak;
+
+        let foreign = rig.foreign();
+        let vault_id = rig.session.data.vault_id;
+        let locator = rig.locator();
+        let elsewhere = Locator::new(OTHER_LOCAL).unwrap();
+        let own = rig.v3(&rig.mine(1));
+        let mine = rig.mine(1);
+
+        // This vault's identity, but another vault's key.
+        let wrong_key = SyncStateMacKey::derive(&foreign.vault_key, vault_id).unwrap();
+
+        let mut non_canonical = own.clone();
+        non_canonical.push(b' ');
+
+        vec![
+            ("own version 3", own.clone(), Expect::Authenticated),
+            (
+                "version 3 with exchange records",
+                rig.v3(&rig.exchange_state()),
+                Expect::Authenticated,
+            ),
+            (
+                "version 3 signed by another vault",
+                v3_of(&foreign, &state_for(foreign.data.vault_id, &locator, 5)),
+                Expect::Weak(Weak::NotAuthentic),
+            ),
+            (
+                "version 3 with the wrong Vault Key",
+                mine.encode_authenticated(&wrong_key).unwrap(),
+                Expect::Weak(Weak::NotAuthentic),
+            ),
+            (
+                "version 3 with a flipped tag bit",
+                flip_hex_after(&own, "\"mac\":\""),
+                Expect::Weak(Weak::NotAuthentic),
+            ),
+            (
+                "version 3 with a changed body byte",
+                change_a_body_letter(&own),
+                Expect::Weak(Weak::NotAuthentic),
+            ),
+            (
+                "version 3 for another location",
+                v3_of(&rig.session, &state_for(vault_id, &elsewhere, 5)),
+                Expect::Weak(Weak::WrongLocator),
+            ),
+            (
+                "version 3, not canonical",
+                non_canonical,
+                Expect::Weak(Weak::Corrupt),
+            ),
+            (
+                "version 1",
+                mine.encode().unwrap(),
+                Expect::Weak(Weak::LegacyV1),
+            ),
+            (
+                "version 1 of another vault",
+                state_for(foreign.data.vault_id, &locator, 5)
+                    .encode()
+                    .unwrap(),
+                Expect::Weak(Weak::LegacyBoundElsewhere),
+            ),
+            (
+                "version 1 for another location",
+                state_for(vault_id, &elsewhere, 5).encode().unwrap(),
+                Expect::Weak(Weak::WrongLocator),
+            ),
+            (
+                "version 2",
+                mine.encode_exchange_record().unwrap(),
+                Expect::Weak(Weak::UnauthenticatedExchangeFormat),
+            ),
+            (
+                "a future version",
+                br#"{"format":"localvault-sync-state","version":4}"#.to_vec(),
+                Expect::Weak(Weak::UnsupportedVersion),
+            ),
+            (
+                "junk",
+                b"this is not a sync-state record".to_vec(),
+                Expect::Weak(Weak::Corrupt),
+            ),
+            ("empty", Vec::new(), Expect::Weak(Weak::Empty)),
+            (
+                "larger than the maximum",
+                vec![b'a'; MAX_SYNC_STATE_BYTES + 1],
+                Expect::Weak(Weak::TooLarge),
+            ),
+        ]
+    }
+
+    fn primary_class_of(assessment: StateAssessment) -> (NonAuthoritativePrimary, SiblingReport) {
+        match assessment {
+            StateAssessment::PrimaryNotAuthenticated { class, siblings } => (class, siblings),
+            other => panic!("expected PrimaryNotAuthenticated, found {other:?}"),
+        }
+    }
+
+    fn missing_siblings_of(assessment: StateAssessment) -> SiblingReport {
+        match assessment {
+            StateAssessment::PrimaryMissing { siblings } => siblings,
+            other => panic!("expected PrimaryMissing, found {other:?}"),
+        }
+    }
+
+    fn authenticated_of(
+        assessment: StateAssessment,
+    ) -> (Box<StoredAuthenticatedRecord>, SiblingReport) {
+        match assessment {
+            StateAssessment::PrimaryAuthenticatedForVaultAndLocator { record, siblings } => {
+                (record, siblings)
+            }
+            other => panic!("expected an authenticated primary, found {other:?}"),
+        }
+    }
+
+    // ---- the same classifier for a primary and for a sibling -----------------------
+
+    #[test]
+    fn every_content_class_is_the_same_for_a_primary_and_for_a_sibling() {
+        let rig = Rig::new("table");
+
+        for (label, bytes, expect) in fixtures(&rig) {
+            // As the primary.
+            rig.clear();
+            rig.put_primary(&bytes);
+
+            match expect {
+                Expect::Authenticated => {
+                    let (record, siblings) = authenticated_of(rig.assess());
+
+                    assert_eq!(record.fingerprint(), fingerprint_of(&bytes), "{label}");
+                    assert_eq!(record.artifacts(), ArtifactPresence::None, "{label}");
+                    assert!(siblings.is_empty(), "{label}");
+                }
+                Expect::Weak(class) => {
+                    let (found, siblings) = primary_class_of(rig.assess());
+
+                    assert_eq!(found, class, "{label}");
+                    assert!(siblings.is_empty(), "{label}");
+                }
+            }
+
+            // As a lone staging file, then as a lone retired file: never a primary.
+            rig.clear();
+            rig.put(&rig.staging_path(TOKEN), &bytes);
+            let report = missing_siblings_of(rig.assess());
+            assert_eq!(report.staging(), [expect.verdict(&bytes)], "{label}");
+            assert!(report.retired().is_empty(), "{label}");
+
+            rig.clear();
+            rig.put(&rig.retired_path(RETIRED_TOKEN), &bytes);
+            let report = missing_siblings_of(rig.assess());
+            assert_eq!(report.retired(), [expect.verdict(&bytes)], "{label}");
+            assert!(report.staging().is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn a_sibling_never_changes_how_the_primary_is_classified() {
+        let rig = Rig::new("table-beside");
+        let own = rig.v3(&rig.mine(1));
+
+        for (label, bytes, expect) in fixtures(&rig) {
+            rig.clear();
+            rig.put_primary(&own);
+            rig.put(&rig.staging_path(TOKEN), &bytes);
+            rig.put(&rig.retired_path(RETIRED_TOKEN), &bytes);
+
+            let (record, siblings) = authenticated_of(rig.assess());
+
+            assert_eq!(*record.state(), rig.mine(1), "{label}");
+            assert_eq!(record.fingerprint(), fingerprint_of(&own), "{label}");
+            assert_eq!(record.artifacts(), ArtifactPresence::Present, "{label}");
+            assert_eq!(siblings.staging(), [expect.verdict(&bytes)], "{label}");
+            assert_eq!(siblings.retired(), [expect.verdict(&bytes)], "{label}");
+        }
+    }
+
+    #[test]
+    fn every_classifier_outcome_has_its_own_fixed_route() {
+        use AuthenticatedStateLoad as Load;
+        use NonAuthoritativePrimary as Weak;
+
+        // A record that is MAC-valid under this key but carries another vault's tag
+        // cannot be built with the public encoder (it refuses), so the route for that
+        // classifier outcome is pinned here instead of through bytes.
+        let weak = |load: Load, class: Weak| match judge(load) {
+            Judged::Weak(found) => assert_eq!(found, class),
+            _ => panic!("expected a weak class"),
+        };
+
+        weak(
+            Load::BindingMismatch(BindingMismatch::VaultIdentity),
+            Weak::BoundToOtherVault,
+        );
+        weak(
+            Load::BindingMismatch(BindingMismatch::LocalLocator),
+            Weak::WrongLocator,
+        );
+        weak(
+            Load::BindingMismatch(BindingMismatch::TargetLocator),
+            Weak::WrongLocator,
+        );
+        weak(
+            Load::LegacyMismatch(BindingMismatch::VaultIdentity),
+            Weak::LegacyBoundElsewhere,
+        );
+        weak(Load::NotAuthentic, Weak::NotAuthentic);
+        weak(
+            Load::UnauthenticatedExchangeFormat,
+            Weak::UnauthenticatedExchangeFormat,
+        );
+        weak(Load::UnsupportedVersion, Weak::UnsupportedVersion);
+        weak(Load::Corrupt(CorruptReason::Empty), Weak::Empty);
+        weak(Load::Corrupt(CorruptReason::TooLarge), Weak::TooLarge);
+        weak(Load::Corrupt(CorruptReason::Undecodable), Weak::Corrupt);
+        weak(
+            Load::Corrupt(CorruptReason::LocatorMismatch),
+            Weak::WrongLocator,
+        );
+
+        assert!(matches!(
+            judge(Load::KeyUnavailable),
+            Judged::KeyUnavailable
+        ));
+
+        // Outcomes the classifier cannot produce for bytes it was given are never
+        // authority.
+        for load in [
+            Load::NotConfigured,
+            Load::Unreadable(UnreadableReason::UnresolvedArtifacts),
+            Load::Unavailable(SyncStateUnavailable::Root),
+        ] {
+            assert!(matches!(judge(load), Judged::Unusable));
+        }
+    }
+
+    // ---- authenticated layouts ----------------------------------------------------
+
+    #[test]
+    fn a_valid_primary_alone_is_authenticated_with_the_exact_fingerprint() {
+        let rig = Rig::new("a-primary");
+        let state = rig.mine(1);
+        let bytes = rig.v3(&state);
+
+        rig.put_primary(&bytes);
+
+        let (record, siblings) = authenticated_of(rig.assess());
+
+        assert_eq!(*record.state(), state);
+        assert_eq!(record.fingerprint(), fingerprint_of(&bytes));
+        assert_eq!(record.artifacts(), ArtifactPresence::None);
+        assert!(siblings.is_empty());
+        assert_eq!(siblings.unrecognized(), 0);
+    }
+
+    #[test]
+    fn a_valid_primary_beside_a_staging_or_a_retired_file_reports_it() {
+        let rig = Rig::new("b-and-c");
+        let bytes = rig.v3(&rig.mine(1));
+        let newer = rig.v3(&rig.mine(7));
+
+        rig.put_primary(&bytes);
+        rig.put(&rig.staging_path(TOKEN), &newer);
+
+        let (record, siblings) = authenticated_of(rig.assess());
+        assert_eq!(record.artifacts(), ArtifactPresence::Present);
+        assert_eq!(
+            siblings.staging(),
+            [SiblingVerdict::AuthenticatedForVaultAndLocator(
+                fingerprint_of(&newer)
+            )]
+        );
+        assert!(siblings.retired().is_empty());
+
+        rig.clear();
+        rig.put_primary(&bytes);
+        rig.put(&rig.retired_path(RETIRED_TOKEN), b"junk");
+
+        let (record, siblings) = authenticated_of(rig.assess());
+        assert_eq!(record.artifacts(), ArtifactPresence::Present);
+        assert!(siblings.staging().is_empty());
+        assert_eq!(siblings.retired(), [SiblingVerdict::Corrupt]);
+    }
+
+    #[test]
+    fn a_newer_valid_staging_file_never_replaces_an_older_primary() {
+        let rig = Rig::new("primary-wins");
+        let older = rig.mine(1);
+        let newer = rig.mine(9);
+
+        rig.put_primary(&rig.v3(&older));
+        rig.put(&rig.staging_path(TOKEN), &rig.v3(&newer));
+        rig.put(&rig.retired_path(RETIRED_TOKEN), &rig.v3(&newer));
+
+        let (record, siblings) = authenticated_of(rig.assess());
+
+        assert_eq!(*record.state(), older);
+        assert_ne!(*record.state(), newer);
+        assert_eq!(siblings.staging().len(), 1);
+        assert_eq!(siblings.retired().len(), 1);
+
+        // And a valid sibling does not rescue a damaged primary either.
+        rig.put_primary(b"damaged");
+        let (class, siblings) = primary_class_of(rig.assess());
+
+        assert_eq!(class, NonAuthoritativePrimary::Corrupt);
+        assert_eq!(siblings.staging().len(), 1);
+    }
+
+    #[test]
+    fn replay_of_an_older_valid_record_is_not_detected_by_the_assessment() {
+        // Documented limit, pinned on purpose: with no external anchor an older,
+        // validly authenticated record of the same binding is accepted as the
+        // primary. Nothing here detects replay.
+        let rig = Rig::new("replay");
+        let older = rig.mine(1);
+        let newer = rig.mine(9);
+
+        rig.put_primary(&rig.v3(&newer));
+        assert_eq!(*authenticated_of(rig.assess()).0.state(), newer);
+
+        rig.put_primary(&rig.v3(&older));
+        let (record, _) = authenticated_of(rig.assess());
+
+        assert_eq!(*record.state(), older);
+        assert_ne!(*record.state(), newer);
+    }
+
+    #[test]
+    fn exchange_records_are_classified_and_nothing_is_started_or_changed() {
+        let rig = Rig::new("exchange");
+        let state = rig.exchange_state();
+
+        assert!(state.has_exchange_records());
+        rig.put_primary(&rig.v3(&state));
+        rig.put(&rig.staging_path(TOKEN), &rig.v3(&state));
+
+        // `assess` proves the whole tree is unchanged.
+        let (record, siblings) = authenticated_of(rig.assess());
+
+        assert_eq!(*record.state(), state);
+        assert!(record.state().has_exchange_records());
+        assert_eq!(siblings.staging().len(), 1);
+    }
+
+    // ---- a missing primary is never absence ---------------------------------------------
+
+    #[test]
+    fn no_primary_beside_any_sibling_is_primary_missing_never_absent() {
+        let rig = Rig::new("missing");
+        let own = rig.v3(&rig.mine(1));
+
+        type Setup = fn(&Rig, &[u8]);
+
+        let cases: [(&str, Setup, usize, usize, usize); 6] = [
+            ("staging", |r, b| r.put(&r.staging_path(TOKEN), b), 1, 0, 0),
+            (
+                "retired",
+                |r, b| r.put(&r.retired_path(RETIRED_TOKEN), b),
+                0,
+                1,
+                0,
+            ),
+            (
+                "both",
+                |r, b| {
+                    r.put(&r.staging_path(TOKEN), b);
+                    r.put(&r.retired_path(RETIRED_TOKEN), b);
+                },
+                1,
+                1,
+                0,
+            ),
+            (
+                "several retired",
+                |r, b| {
+                    for index in 0..3 {
+                        r.put(&r.retired_path(&format!("{index:032x}")), b);
+                    }
+                },
+                0,
+                3,
+                0,
+            ),
+            (
+                "only a suspicious key-prefixed name",
+                |r, b| {
+                    let key = key_of(&r.locator());
+                    r.put(&r.state_dir().join(format!("{key}.json.bak")), b);
+                },
+                0,
+                0,
+                1,
+            ),
+            (
+                "a misleading retired name",
+                |r, b| {
+                    let key = key_of(&r.locator());
+                    r.put(
+                        &r.state_dir()
+                            .join(format!("{key}.{RETIRED_TOKEN}.retired.x")),
+                        b,
+                    );
+                },
+                0,
+                0,
+                1,
+            ),
+        ];
+
+        for (label, setup, staging, retired, unrecognized) in cases {
+            rig.clear();
+            setup(&rig, &own);
+
+            let assessment = rig.assess();
+
+            assert!(
+                !matches!(assessment, StateAssessment::ConfirmedAbsent),
+                "{label}"
+            );
+
+            let report = missing_siblings_of(assessment);
+
+            assert_eq!(report.staging().len(), staging, "{label}");
+            assert_eq!(report.retired().len(), retired, "{label}");
+            assert_eq!(report.unrecognized(), unrecognized, "{label}");
+            assert!(!report.is_empty(), "{label}");
+        }
+    }
+
+    #[test]
+    fn confirmed_absent_needs_a_complete_clean_observation_and_nothing_else() {
+        let rig = Rig::new("absent");
+
+        // No directory at all, and an empty one: confirmed absent, created nothing.
+        assert!(matches!(rig.assess(), StateAssessment::ConfirmedAbsent));
+        assert!(!rig.state_dir().exists());
+
+        fs::create_dir_all(rig.state_dir()).unwrap();
+        assert!(matches!(rig.assess(), StateAssessment::ConfirmedAbsent));
+
+        // Files that belong to another location or to nobody do not count.
+        let other = key_of(&Locator::new(OTHER_LOCAL).unwrap());
+        rig.put(&rig.state_dir().join(format!("{other}.json")), b"x");
+        rig.put(&rig.state_dir().join(format!("{other}.{TOKEN}.tmp")), b"x");
+        rig.put(
+            &rig.state_dir().join(format!("{other}.{TOKEN}.retired")),
+            b"x",
+        );
+        rig.put(&rig.state_dir().join("notes.txt"), b"x");
+        assert!(matches!(rig.assess(), StateAssessment::ConfirmedAbsent));
+
+        // Any one thing of ours makes it something else.
+        rig.put(&rig.staging_path(TOKEN), b"x");
+        assert!(!matches!(rig.assess(), StateAssessment::ConfirmedAbsent));
+    }
+
+    #[test]
+    fn an_incomplete_or_unexpected_observation_is_uncertain_never_absent() {
+        let rig = Rig::new("uncertain");
+
+        // Too many entries.
+        fs::create_dir_all(rig.state_dir()).unwrap();
+        for index in 0..=10_000 {
+            fs::write(rig.state_dir().join(format!("unrelated-{index}.dat")), b"x").unwrap();
+        }
+        assert!(matches!(
+            rig.assess(),
+            StateAssessment::Uncertain(LayoutUncertainty::EntryLimit)
+        ));
+
+        // Too many siblings.
+        rig.clear();
+        for index in 0..17 {
+            rig.put(&rig.retired_path(&format!("{index:032x}")), b"r");
+        }
+        assert!(matches!(
+            rig.assess(),
+            StateAssessment::Uncertain(LayoutUncertainty::SiblingLimit)
+        ));
+
+        // The state directory is a junction (a valid-looking record sits behind it).
+        rig.clear();
+        let moved = rig.dir.path().join("moved");
+        fs::create_dir_all(&moved).unwrap();
+        fs::write(
+            moved.join(rig.primary_path().file_name().unwrap()),
+            rig.v3(&rig.mine(1)),
+        )
+        .unwrap();
+        make_junction(&rig.state_dir(), &moved);
+        assert!(matches!(
+            rig.assess(),
+            StateAssessment::Uncertain(LayoutUncertainty::UnexpectedObject)
+        ));
+
+        // An ancestor of the root is a junction.
+        let real = rig.dir.path().join("real");
+        let link = rig.dir.path().join("link");
+        fs::create_dir_all(real.join("app-local").join(SYNC_STATE_DIRECTORY)).unwrap();
+        make_junction(&link, &real);
+        let through = SyncStateStore::new(&link.join("app-local")).unwrap();
+        assert!(matches!(
+            rig.assess_in(&through),
+            StateAssessment::Uncertain(LayoutUncertainty::UnexpectedObject)
+        ));
+
+        // The state directory is a regular file.
+        let rig = Rig::new("uncertain-file");
+        fs::create_dir_all(rig.root.path()).unwrap();
+        fs::write(rig.state_dir(), b"a file").unwrap();
+        assert!(matches!(
+            rig.assess(),
+            StateAssessment::Uncertain(LayoutUncertainty::UnexpectedObject)
+        ));
+    }
+
+    #[test]
+    fn a_directory_in_place_of_the_primary_or_a_sibling_is_reported_and_untouched() {
+        let rig = Rig::new("objects");
+
+        fs::create_dir_all(rig.primary_path()).unwrap();
+        let (class, siblings) = primary_class_of(rig.assess());
+        assert_eq!(class, NonAuthoritativePrimary::UnexpectedObject);
+        assert!(siblings.is_empty());
+
+        rig.clear();
+        fs::create_dir_all(rig.staging_path(TOKEN)).unwrap();
+        let report = missing_siblings_of(rig.assess());
+        assert_eq!(report.staging(), [SiblingVerdict::UnexpectedObject]);
+    }
+
+    // ---- the session guard ----------------------------------------------------------
+
+    #[test]
+    fn a_vault_changed_on_disk_is_unavailable_and_the_store_is_not_consulted() {
+        let rig = Rig::new("vault-changed");
+        let foreign = rig.foreign();
+
+        // Without a state directory the store would answer "confirmed absent", and
+        // that is exactly what must not leak through.
+        assert!(!rig.state_dir().exists());
+        fs::copy(foreign.path(), &rig.vault).unwrap();
+
+        assert!(matches!(
+            rig.session.assess_authenticated_sync_state_in(&rig.store()),
+            StateAssessment::Unavailable(SyncStateUnavailable::LocalVaultChanged)
+        ));
+
+        fs::remove_file(&rig.vault).unwrap();
+        assert!(matches!(
+            rig.session.assess_authenticated_sync_state_in(&rig.store()),
+            StateAssessment::Unavailable(SyncStateUnavailable::LocalVaultChanged)
+        ));
+
+        fs::write(&rig.vault, b"not a vault").unwrap();
+        assert!(matches!(
+            rig.session.assess_authenticated_sync_state_in(&rig.store()),
+            StateAssessment::Unavailable(SyncStateUnavailable::LocalVaultChanged)
+        ));
+
+        // The store was never touched.
+        assert!(!rig.state_dir().exists());
+    }
+
+    #[test]
+    fn a_vault_without_a_normalized_location_is_unavailable() {
+        let dir = scratch("no-locator");
+        let session = new_session(&dir.path().join("vault.bin"));
+        let root = SyncStateRoot::for_test(dir.path().join("app-local"));
+
+        assert!(matches!(
+            session.assess_authenticated_sync_state(&root),
+            StateAssessment::Unavailable(SyncStateUnavailable::LocalLocator)
+        ));
+        assert!(!dir.path().join("app-local").exists());
+    }
+
+    #[test]
+    fn a_session_without_a_usable_vault_id_has_no_key_but_absence_needs_none() {
+        let mut rig = Rig::new("no-key");
+        let own = rig.v3(&rig.mine(1));
+
+        rig.session.data_mut().vault_id = Uuid::nil();
+
+        // Nothing to classify: confirmed absent needs no key.
+        assert!(matches!(rig.assess(), StateAssessment::ConfirmedAbsent));
+
+        // A primary or a sibling with bytes cannot be classified without one.
+        rig.put_primary(&own);
+        assert!(matches!(rig.assess(), StateAssessment::KeyUnavailable));
+
+        rig.clear();
+        rig.put(&rig.retired_path(RETIRED_TOKEN), &own);
+        assert!(matches!(rig.assess(), StateAssessment::KeyUnavailable));
+
+        // Content that needs no key is still reported as what it is.
+        rig.clear();
+        rig.put(&rig.retired_path(RETIRED_TOKEN), b"");
+        let report = missing_siblings_of(rig.assess());
+        assert_eq!(report.retired(), [SiblingVerdict::Empty]);
+    }
+
+    // ---- key lifetime ---------------------------------------------------------------
+
+    #[test]
+    fn a_master_password_change_and_a_relock_keep_the_verdicts() {
+        let mut rig = Rig::new("password-change");
+        let bytes = rig.v3(&rig.mine(1));
+
+        rig.put_primary(&bytes);
+        rig.put(&rig.staging_path(TOKEN), &bytes);
+
+        let before = authenticated_of(rig.assess()).0.fingerprint();
+
+        rig.session
+            .change_master_password(password(), Zeroizing::new(NEW_PASSWORD.to_owned()))
+            .unwrap();
+
+        // The same Vault Key was re-wrapped, so the same records still verify.
+        let (record, siblings) = authenticated_of(rig.assess());
+        assert_eq!(record.fingerprint(), before);
+        assert_eq!(
+            siblings.staging(),
+            [SiblingVerdict::AuthenticatedForVaultAndLocator(before)]
+        );
+
+        // And again after a full lock and unlock with the new password.
+        let Rig {
+            session,
+            root,
+            vault,
+            dir,
+        } = rig;
+
+        session.lock();
+
+        let reopened =
+            UnlockedVaultSession::unlock(&vault, Zeroizing::new(NEW_PASSWORD.to_owned())).unwrap();
+
+        let (record, siblings) = authenticated_of(reopened.assess_authenticated_sync_state(&root));
+        assert_eq!(record.fingerprint(), before);
+        assert_eq!(siblings.staging().len(), 1);
+
+        drop(record);
+        drop(reopened);
+        drop(dir);
+    }
+
+    // ---- the existing paths -----------------------------------------------------------
+
+    #[test]
+    fn the_existing_reset_never_removes_a_retired_file_and_the_assessment_still_sees_it() {
+        let mut rig = Rig::bound("reset-retired");
+
+        // A real version-1 binding, and a retired file beside it that v1 cannot see.
+        rig.put(&rig.retired_path(RETIRED_TOKEN), b"retired bytes");
+
+        let (class, siblings) = primary_class_of(rig.assess());
+        assert_eq!(class, NonAuthoritativePrimary::LegacyV1);
+        assert_eq!(siblings.retired().len(), 1);
+
+        let preview = rig.session.prepare_binding_reset(&rig.root).unwrap();
+        assert_eq!(preview.subject(), BindingResetSubject::VerifiedBinding);
+
+        let id = preview.preparation_id().to_owned();
+        assert_eq!(
+            rig.session.confirm_binding_reset(&rig.root, &id),
+            Ok(BindingResetOutcome::ResetAndVerified)
+        );
+
+        // The primary is gone; the retired file is untouched, and the assessment
+        // refuses to call this absence.
+        assert!(!rig.primary_path().exists());
+        assert_eq!(
+            fs::read(rig.retired_path(RETIRED_TOKEN)).unwrap(),
+            b"retired bytes"
+        );
+
+        let report = missing_siblings_of(rig.assess());
+        assert_eq!(report.retired().len(), 1);
+
+        // The legacy loader still calls this "not configured": the known v1 blind
+        // spot, unchanged and documented.
+        assert!(matches!(
+            rig.session.load_authenticated_sync_state(&rig.root),
+            AuthenticatedStateLoad::NotConfigured
+        ));
+    }
+
+    // ---- determinism and concurrency -------------------------------------------------
+
+    type Summary = (
+        &'static str,
+        Option<RecordFingerprint>,
+        Option<SiblingReport>,
+        Option<NonAuthoritativePrimary>,
+    );
+
+    fn summary(assessment: &StateAssessment) -> Summary {
+        match assessment {
+            StateAssessment::ConfirmedAbsent => ("absent", None, None, None),
+            StateAssessment::PrimaryAuthenticatedForVaultAndLocator { record, siblings } => (
+                "authenticated",
+                Some(record.fingerprint()),
+                Some(siblings.clone()),
+                None,
+            ),
+            StateAssessment::PrimaryMissing { siblings } => {
+                ("missing", None, Some(siblings.clone()), None)
+            }
+            StateAssessment::PrimaryNotAuthenticated { class, siblings } => (
+                "not-authenticated",
+                None,
+                Some(siblings.clone()),
+                Some(*class),
+            ),
+            StateAssessment::Uncertain(_) => ("uncertain", None, None, None),
+            StateAssessment::Unavailable(_) => ("unavailable", None, None, None),
+            StateAssessment::KeyUnavailable => ("key", None, None, None),
+        }
+    }
+
+    #[test]
+    fn repeated_assessments_of_a_stable_layout_agree() {
+        let rig = Rig::new("determinism");
+        let bytes = rig.v3(&rig.mine(1));
+
+        rig.put_primary(&bytes);
+        for index in [4usize, 1, 3] {
+            rig.put(&rig.retired_path(&format!("{index:032x}")), &bytes);
+        }
+        rig.put(&rig.staging_path(TOKEN), b"junk");
+
+        let first = summary(&rig.assess());
+        let second = summary(&rig.assess());
+
+        assert_eq!(first, second);
+        assert_eq!(first.0, "authenticated");
+
+        // Missing primary, too.
+        fs::remove_file(rig.primary_path()).unwrap();
+        assert_eq!(summary(&rig.assess()), summary(&rig.assess()));
+    }
+
+    #[test]
+    fn a_staging_file_created_and_removed_concurrently_never_yields_an_unsafe_outcome() {
+        // A helper thread churns one staging file while the assessment runs
+        // repeatedly. The tree changes on purpose, so this proves no whole-tree
+        // equality. It asserts only that every outcome is a safe one: an observation
+        // that saw nothing, one that saw exactly the churned file, or "uncertain".
+        // The distribution of outcomes depends on scheduling and is not asserted.
+        let rig = Rig::new("race");
+        let churned = rig.staging_path(TOKEN);
+        let stop = Arc::new(AtomicBool::new(false));
+        let cycles = Arc::new(AtomicUsize::new(0));
+
+        fs::create_dir_all(rig.state_dir()).unwrap();
+
+        let worker = {
+            let (stop, cycles, churned) = (stop.clone(), cycles.clone(), churned.clone());
+
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = fs::write(&churned, b"churned");
+                    let _ = fs::remove_file(&churned);
+                    cycles.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+
+        for _ in 0..300 {
+            match rig.session.assess_authenticated_sync_state_in(&rig.store()) {
+                StateAssessment::ConfirmedAbsent => {}
+                StateAssessment::PrimaryMissing { siblings } => {
+                    assert_eq!(siblings.staging().len(), 1);
+                    assert!(siblings.retired().is_empty());
+                    assert_eq!(siblings.unrecognized(), 0);
+                }
+                StateAssessment::Uncertain(
+                    LayoutUncertainty::ChangedDuringScan | LayoutUncertainty::Io(_),
+                ) => {}
+                other => panic!("an unsafe outcome under a sibling race: {other:?}"),
+            }
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+
+        assert!(cycles.load(Ordering::SeqCst) > 0, "the race never ran");
+
+        // Once it stops, the observation is complete and stable again.
+        let _ = fs::remove_file(&churned);
+        assert!(matches!(rig.assess(), StateAssessment::ConfirmedAbsent));
+    }
+
+    // ---- redaction -----------------------------------------------------------------
+
+    fn has_hex_run(text: &str, length: usize) -> bool {
+        let mut run = 0;
+
+        for c in text.chars() {
+            if c.is_ascii_hexdigit() {
+                run += 1;
+                if run >= length {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+
+        false
+    }
+
+    #[test]
+    fn debug_output_reveals_no_path_locator_identifier_fingerprint_mac_or_token() {
+        let rig = Rig::new("redaction");
+        let state = rig.mine(1);
+        let own = rig.v3(&state);
+        let mac = {
+            let text = std::str::from_utf8(&own).unwrap();
+            let at = text.find("\"mac\":\"").unwrap() + "\"mac\":\"".len();
+            text[at..at + 64].to_owned()
+        };
+
+        rig.put_primary(&own);
+        rig.put(&rig.staging_path(TOKEN), &own);
+        rig.put(&rig.retired_path(RETIRED_TOKEN), b"junk");
+
+        let assessment = rig.assess();
+        let (record, siblings) = authenticated_of(rig.assess());
+
+        let mut rendered = vec![
+            format!("{assessment:?}"),
+            format!("{record:?}"),
+            format!("{siblings:?}"),
+            format!("{:?}", siblings.staging()),
+            format!("{:?}", siblings.retired()),
+        ];
+
+        for class in [
+            NonAuthoritativePrimary::LegacyV1,
+            NonAuthoritativePrimary::LegacyBoundElsewhere,
+            NonAuthoritativePrimary::UnauthenticatedExchangeFormat,
+            NonAuthoritativePrimary::NotAuthentic,
+            NonAuthoritativePrimary::BoundToOtherVault,
+            NonAuthoritativePrimary::WrongLocator,
+            NonAuthoritativePrimary::Corrupt,
+            NonAuthoritativePrimary::Empty,
+            NonAuthoritativePrimary::TooLarge,
+            NonAuthoritativePrimary::UnsupportedVersion,
+            NonAuthoritativePrimary::UnexpectedObject,
+        ] {
+            rendered.push(format!("{class:?}"));
+            rendered.push(format!("{:?}", SiblingVerdict::from(class)));
+            rendered.push(format!(
+                "{:?}",
+                StateAssessment::PrimaryNotAuthenticated {
+                    class,
+                    siblings: siblings.clone()
+                }
+            ));
+        }
+
+        for verdict in [
+            SiblingVerdict::AuthenticatedForVaultAndLocator(fingerprint_of(&own)),
+            SiblingVerdict::Unreadable,
+            SiblingVerdict::Vanished,
+        ] {
+            rendered.push(format!("{verdict:?}"));
+        }
+
+        for reason in [
+            LayoutUncertainty::Io(std::io::ErrorKind::PermissionDenied),
+            LayoutUncertainty::UnexpectedObject,
+            LayoutUncertainty::EntryLimit,
+            LayoutUncertainty::SiblingLimit,
+            LayoutUncertainty::AliasAmbiguity,
+            LayoutUncertainty::ChangedDuringScan,
+        ] {
+            rendered.push(format!("{:?}", StateAssessment::Uncertain(reason)));
+        }
+
+        for other in [
+            StateAssessment::ConfirmedAbsent,
+            StateAssessment::PrimaryMissing {
+                siblings: siblings.clone(),
+            },
+            StateAssessment::Unavailable(SyncStateUnavailable::LocalLocator),
+            StateAssessment::Unavailable(SyncStateUnavailable::LocalVaultChanged),
+            StateAssessment::Unavailable(SyncStateUnavailable::Root),
+            StateAssessment::KeyUnavailable,
+        ] {
+            rendered.push(format!("{other:?}"));
+        }
+
+        let vault_id = rig.session.data.vault_id;
+        let forbidden = [
+            rig.dir.path().to_string_lossy().into_owned(),
+            rig.vault.to_string_lossy().into_owned(),
+            rig.locator().as_str().to_owned(),
+            state.target_locator().as_str().to_owned(),
+            vault_id.hyphenated().to_string(),
+            vault_id.simple().to_string(),
+            state.binding_id().uuid().hyphenated().to_string(),
+            fingerprint_of(&own).digest.to_hex(),
+            key_of(&rig.locator()),
+            mac,
+            TOKEN.to_owned(),
+            RETIRED_TOKEN.to_owned(),
+            ".lvault".to_owned(),
+            r"\\?\".to_owned(),
+            ".json".to_owned(),
+            ".tmp".to_owned(),
+            ".retired".to_owned(),
+        ];
+
+        for text in &rendered {
+            assert!(!has_hex_run(text, 16), "{text}");
+
+            for mark in &forbidden {
+                assert!(!text.contains(mark.as_str()), "{mark} leaked in {text}");
+            }
+        }
+    }
+
+    // ---- isolation -----------------------------------------------------------------
+
+    fn production_half(source: &str) -> &str {
+        source.split("#[cfg(all(test, windows))]").next().unwrap()
+    }
+
+    fn all_sources(dir: &Path, found: &mut Vec<(PathBuf, String)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+
+            if path.is_dir() {
+                all_sources(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push((path.clone(), fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+
+    fn tauri_sources() -> Vec<(PathBuf, String)> {
+        let mut found = Vec::new();
+
+        all_sources(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+
+        found
+    }
+
+    fn file_name(path: &Path) -> String {
+        path.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    /// Every identifier that follows `fn ` in `source`.
+    fn function_names(source: &str) -> Vec<String> {
+        source
+            .split("fn ")
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_production_half_derives_decodes_and_observes_exactly_once_and_cannot_mutate() {
+        let production = production_half(include_str!("authenticated_state.rs"));
+
+        // The new assessment adds no key derivation and no decode of its own: it
+        // reaches both only through the existing classifier.
+        assert_eq!(production.matches("SyncStateMacKey::derive(").count(), 1);
+        assert_eq!(
+            production
+                .matches("AuthenticatedSyncState::decode(")
+                .count(),
+            1
+        );
+        assert_eq!(production.matches("fn classify_present(").count(), 1);
+        // The load path, the assessment's primary, and the assessment's siblings.
+        assert_eq!(production.matches("self.classify_present(").count(), 3);
+        assert_eq!(production.matches(".inspect_v3_layout(").count(), 1);
+        assert!(!production.contains("#[cfg("));
+
+        // None of the mutating or clock-like tokens, in code or in comments.
+        for forbidden in [
+            ".create(",
+            ".replace(",
+            ".delete(",
+            "delete_if_evidence_matches",
+            "fs::write",
+            "fs::copy",
+            "OpenOptions",
+            "remove_file",
+            "remove_dir",
+            "rename",
+            "hard_link",
+            "create_new",
+            "set_len",
+            "truncate",
+            "write_all",
+            "sync_all",
+            "unsafe",
+            "allow(",
+            "getrandom",
+            "new_v4",
+            "temp_dir",
+            "Instant",
+            "SystemTime",
+            "thread",
+            "Command",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "{forbidden:?} in the production half"
+            );
+        }
+    }
+
+    #[test]
+    fn no_readiness_permission_or_recovery_accessor_exists() {
+        let production = production_half(include_str!("authenticated_state.rs"));
+        let store = include_str!("../sync_state_store.rs");
+        let start = store
+            .find("\n// ---- v3 layout assessment (read-only)")
+            .unwrap();
+        let end = start
+            + store[start..]
+                .find("\n// ---- end v3 layout assessment")
+                .unwrap();
+
+        let mut names =
+            function_names(&production[production.find("// ---- layout assessment").unwrap()..]);
+        names.extend(function_names(&store[start..end]));
+
+        assert!(names
+            .iter()
+            .any(|name| name == "assess_authenticated_sync_state"));
+        assert!(names.iter().any(|name| name == "inspect_v3_layout"));
+
+        for name in &names {
+            for word in [
+                "ready", "clean", "safe", "allow", "permit", "may_", "can_", "authoriz", "adopt",
+                "recover", "release", "restore", "write", "delete", "remove", "publish",
+                "finalize", "prefer", "approve", "grant",
+            ] {
+                assert!(!name.contains(word), "{name} looks like a {word} accessor");
+            }
+        }
+
+        // The assessment value is not an approval, a lock or a token either.
+        for text in [production, store] {
+            assert!(!text.contains("impl From<StateAssessment>"));
+            assert!(!text.contains("impl PartialOrd for StateAssessment"));
+        }
+    }
+
+    #[test]
+    fn nothing_outside_the_store_the_module_and_the_reexport_knows_the_new_apis() {
+        let sources = tauri_sources();
+
+        let mut layout_callers: Vec<String> = sources
+            .iter()
+            .filter(|(_, text)| text.contains("inspect_v3_layout("))
+            .map(|(path, _)| file_name(path))
+            .collect();
+        layout_callers.sort();
+        assert_eq!(
+            layout_callers,
+            ["authenticated_state.rs", "sync_state_store.rs"]
+        );
+
+        let mut assessors: Vec<String> = sources
+            .iter()
+            .filter(|(_, text)| text.contains("assess_authenticated_sync_state"))
+            .map(|(path, _)| file_name(path))
+            .collect();
+        assessors.sort();
+        assert_eq!(assessors, ["authenticated_state.rs"]);
+
+        let names = [
+            "StateAssessment",
+            "SiblingVerdict",
+            "SiblingReport",
+            "NonAuthoritativePrimary",
+            "V3Layout",
+            "V3LayoutInspection",
+            "LayoutPrimary",
+            "LayoutSibling",
+            "LayoutUncertainty",
+            "SiblingContent",
+            "SiblingKind",
+            "inspect_v3_layout",
+            "recognize_v3_sibling_name",
+        ];
+
+        for (path, text) in &sources {
+            let name = file_name(path);
+
+            if matches!(
+                name.as_str(),
+                "authenticated_state.rs" | "sync_state_store.rs"
+            ) {
+                continue;
+            }
+
+            for word in names {
+                if name == "session.rs" {
+                    // Only the existing re-export mentions the four public types.
+                    if !matches!(
+                        word,
+                        "StateAssessment"
+                            | "SiblingVerdict"
+                            | "SiblingReport"
+                            | "NonAuthoritativePrimary"
+                    ) {
+                        assert!(!text.contains(word), "session.rs mentions {word}");
+                    }
+                } else {
+                    assert!(!text.contains(word), "{} mentions {word}", path.display());
+                }
+            }
+        }
+
+        // No frontend file knows about it.
+        let frontend = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("src");
+
+        fn walk(dir: &Path) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+
+                if path.is_dir() {
+                    walk(&path);
+                } else if path
+                    .extension()
+                    .is_some_and(|ext| ext == "ts" || ext == "tsx")
+                {
+                    let text = fs::read_to_string(&path).unwrap();
+
+                    assert!(
+                        !text.contains("assess_authenticated_sync_state")
+                            && !text.contains("StateAssessment"),
+                        "{}",
+                        path.display()
+                    );
+                }
+            }
+        }
+
+        walk(&frontend);
+
+        // The re-export stays in the one existing declaration.
+        let session = sources
+            .iter()
+            .find(|(path, _)| file_name(path) == "session.rs")
+            .unwrap();
+
+        assert!(session.1.starts_with("mod authenticated_state;"));
+        assert_eq!(
+            session.1.matches("pub use authenticated_state::{").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_scratch_base_is_the_b3c3b1_directory_and_never_the_temp_directory() {
+        let dir = scratch("scratch-base");
+
+        assert!(!dir.path().starts_with(std::env::temp_dir()));
+        assert!(dir
+            .path()
+            .components()
+            .any(|part| part.as_os_str() == "sync-state-b3c3b1-tests"));
     }
 }

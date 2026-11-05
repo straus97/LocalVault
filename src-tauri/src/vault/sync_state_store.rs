@@ -80,6 +80,21 @@
 //! a narrowed read-then-delete, **not** compare-and-swap. `load` and `delete`
 //! are unchanged.
 //!
+//! # v3 layout diagnostic (Stage 1U-4 B3c-3b-1)
+//!
+//! [`SyncStateStore::inspect_v3_layout`] is a separate, dormant, strictly
+//! read-only observation of the directory for one record key: the primary,
+//! `<key>.<32 hex>.tmp` and `<key>.<32 hex>.retired` siblings, and a count of other
+//! key-prefixed entries. It has its own name grammar and its own bounded scan, and
+//! it shares no code with the recovery-artifact rules above. Those rules, and every
+//! method that uses them, are **unchanged**: the legacy store still recognizes only
+//! its `.tmp` staging names, is blind to `.retired` files, never removes one, and
+//! `create` does not refuse because of one. That blind spot is a known limit
+//! that blocks any later v3 persistence; it is documented and pinned by tests, not
+//! fixed here. A recognized name is an indicator only (never ownership, recovery
+//! authority, deletion authority or write permission), nothing calls the
+//! diagnostic outside tests, and a successful observation is not a lock.
+//!
 //! # Guarantees and limits
 //!
 //! * **Create** is no-clobber because publication is `hard_link(temp, record)`,
@@ -1468,6 +1483,483 @@ fn open_no_follow(path: &Path) -> io::Result<File> {
 
     options.open(path)
 }
+
+// ---- v3 layout assessment (read-only) ----------------------------------------
+//
+// Stage 1U-4 B3c-3b-1. A dormant, strictly read-only diagnostic. Nothing in this
+// region writes, moves, links or deletes anything, it never calls the legacy
+// artifact scan or any mutator, and nothing outside tests calls it. It shares no
+// code with the legacy (v1) artifact recognition, which is unchanged and still
+// knows only its own staging names.
+
+/// Diagnostic bound: the most directory entries one v3 layout observation will
+/// visit. A scanning safety limit that keeps one observation finite. It is **not**
+/// a retention policy and says nothing about how many files a product may keep.
+const V3_SCAN_ENTRY_LIMIT: usize = 10_000;
+/// Diagnostic bound: the most recognized sibling files one observation will read.
+/// Like [`V3_SCAN_ENTRY_LIMIT`] it is a scanning limit, not a retention policy.
+const V3_SIBLING_READ_LIMIT: usize = 16;
+/// Length of the hexadecimal token in a sibling name.
+const V3_SIBLING_TOKEN_LEN: usize = 32;
+/// Length of a record key (hexadecimal SHA-256).
+const V3_KEY_LEN: usize = 64;
+/// The longest file name a component may have, in UTF-16 code units.
+const V3_MAX_NAME_UNITS: usize = 255;
+
+/// What kind of sibling a recognized name is. A name is an indicator only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SiblingKind {
+    /// `<key>.<32 hex>.tmp`
+    Staging,
+    /// `<key>.<32 hex>.retired`
+    Retired,
+}
+
+/// How one directory entry name relates to one record key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V3NameClass {
+    /// Exactly `<key>.json`, compared ASCII case-insensitively.
+    Primary,
+    /// Exactly `<key>.<32 hex>.tmp` or `<key>.<32 hex>.retired`.
+    Sibling(SiblingKind),
+    /// Starts with the key (ASCII case-insensitively, judged on the lossy form so
+    /// that a non-Unicode name still counts) but is none of the shapes above.
+    Unrecognized,
+    /// Not related to this key. Ignored and uncounted.
+    Other,
+}
+
+/// Pure name grammar of the v3 reader. `entry_lossy` is the entry name converted
+/// lossily; `exact_unicode` says whether the original name was valid Unicode, and
+/// only an exactly valid name is ever recognized as a primary or a sibling.
+///
+/// A match is an **indication only**. It gives no ownership, no authentication,
+/// no recovery authority, no deletion authority and no write permission, and a
+/// path derived from it must never be handed to any operation that changes
+/// anything.
+fn recognize_v3_sibling_name(entry_lossy: &str, exact_unicode: bool, key: &str) -> V3NameClass {
+    let key = key.as_bytes();
+
+    // Only a well-formed key can match anything.
+    if key.len() != V3_KEY_LEN
+        || !key
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return V3NameClass::Other;
+    }
+
+    let name = entry_lossy.as_bytes();
+
+    if name.len() < key.len() || !name[..key.len()].eq_ignore_ascii_case(key) {
+        return V3NameClass::Other;
+    }
+
+    // A name longer than a path component can be is never a recognized shape,
+    // but it is still a suspicious key-prefixed entry.
+    if !exact_unicode || entry_lossy.encode_utf16().count() > V3_MAX_NAME_UNITS {
+        return V3NameClass::Unrecognized;
+    }
+
+    let rest = &name[key.len()..];
+
+    if rest.eq_ignore_ascii_case(b".json") {
+        return V3NameClass::Primary;
+    }
+
+    match v3_sibling_shape(rest) {
+        Some(kind) => V3NameClass::Sibling(kind),
+        None => V3NameClass::Unrecognized,
+    }
+}
+
+/// `.<32 hex>.tmp` or `.<32 hex>.retired`, either case, nothing else.
+fn v3_sibling_shape(rest: &[u8]) -> Option<SiblingKind> {
+    let rest = rest.strip_prefix(b".")?;
+
+    if rest.len() <= V3_SIBLING_TOKEN_LEN {
+        return None;
+    }
+
+    let (token, tail) = rest.split_at(V3_SIBLING_TOKEN_LEN);
+
+    if !token.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+
+    if tail.eq_ignore_ascii_case(b".tmp") {
+        Some(SiblingKind::Staging)
+    } else if tail.eq_ignore_ascii_case(b".retired") {
+        Some(SiblingKind::Retired)
+    } else {
+        None
+    }
+}
+
+/// The primary record of a v3 layout observation, as the filesystem showed it.
+/// The bytes are neither decoded nor authenticated here.
+#[derive(PartialEq, Eq)]
+pub enum LayoutPrimary {
+    /// No primary record was present.
+    Absent,
+    /// Zero bytes.
+    Empty,
+    /// Larger than the supported maximum; not read past the limit.
+    TooLarge,
+    /// The exact bounded bytes.
+    Bytes(Vec<u8>),
+    /// A directory, junction, symlink or other object where a file belongs.
+    Unexpected,
+}
+
+// The bytes, and their length, are not printed.
+impl fmt::Debug for LayoutPrimary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => f.write_str("Absent"),
+            Self::Empty => f.write_str("Empty"),
+            Self::TooLarge => f.write_str("TooLarge"),
+            Self::Bytes(_) => f.write_str("Bytes(<redacted>)"),
+            Self::Unexpected => f.write_str("Unexpected"),
+        }
+    }
+}
+
+/// What reading one recognized sibling gave.
+pub enum SiblingContent {
+    /// The exact bounded bytes.
+    Bytes(Vec<u8>),
+    Empty,
+    TooLarge,
+    /// The sibling could not be read.
+    Unreadable(io::ErrorKind),
+    /// A directory, junction, symlink or other object where a file belongs.
+    Unexpected,
+    /// The sibling was listed and was gone when it was read.
+    Vanished,
+}
+
+// The bytes, and their length, are not printed.
+impl fmt::Debug for SiblingContent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bytes(_) => f.write_str("Bytes(<redacted>)"),
+            Self::Empty => f.write_str("Empty"),
+            Self::TooLarge => f.write_str("TooLarge"),
+            Self::Unreadable(kind) => write!(f, "Unreadable({kind:?})"),
+            Self::Unexpected => f.write_str("Unexpected"),
+            Self::Vanished => f.write_str("Vanished"),
+        }
+    }
+}
+
+/// One recognized sibling. Neither its name nor its token nor its path is kept.
+pub struct LayoutSibling {
+    kind: SiblingKind,
+    content: SiblingContent,
+}
+
+impl LayoutSibling {
+    pub fn kind(&self) -> SiblingKind {
+        self.kind
+    }
+
+    pub fn content(&self) -> &SiblingContent {
+        &self.content
+    }
+}
+
+impl fmt::Debug for LayoutSibling {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LayoutSibling(<redacted>)")
+    }
+}
+
+/// Why a v3 layout observation is incomplete or untrustworthy. Never absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutUncertainty {
+    /// An I/O or permission failure.
+    Io(io::ErrorKind),
+    /// A directory, junction, symlink or other object where a plain directory was
+    /// required (the state directory or one of its ancestors).
+    UnexpectedObject,
+    /// More directory entries than the scan visits ([`V3_SCAN_ENTRY_LIMIT`]).
+    EntryLimit,
+    /// More recognized siblings than one observation reads
+    /// ([`V3_SIBLING_READ_LIMIT`]).
+    SiblingLimit,
+    /// Two or more entries fold to the same recognized name, so which one a path
+    /// reaches is ambiguous.
+    AliasAmbiguity,
+    /// The two observations of the directory, or of the primary, disagreed.
+    ChangedDuringScan,
+}
+
+impl From<Fault> for LayoutUncertainty {
+    fn from(fault: Fault) -> Self {
+        match fault {
+            Fault::Io(kind) => Self::Io(kind),
+            Fault::Unexpected => Self::UnexpectedObject,
+            Fault::EntryLimit => Self::EntryLimit,
+        }
+    }
+}
+
+/// A complete observation of the state directory for one record key: the primary,
+/// the recognized siblings in a stable order, and a count of suspicious
+/// key-prefixed entries that match no recognized shape.
+///
+/// What was observed at one point in time; see [`SyncStateStore::inspect_v3_layout`].
+pub struct V3Layout {
+    primary: LayoutPrimary,
+    siblings: Vec<LayoutSibling>,
+    unrecognized: usize,
+}
+
+impl V3Layout {
+    pub fn primary(&self) -> &LayoutPrimary {
+        &self.primary
+    }
+
+    pub fn siblings(&self) -> &[LayoutSibling] {
+        &self.siblings
+    }
+
+    /// Key-prefixed entries that are none of the recognized shapes.
+    pub fn unrecognized(&self) -> usize {
+        self.unrecognized
+    }
+}
+
+impl fmt::Debug for V3Layout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("V3Layout(<redacted>)")
+    }
+}
+
+/// Result of [`SyncStateStore::inspect_v3_layout`].
+#[must_use]
+pub enum V3LayoutInspection {
+    Observed(V3Layout),
+    Uncertain(LayoutUncertainty),
+}
+
+impl fmt::Debug for V3LayoutInspection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Observed(_) => f.write_str("Observed(<redacted>)"),
+            Self::Uncertain(reason) => write!(f, "Uncertain({reason:?})"),
+        }
+    }
+}
+
+/// How a listed entry was recognized, ordered for a stable comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NameTag {
+    Primary,
+    Sibling(SiblingKind),
+    Unrecognized,
+}
+
+/// Every related directory entry of one enumeration, sorted.
+type ObservedNames = Vec<(NameTag, std::ffi::OsString)>;
+
+impl SyncStateStore {
+    /// Observe, without changing anything, what the state directory holds for
+    /// `local_locator`: the primary record, every `<key>.<32 hex>.tmp` and
+    /// `<key>.<32 hex>.retired` sibling, and a count of other key-prefixed entries.
+    ///
+    /// In order: the directory and every existing ancestor must be plain
+    /// directories (an absent directory is an observed absence; a redirected or
+    /// otherwise unexpected one is uncertain, never absence); one bounded enumeration classifies the names;
+    /// the primary and each recognized sibling are read through the existing
+    /// bounded, no-follow, read-only reader; then the directory is enumerated and
+    /// the primary read a second time, and any difference makes the result
+    /// uncertain.
+    ///
+    /// A failed or over-limit enumeration, an ambiguous alias, too many siblings or
+    /// disagreeing observations is [`V3LayoutInspection::Uncertain`], and no
+    /// uncertainty is ever turned into confirmed absence. A sibling that is not a
+    /// plain file is reported as such and is never followed.
+    ///
+    /// # What this does not do
+    ///
+    /// The second pass only narrows a race. It cannot prove that no change
+    /// happened between or after the passes: another process can add, delete,
+    /// replace or re-create (and restore) any name at any moment, and the second
+    /// pass cannot tell a change that was undone. No file identity is recorded, and
+    /// the ancestor inspection is check-then-use. The result is what was observed,
+    /// never what is. A recognized name is not ownership, authentication, recovery
+    /// authority, deletion authority or write permission, and this function is not
+    /// a lock.
+    pub fn inspect_v3_layout(&self, local_locator: &Locator) -> V3LayoutInspection {
+        let key = record_key(local_locator);
+
+        match self.inspect_directory() {
+            Ok(DirState::Absent) => {
+                return V3LayoutInspection::Observed(V3Layout {
+                    primary: LayoutPrimary::Absent,
+                    siblings: Vec::new(),
+                    unrecognized: 0,
+                })
+            }
+            Ok(DirState::Present) => {}
+            Err(fault) => return V3LayoutInspection::Uncertain(fault.into()),
+        }
+
+        match self.observe_v3_layout(&key) {
+            Ok(layout) => V3LayoutInspection::Observed(layout),
+            Err(uncertainty) => V3LayoutInspection::Uncertain(uncertainty),
+        }
+    }
+
+    fn observe_v3_layout(&self, key: &str) -> Result<V3Layout, LayoutUncertainty> {
+        let first = self.enumerate_v3_names(key)?;
+
+        reject_v3_aliases(&first)?;
+
+        let siblings: Vec<_> = first
+            .iter()
+            .filter(|(tag, _)| matches!(tag, NameTag::Sibling(_)))
+            .collect();
+
+        if siblings.len() > V3_SIBLING_READ_LIMIT {
+            return Err(LayoutUncertainty::SiblingLimit);
+        }
+
+        let primary = self.read_v3_primary(key, &first)?;
+
+        let mut read = Vec::with_capacity(siblings.len());
+        for (tag, name) in siblings {
+            let NameTag::Sibling(kind) = *tag else {
+                continue;
+            };
+
+            read.push(LayoutSibling {
+                kind,
+                content: self.read_v3_sibling(name),
+            });
+        }
+
+        // The consistency re-check: the same names and the same primary, or the
+        // observation is not trusted. It narrows the race; it does not close it.
+        let second = self.enumerate_v3_names(key)?;
+        let primary_again = self.read_v3_primary(key, &second)?;
+
+        if second != first || primary_again != primary {
+            return Err(LayoutUncertainty::ChangedDuringScan);
+        }
+
+        let unrecognized = first
+            .iter()
+            .filter(|(tag, _)| *tag == NameTag::Unrecognized)
+            .count();
+
+        Ok(V3Layout {
+            primary,
+            siblings: read,
+            unrecognized,
+        })
+    }
+
+    /// One bounded pass over the directory, keeping only the entries related to
+    /// `key`. Names are classified from the lossy form so that a non-Unicode name
+    /// with the key prefix is counted rather than ignored.
+    fn enumerate_v3_names(&self, key: &str) -> Result<ObservedNames, LayoutUncertainty> {
+        let entries =
+            fs::read_dir(&self.directory).map_err(|error| LayoutUncertainty::Io(error.kind()))?;
+
+        let mut found = ObservedNames::new();
+
+        for (index, entry) in entries.enumerate() {
+            if index >= V3_SCAN_ENTRY_LIMIT {
+                return Err(LayoutUncertainty::EntryLimit);
+            }
+
+            let entry = entry.map_err(|error| LayoutUncertainty::Io(error.kind()))?;
+            let name = entry.file_name();
+            let exact = name.to_str().is_some();
+
+            let tag = match recognize_v3_sibling_name(&name.to_string_lossy(), exact, key) {
+                V3NameClass::Primary => NameTag::Primary,
+                V3NameClass::Sibling(kind) => NameTag::Sibling(kind),
+                V3NameClass::Unrecognized => NameTag::Unrecognized,
+                V3NameClass::Other => continue,
+            };
+
+            found.push((tag, name));
+        }
+
+        found.sort();
+
+        Ok(found)
+    }
+
+    /// Read the primary through the bounded no-follow reader. The listing and the
+    /// read must agree about whether a primary exists.
+    fn read_v3_primary(
+        &self,
+        key: &str,
+        names: &[(NameTag, std::ffi::OsString)],
+    ) -> Result<LayoutPrimary, LayoutUncertainty> {
+        let listed = names.iter().find(|(tag, _)| *tag == NameTag::Primary);
+
+        let path = match listed {
+            Some((_, name)) => self.directory.join(name),
+            None => self.record_path(key),
+        };
+
+        let primary = match self.read_primary(&path) {
+            Ok(Primary::Absent) => LayoutPrimary::Absent,
+            Ok(Primary::Empty) => LayoutPrimary::Empty,
+            Ok(Primary::TooLarge) => LayoutPrimary::TooLarge,
+            Ok(Primary::Bytes(bytes)) => LayoutPrimary::Bytes(bytes),
+            Err(Fault::Unexpected) => LayoutPrimary::Unexpected,
+            Err(fault) => return Err(fault.into()),
+        };
+
+        // Listed but gone, or unlisted but there: two views of one directory
+        // that disagree.
+        if listed.is_some() == matches!(primary, LayoutPrimary::Absent) {
+            return Err(LayoutUncertainty::ChangedDuringScan);
+        }
+
+        Ok(primary)
+    }
+
+    fn read_v3_sibling(&self, name: &std::ffi::OsString) -> SiblingContent {
+        match self.read_primary(&self.directory.join(name)) {
+            Ok(Primary::Absent) => SiblingContent::Vanished,
+            Ok(Primary::Empty) => SiblingContent::Empty,
+            Ok(Primary::TooLarge) => SiblingContent::TooLarge,
+            Ok(Primary::Bytes(bytes)) => SiblingContent::Bytes(bytes),
+            Err(Fault::Unexpected) => SiblingContent::Unexpected,
+            Err(Fault::Io(io::ErrorKind::NotFound)) => SiblingContent::Vanished,
+            Err(Fault::Io(kind)) => SiblingContent::Unreadable(kind),
+            Err(Fault::EntryLimit) => SiblingContent::Unreadable(io::ErrorKind::Other),
+        }
+    }
+}
+
+/// Two recognized entries that fold to the same name make every path to "the"
+/// primary or sibling ambiguous.
+fn reject_v3_aliases(names: &[(NameTag, std::ffi::OsString)]) -> Result<(), LayoutUncertainty> {
+    let mut folded: Vec<String> = names
+        .iter()
+        .filter(|(tag, _)| *tag != NameTag::Unrecognized)
+        .map(|(_, name)| name.to_string_lossy().to_ascii_lowercase())
+        .collect();
+
+    folded.sort();
+
+    if folded.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(LayoutUncertainty::AliasAmbiguity);
+    }
+
+    Ok(())
+}
+
+// ---- end v3 layout assessment ------------------------------------------------
 
 /// Windows storage tests. Synthetic states only; no vault fixture is read or
 /// modified. Every test owns a uniquely named scratch directory under the
@@ -6046,5 +6538,1755 @@ mod read_record_tests {
             assert!(!output.contains("MARKER"));
             assert!(!output.contains(&record_key(&loc(LOCAL))));
         }
+    }
+}
+
+// ---- B3c-3b-1 test support (begin) -------------------------------------------
+
+/// Shared scaffolding for the Stage 1U-4 B3c-3b-1 tests. Synthetic bytes only.
+/// Every test owns a uniquely named scratch directory under the git-ignored
+/// `<repo>/.qa-local/sync-state-b3c3b1-tests/` (never `%TEMP%`) and removes only
+/// that directory.
+#[cfg(all(test, windows))]
+mod b3c3b1_support {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    use localvault_core::{
+        sync::{EnvelopeFingerprint, PushBaseline, PushIntent},
+        sync_state::{
+            BindingId, Locator, PendingPush, SyncBase, SyncState, VaultBindingTag, BINDING_SALT_LEN,
+        },
+    };
+    use uuid::Uuid;
+
+    use super::{record_key, SyncStateStore, SYNC_STATE_DIRECTORY};
+
+    pub(super) const LOCAL: &str = r"\\?\C:\Synthetic\Vaults\LOCAL-MARKER.lvault";
+    pub(super) const OTHER_LOCAL: &str = r"\\?\C:\Synthetic\Vaults\OTHER-MARKER.lvault";
+    pub(super) const TARGET: &str = r"\\?\D:\Synthetic\Remote\TARGET-MARKER.lvault";
+    pub(super) const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+    pub(super) const RETIRED_TOKEN: &str = "fedcba9876543210fedcba9876543210";
+
+    pub(super) struct Scratch {
+        pub(super) dir: tempfile::TempDir,
+    }
+
+    impl Scratch {
+        pub(super) fn new(name: &str) -> Self {
+            let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(".qa-local")
+                .join("sync-state-b3c3b1-tests");
+            fs::create_dir_all(&base).unwrap();
+
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("{name}-"))
+                .tempdir_in(&base)
+                .unwrap();
+
+            assert!(!dir.path().starts_with(std::env::temp_dir()));
+
+            Self { dir }
+        }
+
+        pub(super) fn root(&self) -> PathBuf {
+            self.dir.path().to_path_buf()
+        }
+
+        pub(super) fn state_dir(&self) -> PathBuf {
+            self.root().join(SYNC_STATE_DIRECTORY)
+        }
+
+        pub(super) fn store(&self) -> SyncStateStore {
+            SyncStateStore::new(&self.root()).unwrap()
+        }
+
+        pub(super) fn record(&self, local: &str) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.json", record_key(&loc(local))))
+        }
+
+        pub(super) fn staging(&self, local: &str, token: &str) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.{token}.tmp", record_key(&loc(local))))
+        }
+
+        pub(super) fn retired(&self, local: &str, token: &str) -> PathBuf {
+            self.state_dir()
+                .join(format!("{}.{token}.retired", record_key(&loc(local))))
+        }
+
+        pub(super) fn put(&self, path: &Path, bytes: &[u8]) {
+            fs::create_dir_all(self.state_dir()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+    }
+
+    pub(super) fn loc(value: &str) -> Locator {
+        Locator::new(value).unwrap()
+    }
+
+    pub(super) fn state(local: &str) -> SyncState {
+        let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+        let intent =
+            PushIntent::new(PushBaseline::Absent, EnvelopeFingerprint::of_bytes(&[2])).unwrap();
+        let intent_id = Uuid::from_u128(0xaaaa_aaaa_bbbb_4ccc_8ddd_eeee_eeee_eeee);
+
+        SyncState::new(
+            BindingId::new(Uuid::from_u128(0x1111_1111_2222_3333_4444_5555_5555_5555)).unwrap(),
+            VaultBindingTag::derive(
+                salt,
+                Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+            )
+            .unwrap(),
+            loc(local),
+            loc(TARGET),
+            SyncBase::Unbased,
+            Some(PendingPush::new(intent_id, intent, 1).unwrap()),
+        )
+        .unwrap()
+    }
+
+    /// Sorted names of the direct children of `dir`.
+    pub(super) fn names(dir: &Path) -> Vec<String> {
+        let mut found: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        found.sort();
+        found
+    }
+}
+
+// ---- B3c-3b-1 test support (end) ---------------------------------------------
+
+// ---- B3c-3b-1 v1 non-regression tests (begin) --------------------------------
+
+/// Stage 1U-4 B3c-3b-1: the legacy (v1) store is deliberately **blind** to
+/// `<key>.<32hex>.retired` files, and this slice must not change that. These
+/// tests pin the exact v1 outcomes for three synthetic layouts so that any later
+/// edit of the legacy artifact machinery is noticed. They document a known
+/// legacy limitation (a retired file is invisible to `create` and survives a v1
+/// reset); they do not fix it, and a v1 mutator must never remove such a file.
+#[cfg(all(test, windows))]
+mod v1_retired_tests {
+    use std::fs;
+
+    use super::b3c3b1_support::{
+        loc, names, state, Scratch, LOCAL, OTHER_LOCAL, RETIRED_TOKEN, TOKEN,
+    };
+    use super::*;
+    use crate::vault::handle_ops::test_support::snapshot;
+
+    const RETIRED_BYTES: &[u8] = b"synthetic retired record, never read by v1";
+
+    #[derive(Clone, Copy, Debug)]
+    enum Layout {
+        RetiredOnly,
+        PrimaryAndRetired,
+        StagingAndRetired,
+    }
+
+    const LAYOUTS: [Layout; 3] = [
+        Layout::RetiredOnly,
+        Layout::PrimaryAndRetired,
+        Layout::StagingAndRetired,
+    ];
+
+    fn primary_bytes() -> Vec<u8> {
+        state(LOCAL).encode().unwrap()
+    }
+
+    fn fixture(layout: Layout) -> Scratch {
+        let scratch = Scratch::new("v1-retired");
+
+        scratch.put(&scratch.retired(LOCAL, RETIRED_TOKEN), RETIRED_BYTES);
+
+        match layout {
+            Layout::RetiredOnly => {}
+            Layout::PrimaryAndRetired => scratch.put(&scratch.record(LOCAL), &primary_bytes()),
+            Layout::StagingAndRetired => scratch.put(&scratch.staging(LOCAL, TOKEN), b"staging"),
+        }
+
+        scratch
+    }
+
+    fn retired_is_untouched(scratch: &Scratch) {
+        assert_eq!(
+            fs::read(scratch.retired(LOCAL, RETIRED_TOKEN)).unwrap(),
+            RETIRED_BYTES,
+            "the retired file was changed or removed"
+        );
+    }
+
+    fn only_the_retired_file_is_left(scratch: &Scratch, layout: Layout) {
+        assert_eq!(
+            names(&scratch.state_dir()),
+            [format!(
+                "{}.{RETIRED_TOKEN}.retired",
+                record_key(&loc(LOCAL))
+            )],
+            "{layout:?}"
+        );
+        retired_is_untouched(scratch);
+    }
+
+    #[test]
+    fn load_and_read_record_are_blind_to_retired_files_and_change_nothing() {
+        for layout in LAYOUTS {
+            let scratch = fixture(layout);
+            let store = scratch.store();
+            let before = snapshot(scratch.dir.path());
+
+            let load = store.load(&loc(LOCAL));
+            let read = store.read_record(&loc(LOCAL));
+
+            match layout {
+                Layout::RetiredOnly => {
+                    assert_eq!(load, StateLoad::NotConfigured, "{layout:?}");
+                    assert!(
+                        matches!(read, RecordRead::NotConfigured),
+                        "{layout:?}: {read:?}"
+                    );
+                }
+                Layout::PrimaryAndRetired => {
+                    assert_eq!(
+                        load,
+                        StateLoad::Loaded(Box::new(state(LOCAL))),
+                        "{layout:?}"
+                    );
+
+                    let RecordRead::Present(present) = &read else {
+                        panic!("{layout:?}: expected a present record, got {read:?}");
+                    };
+                    assert_eq!(present.bytes(), primary_bytes());
+                    // The retired file is not a recognized artifact to v1.
+                    assert_eq!(present.artifacts(), ArtifactPresence::None);
+                }
+                Layout::StagingAndRetired => {
+                    assert_eq!(
+                        load,
+                        StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts),
+                        "{layout:?}"
+                    );
+                    assert!(
+                        matches!(
+                            read,
+                            RecordRead::Unreadable(UnreadableReason::UnresolvedArtifacts)
+                        ),
+                        "{layout:?}: {read:?}"
+                    );
+                }
+            }
+
+            assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}");
+            retired_is_untouched(&scratch);
+        }
+    }
+
+    #[test]
+    fn create_ignores_retired_files_and_never_touches_them() {
+        for layout in LAYOUTS {
+            let scratch = fixture(layout);
+            let store = scratch.store();
+            let before = snapshot(scratch.dir.path());
+            let result = store.create(&state(LOCAL));
+
+            match layout {
+                Layout::RetiredOnly => {
+                    // v1 buries the retired file: it neither sees nor refuses it.
+                    assert_eq!(result, Ok(()), "{layout:?}");
+                    assert_eq!(
+                        fs::read(scratch.record(LOCAL)).unwrap(),
+                        primary_bytes(),
+                        "{layout:?}"
+                    );
+                    assert_eq!(names(&scratch.state_dir()).len(), 2, "{layout:?}");
+                }
+                Layout::PrimaryAndRetired => {
+                    assert_eq!(result, Err(StoreError::AlreadyExists), "{layout:?}");
+                    assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}");
+                }
+                Layout::StagingAndRetired => {
+                    assert_eq!(result, Err(StoreError::UnresolvedArtifacts), "{layout:?}");
+                    assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}");
+                }
+            }
+
+            retired_is_untouched(&scratch);
+        }
+    }
+
+    #[test]
+    fn evidence_does_not_bind_retired_files() {
+        for layout in LAYOUTS {
+            let scratch = fixture(layout);
+            let store = scratch.store();
+            let before = snapshot(scratch.dir.path());
+
+            let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+            assert_eq!(
+                evidence.primary_present(),
+                matches!(layout, Layout::PrimaryAndRetired),
+                "{layout:?}"
+            );
+            assert_eq!(
+                evidence.artifact_count(),
+                usize::from(matches!(layout, Layout::StagingAndRetired)),
+                "{layout:?}"
+            );
+
+            assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}");
+            retired_is_untouched(&scratch);
+        }
+    }
+
+    #[test]
+    fn delete_never_removes_a_retired_file() {
+        for layout in LAYOUTS {
+            let scratch = fixture(layout);
+            let outcome = scratch.store().delete(&loc(LOCAL));
+
+            match layout {
+                Layout::RetiredOnly => {
+                    assert_eq!(outcome, Ok(DeleteOutcome::AlreadyAbsent), "{layout:?}");
+                }
+                Layout::PrimaryAndRetired | Layout::StagingAndRetired => {
+                    assert_eq!(outcome, Ok(DeleteOutcome::Removed), "{layout:?}");
+                }
+            }
+
+            // Whatever v1 removed, the retired file is the only thing left.
+            only_the_retired_file_is_left(&scratch, layout);
+        }
+    }
+
+    #[test]
+    fn conditional_delete_never_removes_a_retired_file() {
+        for layout in LAYOUTS {
+            let scratch = fixture(layout);
+            let store = scratch.store();
+            let evidence = store.evidence(&loc(LOCAL)).unwrap();
+            let outcome = store.delete_if_evidence_matches(&loc(LOCAL), &evidence);
+
+            match layout {
+                Layout::RetiredOnly => {
+                    assert_eq!(outcome, Ok(DeleteOutcome::AlreadyAbsent), "{layout:?}");
+                }
+                Layout::PrimaryAndRetired | Layout::StagingAndRetired => {
+                    assert_eq!(outcome, Ok(DeleteOutcome::Removed), "{layout:?}");
+                }
+            }
+
+            only_the_retired_file_is_left(&scratch, layout);
+        }
+    }
+
+    #[test]
+    fn a_retired_file_of_another_location_is_untouched_by_every_mutator() {
+        let scratch = fixture(Layout::PrimaryAndRetired);
+        let other = scratch.retired(OTHER_LOCAL, RETIRED_TOKEN);
+
+        scratch.put(&other, RETIRED_BYTES);
+
+        let store = scratch.store();
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+            Ok(DeleteOutcome::Removed)
+        );
+        assert_eq!(
+            store.delete(&loc(OTHER_LOCAL)),
+            Ok(DeleteOutcome::AlreadyAbsent)
+        );
+        assert_eq!(fs::read(&other).unwrap(), RETIRED_BYTES);
+        retired_is_untouched(&scratch);
+    }
+}
+
+// ---- B3c-3b-1 v1 non-regression tests (end) ----------------------------------
+
+/// Stage 1U-4 B3c-3b-1 tests of the name grammar and of the read-only
+/// [`SyncStateStore::inspect_v3_layout`]. Real NTFS, synthetic bytes. Fixtures are
+/// built with plain file operations on uniquely owned scratch directories, as an
+/// interrupted write or another process would leave them. The assessment itself
+/// only reads: every no-mutation proof prepares a stable fixture, takes a
+/// snapshot, calls **only** the assessment and requires the same snapshot. The
+/// race tests change the tree on purpose and therefore never claim whole-tree
+/// equality; they assert safe outcomes only.
+#[cfg(all(test, windows))]
+mod v3_layout_tests {
+    use std::{
+        ffi::OsString,
+        fs,
+        os::windows::ffi::OsStringExt,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+    };
+
+    use super::b3c3b1_support::{loc, names, Scratch, LOCAL, OTHER_LOCAL, RETIRED_TOKEN, TOKEN};
+    use super::*;
+    use crate::vault::handle_ops::test_support::{make_junction, snapshot};
+
+    type Shape = (Option<Vec<u8>>, Vec<(SiblingKind, Option<Vec<u8>>)>, usize);
+
+    const PRIMARY_BYTES: &[u8] = b"SECRET-PRIMARY-MARKER";
+    const SIBLING_BYTES: &[u8] = b"SECRET-SIBLING-MARKER";
+
+    fn key() -> String {
+        record_key(&loc(LOCAL))
+    }
+
+    fn class(name: &str) -> V3NameClass {
+        recognize_v3_sibling_name(name, true, &key())
+    }
+
+    // ---- the pure grammar ---------------------------------------------------------
+
+    #[test]
+    fn the_exact_shapes_are_recognized() {
+        let key = key();
+
+        assert_eq!(key.len(), 64);
+        assert_eq!(class(&format!("{key}.json")), V3NameClass::Primary);
+        assert_eq!(
+            class(&format!("{key}.{TOKEN}.tmp")),
+            V3NameClass::Sibling(SiblingKind::Staging)
+        );
+        assert_eq!(
+            class(&format!("{key}.{RETIRED_TOKEN}.retired")),
+            V3NameClass::Sibling(SiblingKind::Retired)
+        );
+    }
+
+    #[test]
+    fn case_variants_are_recognized_like_the_lowercase_names() {
+        let key = key();
+        let upper_token = TOKEN.to_ascii_uppercase();
+
+        for name in [
+            format!("{}.JSON", key.to_ascii_uppercase()),
+            format!("{}.Json", key.to_ascii_uppercase()),
+            format!("{key}.JSON"),
+        ] {
+            assert_eq!(class(&name), V3NameClass::Primary, "{name}");
+        }
+
+        for (name, kind) in [
+            (
+                format!("{}.{upper_token}.TMP", key.to_ascii_uppercase()),
+                SiblingKind::Staging,
+            ),
+            (format!("{key}.{upper_token}.tmp"), SiblingKind::Staging),
+            (
+                format!("{}.{RETIRED_TOKEN}.RETIRED", key.to_ascii_uppercase()),
+                SiblingKind::Retired,
+            ),
+            (
+                format!("{key}.{}.Retired", RETIRED_TOKEN.to_ascii_uppercase()),
+                SiblingKind::Retired,
+            ),
+        ] {
+            assert_eq!(class(&name), V3NameClass::Sibling(kind), "{name}");
+        }
+    }
+
+    #[test]
+    fn another_key_or_an_unrelated_name_is_ignored() {
+        let key = key();
+        let other = record_key(&loc(OTHER_LOCAL));
+
+        assert_ne!(key, other);
+
+        for name in [
+            format!("{other}.json"),
+            format!("{other}.{TOKEN}.tmp"),
+            format!("{other}.{TOKEN}.retired"),
+            // One character short of the key, or a prefix of it.
+            format!("{}.json", &key[..63]),
+            format!("x{key}.json"),
+            format!(" {key}.json"),
+            "unrelated.dat".to_owned(),
+            ".lock".to_owned(),
+            String::new(),
+            "a".to_owned(),
+        ] {
+            assert_eq!(class(&name), V3NameClass::Other, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_token_of_the_wrong_length_or_alphabet_is_suspicious_not_recognized() {
+        let key = key();
+
+        for token in [
+            TOKEN[..31].to_owned(),
+            format!("{TOKEN}0"),
+            String::new(),
+            "0".to_owned(),
+            format!("{}g", &TOKEN[..31]),
+            format!("{}-", &TOKEN[..31]),
+            format!("{} ", &TOKEN[..31]),
+        ] {
+            for extension in ["tmp", "retired"] {
+                let name = format!("{key}.{token}.{extension}");
+
+                assert_eq!(class(&name), V3NameClass::Unrecognized, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn misleading_suffixes_are_suspicious_not_recognized() {
+        let key = key();
+
+        for name in [
+            key.clone(),
+            format!("{key}."),
+            format!("{key}.json.bak"),
+            format!("{key}.json.tmp"),
+            format!("{key}.json.retired"),
+            format!("{key}.jsonx"),
+            format!("{key}.JSON.old"),
+            format!("{key}.{TOKEN}"),
+            format!("{key}.{TOKEN}."),
+            format!("{key}.{TOKEN}.tmp.old"),
+            format!("{key}.{TOKEN}.tmp.retired"),
+            format!("{key}.{TOKEN}.retired.x"),
+            format!("{key}.{TOKEN}.retired.tmp"),
+            format!("{key}.{TOKEN}.tmpx"),
+            format!("{key}.{TOKEN}.retire"),
+            format!("{key}.{TOKEN}.json"),
+            format!("{key}.tmp"),
+            format!("{key}.retired"),
+            format!("{key}..tmp"),
+            format!("{key}..retired"),
+            format!("{key}.{TOKEN}{TOKEN}.tmp"),
+            format!("{key}.{TOKEN}.{TOKEN}.tmp"),
+            format!("{key}.notes.txt"),
+            format!("{key}{TOKEN}.tmp"),
+        ] {
+            assert_eq!(class(&name), V3NameClass::Unrecognized, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_dot_or_space_is_suspicious_not_recognized() {
+        let key = key();
+
+        for name in [
+            format!("{key}.json."),
+            format!("{key}.json "),
+            format!("{key}.json. "),
+            format!("{key}.{TOKEN}.tmp."),
+            format!("{key}.{TOKEN}.tmp "),
+            format!("{key}.{TOKEN}.retired."),
+            format!("{key}.{TOKEN}.retired "),
+            format!("{key}.{TOKEN}.retired\t"),
+            format!("{key}.json\n"),
+        ] {
+            assert_eq!(class(&name), V3NameClass::Unrecognized, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn non_ascii_names_never_match_but_a_key_prefix_still_counts() {
+        let key = key();
+
+        // After the key: suspicious.
+        for name in [
+            format!("{key}.json\u{e9}"),
+            format!("{key}.\u{ff4a}son"),
+            format!("{key}.{TOKEN}.tm\u{440}"),
+            format!("{key}.{}\u{e9}.tmp", &TOKEN[..31]),
+            format!("{key}\u{200b}.json"),
+        ] {
+            assert_eq!(class(&name), V3NameClass::Unrecognized, "{name:?}");
+        }
+
+        // Inside the key or before it: not this key's name at all.
+        for name in [
+            format!("\u{e9}{}.json", &key[1..]),
+            format!("{}\u{ff41}{}.json", &key[..10], &key[11..]),
+            format!("\u{feff}{key}.json"),
+        ] {
+            assert_eq!(class(&name), V3NameClass::Other, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_valid_unicode_is_never_recognized() {
+        let key = key();
+
+        // The lossy form of a non-Unicode name keeps its ASCII prefix.
+        for lossy in [
+            format!("{key}.json\u{fffd}"),
+            format!("{key}.json"),
+            format!("{key}.{TOKEN}.tmp"),
+            format!("{key}.{TOKEN}.retired"),
+            format!("{key}.\u{fffd}"),
+        ] {
+            assert_eq!(
+                recognize_v3_sibling_name(&lossy, false, &key),
+                V3NameClass::Unrecognized,
+                "{lossy:?}"
+            );
+        }
+
+        assert_eq!(
+            recognize_v3_sibling_name("unrelated\u{fffd}", false, &key),
+            V3NameClass::Other
+        );
+        assert_eq!(
+            recognize_v3_sibling_name(&format!("{}\u{fffd}", &key[..63]), false, &key),
+            V3NameClass::Other
+        );
+    }
+
+    #[test]
+    fn an_overlong_name_is_never_recognized_and_the_unit_count_is_utf16() {
+        let key = key();
+
+        // 255 UTF-16 units is the longest component; 256 is not a name at all.
+        let long_suffix = "a".repeat(V3_MAX_NAME_UNITS + 1 - key.len());
+        let prefixed = format!("{key}{long_suffix}");
+
+        assert_eq!(prefixed.encode_utf16().count(), V3_MAX_NAME_UNITS + 1);
+        assert_eq!(class(&prefixed), V3NameClass::Unrecognized);
+        assert_eq!(class(&"b".repeat(400)), V3NameClass::Other);
+
+        // A supplementary-plane character is two units and four bytes: the limit
+        // is counted in units, never in bytes or characters.
+        let astral = format!("{key}.json{}", "\u{1f600}".repeat(95));
+        assert_eq!(astral.chars().count(), key.len() + 5 + 95);
+        assert_eq!(astral.encode_utf16().count(), key.len() + 5 + 190);
+        assert!(astral.encode_utf16().count() > V3_MAX_NAME_UNITS);
+        assert_eq!(class(&astral), V3NameClass::Unrecognized);
+
+        // The recognized shapes are far below the limit.
+        assert!(format!("{key}.{RETIRED_TOKEN}.retired").len() < V3_MAX_NAME_UNITS);
+    }
+
+    #[test]
+    fn a_malformed_key_matches_nothing() {
+        let key = key();
+
+        for bad in [
+            String::new(),
+            "abc".to_owned(),
+            key[..63].to_owned(),
+            format!("{key}0"),
+            key.to_ascii_uppercase(),
+            format!("{}g", &key[..63]),
+        ] {
+            for name in [
+                format!("{key}.json"),
+                format!("{key}.{TOKEN}.tmp"),
+                bad.clone(),
+            ] {
+                assert_eq!(
+                    recognize_v3_sibling_name(&name, true, &bad),
+                    V3NameClass::Other,
+                    "{bad:?} {name:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_staging_grammar_agrees_with_the_unchanged_v1_rule_without_sharing_code() {
+        let key = key();
+        let upper_key = key.to_ascii_uppercase();
+        let other = record_key(&loc(OTHER_LOCAL));
+
+        let battery = [
+            format!("{key}.{TOKEN}.tmp"),
+            format!("{upper_key}.{TOKEN}.TMP"),
+            format!("{key}.{}.tmp", TOKEN.to_ascii_uppercase()),
+            format!("{key}.{}.tmp", &TOKEN[..31]),
+            format!("{key}.{TOKEN}0.tmp"),
+            format!("{key}.{}g.tmp", &TOKEN[..31]),
+            format!("{key}.{TOKEN}.tmp.old"),
+            format!("{key}.{TOKEN}.tmp "),
+            format!("{key}.{TOKEN}.tmp."),
+            format!("{key}.{TOKEN}.retired"),
+            format!("{key}.{TOKEN}.json"),
+            format!("{key}.json"),
+            format!("{key}.tmp"),
+            format!("{key}..tmp"),
+            format!("{other}.{TOKEN}.tmp"),
+            format!("x{key}.{TOKEN}.tmp"),
+            "unrelated.tmp".to_owned(),
+        ];
+
+        for name in &battery {
+            assert_eq!(
+                is_artifact_name(name, &key),
+                class(name) == V3NameClass::Sibling(SiblingKind::Staging),
+                "{name:?}"
+            );
+        }
+
+        // And the v1 rule stays blind to the new sibling kind.
+        let retired = format!("{key}.{RETIRED_TOKEN}.retired");
+        assert!(!is_artifact_name(&retired, &key));
+        assert_eq!(class(&retired), V3NameClass::Sibling(SiblingKind::Retired));
+    }
+
+    // ---- fixtures and the no-mutation helper ------------------------------------
+
+    /// One assessment of a **stable** fixture: the whole scratch tree is
+    /// snapshotted before and after, and only the assessment runs in between.
+    fn observe(scratch: &Scratch) -> V3LayoutInspection {
+        let store = scratch.store();
+        let before = snapshot(scratch.dir.path());
+        let result = store.inspect_v3_layout(&loc(LOCAL));
+
+        assert_eq!(
+            snapshot(scratch.dir.path()),
+            before,
+            "the assessment changed the filesystem"
+        );
+
+        result
+    }
+
+    fn layout_of(inspection: V3LayoutInspection) -> V3Layout {
+        match inspection {
+            V3LayoutInspection::Observed(layout) => layout,
+            other => panic!("expected an observed layout, got {other:?}"),
+        }
+    }
+
+    fn uncertainty_of(inspection: V3LayoutInspection) -> LayoutUncertainty {
+        match inspection {
+            V3LayoutInspection::Uncertain(reason) => reason,
+            other => panic!("expected an uncertain result, got {other:?}"),
+        }
+    }
+
+    fn content_bytes(content: &SiblingContent) -> Option<&[u8]> {
+        match content {
+            SiblingContent::Bytes(bytes) => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// Everything a layout shows, as plain comparable data.
+    fn shape(layout: &V3Layout) -> Shape {
+        let primary = match layout.primary() {
+            LayoutPrimary::Bytes(bytes) => Some(bytes.clone()),
+            _ => None,
+        };
+
+        (
+            primary,
+            layout
+                .siblings()
+                .iter()
+                .map(|sibling| {
+                    (
+                        sibling.kind(),
+                        content_bytes(sibling.content()).map(<[u8]>::to_vec),
+                    )
+                })
+                .collect(),
+            layout.unrecognized(),
+        )
+    }
+
+    fn token(index: usize) -> String {
+        format!("{index:032x}")
+    }
+
+    // ---- case A: nothing there --------------------------------------------------
+
+    #[test]
+    fn a_missing_directory_is_an_observed_absence_and_nothing_is_created() {
+        let scratch = Scratch::new("v3-absent");
+        let layout = layout_of(observe(&scratch));
+
+        assert_eq!(*layout.primary(), LayoutPrimary::Absent);
+        assert!(layout.siblings().is_empty());
+        assert_eq!(layout.unrecognized(), 0);
+        assert!(!scratch.state_dir().exists());
+    }
+
+    #[test]
+    fn an_empty_directory_and_unrelated_files_are_an_observed_absence() {
+        let scratch = Scratch::new("v3-empty");
+
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+        let layout = layout_of(observe(&scratch));
+        assert_eq!(*layout.primary(), LayoutPrimary::Absent);
+        assert!(layout.siblings().is_empty());
+        assert_eq!(layout.unrecognized(), 0);
+
+        // Other keys and unrelated names are ignored and uncounted.
+        let other = loc(OTHER_LOCAL);
+        scratch.put(&scratch.record(OTHER_LOCAL), PRIMARY_BYTES);
+        scratch.put(&scratch.staging(OTHER_LOCAL, TOKEN), SIBLING_BYTES);
+        scratch.put(&scratch.retired(OTHER_LOCAL, TOKEN), SIBLING_BYTES);
+        scratch.put(&scratch.state_dir().join("notes.txt"), b"x");
+        scratch.put(&scratch.state_dir().join("sync.lock"), b"");
+
+        assert_ne!(record_key(&other), key());
+
+        let layout = layout_of(observe(&scratch));
+        assert_eq!(*layout.primary(), LayoutPrimary::Absent);
+        assert!(layout.siblings().is_empty());
+        assert_eq!(layout.unrecognized(), 0);
+    }
+
+    // ---- cases A-G: primary and siblings ------------------------------------------
+
+    #[test]
+    fn a_primary_alone_is_read_in_full() {
+        let scratch = Scratch::new("v3-primary");
+
+        scratch.put(&scratch.record(LOCAL), PRIMARY_BYTES);
+
+        let layout = layout_of(observe(&scratch));
+
+        assert_eq!(
+            *layout.primary(),
+            LayoutPrimary::Bytes(PRIMARY_BYTES.to_vec())
+        );
+        assert!(layout.siblings().is_empty());
+        assert_eq!(layout.unrecognized(), 0);
+    }
+
+    #[test]
+    fn a_primary_beside_a_staging_or_retired_sibling_reports_both() {
+        let scratch = Scratch::new("v3-primary-sibling");
+
+        scratch.put(&scratch.record(LOCAL), PRIMARY_BYTES);
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"staging bytes");
+
+        let layout = layout_of(observe(&scratch));
+        assert_eq!(
+            *layout.primary(),
+            LayoutPrimary::Bytes(PRIMARY_BYTES.to_vec())
+        );
+        assert_eq!(
+            shape(&layout).1,
+            [(SiblingKind::Staging, Some(b"staging bytes".to_vec()))]
+        );
+
+        scratch.put(&scratch.retired(LOCAL, RETIRED_TOKEN), b"retired bytes");
+
+        let layout = layout_of(observe(&scratch));
+        assert_eq!(
+            *layout.primary(),
+            LayoutPrimary::Bytes(PRIMARY_BYTES.to_vec())
+        );
+        assert_eq!(
+            shape(&layout).1,
+            [
+                (SiblingKind::Staging, Some(b"staging bytes".to_vec())),
+                (SiblingKind::Retired, Some(b"retired bytes".to_vec())),
+            ]
+        );
+    }
+
+    #[test]
+    fn siblings_without_a_primary_are_reported_and_the_primary_stays_absent() {
+        // Staging only, retired only, both, and several retired.
+        type Setup = fn(&Scratch);
+
+        let cases: [(&str, Setup, usize); 4] = [
+            ("staging", |s| s.put(&s.staging(LOCAL, TOKEN), b"s"), 1),
+            (
+                "retired",
+                |s| s.put(&s.retired(LOCAL, RETIRED_TOKEN), b"r"),
+                1,
+            ),
+            (
+                "both",
+                |s| {
+                    s.put(&s.staging(LOCAL, TOKEN), b"s");
+                    s.put(&s.retired(LOCAL, RETIRED_TOKEN), b"r");
+                },
+                2,
+            ),
+            (
+                "several retired",
+                |s| {
+                    for index in 0..5 {
+                        s.put(&s.retired(LOCAL, &token(index)), b"r");
+                    }
+                },
+                5,
+            ),
+        ];
+
+        for (label, setup, count) in cases {
+            let scratch = Scratch::new("v3-no-primary");
+            setup(&scratch);
+
+            let layout = layout_of(observe(&scratch));
+
+            assert_eq!(*layout.primary(), LayoutPrimary::Absent, "{label}");
+            assert_eq!(layout.siblings().len(), count, "{label}");
+            assert_eq!(layout.unrecognized(), 0, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_suspicious_key_prefixed_entry_is_counted_and_never_ignored() {
+        let scratch = Scratch::new("v3-suspicious");
+        let key = key();
+
+        for name in [
+            format!("{key}.json.bak"),
+            format!("{key}.{TOKEN}.retired.x"),
+            format!("{key}.retired"),
+            format!("{key}.{}.tmp", &TOKEN[..31]),
+            format!("{key}.notes.txt"),
+        ] {
+            scratch.put(&scratch.state_dir().join(&name), b"x");
+        }
+
+        let layout = layout_of(observe(&scratch));
+
+        assert_eq!(*layout.primary(), LayoutPrimary::Absent);
+        assert!(layout.siblings().is_empty());
+        assert_eq!(layout.unrecognized(), 5);
+
+        // They do not disturb a real primary either.
+        scratch.put(&scratch.record(LOCAL), PRIMARY_BYTES);
+
+        let layout = layout_of(observe(&scratch));
+        assert_eq!(
+            *layout.primary(),
+            LayoutPrimary::Bytes(PRIMARY_BYTES.to_vec())
+        );
+        assert_eq!(layout.unrecognized(), 5);
+    }
+
+    #[test]
+    fn siblings_come_back_in_a_stable_order_and_two_observations_agree() {
+        let scratch = Scratch::new("v3-order");
+
+        scratch.put(&scratch.record(LOCAL), PRIMARY_BYTES);
+        for index in [7usize, 3, 11, 1] {
+            scratch.put(&scratch.retired(LOCAL, &token(index)), &[index as u8]);
+        }
+        scratch.put(&scratch.staging(LOCAL, &token(9)), b"s");
+
+        let first = layout_of(observe(&scratch));
+        let second = layout_of(observe(&scratch));
+
+        assert_eq!(shape(&first), shape(&second));
+
+        // Staging first, then retired, each by name.
+        let kinds: Vec<_> = first.siblings().iter().map(LayoutSibling::kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                SiblingKind::Staging,
+                SiblingKind::Retired,
+                SiblingKind::Retired,
+                SiblingKind::Retired,
+                SiblingKind::Retired,
+            ]
+        );
+        assert_eq!(
+            shape(&first)
+                .1
+                .iter()
+                .skip(1)
+                .map(|(_, bytes)| bytes.clone().unwrap())
+                .collect::<Vec<_>>(),
+            [vec![1u8], vec![3], vec![7], vec![11]]
+        );
+    }
+
+    #[test]
+    fn foreign_bytes_at_a_valid_name_are_just_bytes_here() {
+        // The store is crypto-agnostic: it never decides whose a file is.
+        let scratch = Scratch::new("v3-foreign");
+
+        scratch.put(&scratch.record(LOCAL), &[0xff, 0xfe, 0x00]);
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"{\"not\":\"ours\"}");
+
+        let layout = layout_of(observe(&scratch));
+
+        assert_eq!(
+            *layout.primary(),
+            LayoutPrimary::Bytes(vec![0xff, 0xfe, 0x00])
+        );
+        assert_eq!(shape(&layout).1.len(), 1);
+    }
+
+    // ---- primary sizes and unexpected objects -------------------------------------
+
+    #[test]
+    fn an_empty_and_an_oversized_primary_are_reported_not_returned() {
+        let scratch = Scratch::new("v3-sizes");
+
+        scratch.put(&scratch.record(LOCAL), b"");
+        assert_eq!(
+            *layout_of(observe(&scratch)).primary(),
+            LayoutPrimary::Empty
+        );
+
+        scratch.put(
+            &scratch.record(LOCAL),
+            &vec![b'a'; MAX_SYNC_STATE_BYTES + 1],
+        );
+        assert_eq!(
+            *layout_of(observe(&scratch)).primary(),
+            LayoutPrimary::TooLarge
+        );
+
+        let exact = vec![b'a'; MAX_SYNC_STATE_BYTES];
+        scratch.put(&scratch.record(LOCAL), &exact);
+        assert_eq!(
+            *layout_of(observe(&scratch)).primary(),
+            LayoutPrimary::Bytes(exact)
+        );
+    }
+
+    #[test]
+    fn an_empty_and_an_oversized_sibling_are_reported_not_returned() {
+        let scratch = Scratch::new("v3-sibling-sizes");
+
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"");
+        scratch.put(
+            &scratch.retired(LOCAL, RETIRED_TOKEN),
+            &vec![b'a'; MAX_SYNC_STATE_BYTES + 1],
+        );
+
+        let layout = layout_of(observe(&scratch));
+        let contents: Vec<_> = layout
+            .siblings()
+            .iter()
+            .map(LayoutSibling::content)
+            .collect();
+
+        assert!(matches!(contents[0], SiblingContent::Empty));
+        assert!(matches!(contents[1], SiblingContent::TooLarge));
+    }
+
+    #[test]
+    fn a_directory_or_junction_in_place_of_the_primary_is_unexpected_and_untouched() {
+        let scratch = Scratch::new("v3-primary-objects");
+        let record = scratch.record(LOCAL);
+
+        fs::create_dir_all(&record).unwrap();
+        assert_eq!(
+            *layout_of(observe(&scratch)).primary(),
+            LayoutPrimary::Unexpected
+        );
+        fs::remove_dir(&record).unwrap();
+
+        let behind = scratch.root().join("behind");
+        fs::create_dir_all(&behind).unwrap();
+        fs::write(behind.join("inside.txt"), b"inside").unwrap();
+        make_junction(&record, &behind);
+
+        assert_eq!(
+            *layout_of(observe(&scratch)).primary(),
+            LayoutPrimary::Unexpected
+        );
+
+        // Nothing was followed or removed.
+        assert_eq!(fs::read(behind.join("inside.txt")).unwrap(), b"inside");
+    }
+
+    #[test]
+    fn a_file_symlink_primary_is_not_followed_where_one_can_be_created() {
+        let scratch = Scratch::new("v3-primary-symlink");
+        let target = scratch.root().join("target.bin");
+
+        fs::write(&target, PRIMARY_BYTES).unwrap();
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+
+        if std::os::windows::fs::symlink_file(&target, scratch.record(LOCAL)).is_err() {
+            eprintln!("SKIPPED file-symlink primary: this account cannot create a symlink");
+            return;
+        }
+
+        assert_eq!(
+            *layout_of(observe(&scratch)).primary(),
+            LayoutPrimary::Unexpected
+        );
+    }
+
+    #[test]
+    fn a_directory_or_junction_in_place_of_a_sibling_is_unexpected_and_untouched() {
+        let scratch = Scratch::new("v3-sibling-objects");
+        let behind = scratch.root().join("behind");
+
+        fs::create_dir_all(&behind).unwrap();
+        fs::write(behind.join("inside.txt"), b"inside").unwrap();
+
+        fs::create_dir_all(scratch.staging(LOCAL, TOKEN)).unwrap();
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+        make_junction(&scratch.retired(LOCAL, RETIRED_TOKEN), &behind);
+
+        let layout = layout_of(observe(&scratch));
+        let contents: Vec<_> = layout
+            .siblings()
+            .iter()
+            .map(LayoutSibling::content)
+            .collect();
+
+        assert_eq!(contents.len(), 2);
+        assert!(contents
+            .iter()
+            .all(|content| matches!(content, SiblingContent::Unexpected)));
+        assert_eq!(fs::read(behind.join("inside.txt")).unwrap(), b"inside");
+    }
+
+    #[test]
+    fn a_hard_linked_sibling_is_read_as_the_file_it_is_and_the_other_name_is_untouched() {
+        // The store records no link facts (no file identity in this slice): a
+        // second name for a file is read like any file. Pinned so that nothing
+        // later assumes otherwise.
+        let scratch = Scratch::new("v3-sibling-link");
+        let outside = scratch.root().join("outside.bin");
+
+        fs::write(&outside, SIBLING_BYTES).unwrap();
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+        fs::hard_link(&outside, scratch.retired(LOCAL, RETIRED_TOKEN)).unwrap();
+
+        let layout = layout_of(observe(&scratch));
+
+        assert_eq!(
+            shape(&layout).1,
+            [(SiblingKind::Retired, Some(SIBLING_BYTES.to_vec()))]
+        );
+        assert_eq!(fs::read(&outside).unwrap(), SIBLING_BYTES);
+    }
+
+    // ---- limits --------------------------------------------------------------------
+
+    #[test]
+    fn the_entry_limit_is_uncertain_never_absence() {
+        let scratch = Scratch::new("v3-entry-limit");
+
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+        for index in 0..V3_SCAN_ENTRY_LIMIT {
+            fs::write(
+                scratch.state_dir().join(format!("unrelated-{index}.dat")),
+                b"x",
+            )
+            .unwrap();
+        }
+
+        // Exactly the limit is still fully observed.
+        let layout = layout_of(observe(&scratch));
+        assert_eq!(*layout.primary(), LayoutPrimary::Absent);
+
+        // One more is not.
+        fs::write(scratch.state_dir().join("one-more.dat"), b"x").unwrap();
+        assert_eq!(
+            uncertainty_of(observe(&scratch)),
+            LayoutUncertainty::EntryLimit
+        );
+
+        // Not even with a primary that was there to read.
+        scratch.put(&scratch.record(LOCAL), PRIMARY_BYTES);
+        assert_eq!(
+            uncertainty_of(observe(&scratch)),
+            LayoutUncertainty::EntryLimit
+        );
+    }
+
+    #[test]
+    fn the_sibling_read_limit_is_uncertain_never_a_partial_list() {
+        let scratch = Scratch::new("v3-sibling-limit");
+
+        for index in 0..V3_SIBLING_READ_LIMIT {
+            scratch.put(&scratch.retired(LOCAL, &token(index)), b"r");
+        }
+
+        let layout = layout_of(observe(&scratch));
+        assert_eq!(layout.siblings().len(), V3_SIBLING_READ_LIMIT);
+
+        scratch.put(&scratch.staging(LOCAL, &token(99)), b"s");
+        assert_eq!(
+            uncertainty_of(observe(&scratch)),
+            LayoutUncertainty::SiblingLimit
+        );
+    }
+
+    // ---- aliases ---------------------------------------------------------------------
+
+    #[test]
+    fn an_upper_case_primary_name_is_the_same_primary() {
+        let scratch = Scratch::new("v3-case");
+        let upper = scratch
+            .state_dir()
+            .join(format!("{}.JSON", key().to_ascii_uppercase()));
+
+        scratch.put(&upper, PRIMARY_BYTES);
+
+        let layout = layout_of(observe(&scratch));
+
+        assert_eq!(
+            *layout.primary(),
+            LayoutPrimary::Bytes(PRIMARY_BYTES.to_vec())
+        );
+        assert_eq!(layout.unrecognized(), 0);
+    }
+
+    #[test]
+    fn two_entries_that_fold_to_one_name_are_ambiguous() {
+        let key = key();
+
+        // The decision itself, on synthetic listings.
+        let primary = |name: String| (NameTag::Primary, OsString::from(name));
+        let staging = |name: String| (NameTag::Sibling(SiblingKind::Staging), OsString::from(name));
+
+        assert_eq!(
+            reject_v3_aliases(&[
+                primary(format!("{key}.json")),
+                primary(format!("{key}.JSON")),
+            ]),
+            Err(LayoutUncertainty::AliasAmbiguity)
+        );
+        assert_eq!(
+            reject_v3_aliases(&[
+                staging(format!("{key}.{TOKEN}.tmp")),
+                staging(format!("{key}.{}.TMP", TOKEN.to_ascii_uppercase())),
+            ]),
+            Err(LayoutUncertainty::AliasAmbiguity)
+        );
+        assert_eq!(
+            reject_v3_aliases(&[
+                primary(format!("{key}.json")),
+                staging(format!("{key}.{TOKEN}.tmp")),
+                (NameTag::Unrecognized, OsString::from(format!("{key}.json"))),
+            ]),
+            Ok(())
+        );
+
+        // The physical case: a case-sensitive directory can hold both spellings.
+        let scratch = Scratch::new("v3-alias");
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+
+        let enabled = std::process::Command::new("fsutil.exe")
+            .args(["file", "setCaseSensitiveInfo"])
+            .arg(scratch.state_dir())
+            .arg("enable")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+
+        if !enabled {
+            eprintln!("SKIPPED physical case alias: per-directory case sensitivity is unavailable");
+            return;
+        }
+
+        fs::write(scratch.state_dir().join(format!("{key}.json")), b"lower").unwrap();
+        fs::write(scratch.state_dir().join(format!("{key}.JSON")), b"upper").unwrap();
+
+        if names(&scratch.state_dir()).len() != 2 {
+            eprintln!("SKIPPED physical case alias: the directory stayed case-insensitive");
+            return;
+        }
+
+        assert_eq!(
+            uncertainty_of(observe(&scratch)),
+            LayoutUncertainty::AliasAmbiguity
+        );
+    }
+
+    // ---- non-Unicode names ----------------------------------------------------------------
+
+    #[test]
+    fn a_non_unicode_key_prefixed_name_is_counted_and_an_unrelated_one_is_not() {
+        let scratch = Scratch::new("v3-non-unicode");
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+
+        // A lone surrogate is a legal NTFS name unit and is not valid Unicode.
+        let mut prefixed: Vec<u16> = format!("{}.json", key()).encode_utf16().collect();
+        prefixed.push(0xD800);
+        let prefixed = OsString::from_wide(&prefixed);
+
+        let mut unrelated: Vec<u16> = "unrelated".encode_utf16().collect();
+        unrelated.push(0xD800);
+        let unrelated = OsString::from_wide(&unrelated);
+
+        if fs::write(scratch.state_dir().join(&prefixed), b"x").is_err() {
+            eprintln!("SKIPPED non-Unicode name: the filesystem refused a lone surrogate");
+            return;
+        }
+        fs::write(scratch.state_dir().join(&unrelated), b"x").unwrap();
+
+        assert!(prefixed.to_str().is_none());
+
+        let layout = layout_of(observe(&scratch));
+
+        assert_eq!(*layout.primary(), LayoutPrimary::Absent);
+        assert!(layout.siblings().is_empty());
+        assert_eq!(layout.unrecognized(), 1);
+    }
+
+    // ---- unsafe directories and ancestors ------------------------------------------------
+
+    #[test]
+    fn an_unsafe_state_directory_or_ancestor_is_uncertain_never_absence() {
+        // The state directory itself is a junction.
+        let scratch = Scratch::new("v3-dir-junction");
+        let moved = scratch.root().join("moved");
+
+        fs::create_dir_all(&moved).unwrap();
+        fs::write(
+            moved.join(scratch.record(LOCAL).file_name().unwrap()),
+            PRIMARY_BYTES,
+        )
+        .unwrap();
+        make_junction(&scratch.state_dir(), &moved);
+
+        assert_eq!(
+            uncertainty_of(observe(&scratch)),
+            LayoutUncertainty::UnexpectedObject
+        );
+
+        // An ancestor of the root is a junction.
+        let real = scratch.root().join("real");
+        let link = scratch.root().join("link");
+        fs::create_dir_all(real.join("app-local").join(SYNC_STATE_DIRECTORY)).unwrap();
+        make_junction(&link, &real);
+
+        let through = SyncStateStore::new(&link.join("app-local")).unwrap();
+        assert_eq!(
+            uncertainty_of(through.inspect_v3_layout(&loc(LOCAL))),
+            LayoutUncertainty::UnexpectedObject
+        );
+    }
+
+    #[test]
+    fn a_regular_file_in_place_of_the_state_directory_or_an_ancestor_is_uncertain() {
+        let scratch = Scratch::new("v3-dir-file");
+
+        fs::write(scratch.state_dir(), b"a file").unwrap();
+        assert_eq!(
+            uncertainty_of(observe(&scratch)),
+            LayoutUncertainty::UnexpectedObject
+        );
+
+        let blocked = scratch.root().join("blocked");
+        fs::write(&blocked, b"a file").unwrap();
+
+        let below = SyncStateStore::new(&blocked.join("app-local")).unwrap();
+        let result = below.inspect_v3_layout(&loc(LOCAL));
+
+        assert!(
+            matches!(
+                result,
+                V3LayoutInspection::Uncertain(
+                    LayoutUncertainty::UnexpectedObject | LayoutUncertainty::Io(_)
+                )
+            ),
+            "{result:?}"
+        );
+    }
+
+    // ---- the two observations: deterministic pieces -------------------------------------
+
+    #[test]
+    fn a_listed_primary_that_is_gone_or_an_unlisted_one_that_is_there_disagree() {
+        let scratch = Scratch::new("v3-pieces");
+        let store = scratch.store();
+        let key = key();
+        let listed = vec![(NameTag::Primary, OsString::from(format!("{key}.json")))];
+        let unlisted = ObservedNames::new();
+
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+
+        // Listed, then gone.
+        assert_eq!(
+            store.read_v3_primary(&key, &listed),
+            Err(LayoutUncertainty::ChangedDuringScan)
+        );
+        // Not listed, but there.
+        scratch.put(&scratch.record(LOCAL), PRIMARY_BYTES);
+        assert_eq!(
+            store.read_v3_primary(&key, &unlisted),
+            Err(LayoutUncertainty::ChangedDuringScan)
+        );
+        // Listed and there: agreement.
+        assert_eq!(
+            store.read_v3_primary(&key, &listed),
+            Ok(LayoutPrimary::Bytes(PRIMARY_BYTES.to_vec()))
+        );
+        // Unlisted and not there: agreement.
+        fs::remove_file(scratch.record(LOCAL)).unwrap();
+        assert_eq!(
+            store.read_v3_primary(&key, &unlisted),
+            Ok(LayoutPrimary::Absent)
+        );
+    }
+
+    #[test]
+    fn a_sibling_that_disappears_between_listing_and_reading_is_vanished() {
+        let scratch = Scratch::new("v3-vanished");
+        let store = scratch.store();
+        let name = OsString::from(format!("{}.{TOKEN}.tmp", key()));
+
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+
+        assert!(matches!(
+            store.read_v3_sibling(&name),
+            SiblingContent::Vanished
+        ));
+    }
+
+    #[test]
+    fn two_enumerations_of_a_changed_directory_differ() {
+        let scratch = Scratch::new("v3-enumeration");
+        let store = scratch.store();
+        let key = key();
+
+        scratch.put(&scratch.record(LOCAL), PRIMARY_BYTES);
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"s");
+
+        let first = store.enumerate_v3_names(&key).unwrap();
+        assert_eq!(first, store.enumerate_v3_names(&key).unwrap());
+
+        // A sibling added, one removed, one swapped for another name, and a
+        // suspicious entry added each change the observation.
+        scratch.put(&scratch.retired(LOCAL, RETIRED_TOKEN), b"r");
+        let added = store.enumerate_v3_names(&key).unwrap();
+        assert_ne!(first, added);
+
+        fs::remove_file(scratch.retired(LOCAL, RETIRED_TOKEN)).unwrap();
+        scratch.put(&scratch.state_dir().join(format!("{key}.json.bak")), b"x");
+        let suspicious = store.enumerate_v3_names(&key).unwrap();
+        assert_ne!(first, suspicious);
+        assert_ne!(added, suspicious);
+
+        fs::remove_file(scratch.state_dir().join(format!("{key}.json.bak"))).unwrap();
+        fs::remove_file(scratch.staging(LOCAL, TOKEN)).unwrap();
+        scratch.put(&scratch.staging(LOCAL, &token(1)), b"s");
+        assert_ne!(first, store.enumerate_v3_names(&key).unwrap());
+    }
+
+    // ---- the race, stress style -----------------------------------------------------------
+
+    #[test]
+    fn a_sibling_created_and_removed_concurrently_is_never_misreported() {
+        // A helper thread churns one sibling while the assessment runs repeatedly.
+        // The tree changes on purpose, so this proves no whole-tree equality; it
+        // asserts only that every outcome is a safe one. The distribution of
+        // outcomes depends on scheduling and is deliberately not asserted.
+        let scratch = Scratch::new("v3-race");
+        let store = scratch.store();
+        let churned = scratch.staging(LOCAL, TOKEN);
+        let stop = Arc::new(AtomicBool::new(false));
+        let cycles = Arc::new(AtomicUsize::new(0));
+
+        scratch.put(&scratch.record(LOCAL), PRIMARY_BYTES);
+
+        let worker = {
+            let (stop, cycles, churned) = (stop.clone(), cycles.clone(), churned.clone());
+
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = fs::write(&churned, b"churned");
+                    let _ = fs::remove_file(&churned);
+                    cycles.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+
+        for _ in 0..300 {
+            match store.inspect_v3_layout(&loc(LOCAL)) {
+                V3LayoutInspection::Observed(layout) => {
+                    // The primary never changed and nothing else could appear.
+                    assert_eq!(
+                        *layout.primary(),
+                        LayoutPrimary::Bytes(PRIMARY_BYTES.to_vec())
+                    );
+                    assert!(layout.siblings().len() <= 1);
+                    assert_eq!(layout.unrecognized(), 0);
+                }
+                V3LayoutInspection::Uncertain(
+                    LayoutUncertainty::ChangedDuringScan | LayoutUncertainty::Io(_),
+                ) => {}
+                V3LayoutInspection::Uncertain(other) => {
+                    panic!("an unrelated uncertainty under a sibling race: {other:?}")
+                }
+            }
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+
+        assert!(cycles.load(Ordering::SeqCst) > 0, "the race never ran");
+
+        // Once the churn stops, the observation is complete and stable again.
+        let _ = fs::remove_file(&churned);
+        let layout = layout_of(observe(&scratch));
+        assert!(layout.siblings().is_empty());
+    }
+
+    #[test]
+    fn a_primary_replaced_concurrently_is_never_reported_as_stable_garbage() {
+        // The primary alternates between two valid contents. An observation either
+        // returns exactly one of them or is uncertain.
+        let scratch = Scratch::new("v3-race-primary");
+        let store = scratch.store();
+        let record = scratch.record(LOCAL);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        scratch.put(&record, b"AAAAAAAAAAAAAAAAAAAA");
+
+        let worker = {
+            let stop = stop.clone();
+            let record = record.clone();
+            let scratch_root = scratch.root();
+
+            std::thread::spawn(move || {
+                let mut flip = false;
+
+                while !stop.load(Ordering::SeqCst) {
+                    flip = !flip;
+
+                    // Whole-file replacement through a sibling of the root, as a
+                    // foreign writer would, so a reader sees one content or the other.
+                    let staged = scratch_root.join("swap.bin");
+                    let content: &[u8] = if flip {
+                        b"BBBBBBBBBBBBBBBBBBBB"
+                    } else {
+                        b"AAAAAAAAAAAAAAAAAAAA"
+                    };
+
+                    if fs::write(&staged, content).is_ok() {
+                        let _ = fs::rename(&staged, &record);
+                    }
+                }
+            })
+        };
+
+        for _ in 0..300 {
+            match store.inspect_v3_layout(&loc(LOCAL)) {
+                V3LayoutInspection::Observed(layout) => match layout.primary() {
+                    LayoutPrimary::Bytes(bytes) => assert!(
+                        bytes == b"AAAAAAAAAAAAAAAAAAAA" || bytes == b"BBBBBBBBBBBBBBBBBBBB",
+                        "a torn primary was reported as observed"
+                    ),
+                    // A momentary absence while a foreign writer swaps the name is
+                    // a faithful observation; garbage is what must never appear.
+                    LayoutPrimary::Absent => {}
+                    other => panic!("an unexpected primary under a replacement race: {other:?}"),
+                },
+                V3LayoutInspection::Uncertain(
+                    LayoutUncertainty::ChangedDuringScan | LayoutUncertainty::Io(_),
+                ) => {}
+                V3LayoutInspection::Uncertain(other) => {
+                    panic!("an unrelated uncertainty under a replacement race: {other:?}")
+                }
+            }
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+    }
+
+    // ---- redaction and isolation --------------------------------------------------------------
+
+    #[test]
+    fn debug_output_reveals_no_bytes_path_name_token_key_or_length() {
+        let scratch = Scratch::new("v3-debug");
+
+        scratch.put(&scratch.record(LOCAL), PRIMARY_BYTES);
+        scratch.put(&scratch.staging(LOCAL, TOKEN), SIBLING_BYTES);
+        scratch.put(&scratch.retired(LOCAL, RETIRED_TOKEN), SIBLING_BYTES);
+        scratch.put(
+            &scratch.state_dir().join(format!("{}.json.bak", key())),
+            b"x",
+        );
+
+        let inspection = observe(&scratch);
+        let V3LayoutInspection::Observed(layout) = &inspection else {
+            panic!("expected an observed layout");
+        };
+
+        let mut rendered = vec![
+            format!("{inspection:?}"),
+            format!("{layout:?}"),
+            format!("{:?}", layout.primary()),
+            format!("{:?}", layout.siblings()),
+            format!("{:?}", layout.siblings()[0]),
+            format!("{:?}", layout.siblings()[0].content()),
+            format!("{:?}", layout.siblings()[0].kind()),
+            format!("{:?}", LayoutPrimary::Bytes(PRIMARY_BYTES.to_vec())),
+            format!("{:?}", SiblingContent::Bytes(SIBLING_BYTES.to_vec())),
+            format!(
+                "{:?}",
+                SiblingContent::Unreadable(io::ErrorKind::PermissionDenied)
+            ),
+        ];
+
+        for primary in [
+            LayoutPrimary::Absent,
+            LayoutPrimary::Empty,
+            LayoutPrimary::TooLarge,
+            LayoutPrimary::Unexpected,
+        ] {
+            rendered.push(format!("{primary:?}"));
+        }
+        for content in [
+            SiblingContent::Empty,
+            SiblingContent::TooLarge,
+            SiblingContent::Unexpected,
+            SiblingContent::Vanished,
+        ] {
+            rendered.push(format!("{content:?}"));
+        }
+        for reason in [
+            LayoutUncertainty::Io(io::ErrorKind::PermissionDenied),
+            LayoutUncertainty::UnexpectedObject,
+            LayoutUncertainty::EntryLimit,
+            LayoutUncertainty::SiblingLimit,
+            LayoutUncertainty::AliasAmbiguity,
+            LayoutUncertainty::ChangedDuringScan,
+        ] {
+            rendered.push(format!("{:?}", V3LayoutInspection::Uncertain(reason)));
+            rendered.push(format!("{reason:?}"));
+        }
+
+        assert_eq!(rendered[0], "Observed(<redacted>)");
+        assert_eq!(rendered[1], "V3Layout(<redacted>)");
+        assert_eq!(rendered[2], "Bytes(<redacted>)");
+        assert_eq!(rendered[4], "LayoutSibling(<redacted>)");
+
+        let forbidden = [
+            "SECRET".to_owned(),
+            "MARKER".to_owned(),
+            key(),
+            TOKEN.to_owned(),
+            RETIRED_TOKEN.to_owned(),
+            scratch.dir.path().to_string_lossy().into_owned(),
+            ".qa-local".to_owned(),
+            ".lvault".to_owned(),
+            ".json".to_owned(),
+            ".tmp".to_owned(),
+            ".retired".to_owned(),
+            // The lengths of the byte fixtures.
+            PRIMARY_BYTES.len().to_string(),
+            SIBLING_BYTES.len().to_string(),
+        ];
+
+        for text in &rendered {
+            for mark in &forbidden {
+                assert!(!text.contains(mark.as_str()), "{mark} leaked in {text}");
+            }
+        }
+    }
+
+    /// The text of the read-only region of the production half of this file.
+    fn region() -> &'static str {
+        let source = include_str!("sync_state_store.rs");
+        let start = source
+            .find("\n// ---- v3 layout assessment (read-only)")
+            .expect("the begin marker");
+        let end = start
+            + source[start..]
+                .find("\n// ---- end v3 layout assessment")
+                .expect("the end marker");
+
+        &source[start..end]
+    }
+
+    #[test]
+    fn the_read_only_region_contains_no_mutating_or_legacy_call() {
+        let region = region();
+
+        assert!(region.contains("fn inspect_v3_layout"));
+        assert!(region.contains("fn recognize_v3_sibling_name"));
+        assert!(!region.contains("#[cfg("));
+
+        for forbidden in [
+            "remove_file",
+            "remove_dir",
+            ".remove(",
+            "rename",
+            "hard_link",
+            "create_new",
+            "write_all",
+            "sync_all",
+            "OpenOptions",
+            "fs::write",
+            "fs::copy",
+            "set_len",
+            "truncate",
+            "unsafe",
+            "allow(",
+            "getrandom",
+            "new_v4",
+            "File::create",
+            "scan_artifacts",
+            "is_artifact_name",
+            "ARTIFACT_EXTENSION",
+            "MAX_SCANNED_ENTRIES",
+            "plan_delete",
+            "execute_delete",
+            "write_temp",
+            "create_temp",
+            "ensure_directory",
+            "self.hook",
+            "Point::",
+            "evidence(",
+            "delete_if_evidence_matches",
+            ".create(",
+            ".replace(",
+            ".delete(",
+            "thread",
+            "Command",
+        ] {
+            assert!(!region.contains(forbidden), "{forbidden:?} in the region");
+        }
+
+        // The only file it opens is through the existing bounded no-follow reader.
+        assert!(region.contains("self.read_primary("));
+        assert!(!region.contains("open_no_follow"));
+    }
+
+    #[test]
+    fn the_legacy_artifact_machinery_still_names_only_tmp() {
+        let source = include_str!("sync_state_store.rs");
+
+        // Everything before the v3 region is the legacy production code (and its
+        // documentation); the test modules, which quote these strings, come after.
+        let legacy = &source[..source
+            .find("\n// ---- v3 layout assessment (read-only)")
+            .unwrap()];
+
+        assert!(legacy.contains("const ARTIFACT_EXTENSION: &str = \"tmp\";"));
+        assert_eq!(
+            legacy
+                .matches("fn is_artifact_name(name: &str, key: &str) -> bool")
+                .count(),
+            1
+        );
+        // The legacy items do not mention the new kind in their production bodies.
+        assert!(!legacy.contains(".retired\""));
+        assert!(!legacy.contains("Retired"));
+    }
+
+    #[test]
+    fn the_scratch_base_is_under_the_repository_and_never_the_temp_directory() {
+        let scratch = Scratch::new("v3-base");
+
+        assert!(!scratch.dir.path().starts_with(std::env::temp_dir()));
+        assert!(scratch
+            .root()
+            .components()
+            .any(|part| part.as_os_str() == "sync-state-b3c3b1-tests"));
     }
 }
