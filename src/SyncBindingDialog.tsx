@@ -433,6 +433,12 @@ const problemTexts: Record<
   unreadable:
     "Локальную запись о связи не удалось прочитать.",
 
+  unresolvedFiles:
+    "Рядом с записью о связи есть служебные файлы, которые эта версия LocalVault не может безопасно обработать. Привязка и сброс заблокированы. Файлы не удаляются автоматически, само хранилище не затронуто.",
+
+  unrecognizedFiles:
+    "В папке служебных данных LocalVault есть неизвестные файлы, относящиеся к этому хранилищу. Привязка и сброс заблокированы. Файлы не удаляются автоматически, само хранилище не затронуто.",
+
   mismatch:
     "Локальная запись о связи не соответствует этому хранилищу или расположению его файла, поэтому ей нельзя доверять.",
 
@@ -518,7 +524,9 @@ function pendingPushText(
   }
 }
 
-/* The reset is offered only where Rust can plausibly accept it. */
+/* The reset is offered only where Rust can plausibly accept it. A record of
+   an unsupported version and files of a newer or unrecognized state are
+   refused by Rust and are never offered. */
 function resetOffered(
   status: SyncBindingStatus,
 ): boolean {
@@ -528,7 +536,13 @@ function resetOffered(
 
     case "needsAttention":
       return (
-        status.state.problem !== "unavailable"
+        status.state.problem !== "unavailable" &&
+        status.state.problem !==
+          "unsupportedVersion" &&
+        status.state.problem !==
+          "unresolvedFiles" &&
+        status.state.problem !==
+          "unrecognizedFiles"
       );
 
     default:

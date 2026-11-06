@@ -1988,8 +1988,7 @@ impl UnlockedVaultSession {
     ///
     /// * a verified binding (with or without a pending push);
     /// * a readable record for another vault or location;
-    /// * a corrupt record (any decodable-or-not bytes, empty included) or one of
-    ///   an unsupported version;
+    /// * a corrupt record (any decodable-or-not bytes, empty included);
     /// * recovery artifacts of an interrupted write with no record.
     ///
     /// Refused, and **intentionally not resettable**: no state at all
@@ -1999,6 +1998,18 @@ impl UnlockedVaultSession {
     /// entries); and anything whose evidence cannot be captured (an inaccessible
     /// or oversized record or artifact). Their contents are unknown, so no
     /// confirmation could be shown to be about them.
+    ///
+    /// Since B3c-3b-2a also refused (as `UnreadableState(UnresolvedNewerState)`, or
+    /// the store's own category for an uncertain or unrecognized layout): a record
+    /// of an **unsupported version** (it may belong to a newer state, so every
+    /// non-v1 primary is refused, because this build cannot tell versions 2 and 3
+    /// apart), and any layout in which the store's compatibility gate finds
+    /// newer-state evidence beside the record (a retained or reserved-staging
+    /// sibling, a complete newer-version staging record, unrecognized entries for
+    /// this key) or cannot finish its observation. Nothing is removed in those
+    /// cases and no file is touched; manual inspection may be needed, with no
+    /// in-app guidance yet. The gate is check-then-use; see the store's module
+    /// documentation for the known races that remain.
     ///
     /// The state is read, bound by evidence, read again and bound again; the two
     /// must agree, or the preparation is refused as changed.
@@ -2223,6 +2234,15 @@ impl UnlockedVaultSession {
 
         let first = store.load(&local_locator);
         let class = self.classify_for_reset(first.clone(), &local_locator)?;
+
+        // A record of a version this build does not support may belong to a newer
+        // state; it is not something this build may remove. (The store's deletion
+        // planning refuses it too; this refuses it earlier, with the same category.)
+        if class.subject == BindingResetSubject::UnsupportedRecord {
+            return Err(Refusal::UnreadableState(
+                UnreadableReason::UnresolvedNewerState,
+            ));
+        }
 
         let before = store.evidence(&local_locator).map_err(Refusal::Evidence)?;
         let second = store.load(&local_locator);
@@ -2560,6 +2580,10 @@ pub(crate) fn replace_error_may_follow_publication(error: StoreError) -> bool {
         | StoreError::BindingIdentityChanged
         | StoreError::TrustedHistoryRegression
         | StoreError::Encode(_)
+        // The compatibility gate refuses before anything is staged or renamed.
+        | StoreError::UnresolvedNewerState
+        | StoreError::LayoutUncertain
+        | StoreError::UnrecognizedEntries
         | StoreError::RootNotAbsolute => false,
 
         StoreError::Io {
@@ -2604,7 +2628,11 @@ pub(crate) fn create_error_may_follow_publication(error: StoreError) -> bool {
         | StoreError::UnresolvedArtifacts
         | StoreError::UnexpectedObject
         | StoreError::NoClobberUnsupported
-        | StoreError::Encode(_) => false,
+        | StoreError::Encode(_)
+        // The compatibility gate refuses before anything is staged or linked.
+        | StoreError::UnresolvedNewerState
+        | StoreError::LayoutUncertain
+        | StoreError::UnrecognizedEntries => false,
 
         StoreError::Io {
             stage: IoStage::Replace,
@@ -7743,6 +7771,494 @@ mod tests {
                 serde_json::to_vec(&value).unwrap()
             }
 
+            // Stage 1U-4 B3c-3b-2a: the refuse-only compatibility gate, seen through
+            // the session. Real sessions, real files under the git-ignored
+            // `.qa-local/`. Whatever sits beside the record, the vault, its backup and
+            // the target are never written, and nothing is removed or adopted.
+            mod newer_state {
+                use super::*;
+                use crate::vault::session::CopyCreationRefusal;
+
+                type Case = (&'static str, Box<dyn Fn(&Bx)>, UnreadableReason);
+
+                const NEWER: UnreadableReason = UnreadableReason::UnresolvedNewerState;
+                const STRANGE: UnreadableReason = UnreadableReason::UnrecognizedEntries;
+
+                fn retired_path(bx: &Bx) -> PathBuf {
+                    bx.state_dir()
+                        .join(format!("{}.{OTHER_TOKEN}.retired", key(bx)))
+                }
+
+                fn reserved_path(bx: &Bx) -> PathBuf {
+                    bx.state_dir()
+                        .join(format!("{}.{OTHER_TOKEN}.v3stage", key(bx)))
+                }
+
+                fn stray_path(bx: &Bx) -> PathBuf {
+                    bx.state_dir().join(format!("{}.notes.txt", key(bx)))
+                }
+
+                /// The version-1 wrapper with another version number.
+                fn with_version(state: &SyncState, version: u64) -> Vec<u8> {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&state.encode().unwrap()).unwrap();
+
+                    value["version"] = serde_json::json!(version);
+
+                    serde_json::to_vec(&value).unwrap()
+                }
+
+                /// Write `bytes` at `dest` from a REAL separate process (`cmd.exe`).
+                fn child_puts(root: &Path, dest: &Path, bytes: &[u8]) {
+                    let source = root.join("child-source.bin");
+
+                    fs::write(&source, bytes).unwrap();
+
+                    let output = std::process::Command::new("cmd")
+                        .arg("/C")
+                        .arg("copy")
+                        .arg("/Y")
+                        .arg(&source)
+                        .arg(dest)
+                        .output()
+                        .unwrap();
+
+                    fs::remove_file(&source).unwrap();
+
+                    assert!(output.status.success(), "the child process could not write");
+                }
+
+                fn cases() -> Vec<Case> {
+                    vec![
+                        (
+                            "retired only",
+                            Box::new(|bx| put(bx, &retired_path(bx), b"r")),
+                            NEWER,
+                        ),
+                        (
+                            "retired and a temp",
+                            Box::new(|bx| {
+                                put(bx, &retired_path(bx), b"r");
+                                put(bx, &artifact_path(bx, STALE_TOKEN), b"debris");
+                            }),
+                            NEWER,
+                        ),
+                        (
+                            "retired beside a verified binding",
+                            Box::new(|bx| {
+                                bx.publish(&bx.based());
+                                put(bx, &retired_path(bx), b"r");
+                            }),
+                            NEWER,
+                        ),
+                        (
+                            "reserved staging name, empty",
+                            Box::new(|bx| put(bx, &reserved_path(bx), b"")),
+                            NEWER,
+                        ),
+                        (
+                            "reserved staging name beside a verified binding",
+                            Box::new(|bx| {
+                                bx.publish(&bx.based());
+                                put(bx, &reserved_path(bx), b"x");
+                            }),
+                            NEWER,
+                        ),
+                        (
+                            "a complete newer record in a legacy temp",
+                            Box::new(|bx| {
+                                put(
+                                    bx,
+                                    &artifact_path(bx, STALE_TOKEN),
+                                    &with_version(&bx.based(), 3),
+                                )
+                            }),
+                            NEWER,
+                        ),
+                        (
+                            "an unrecognized entry",
+                            Box::new(|bx| put(bx, &stray_path(bx), b"x")),
+                            STRANGE,
+                        ),
+                        (
+                            "an unrecognized entry beside a verified binding",
+                            Box::new(|bx| {
+                                bx.publish(&bx.based());
+                                put(bx, &stray_path(bx), b"x");
+                            }),
+                            STRANGE,
+                        ),
+                    ]
+                }
+
+                #[test]
+                fn status_and_load_need_attention_and_are_never_absence_or_a_link() {
+                    for (name, setup, expected) in cases() {
+                        let bx = Bx::new(&format!("gate-status-{}", name.len()));
+
+                        setup(&bx);
+
+                        let outside = untouchable(&bx);
+                        let state = state_snapshot(&bx);
+
+                        assert_eq!(
+                            bx.session.load_sync_state(&bx.root),
+                            SessionSyncState::Unreadable(expected),
+                            "{name}"
+                        );
+
+                        let status = bx.session.binding_status(&bx.root);
+
+                        assert_eq!(
+                            status.state(),
+                            &BindingState::NeedsAttention(BindingAttention::Unreadable(expected)),
+                            "{name}"
+                        );
+                        assert_eq!(status.target_path(), None, "{name}");
+                        assert_eq!(
+                            status.pending_push(),
+                            PendingPushIndication::Unavailable,
+                            "{name}"
+                        );
+
+                        assert_eq!(untouchable(&bx), outside, "{name}");
+                        assert_eq!(state_snapshot(&bx), state, "{name}");
+                    }
+                }
+
+                #[test]
+                fn a_new_binding_is_refused_before_the_target_is_read() {
+                    for (name, setup, expected) in cases() {
+                        let bx = Bx::new(&format!("gate-bind-{}", name.len()));
+
+                        setup(&bx);
+
+                        bx.assert_refused_unread(Refusal::Unreadable(expected));
+                    }
+
+                    // The preparation step too.
+                    for (name, setup, expected) in cases() {
+                        let mut bx = Bx::new(&format!("gate-prepare-{}", name.len()));
+
+                        setup(&bx);
+
+                        let state = state_snapshot(&bx);
+
+                        assert_eq!(
+                            bx.session
+                                .prepare_initial_binding(&bx.root, &bx.target)
+                                .map(|_| ()),
+                            Err(Refusal::Unreadable(expected)),
+                            "{name}"
+                        );
+                        assert_eq!(state_snapshot(&bx), state, "{name}");
+                        assert!(
+                            bx.session.pending_initial_binding.is_none(),
+                            "{name}: nothing may be pending"
+                        );
+                    }
+                }
+
+                #[test]
+                fn a_confirmation_over_newer_state_creates_nothing() {
+                    let mut bx = Bx::new("gate-confirm-bind");
+                    let prepared = bx
+                        .session
+                        .prepare_initial_binding(&bx.root, &bx.target)
+                        .expect("a clean directory prepares");
+                    let id = prepared.preparation_id().to_owned();
+
+                    // Newer-state evidence appears between the two steps.
+                    put(&bx, &retired_path(&bx), b"r");
+
+                    let state = state_snapshot(&bx);
+                    let outside = untouchable(&bx);
+
+                    assert_eq!(
+                        bx.session.confirm_initial_binding(&bx.root, &id),
+                        Err(InitialBindingConfirmRefusal::Binding(Refusal::Unreadable(
+                            NEWER
+                        )))
+                    );
+                    assert_eq!(state_snapshot(&bx), state);
+                    assert_eq!(untouchable(&bx), outside);
+                    assert!(bx.record().is_none());
+                }
+
+                #[test]
+                fn copy_creation_is_refused_and_nothing_is_written() {
+                    for (name, setup, _) in cases() {
+                        let mut bx = Bx::bare(&format!("gate-copy-{}", name.len()));
+
+                        setup(&bx);
+
+                        let outside = untouchable(&bx);
+                        let state = state_snapshot(&bx);
+
+                        assert_eq!(
+                            bx.session
+                                .prepare_copy_creation(&bx.root, &bx.target)
+                                .map(|_| ()),
+                            Err(CopyCreationRefusal::BindingStateUnreadable),
+                            "{name}"
+                        );
+                        assert_eq!(untouchable(&bx), outside, "{name}");
+                        assert_eq!(state_snapshot(&bx), state, "{name}");
+                        assert!(!bx.remote.exists(), "{name}: the copy must not exist");
+                    }
+                }
+
+                #[test]
+                fn reset_preparation_is_refused_and_leaves_everything() {
+                    for (name, setup, expected) in cases() {
+                        let mut bx = Bx::new(&format!("gate-reset-{}", name.len()));
+
+                        setup(&bx);
+
+                        let outside = untouchable(&bx);
+                        let state = state_snapshot(&bx);
+
+                        assert_eq!(
+                            prepare(&mut bx).map(|_| ()),
+                            Err(Reset::UnreadableState(expected)),
+                            "{name}"
+                        );
+                        assert_eq!(untouchable(&bx), outside, "{name}");
+                        assert_eq!(state_snapshot(&bx), state, "{name}");
+                        assert_nothing_pending(&mut bx);
+                    }
+                }
+
+                #[test]
+                fn a_reset_confirmation_is_refused_when_evidence_appeared_after_preparation() {
+                    let mut bx = Bx::new("gate-reset-confirm");
+
+                    bx.publish(&bx.based());
+
+                    let id = prepared(&mut bx);
+
+                    put(&bx, &retired_path(&bx), b"r");
+
+                    let outside = untouchable(&bx);
+                    let state = state_snapshot(&bx);
+
+                    assert_eq!(
+                        confirm(&mut bx, &id),
+                        Err(refused(Reset::UnreadableState(NEWER)))
+                    );
+                    assert_eq!(untouchable(&bx), outside);
+                    assert_eq!(state_snapshot(&bx), state);
+                    assert!(record_path(&bx).exists());
+                    assert!(retired_path(&bx).exists());
+                }
+
+                #[test]
+                fn an_unsupported_record_is_no_longer_resettable() {
+                    // Used to be a resettable kind (`UnsupportedRecord`, the old case
+                    // "b1i-kind-unsupported"). Status is unchanged; the reset is not.
+                    for version in [2u64, 3, 99] {
+                        let mut bx = Bx::new("gate-unsupported");
+
+                        put(&bx, &record_path(&bx), &with_version(&bx.based(), version));
+
+                        let outside = untouchable(&bx);
+                        let state = state_snapshot(&bx);
+
+                        assert_eq!(
+                            bx.session.binding_status(&bx.root).state(),
+                            &BindingState::NeedsAttention(BindingAttention::UnsupportedVersion),
+                            "version {version}"
+                        );
+                        assert_eq!(
+                            prepare(&mut bx).map(|_| ()),
+                            Err(Reset::UnreadableState(NEWER)),
+                            "version {version}"
+                        );
+                        assert_eq!(untouchable(&bx), outside, "version {version}");
+                        assert_eq!(state_snapshot(&bx), state, "version {version}");
+                        assert_nothing_pending(&mut bx);
+                    }
+                }
+
+                #[test]
+                fn remote_observation_is_refused_and_does_not_read_the_target() {
+                    let bx = Bx::new("gate-observe");
+
+                    bx.publish(&bx.based());
+                    put(&bx, &retired_path(&bx), b"r");
+
+                    let state = state_snapshot(&bx);
+                    let outside = untouchable(&bx);
+
+                    assert_eq!(
+                        bx.session
+                            .record_remote_observation(
+                                &bx.root,
+                                bx.target.locator(),
+                                &bx.resealed(|_| {})
+                            )
+                            .map(|_| ()),
+                        Err(RemoteObservationRefusal::Unreadable(NEWER))
+                    );
+
+                    let reads = Cell::new(0usize);
+                    let result =
+                        bx.session
+                            .observe_remote_target_with(&bx.root, &bx.target, |target| {
+                                reads.set(reads.get() + 1);
+
+                                target.read()
+                            });
+
+                    assert_eq!(
+                        result.map(|_| ()),
+                        Err(RemoteTargetRefusal::Observation(
+                            RemoteObservationRefusal::Unreadable(NEWER)
+                        ))
+                    );
+                    assert_eq!(reads.get(), 0, "the target was read before the check");
+                    assert_eq!(state_snapshot(&bx), state);
+                    assert_eq!(untouchable(&bx), outside);
+                }
+
+                #[test]
+                fn ordinary_local_use_stays_available_and_nothing_else_is_written() {
+                    let mut bx = Bx::new("gate-local-use");
+
+                    bx.publish(&bx.based());
+                    put(&bx, &retired_path(&bx), b"r");
+
+                    let state = state_snapshot(&bx);
+                    let remote = fs::read(&bx.remote).unwrap();
+
+                    // The vault itself is saved, and its backup is written as usual.
+                    bx.session.data_mut().updated_at_ms = NOW_MS + 7;
+                    assert!(bx.session.save().unwrap());
+                    assert!(bx.session.backup_path().exists());
+
+                    // Neither the sync-state directory nor the target was touched,
+                    // and the status still needs attention.
+                    assert_eq!(state_snapshot(&bx), state);
+                    assert_eq!(fs::read(&bx.remote).unwrap(), remote);
+                    assert!(matches!(
+                        bx.session.binding_status(&bx.root).state(),
+                        BindingState::NeedsAttention(_)
+                    ));
+                }
+
+                // ---- forced races, through the real session ---------------------------
+
+                #[test]
+                fn a_retired_file_inserted_at_publication_is_unverified_not_a_binding() {
+                    // NOT PREVENTED, DETECTED AFTERWARD. The no-clobber link cannot see
+                    // a file that appears at that instant; the fresh load that follows
+                    // refuses, so the outcome is `PersistenceUnverified`, never a
+                    // verified binding.
+                    let bx = Bx::new("gate-race-bind");
+                    let store = bx.store();
+                    let root = bx.dir.path().to_path_buf();
+                    let retired = retired_path(&bx);
+                    let hook_retired = retired.clone();
+
+                    store.run_before_publish_for_test(move || {
+                        child_puts(&root, &hook_retired, b"late")
+                    });
+
+                    assert_eq!(
+                        bx.session.bind_existing_identical_target_in(
+                            &store,
+                            &bx.target,
+                            InitialBindingApproval::for_test(&bx.target),
+                            &mut |target| target.read(),
+                            &mut |buffer| getrandom::fill(buffer).is_ok(),
+                        ),
+                        Err(Refusal::PersistenceUnverified)
+                    );
+                    assert_eq!(fs::read(&retired).unwrap(), b"late");
+                    assert!(matches!(
+                        bx.session.binding_status(&bx.root).state(),
+                        BindingState::NeedsAttention(_)
+                    ));
+                }
+
+                #[test]
+                fn a_retired_file_inserted_before_the_primary_removal_is_ambiguous_never_a_reset() {
+                    // NOT PREVENTED, DETECTED AFTERWARD. The deletion has passed every
+                    // comparison; a child process drops a retired file just before the
+                    // primary goes. The record is removed, the fresh load refuses, and
+                    // the result is `Ambiguous`, never `ResetAndVerified`. The retired
+                    // file is never touched.
+                    let mut bx = Bx::new("gate-race-reset");
+
+                    bx.publish(&bx.based());
+
+                    let id = prepared(&mut bx);
+                    let store = bx.store();
+                    let root = bx.dir.path().to_path_buf();
+                    let retired = retired_path(&bx);
+                    let hook_retired = retired.clone();
+
+                    store.run_before_primary_removal_for_test(move || {
+                        child_puts(&root, &hook_retired, b"late")
+                    });
+
+                    let result = bx.session.confirm_binding_reset_in(
+                        &store,
+                        &id,
+                        &mut |store, locator| store.load(locator),
+                        Instant::now(),
+                    );
+
+                    assert_eq!(
+                        result,
+                        Err(Confirm::Ambiguous(
+                            BindingResetAmbiguity::AbsenceNotConfirmed
+                        ))
+                    );
+                    assert_eq!(fs::read(&retired).unwrap(), b"late");
+                }
+
+                #[test]
+                fn a_primary_replaced_after_the_final_comparison_is_reset_as_if_nothing_happened_known_race_g12(
+                ) {
+                    // KNOWN VULNERABILITY (gate G12, OPEN), characterized on a
+                    // synthetic stand-in ONLY, and not acceptable behaviour: the
+                    // legacy deletion resolves the primary by its current path, with
+                    // no held handle and no identity check. A child process overwrites
+                    // the primary after the last comparison; it is removed as it then
+                    // is, and the session reports a verified reset. This pins the
+                    // present behaviour so a change is noticed; it is not a security
+                    // success and is to be corrected in a separate slice.
+                    let mut bx = Bx::new("gate-race-g12");
+
+                    bx.publish(&bx.based());
+
+                    let id = prepared(&mut bx);
+                    let store = bx.store();
+                    let root = bx.dir.path().to_path_buf();
+                    let record = record_path(&bx);
+                    let hook_record = record.clone();
+
+                    store.run_before_primary_removal_for_test(move || {
+                        child_puts(
+                            &root,
+                            &hook_record,
+                            b"SYNTHETIC-FOREIGN-BYTES-NOT-A-REAL-RECORD",
+                        )
+                    });
+
+                    let result = bx.session.confirm_binding_reset_in(
+                        &store,
+                        &id,
+                        &mut |store, locator| store.load(locator),
+                        Instant::now(),
+                    );
+
+                    assert_eq!(result, Ok(Done::ResetAndVerified));
+                    assert!(!record.exists(), "the foreign bytes are gone");
+                }
+            }
+
             // -- preparation --------------------------------------------------
 
             #[test]
@@ -7833,7 +8349,14 @@ mod tests {
                     false,
                 );
                 bx.store().create(&neighbour).unwrap();
-                let unrelated = bx.state_dir().join(format!("{}.notes.txt", key(&bx)));
+                // (B3c-3b-2a, U2: a file sharing THIS record's key prefix now blocks
+                // the reset, see `newer_state`, and one with the neighbour record's
+                // prefix would block that record; this one carries a third key.)
+                let neighbour_key = EnvelopeFingerprint::of_bytes(
+                    r"\\?\c:\synthetic\vaults\third.lvault".as_bytes(),
+                )
+                .to_hex();
+                let unrelated = bx.state_dir().join(format!("{neighbour_key}.notes.txt"));
                 fs::write(&unrelated, b"unrelated").unwrap();
 
                 let vault_bytes = fs::read(&bx.vault).unwrap();
@@ -7916,13 +8439,8 @@ mod tests {
                         }),
                         BindingResetSubject::CorruptRecord,
                     ),
-                    (
-                        "b1i-kind-unsupported",
-                        Box::new(|bx| {
-                            put(bx, &record_path(bx), &tampered_version(&bx.based()));
-                        }),
-                        BindingResetSubject::UnsupportedRecord,
-                    ),
+                    // (B3c-3b-2a: "b1i-kind-unsupported" is no longer resettable and
+                    // moved to `newer_state::an_unsupported_record_is_no_longer_resettable`.)
                     (
                         "b1i-kind-remnants",
                         Box::new(|bx| {
@@ -8090,10 +8608,14 @@ mod tests {
                 {
                     let _guard = hold_exclusively(&artifact_path(&bx, STALE_TOKEN));
 
-                    assert_eq!(
-                        prepare(&mut bx).map(|_| ()),
-                        Err(Reset::Evidence(EvidenceRefusal::Unreadable))
-                    );
+                    // B3c-3b-2a: the store's compatibility gate cannot read the
+                    // held artifact either, so the refusal now comes from the
+                    // state load (formerly from the evidence capture). Still
+                    // refused, still nothing pending.
+                    assert!(matches!(
+                        prepare(&mut bx),
+                        Err(Reset::UnreadableState(UnreadableReason::Io(_)))
+                    ));
                 }
                 assert_eq!(state_snapshot(&bx), state);
                 assert_nothing_pending(&mut bx);

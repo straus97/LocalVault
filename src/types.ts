@@ -146,6 +146,8 @@ export type SyncBindingProblem =
   | "corrupt"
   | "unsupportedVersion"
   | "unreadable"
+  | "unresolvedFiles"
+  | "unrecognizedFiles"
   | "mismatch"
   | "unavailable";
 

@@ -65,12 +65,16 @@
 //!
 //! The future retired-record artifact and the retire-and-publish protocol are
 //! **not** approved. This module creates no such record, removes none, never
-//! recognizes one as trusted and never adopts one. The store recognizes only its
-//! own `.tmp` staging names, so a retired-record file would be invisible to the
-//! artifact scan: its recognition, its handling beside a missing primary and its
-//! effect on [`ArtifactPresence`] are an explicit prerequisite of B3c-3b and must
-//! be decided there before anything publishes. The existing v1 store's artifact
-//! handling is unchanged.
+//! recognizes one as trusted and never adopts one. The store's artifact scan
+//! recognizes only its own `.tmp` staging names, so a legacy reset never removes a
+//! retired-record file, and nothing here changes that. Since B3c-3b-2a the legacy
+//! store does not ignore such a file either: a refuse-only compatibility gate in
+//! the store (it only observes) makes every legacy operation refuse while a
+//! `.retired` or reserved `.v3stage` sibling of this record exists, and a record
+//! of an unsupported version is no longer resettable. That gate is check-then-use,
+//! grants nothing and recovers nothing. Handling a retired record beside a missing
+//! primary (recovery authority) remains **not approved**, and the name `.v3stage`
+//! is reserved only: no code creates, adopts or removes such a file.
 //!
 //! Every type here is a fixed category: no `Debug` output contains a path,
 //! locator, identifier, fingerprint, MAC or record body.
@@ -80,7 +84,8 @@
 //! [`UnlockedVaultSession::assess_authenticated_sync_state`] is a second, equally
 //! dormant and read-only entry point. Instead of the raw record alone it asks the
 //! store for the whole v3 layout of this vault's record key (the primary, any
-//! `.tmp` and `.retired` siblings, and suspicious key-prefixed entries) and sorts
+//! `.tmp`, `.retired` and reserved `.v3stage` siblings, and suspicious
+//! key-prefixed entries) and sorts
 //! every file it holds with the same classifier as above. Its purpose is narrow: a
 //! missing primary beside any sibling, or an incomplete observation, can never be
 //! mistaken for absence.
@@ -685,7 +690,12 @@ impl UnlockedVaultSession {
             };
 
             match sibling.kind() {
-                SiblingKind::Staging => siblings.staging.push(verdict),
+                // A reserved staging name is reported with the staging files,
+                // classified by its content like any other, never adopted and
+                // never preferred over the primary.
+                SiblingKind::Staging | SiblingKind::ReservedStaging => {
+                    siblings.staging.push(verdict)
+                }
                 SiblingKind::Retired => siblings.retired.push(verdict),
             }
         }
@@ -1766,7 +1776,10 @@ mod tests {
     }
 
     #[test]
-    fn the_existing_reset_still_removes_version_one_and_version_three_records() {
+    fn the_existing_reset_still_removes_version_one_but_no_longer_a_version_three_record() {
+        // B3c-3b-2a: this used to reset a version-3 record as well ("unsupported
+        // record"). The refuse-only compatibility gate no longer lets the legacy
+        // store remove any record of an unsupported version.
         let mut rig = Rig::bound("reset-v1");
 
         let _ = rig.load();
@@ -1786,15 +1799,21 @@ mod tests {
         rig.put_v3(&rig.v1_state());
         let _ = rig.load();
 
-        let preview = rig.session.prepare_binding_reset(&rig.root).unwrap();
-        assert_eq!(preview.subject(), BindingResetSubject::UnsupportedRecord);
+        let bytes = rig.raw();
 
-        let id = preview.preparation_id().to_owned();
-        assert_eq!(
-            rig.session.confirm_binding_reset(&rig.root, &id),
-            Ok(BindingResetOutcome::ResetAndVerified)
-        );
-        assert!(matches!(rig.load(), AuthenticatedStateLoad::NotConfigured));
+        assert!(matches!(
+            rig.session.prepare_binding_reset(&rig.root),
+            Err(crate::vault::session::BindingResetRefusal::UnreadableState(
+                UnreadableReason::UnresolvedNewerState
+            ))
+        ));
+
+        // Nothing was removed, and the explicit authenticated loader still reads it.
+        assert_eq!(rig.raw(), bytes);
+        assert!(matches!(
+            rig.load(),
+            AuthenticatedStateLoad::Authenticated(_)
+        ));
     }
 
     // ---- exhaustive routing ------------------------------------------------------
@@ -2181,9 +2200,7 @@ mod assessment_tests {
     use super::*;
     use crate::vault::{
         handle_ops::test_support::{assert_local_ntfs, make_junction, snapshot},
-        session::{
-            BindingResetOutcome, BindingResetSubject, InitialBindingApproval, InitialBindingOutcome,
-        },
+        session::{InitialBindingApproval, InitialBindingOutcome},
         sync_file_adapter::SyncFileTarget,
         sync_state_store::SYNC_STATE_DIRECTORY,
     };
@@ -3140,42 +3157,107 @@ mod assessment_tests {
     // ---- the existing paths -----------------------------------------------------------
 
     #[test]
-    fn the_existing_reset_never_removes_a_retired_file_and_the_assessment_still_sees_it() {
+    fn the_existing_reset_refuses_beside_a_retired_file_and_the_assessment_still_sees_it() {
+        // B3c-3b-2a: this used to reset the v1 binding and leave the retired file
+        // behind (the v1 "blind spot"). The compatibility gate now refuses first, so
+        // neither file is removed and the layout is never read as absence.
         let mut rig = Rig::bound("reset-retired");
 
-        // A real version-1 binding, and a retired file beside it that v1 cannot see.
+        // A real version-1 binding, and a retired file beside it.
         rig.put(&rig.retired_path(RETIRED_TOKEN), b"retired bytes");
 
         let (class, siblings) = primary_class_of(rig.assess());
         assert_eq!(class, NonAuthoritativePrimary::LegacyV1);
         assert_eq!(siblings.retired().len(), 1);
 
-        let preview = rig.session.prepare_binding_reset(&rig.root).unwrap();
-        assert_eq!(preview.subject(), BindingResetSubject::VerifiedBinding);
+        let primary = fs::read(rig.primary_path()).unwrap();
 
-        let id = preview.preparation_id().to_owned();
-        assert_eq!(
-            rig.session.confirm_binding_reset(&rig.root, &id),
-            Ok(BindingResetOutcome::ResetAndVerified)
-        );
+        assert!(matches!(
+            rig.session.prepare_binding_reset(&rig.root),
+            Err(crate::vault::session::BindingResetRefusal::UnreadableState(
+                UnreadableReason::UnresolvedNewerState
+            ))
+        ));
 
-        // The primary is gone; the retired file is untouched, and the assessment
-        // refuses to call this absence.
-        assert!(!rig.primary_path().exists());
+        // Both files are untouched, and the assessment still sees the sibling.
+        assert_eq!(fs::read(rig.primary_path()).unwrap(), primary);
         assert_eq!(
             fs::read(rig.retired_path(RETIRED_TOKEN)).unwrap(),
             b"retired bytes"
         );
 
-        let report = missing_siblings_of(rig.assess());
-        assert_eq!(report.retired().len(), 1);
+        let (class, siblings) = primary_class_of(rig.assess());
+        assert_eq!(class, NonAuthoritativePrimary::LegacyV1);
+        assert_eq!(siblings.retired().len(), 1);
 
-        // The legacy loader still calls this "not configured": the known v1 blind
-        // spot, unchanged and documented.
-        assert!(matches!(
+        // The explicit loader still returns the primary it holds: it is never
+        // reported as not configured.
+        assert!(!matches!(
             rig.session.load_authenticated_sync_state(&rig.root),
             AuthenticatedStateLoad::NotConfigured
         ));
+    }
+
+    #[test]
+    fn a_retired_file_with_the_primary_gone_is_never_absence_for_the_legacy_store_either() {
+        // The case the v1 blind spot used to hide: no primary, a retired file.
+        let rig = Rig::new("missing-primary-retired");
+
+        rig.put(&rig.retired_path(RETIRED_TOKEN), b"retired bytes");
+
+        // The assessment says so (unchanged) ...
+        assert_eq!(missing_siblings_of(rig.assess()).retired().len(), 1);
+
+        // ... and so does the state the legacy store reports: attention, with the
+        // retired file untouched, never `NotConfigured`.
+        assert_eq!(
+            rig.session.load_sync_state(&rig.root),
+            crate::vault::session::SessionSyncState::Unreadable(
+                UnreadableReason::UnresolvedNewerState
+            )
+        );
+        assert_eq!(
+            fs::read(rig.retired_path(RETIRED_TOKEN)).unwrap(),
+            b"retired bytes"
+        );
+    }
+
+    #[test]
+    fn a_reserved_staging_name_is_reported_with_the_staging_files_and_never_preferred() {
+        // B3c-3b-2a (U9): recognized by name, classified by content like any other
+        // staging file, never adopted and never preferred over the primary.
+        let rig = Rig::bound("reserved-name");
+        let bytes = rig.v3(&rig.mine(1));
+        let key = key_of(&rig.locator());
+
+        rig.put(
+            &rig.state_dir().join(format!("{key}.{TOKEN}.v3stage")),
+            &bytes,
+        );
+
+        let (class, siblings) = primary_class_of(rig.assess());
+
+        assert_eq!(class, NonAuthoritativePrimary::LegacyV1);
+        assert_eq!(siblings.retired().len(), 0);
+        assert_eq!(siblings.unrecognized(), 0);
+        assert_eq!(siblings.staging().len(), 1);
+        assert!(matches!(
+            siblings.staging()[0],
+            SiblingVerdict::AuthenticatedForVaultAndLocator(_)
+        ));
+
+        // Empty, cut short or malformed: still recognized by its name.
+        for body in [&b""[..], &bytes[..bytes.len() / 2], &b"{{"[..]] {
+            rig.put(
+                &rig.state_dir().join(format!("{key}.{TOKEN}.v3stage")),
+                body,
+            );
+
+            let (_, siblings) = primary_class_of(rig.assess());
+
+            assert_eq!(siblings.staging().len(), 1);
+            assert_eq!(siblings.unrecognized(), 0);
+        }
     }
 
     // ---- determinism and concurrency -------------------------------------------------

@@ -76,7 +76,7 @@ use crate::{
             SyncStateUnavailable,
         },
         sync_file_adapter::{SyncFileTarget, UnavailableReason},
-        sync_state_store::SyncStateRoot,
+        sync_state_store::{SyncStateRoot, UnreadableReason},
     },
 };
 
@@ -318,6 +318,12 @@ pub enum SyncBindingProblemDto {
     Corrupt,
     UnsupportedVersion,
     Unreadable,
+    /// Files of a newer or unresolved sync state exist beside the record. No file
+    /// name, count or reason code is carried.
+    UnresolvedFiles,
+    /// Entries named after this vault's record match no recognized shape. No file
+    /// name or count is carried.
+    UnrecognizedFiles,
     Mismatch,
     Unavailable,
 }
@@ -327,6 +333,14 @@ impl From<&BindingAttention> for SyncBindingProblemDto {
         match attention {
             BindingAttention::Corrupt(_) => Self::Corrupt,
             BindingAttention::UnsupportedVersion => Self::UnsupportedVersion,
+            BindingAttention::Unreadable(UnreadableReason::UnresolvedNewerState) => {
+                Self::UnresolvedFiles
+            }
+            BindingAttention::Unreadable(UnreadableReason::UnrecognizedEntries) => {
+                Self::UnrecognizedFiles
+            }
+            // Every other reason, including an uncertain layout, stays one fixed
+            // category; no reason code or I/O kind reaches the frontend.
             BindingAttention::Unreadable(_) => Self::Unreadable,
             BindingAttention::Mismatch(_) => Self::Mismatch,
             BindingAttention::Unavailable(_) => Self::Unavailable,
@@ -999,6 +1013,18 @@ mod tests {
                 SyncBindingProblemDto::Unreadable,
                 "unreadable",
             ),
+            // B3c-3b-2a: files of a newer state, and (U2) unrecognized entries,
+            // each get their own fixed category.
+            (
+                BindingAttention::Unreadable(UnreadableReason::UnresolvedNewerState),
+                SyncBindingProblemDto::UnresolvedFiles,
+                "unresolvedFiles",
+            ),
+            (
+                BindingAttention::Unreadable(UnreadableReason::UnrecognizedEntries),
+                SyncBindingProblemDto::UnrecognizedFiles,
+                "unrecognizedFiles",
+            ),
             (
                 BindingAttention::Mismatch(BindingMismatch::TargetLocator),
                 SyncBindingProblemDto::Mismatch,
@@ -1026,6 +1052,112 @@ mod tests {
             json(&SyncBindingStateDto::from(&BindingState::NotConfigured)),
             "{\"kind\":\"notConfigured\"}"
         );
+    }
+
+    #[test]
+    fn only_the_two_newer_state_reasons_get_their_own_category_and_none_leaks_a_reason() {
+        // Every other unreadable reason, including an uncertain layout, is the one
+        // generic category: no I/O kind, no reason code and no count reaches the UI.
+        for reason in [
+            UnreadableReason::Io(io::ErrorKind::PermissionDenied),
+            UnreadableReason::UnexpectedObject,
+            UnreadableReason::UnresolvedArtifacts,
+            UnreadableReason::EntryLimit,
+            UnreadableReason::LayoutUncertain,
+        ] {
+            assert_eq!(
+                SyncBindingProblemDto::from(&BindingAttention::Unreadable(reason)),
+                SyncBindingProblemDto::Unreadable,
+                "{reason:?}"
+            );
+        }
+
+        let mut shown = Vec::new();
+
+        for problem in [
+            SyncBindingProblemDto::UnresolvedFiles,
+            SyncBindingProblemDto::UnrecognizedFiles,
+        ] {
+            let dto = SyncBindingStateDto::NeedsAttention { problem };
+
+            shown.push(json(&dto));
+            shown.push(format!("{dto:?}"));
+        }
+
+        assert_eq!(
+            shown[0],
+            "{\"kind\":\"needsAttention\",\"problem\":\"unresolvedFiles\"}"
+        );
+        assert_eq!(
+            shown[2],
+            "{\"kind\":\"needsAttention\",\"problem\":\"unrecognizedFiles\"}"
+        );
+
+        for text in &shown {
+            for forbidden in [
+                ".retired", ".tmp", ".v3stage", ".json", "\\", "/", "Newer", "Entries",
+            ] {
+                assert!(!text.contains(forbidden), "{forbidden:?} in {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn newer_state_files_reach_the_status_as_a_fixed_category_and_nothing_else() {
+        for (name, file_suffix, expected, json_name) in [
+            (
+                "b3c3b2a-status-retired",
+                ".fedcba9876543210fedcba9876543210.retired",
+                SyncBindingProblemDto::UnresolvedFiles,
+                "unresolvedFiles",
+            ),
+            (
+                "b3c3b2a-status-v3stage",
+                ".fedcba9876543210fedcba9876543210.v3stage",
+                SyncBindingProblemDto::UnresolvedFiles,
+                "unresolvedFiles",
+            ),
+            (
+                "b3c3b2a-status-unrecognized",
+                ".notes.txt",
+                SyncBindingProblemDto::UnrecognizedFiles,
+                "unrecognizedFiles",
+            ),
+        ] {
+            let f = fixture(name);
+
+            f.bind();
+
+            let files = f.record_files();
+
+            assert_eq!(files.len(), 1);
+
+            let key = files[0].file_stem().unwrap().to_str().unwrap().to_owned();
+            let extra = files[0].with_file_name(format!("{key}{file_suffix}"));
+
+            fs::write(&extra, b"synthetic").unwrap();
+
+            let status = f.status();
+
+            assert_eq!(
+                status,
+                SyncBindingStatusDto {
+                    state: SyncBindingStateDto::NeedsAttention { problem: expected },
+                    pending_push: PendingPushDto::Unavailable,
+                },
+                "{name}"
+            );
+
+            let text = json(&status);
+
+            assert!(text.contains(json_name), "{text}");
+            assert!(!text.to_lowercase().contains("targetpath"), "{text}");
+            assert!(!text.contains(&key), "{text}");
+
+            // Reading the status removed and changed nothing.
+            assert_eq!(fs::read(&extra).unwrap(), b"synthetic");
+            assert!(files[0].exists());
+        }
     }
 
     #[test]

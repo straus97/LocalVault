@@ -84,16 +84,61 @@
 //!
 //! [`SyncStateStore::inspect_v3_layout`] is a separate, dormant, strictly
 //! read-only observation of the directory for one record key: the primary,
-//! `<key>.<32 hex>.tmp` and `<key>.<32 hex>.retired` siblings, and a count of other
-//! key-prefixed entries. It has its own name grammar and its own bounded scan, and
-//! it shares no code with the recovery-artifact rules above. Those rules, and every
-//! method that uses them, are **unchanged**: the legacy store still recognizes only
-//! its `.tmp` staging names, is blind to `.retired` files, never removes one, and
-//! `create` does not refuse because of one. That blind spot is a known limit
-//! that blocks any later v3 persistence; it is documented and pinned by tests, not
-//! fixed here. A recognized name is an indicator only (never ownership, recovery
-//! authority, deletion authority or write permission), nothing calls the
-//! diagnostic outside tests, and a successful observation is not a lock.
+//! `<key>.<32 hex>.tmp`, `<key>.<32 hex>.retired` and (reserved, see below)
+//! `<key>.<32 hex>.v3stage` siblings, and a count of other key-prefixed entries. It
+//! has its own name grammar and its own bounded scan, and it shares no code with
+//! the recovery-artifact rules above. Those rules are **unchanged in what they
+//! recognize and remove**: the legacy store still recognizes, and deletes, only its
+//! `.tmp` staging names, and it never removes a `.retired` or `.v3stage` file.
+//! Since Stage 1U-4 B3c-3b-2a the legacy operations additionally *consult* the
+//! observation through the compatibility gate described next and refuse when it
+//! shows newer-state evidence. A recognized name is an indicator only (never
+//! ownership, recovery authority, deletion authority or write permission), no
+//! production code calls the diagnostic itself, and a successful observation is not
+//! a lock.
+//!
+//! # Legacy compatibility gate (Stage 1U-4 B3c-3b-2a)
+//!
+//! **Refuse-only.** `load`, `read_record`, `create`, `replace`, `evidence` and the
+//! deletion planning (so `delete` and `delete_if_evidence_matches` too) ask the gate
+//! first. The gate only observes: it creates, removes, renames, replaces and adopts
+//! nothing, it never authenticates a version-1 record as anything else, and it adds
+//! no deletion target. It can only take permissions away. For the current record
+//! key it refuses when:
+//!
+//! * a recognized `.retired` sibling exists, whatever it contains;
+//! * a recognized `.v3stage` sibling exists, whatever it contains or whether it
+//!   can be read (the name is judged before any body byte);
+//! * a key-prefixed entry exists that matches no recognized shape (so renamed or
+//!   future evidence is not silently ignored); entries of other record keys never
+//!   count;
+//! * a `.tmp` holds a **complete, well-formed** record of a version this build
+//!   does not support;
+//! * the observation is incomplete or inconsistent (unreadable entry, entry or
+//!   sibling limit, an alias, or a change between the two passes). Uncertainty is
+//!   never confirmed absence.
+//!
+//! `delete` and `delete_if_evidence_matches` additionally refuse a primary of an
+//! unsupported version, so such a record is no longer resettable. A primary is
+//! never refused by `read_record` (its bytes are still returned, with a truthful
+//! [`ArtifactPresence`]), so the dormant authenticated loader keeps working.
+//!
+//! An incomplete or empty `.tmp` keeps its legacy meaning (a resettable remnant):
+//! the complete-record check cannot see an empty or truncated version-3 record,
+//! because the codec parses the whole input before it reads a version. That is why
+//! the `.v3stage` name is reserved (decision U9): a future publisher must never use
+//! `.tmp`, and **nothing in this build creates a `.v3stage` file**. A matching name
+//! identifies a conforming publisher's file; it is not ownership and gives no
+//! recovery authority.
+//!
+//! **What this is not.** It is check-then-use, not a lock and not compare-and-swap:
+//! anything can change right after the check. Older binaries are not gated. It does
+//! not make the delete path safe against a replaced primary: deletion still resolves
+//! the primary by its current path with no held handle and no file identity, so a
+//! primary swapped in after the final evidence comparison is removed as it then is
+//! and the removal is reported as a success (known race **G12**, open). `replace`
+//! has the same check-then-rename shape and its re-check before the rename narrows,
+//! but does not close, the window. G2 is not resolved by this gate.
 //!
 //! # Guarantees and limits
 //!
@@ -242,6 +287,17 @@ pub enum UnreadableReason {
     UnresolvedArtifacts,
     /// The directory holds too many entries to scan for artifacts.
     EntryLimit,
+    /// Files that this version does not understand exist beside the record (a
+    /// reserved or retained sibling of a newer state, or a complete record of a
+    /// newer version in a staging file). They are never read as state, adopted or
+    /// removed by this version. Never absence.
+    UnresolvedNewerState,
+    /// The directory could not be assessed completely (too many related files, an
+    /// ambiguous name, or a change while it was scanned). Never absence.
+    LayoutUncertain,
+    /// Entries named after this record's key match no recognized shape. They are
+    /// left alone and block the operation. Never absence.
+    UnrecognizedEntries,
 }
 
 /// Typed result of [`SyncStateStore::load`]. A superset of the core
@@ -407,6 +463,12 @@ pub enum StoreError {
     Encode(SyncStateEncodeError),
     #[error("a sync-state filesystem operation failed ({stage:?}, {kind:?})")]
     Io { stage: IoStage, kind: io::ErrorKind },
+    #[error("files of a newer or unresolved sync state exist; nothing was changed")]
+    UnresolvedNewerState,
+    #[error("the sync-state directory could not be assessed completely; nothing was changed")]
+    LayoutUncertain,
+    #[error("unrecognized entries exist for this sync-state record; nothing was changed")]
+    UnrecognizedEntries,
 }
 
 /// Outcome of a successful [`SyncStateStore::delete`].
@@ -440,6 +502,13 @@ pub enum EvidenceRefusal {
     /// A file disappeared between listing it and reading it.
     #[error("a sync-state file changed while evidence was captured")]
     Unstable,
+    /// Files of a newer or unresolved state exist beside the record, so no
+    /// evidence of the record alone can stand for its state.
+    #[error("files of a newer or unresolved sync state exist")]
+    UnresolvedNewerState,
+    /// Entries named after this record's key match no recognized shape.
+    #[error("unrecognized entries exist for this sync-state record")]
+    UnrecognizedEntries,
 }
 
 impl From<Fault> for EvidenceRefusal {
@@ -659,6 +728,12 @@ impl SyncStateStore {
             Err(fault) => return StateLoad::Unreadable(fault.into()),
         }
 
+        // Refuse-only: newer-state evidence or an uncertain scan is never absence
+        // and is never overridden by a readable primary.
+        if let Err(refusal) = self.legacy_gate(&key) {
+            return StateLoad::Unreadable(refusal.into());
+        }
+
         match self.read_primary(&self.record_path(&key)) {
             Err(fault) => StateLoad::Unreadable(fault.into()),
             Ok(Primary::Empty) => StateLoad::Corrupt(CorruptReason::Empty),
@@ -704,25 +779,39 @@ impl SyncStateStore {
             Err(fault) => return RecordRead::Unreadable(fault.into()),
         }
 
+        // The gate never refuses a primary that is present: the read-only
+        // authenticated loader depends on getting its exact bytes. It only makes
+        // the artifact indicator truthful.
+        let gate = self.legacy_gate(&key);
+
         match self.read_primary(&self.record_path(&key)) {
             Err(fault) => RecordRead::Unreadable(fault.into()),
             Ok(Primary::Empty) => RecordRead::Corrupt(CorruptReason::Empty),
             Ok(Primary::TooLarge) => RecordRead::Corrupt(CorruptReason::TooLarge),
             Ok(Primary::Bytes(bytes)) => {
-                let artifacts = match self.scan_artifacts(&key) {
-                    Ok(found) if found.is_empty() => ArtifactPresence::None,
-                    Ok(_) => ArtifactPresence::Present,
-                    Err(_) => ArtifactPresence::Unknown,
+                let artifacts = match gate {
+                    Err(LegacyGateRefusal::NewerState | LegacyGateRefusal::UnrecognizedEntries) => {
+                        ArtifactPresence::Present
+                    }
+                    Err(LegacyGateRefusal::Uncertain(_)) => ArtifactPresence::Unknown,
+                    Ok(_) => match self.scan_artifacts(&key) {
+                        Ok(found) if found.is_empty() => ArtifactPresence::None,
+                        Ok(_) => ArtifactPresence::Present,
+                        Err(_) => ArtifactPresence::Unknown,
+                    },
                 };
 
                 RecordRead::Present(PresentRecord { bytes, artifacts })
             }
-            Ok(Primary::Absent) => match self.scan_artifacts(&key) {
-                Err(fault) => RecordRead::Unreadable(fault.into()),
-                Ok(artifacts) if !artifacts.is_empty() => {
-                    RecordRead::Unreadable(UnreadableReason::UnresolvedArtifacts)
-                }
-                Ok(_) => RecordRead::NotConfigured,
+            Ok(Primary::Absent) => match gate {
+                Err(refusal) => RecordRead::Unreadable(refusal.into()),
+                Ok(_) => match self.scan_artifacts(&key) {
+                    Err(fault) => RecordRead::Unreadable(fault.into()),
+                    Ok(artifacts) if !artifacts.is_empty() => {
+                        RecordRead::Unreadable(UnreadableReason::UnresolvedArtifacts)
+                    }
+                    Ok(_) => RecordRead::NotConfigured,
+                },
             },
         }
     }
@@ -738,6 +827,10 @@ impl SyncStateStore {
         let key = record_key(state.local_locator());
 
         self.ensure_directory()?;
+
+        // Refuse-only. There is deliberately no second check later in this method:
+        // publication is a no-clobber link and the caller reloads afterwards.
+        self.legacy_gate(&key).map_err(StoreError::from)?;
 
         let record = self.record_path(&key);
 
@@ -799,6 +892,8 @@ impl SyncStateStore {
             DirState::Present => {}
         }
 
+        self.legacy_gate(&key).map_err(StoreError::from)?;
+
         let record = self.record_path(&key);
 
         let observed = match self.read_primary(&record) {
@@ -834,6 +929,12 @@ impl SyncStateStore {
                 Ok(_) => return Err(StoreError::Changed),
                 Err(_) => return Err(StoreError::CurrentUnreadable),
             }
+
+            // Newer-state evidence that appeared since the first check refuses
+            // here, before the only step that destroys. A refusal leaves the record
+            // untouched and takes the cleanup path below. This narrows the window
+            // to the calls between this check and the rename; it does not close it.
+            self.legacy_gate(&key).map_err(StoreError::from)?;
 
             self.hook(Point::Replace)
                 .and_then(|()| fs::rename(&temp, &record))
@@ -902,6 +1003,8 @@ impl SyncStateStore {
             }
             DirState::Present => {}
         }
+
+        self.legacy_gate(&key)?;
 
         let primary = match self.read_primary(&self.record_path(&key))? {
             Primary::Absent => None,
@@ -1005,6 +1108,19 @@ impl SyncStateStore {
         {
             DirState::Absent => return Ok(None),
             DirState::Present => {}
+        }
+
+        // Refuse-only. Beyond the sibling evidence, a primary of a version this
+        // build does not support is no longer something it may remove.
+        let layout = self.legacy_gate(&key).map_err(StoreError::from)?;
+
+        if let LayoutPrimary::Bytes(bytes) = layout.primary() {
+            if matches!(
+                SyncStateLoad::from_bytes(bytes),
+                SyncStateLoad::UnsupportedVersion
+            ) {
+                return Err(StoreError::UnresolvedNewerState);
+            }
         }
 
         let record = self.record_path(&key);
@@ -1323,6 +1439,26 @@ impl SyncStateStore {
             .push((Point::BeforeEvidenceRecheck, Action::Run(Box::new(run))));
     }
 
+    /// Test seam: run `run` inside [`create`](Self::create) immediately before the
+    /// no-clobber publication, the window in which a late file can appear.
+    #[cfg(test)]
+    pub(crate) fn run_before_publish_for_test(&self, run: impl Fn() + Send + 'static) {
+        self.faults
+            .lock()
+            .unwrap()
+            .push((Point::Publish, Action::Run(Box::new(run))));
+    }
+
+    /// Test seam: run `run` inside the deletion immediately before the primary
+    /// record is removed, after every comparison has already passed.
+    #[cfg(test)]
+    pub(crate) fn run_before_primary_removal_for_test(&self, run: impl Fn() + Send + 'static) {
+        self.faults
+            .lock()
+            .unwrap()
+            .push((Point::RemovePrimary, Action::Run(Box::new(run))));
+    }
+
     #[cfg(not(test))]
     #[inline(always)]
     fn hook(&self, _point: Point) -> io::Result<()> {
@@ -1486,11 +1622,13 @@ fn open_no_follow(path: &Path) -> io::Result<File> {
 
 // ---- v3 layout assessment (read-only) ----------------------------------------
 //
-// Stage 1U-4 B3c-3b-1. A dormant, strictly read-only diagnostic. Nothing in this
-// region writes, moves, links or deletes anything, it never calls the legacy
-// artifact scan or any mutator, and nothing outside tests calls it. It shares no
-// code with the legacy (v1) artifact recognition, which is unchanged and still
-// knows only its own staging names.
+// Stage 1U-4 B3c-3b-1. A strictly read-only observation. Nothing in this region
+// writes, moves, links or deletes anything, and it never calls the legacy artifact
+// scan or any mutator. Outside this region the only production caller of
+// `observe_v3_layout` is the legacy compatibility gate that follows it
+// (B3c-3b-2a), and `inspect_v3_layout` is called only by the dormant authenticated
+// assessment. It shares no code with the legacy (v1) artifact recognition, which
+// is unchanged and still knows only its own staging names.
 
 /// Diagnostic bound: the most directory entries one v3 layout observation will
 /// visit. A scanning safety limit that keeps one observation finite. It is **not**
@@ -1513,6 +1651,13 @@ pub enum SiblingKind {
     Staging,
     /// `<key>.<32 hex>.retired`
     Retired,
+    /// `<key>.<32 hex>.v3stage`: a name reserved for a future authenticated
+    /// publisher (decision U9). Recognized by name alone, before any body byte is
+    /// read, so an empty, cut-short, malformed, unreadable or non-plain file is
+    /// still recognized. Nothing in this build creates one, a matching name proves
+    /// no ownership and gives no recovery authority, and it is not a legacy
+    /// staging name.
+    ReservedStaging,
 }
 
 /// How one directory entry name relates to one record key.
@@ -1520,7 +1665,8 @@ pub enum SiblingKind {
 enum V3NameClass {
     /// Exactly `<key>.json`, compared ASCII case-insensitively.
     Primary,
-    /// Exactly `<key>.<32 hex>.tmp` or `<key>.<32 hex>.retired`.
+    /// Exactly `<key>.<32 hex>.tmp`, `<key>.<32 hex>.retired` or
+    /// `<key>.<32 hex>.v3stage`.
     Sibling(SiblingKind),
     /// Starts with the key (ASCII case-insensitively, judged on the lossy form so
     /// that a non-Unicode name still counts) but is none of the shapes above.
@@ -1573,7 +1719,8 @@ fn recognize_v3_sibling_name(entry_lossy: &str, exact_unicode: bool, key: &str) 
     }
 }
 
-/// `.<32 hex>.tmp` or `.<32 hex>.retired`, either case, nothing else.
+/// `.<32 hex>.tmp`, `.<32 hex>.retired` or `.<32 hex>.v3stage`, either case,
+/// nothing else.
 fn v3_sibling_shape(rest: &[u8]) -> Option<SiblingKind> {
     let rest = rest.strip_prefix(b".")?;
 
@@ -1591,6 +1738,8 @@ fn v3_sibling_shape(rest: &[u8]) -> Option<SiblingKind> {
         Some(SiblingKind::Staging)
     } else if tail.eq_ignore_ascii_case(b".retired") {
         Some(SiblingKind::Retired)
+    } else if tail.eq_ignore_ascii_case(b".v3stage") {
+        Some(SiblingKind::ReservedStaging)
     } else {
         None
     }
@@ -1961,6 +2110,177 @@ fn reject_v3_aliases(names: &[(NameTag, std::ffi::OsString)]) -> Result<(), Layo
 
 // ---- end v3 layout assessment ------------------------------------------------
 
+// ---- legacy compatibility gate (read-only) -----------------------------------
+//
+// Stage 1U-4 B3c-3b-2a. Refuse-only. This region only observes (through
+// `observe_v3_layout`) and decides; it creates, removes, moves, replaces and adopts
+// nothing, grants nothing, and adds no deletion target. It can only take
+// permissions away from the legacy operations that ask it.
+//
+// It is check-then-use. It is not a lock and not compare-and-swap, and it cannot
+// see a change made after it returned, a change that was undone between its two
+// passes, or evidence that was moved or deleted so it no longer carries this
+// record's key. Older binaries do not ask it anything.
+
+/// Why the legacy store will not act on a record key. A fixed category: no name,
+/// token, path, length or byte of any file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyGateRefusal {
+    /// A sibling that belongs to a newer state exists: a recognized `.retired` or
+    /// `.v3stage` file (judged by name, whatever it holds or whether it can be
+    /// read), or a `.tmp` holding a complete, well-formed record of a version this
+    /// build does not support.
+    NewerState,
+    /// Entries named after this record's key match no recognized shape (decision
+    /// U2). Entries of other record keys never count.
+    UnrecognizedEntries,
+    /// The observation is incomplete or inconsistent. Never absence.
+    Uncertain(LayoutUncertainty),
+}
+
+/// The pure decision over one complete observation. The primary is not judged here.
+///
+/// In order: a `.retired` or `.v3stage` sibling is newer-state evidence whatever
+/// its content; then any unrecognized key-prefixed entry; then each `.tmp` sibling.
+/// For a `.tmp` only a complete, well-formed record of an unsupported version counts
+/// as newer state, because the codec parses its whole input before it reads a
+/// version: an empty or cut-short record of a newer version is byte-for-byte
+/// indistinguishable from a legacy remnant and passes. That is defence in depth
+/// only, never protection of partial staging, and the reason the `.v3stage` name is
+/// reserved. An unreadable `.tmp` or one that vanished during the scan is
+/// uncertainty. Everything else passes to the legacy rules unchanged.
+fn legacy_verdict(layout: &V3Layout) -> Result<(), LegacyGateRefusal> {
+    if layout.siblings().iter().any(|sibling| {
+        matches!(
+            sibling.kind(),
+            SiblingKind::Retired | SiblingKind::ReservedStaging
+        )
+    }) {
+        return Err(LegacyGateRefusal::NewerState);
+    }
+
+    if layout.unrecognized() > 0 {
+        return Err(LegacyGateRefusal::UnrecognizedEntries);
+    }
+
+    let staging = || {
+        layout
+            .siblings()
+            .iter()
+            .filter(|sibling| sibling.kind() == SiblingKind::Staging)
+    };
+
+    if staging().any(|sibling| match sibling.content() {
+        SiblingContent::Bytes(bytes) => matches!(
+            SyncStateLoad::from_bytes(bytes),
+            SyncStateLoad::UnsupportedVersion
+        ),
+        _ => false,
+    }) {
+        return Err(LegacyGateRefusal::NewerState);
+    }
+
+    for sibling in staging() {
+        match sibling.content() {
+            SiblingContent::Unreadable(kind) => {
+                return Err(LegacyGateRefusal::Uncertain(LayoutUncertainty::Io(*kind)))
+            }
+            SiblingContent::Vanished => {
+                return Err(LegacyGateRefusal::Uncertain(
+                    LayoutUncertainty::ChangedDuringScan,
+                ))
+            }
+            SiblingContent::Bytes(_)
+            | SiblingContent::Empty
+            | SiblingContent::TooLarge
+            | SiblingContent::Unexpected => {}
+        }
+    }
+
+    Ok(())
+}
+
+impl SyncStateStore {
+    /// Observe the directory for `key` and decide whether the legacy store may go
+    /// on. Runs only after the directory itself was established to be a plain
+    /// directory. Returns the observation so a caller can look at the primary it
+    /// holds; the observation grants nothing.
+    fn legacy_gate(&self, key: &str) -> Result<V3Layout, LegacyGateRefusal> {
+        let layout = self
+            .observe_v3_layout(key)
+            .map_err(LegacyGateRefusal::Uncertain)?;
+
+        legacy_verdict(&layout)?;
+
+        Ok(layout)
+    }
+}
+
+impl From<LegacyGateRefusal> for UnreadableReason {
+    fn from(refusal: LegacyGateRefusal) -> Self {
+        match refusal {
+            LegacyGateRefusal::NewerState => Self::UnresolvedNewerState,
+            LegacyGateRefusal::UnrecognizedEntries => Self::UnrecognizedEntries,
+            LegacyGateRefusal::Uncertain(LayoutUncertainty::Io(kind)) => Self::Io(kind),
+            LegacyGateRefusal::Uncertain(LayoutUncertainty::UnexpectedObject) => {
+                Self::UnexpectedObject
+            }
+            LegacyGateRefusal::Uncertain(LayoutUncertainty::EntryLimit) => Self::EntryLimit,
+            LegacyGateRefusal::Uncertain(
+                LayoutUncertainty::SiblingLimit
+                | LayoutUncertainty::AliasAmbiguity
+                | LayoutUncertainty::ChangedDuringScan,
+            ) => Self::LayoutUncertain,
+        }
+    }
+}
+
+impl From<LegacyGateRefusal> for StoreError {
+    fn from(refusal: LegacyGateRefusal) -> Self {
+        match refusal {
+            LegacyGateRefusal::NewerState => Self::UnresolvedNewerState,
+            LegacyGateRefusal::UnrecognizedEntries => Self::UnrecognizedEntries,
+            LegacyGateRefusal::Uncertain(LayoutUncertainty::Io(kind)) => Self::Io {
+                stage: IoStage::Scan,
+                kind,
+            },
+            LegacyGateRefusal::Uncertain(LayoutUncertainty::UnexpectedObject) => {
+                Self::UnexpectedObject
+            }
+            // As `Fault::EntryLimit` is mapped today.
+            LegacyGateRefusal::Uncertain(LayoutUncertainty::EntryLimit) => Self::Io {
+                stage: IoStage::Scan,
+                kind: io::ErrorKind::Other,
+            },
+            LegacyGateRefusal::Uncertain(
+                LayoutUncertainty::SiblingLimit
+                | LayoutUncertainty::AliasAmbiguity
+                | LayoutUncertainty::ChangedDuringScan,
+            ) => Self::LayoutUncertain,
+        }
+    }
+}
+
+impl From<LegacyGateRefusal> for EvidenceRefusal {
+    fn from(refusal: LegacyGateRefusal) -> Self {
+        match refusal {
+            LegacyGateRefusal::NewerState => Self::UnresolvedNewerState,
+            LegacyGateRefusal::UnrecognizedEntries => Self::UnrecognizedEntries,
+            LegacyGateRefusal::Uncertain(LayoutUncertainty::Io(_)) => Self::Unreadable,
+            LegacyGateRefusal::Uncertain(LayoutUncertainty::UnexpectedObject) => {
+                Self::UnexpectedObject
+            }
+            LegacyGateRefusal::Uncertain(LayoutUncertainty::EntryLimit) => Self::EntryLimit,
+            LegacyGateRefusal::Uncertain(LayoutUncertainty::ChangedDuringScan) => Self::Unstable,
+            LegacyGateRefusal::Uncertain(
+                LayoutUncertainty::SiblingLimit | LayoutUncertainty::AliasAmbiguity,
+            ) => Self::Unreadable,
+        }
+    }
+}
+
+// ---- end legacy compatibility gate -------------------------------------------
+
 /// Windows storage tests. Synthetic states only; no vault fixture is read or
 /// modified. Every test owns a uniquely named scratch directory under the
 /// git-ignored `<repo>/.qa-local/sync-state-b1-tests/` (never `%TEMP%`) and
@@ -2166,6 +2486,21 @@ mod tests {
         OpenOptions::new()
             .read(true)
             .share_mode(0)
+            .open(path)
+            .unwrap()
+    }
+
+    /// Open for reading and allow others to read but not to write or delete, so a
+    /// reader still gets the bytes while a removal fails with a sharing violation.
+    #[cfg(windows)]
+    fn hold_against_removal(path: &Path) -> fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_SHARE_READ: u32 = 1;
+
+        OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
             .open(path)
             .unwrap()
     }
@@ -2587,11 +2922,29 @@ mod tests {
                 store.load(&loc(LOCAL)).into_sync_state_load(),
                 SyncStateLoad::Unreadable
             );
-            assert_eq!(
-                store.replace(&state, &rebuilt(&state, checkpoint(10), None)),
-                Err(StoreError::CurrentUnreadable)
+            // B3c-3b-2a: the compatibility gate cannot read the held record, so
+            // both mutators are refused at its scan (formerly `CurrentUnreadable`
+            // and `AlreadyExists`). Still a refusal; nothing is replaced or created.
+            assert!(
+                matches!(
+                    store.replace(&state, &rebuilt(&state, checkpoint(10), None)),
+                    Err(StoreError::Io {
+                        stage: IoStage::Scan,
+                        ..
+                    })
+                ),
+                "replace over a held record"
             );
-            assert_eq!(store.create(&state), Err(StoreError::AlreadyExists));
+            assert!(
+                matches!(
+                    store.create(&state),
+                    Err(StoreError::Io {
+                        stage: IoStage::Scan,
+                        ..
+                    })
+                ),
+                "create over a held record"
+            );
         }
 
         // Released: the record was never harmed.
@@ -2756,27 +3109,40 @@ mod tests {
         assert!(artifact.exists());
         assert!(!scratch.record(LOCAL).exists());
 
-        // Files that only look related, and other records' artifacts, are not
-        // this record's artifacts: they neither block nor get touched.
+        // Another record's artifacts are not this record's artifacts: they neither
+        // block nor get touched. (B3c-3b-2a, decision U2: files that only look
+        // related to THIS key used to be ignored here too; they now block, see
+        // `legacy_gate_unrecognized_tests`, and are still never touched.)
         fs::remove_file(&artifact).unwrap();
         let key = record_key(&loc(LOCAL));
-        let unrelated = [
+        let suspicious = [
             scratch.state_dir().join(format!("{key}.notes.txt")),
             scratch.state_dir().join(format!("{key}.json.bak")),
             scratch
                 .state_dir()
                 .join(format!("{key}.{STALE_TOKEN}.tmp.old")),
             scratch.state_dir().join(format!("{key}.short.tmp")),
-            scratch.artifact(OTHER_LOCAL, STALE_TOKEN),
         ];
-        for path in &unrelated {
+        for path in &suspicious {
             fs::write(path, b"unrelated").unwrap();
+            assert_eq!(
+                store.load(&loc(LOCAL)),
+                StateLoad::Unreadable(UnreadableReason::UnrecognizedEntries)
+            );
+            assert_eq!(
+                store.create(&unbased(LOCAL)),
+                Err(StoreError::UnrecognizedEntries)
+            );
+            assert_eq!(fs::read(path).unwrap(), b"unrelated");
+            assert!(!scratch.record(LOCAL).exists());
+            fs::remove_file(path).unwrap();
         }
+
+        let other = scratch.artifact(OTHER_LOCAL, STALE_TOKEN);
+        fs::write(&other, b"unrelated").unwrap();
         assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
         store.create(&unbased(LOCAL)).unwrap();
-        for path in &unrelated {
-            assert_eq!(fs::read(path).unwrap(), b"unrelated");
-        }
+        assert_eq!(fs::read(&other).unwrap(), b"unrelated");
     }
 
     #[test]
@@ -3024,8 +3390,12 @@ mod tests {
         store.create(&doomed).unwrap();
         store.create(&survivor).unwrap();
         scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
-        let key = record_key(&loc(LOCAL));
-        let unrelated = scratch.state_dir().join(format!("{key}.notes.txt"));
+        // B3c-3b-2a (U2): a neighbour that merely shares THIS record's key prefix
+        // now blocks the deletion (and one with the survivor's prefix would block
+        // the survivor), so it carries the key of a third, unrelated location. It
+        // must stay untouched and must not block anything.
+        let third_key = record_key(&loc(r"\\?\C:\Synthetic\Vaults\THIRD-MARKER.lvault"));
+        let unrelated = scratch.state_dir().join(format!("{third_key}.notes.txt"));
         fs::write(&unrelated, b"unrelated").unwrap();
 
         assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
@@ -3123,8 +3493,26 @@ mod tests {
         let state = based(LOCAL, 9);
         store.create(&state).unwrap();
 
+        // B3c-3b-2a: a file held exclusively cannot even be read by the
+        // compatibility gate, so the deletion is refused before anything is
+        // removed (formerly it reached the removal and failed there).
         {
             let _guard = hold_exclusively(&scratch.record(LOCAL));
+            assert!(matches!(
+                store.delete(&loc(LOCAL)),
+                Err(StoreError::Io {
+                    stage: IoStage::Scan,
+                    ..
+                })
+            ));
+            assert!(scratch.record(LOCAL).exists());
+        }
+        assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+
+        // The removal failure itself is still exercised with a file that can be
+        // read but not deleted.
+        {
+            let _guard = hold_against_removal(&scratch.record(LOCAL));
             assert_eq!(
                 store.delete(&loc(LOCAL)),
                 Err(StoreError::IncompleteDeletion)
@@ -3136,7 +3524,7 @@ mod tests {
         // With an artifact held instead, the record must survive.
         scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
         {
-            let _guard = hold_exclusively(&scratch.artifact(LOCAL, STALE_TOKEN));
+            let _guard = hold_against_removal(&scratch.artifact(LOCAL, STALE_TOKEN));
             assert_eq!(
                 store.delete(&loc(LOCAL)),
                 Err(StoreError::IncompleteDeletion)
@@ -3235,9 +3623,15 @@ mod tests {
         assert_eq!(store.evidence(&loc(LOCAL)).unwrap(), nothing);
 
         // Files that are not this record's own are not part of its evidence.
+        // (B3c-3b-2a, U2: the stray file now carries the OTHER record's key; one
+        // with this record's key prefix is refused instead.)
         scratch.put(&scratch.record(OTHER_LOCAL), b"someone else's");
-        let key = record_key(&loc(LOCAL));
-        fs::write(scratch.state_dir().join(format!("{key}.notes.txt")), b"x").unwrap();
+        let other_key = record_key(&loc(OTHER_LOCAL));
+        fs::write(
+            scratch.state_dir().join(format!("{other_key}.notes.txt")),
+            b"x",
+        )
+        .unwrap();
         assert_eq!(store.evidence(&loc(LOCAL)).unwrap(), nothing);
 
         // A zero-byte record is present, and not the same as nothing.
@@ -3492,8 +3886,10 @@ mod tests {
         let survivor = based(OTHER_LOCAL, 4);
         store.create(&survivor).unwrap();
         scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
-        let key = record_key(&loc(LOCAL));
-        let unrelated = scratch.state_dir().join(format!("{key}.notes.txt"));
+        // B3c-3b-2a (U2): the neighbour carries the key of a third, unrelated
+        // location (not this record's, and not the survivor's).
+        let third_key = record_key(&loc(r"\\?\C:\Synthetic\Vaults\THIRD-MARKER.lvault"));
+        let unrelated = scratch.state_dir().join(format!("{third_key}.notes.txt"));
         fs::write(&unrelated, b"unrelated").unwrap();
 
         let evidence = store.evidence(&loc(LOCAL)).unwrap();
@@ -3546,6 +3942,29 @@ mod tests {
             setup(&scratch);
 
             let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+            if *name == "unsupported" {
+                // B3c-3b-2a: a record of an unsupported version may belong to a
+                // newer state. Its evidence can still be captured, but this store
+                // no longer removes it, and nothing is changed.
+                let before = contents(&scratch.state_dir());
+
+                assert_eq!(
+                    store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+                    Err(ConditionalDeleteError::Store(
+                        StoreError::UnresolvedNewerState
+                    )),
+                    "{name}"
+                );
+                assert_eq!(
+                    store.load(&loc(LOCAL)),
+                    StateLoad::UnsupportedVersion,
+                    "{name}"
+                );
+                assert_eq!(contents(&scratch.state_dir()), before, "{name}");
+
+                continue;
+            }
 
             assert_eq!(
                 store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
@@ -4046,7 +4465,15 @@ mod tests {
             StateLoad::Unreadable(UnreadableReason::Io(_))
         ));
         assert_ne!(load.into_sync_state_load(), SyncStateLoad::NotConfigured);
-        assert_eq!(store.create(&state), Err(StoreError::AlreadyExists));
+        // B3c-3b-2a: refused at the compatibility gate's scan (formerly
+        // `AlreadyExists`); creation is still refused and nothing is written.
+        assert!(matches!(
+            store.create(&state),
+            Err(StoreError::Io {
+                stage: IoStage::Scan,
+                ..
+            })
+        ));
         drop(guard);
         assert_eq!(loaded(store.load(&loc(LOCAL))), state);
     }
@@ -6291,15 +6718,24 @@ mod read_record_tests {
 
         scratch.put(&scratch.record(LOCAL), &primary);
 
-        // Files that merely share the prefix, or belong to another location, are
-        // not this record's artifacts.
+        // Files that belong to another location are not this record's artifacts.
         scratch.put(&scratch.artifact(OTHER_LOCAL, TOKEN), b"other");
-        scratch.put(
-            &scratch
-                .state_dir()
-                .join(format!("{}.not-a-token.tmp", record_key(&loc(LOCAL)))),
-            b"unrelated",
+        assert_eq!(
+            bytes_of(store.read_record(&loc(LOCAL))).1,
+            ArtifactPresence::None
         );
+
+        // B3c-3b-2a (U2): a file that merely shares THIS record's key prefix is
+        // not a recognized artifact either, but it is no longer ignored: the
+        // primary is still returned, and the indicator is truthful (`Present`).
+        let stray = scratch
+            .state_dir()
+            .join(format!("{}.not-a-token.tmp", record_key(&loc(LOCAL))));
+        scratch.put(&stray, b"unrelated");
+        let (read, artifacts) = bytes_of(store.read_record(&loc(LOCAL)));
+        assert_eq!(read, primary);
+        assert_eq!(artifacts, ArtifactPresence::Present);
+        fs::remove_file(&stray).unwrap();
         assert_eq!(
             bytes_of(store.read_record(&loc(LOCAL))).1,
             ArtifactPresence::None
@@ -6666,19 +7102,23 @@ mod b3c3b1_support {
 
 // ---- B3c-3b-1 v1 non-regression tests (begin) --------------------------------
 
-/// Stage 1U-4 B3c-3b-1: the legacy (v1) store is deliberately **blind** to
-/// `<key>.<32hex>.retired` files, and this slice must not change that. These
-/// tests pin the exact v1 outcomes for three synthetic layouts so that any later
-/// edit of the legacy artifact machinery is noticed. They document a known
-/// legacy limitation (a retired file is invisible to `create` and survives a v1
-/// reset); they do not fix it, and a v1 mutator must never remove such a file.
+/// Stage 1U-4 B3c-3b-1 pinned the legacy (v1) store as **blind** to
+/// `<key>.<32hex>.retired` files. Stage 1U-4 B3c-3b-2a ends that blindness with a
+/// refuse-only compatibility gate, so these tests now pin the opposite, for the
+/// same three synthetic layouts and the same operations: every legacy operation
+/// refuses (nothing is created, replaced or removed), the tree does not move by a
+/// byte, and a retired file is never removed or changed by any operation, whatever
+/// it contains. A retired file of ANOTHER location blocks only that location.
+///
+/// Originally `v1_retired_tests`; renamed because "v1 retired" is no longer true.
 #[cfg(all(test, windows))]
-mod v1_retired_tests {
+mod legacy_gate_retired_tests {
     use std::fs;
 
     use super::b3c3b1_support::{
         loc, names, state, Scratch, LOCAL, OTHER_LOCAL, RETIRED_TOKEN, TOKEN,
     };
+    use super::b3c3b2a_support::{empty_evidence, proposed_state};
     use super::*;
     use crate::vault::handle_ops::test_support::snapshot;
 
@@ -6702,7 +7142,7 @@ mod v1_retired_tests {
     }
 
     fn fixture(layout: Layout) -> Scratch {
-        let scratch = Scratch::new("v1-retired");
+        let scratch = Scratch::new("legacy-gate-retired");
 
         scratch.put(&scratch.retired(LOCAL, RETIRED_TOKEN), RETIRED_BYTES);
 
@@ -6723,60 +7163,38 @@ mod v1_retired_tests {
         );
     }
 
-    fn only_the_retired_file_is_left(scratch: &Scratch, layout: Layout) {
-        assert_eq!(
-            names(&scratch.state_dir()),
-            [format!(
-                "{}.{RETIRED_TOKEN}.retired",
-                record_key(&loc(LOCAL))
-            )],
-            "{layout:?}"
-        );
-        retired_is_untouched(scratch);
-    }
-
     #[test]
-    fn load_and_read_record_are_blind_to_retired_files_and_change_nothing() {
+    fn load_and_read_record_refuse_and_change_nothing() {
         for layout in LAYOUTS {
             let scratch = fixture(layout);
             let store = scratch.store();
             let before = snapshot(scratch.dir.path());
 
-            let load = store.load(&loc(LOCAL));
+            // Even with a readable primary, the load is refused; never
+            // `NotConfigured`, never `Loaded`.
+            assert_eq!(
+                store.load(&loc(LOCAL)),
+                StateLoad::Unreadable(UnreadableReason::UnresolvedNewerState),
+                "{layout:?}"
+            );
+
             let read = store.read_record(&loc(LOCAL));
 
             match layout {
-                Layout::RetiredOnly => {
-                    assert_eq!(load, StateLoad::NotConfigured, "{layout:?}");
-                    assert!(
-                        matches!(read, RecordRead::NotConfigured),
-                        "{layout:?}: {read:?}"
-                    );
-                }
                 Layout::PrimaryAndRetired => {
-                    assert_eq!(
-                        load,
-                        StateLoad::Loaded(Box::new(state(LOCAL))),
-                        "{layout:?}"
-                    );
-
+                    // A present primary is never refused: the read-only loader gets
+                    // its exact bytes, and the indicator is truthful.
                     let RecordRead::Present(present) = &read else {
                         panic!("{layout:?}: expected a present record, got {read:?}");
                     };
                     assert_eq!(present.bytes(), primary_bytes());
-                    // The retired file is not a recognized artifact to v1.
-                    assert_eq!(present.artifacts(), ArtifactPresence::None);
+                    assert_eq!(present.artifacts(), ArtifactPresence::Present);
                 }
-                Layout::StagingAndRetired => {
-                    assert_eq!(
-                        load,
-                        StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts),
-                        "{layout:?}"
-                    );
+                Layout::RetiredOnly | Layout::StagingAndRetired => {
                     assert!(
                         matches!(
                             read,
-                            RecordRead::Unreadable(UnreadableReason::UnresolvedArtifacts)
+                            RecordRead::Unreadable(UnreadableReason::UnresolvedNewerState)
                         ),
                         "{layout:?}: {read:?}"
                     );
@@ -6789,55 +7207,20 @@ mod v1_retired_tests {
     }
 
     #[test]
-    fn create_ignores_retired_files_and_never_touches_them() {
+    fn create_and_replace_refuse_and_never_touch_the_retired_file() {
         for layout in LAYOUTS {
             let scratch = fixture(layout);
             let store = scratch.store();
             let before = snapshot(scratch.dir.path());
-            let result = store.create(&state(LOCAL));
-
-            match layout {
-                Layout::RetiredOnly => {
-                    // v1 buries the retired file: it neither sees nor refuses it.
-                    assert_eq!(result, Ok(()), "{layout:?}");
-                    assert_eq!(
-                        fs::read(scratch.record(LOCAL)).unwrap(),
-                        primary_bytes(),
-                        "{layout:?}"
-                    );
-                    assert_eq!(names(&scratch.state_dir()).len(), 2, "{layout:?}");
-                }
-                Layout::PrimaryAndRetired => {
-                    assert_eq!(result, Err(StoreError::AlreadyExists), "{layout:?}");
-                    assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}");
-                }
-                Layout::StagingAndRetired => {
-                    assert_eq!(result, Err(StoreError::UnresolvedArtifacts), "{layout:?}");
-                    assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}");
-                }
-            }
-
-            retired_is_untouched(&scratch);
-        }
-    }
-
-    #[test]
-    fn evidence_does_not_bind_retired_files() {
-        for layout in LAYOUTS {
-            let scratch = fixture(layout);
-            let store = scratch.store();
-            let before = snapshot(scratch.dir.path());
-
-            let evidence = store.evidence(&loc(LOCAL)).unwrap();
 
             assert_eq!(
-                evidence.primary_present(),
-                matches!(layout, Layout::PrimaryAndRetired),
+                store.create(&state(LOCAL)),
+                Err(StoreError::UnresolvedNewerState),
                 "{layout:?}"
             );
             assert_eq!(
-                evidence.artifact_count(),
-                usize::from(matches!(layout, Layout::StagingAndRetired)),
+                store.replace(&state(LOCAL), &proposed_state()),
+                Err(StoreError::UnresolvedNewerState),
                 "{layout:?}"
             );
 
@@ -6847,70 +7230,472 @@ mod v1_retired_tests {
     }
 
     #[test]
-    fn delete_never_removes_a_retired_file() {
-        for layout in LAYOUTS {
-            let scratch = fixture(layout);
-            let outcome = scratch.store().delete(&loc(LOCAL));
-
-            match layout {
-                Layout::RetiredOnly => {
-                    assert_eq!(outcome, Ok(DeleteOutcome::AlreadyAbsent), "{layout:?}");
-                }
-                Layout::PrimaryAndRetired | Layout::StagingAndRetired => {
-                    assert_eq!(outcome, Ok(DeleteOutcome::Removed), "{layout:?}");
-                }
-            }
-
-            // Whatever v1 removed, the retired file is the only thing left.
-            only_the_retired_file_is_left(&scratch, layout);
-        }
-    }
-
-    #[test]
-    fn conditional_delete_never_removes_a_retired_file() {
+    fn evidence_refuses_instead_of_binding_a_state_it_does_not_describe() {
         for layout in LAYOUTS {
             let scratch = fixture(layout);
             let store = scratch.store();
-            let evidence = store.evidence(&loc(LOCAL)).unwrap();
-            let outcome = store.delete_if_evidence_matches(&loc(LOCAL), &evidence);
+            let before = snapshot(scratch.dir.path());
 
-            match layout {
-                Layout::RetiredOnly => {
-                    assert_eq!(outcome, Ok(DeleteOutcome::AlreadyAbsent), "{layout:?}");
-                }
-                Layout::PrimaryAndRetired | Layout::StagingAndRetired => {
-                    assert_eq!(outcome, Ok(DeleteOutcome::Removed), "{layout:?}");
-                }
-            }
+            assert_eq!(
+                store.evidence(&loc(LOCAL)).map(|_| ()),
+                Err(EvidenceRefusal::UnresolvedNewerState),
+                "{layout:?}"
+            );
 
-            only_the_retired_file_is_left(&scratch, layout);
+            assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}");
+            retired_is_untouched(&scratch);
         }
     }
 
     #[test]
-    fn a_retired_file_of_another_location_is_untouched_by_every_mutator() {
-        let scratch = fixture(Layout::PrimaryAndRetired);
+    fn delete_never_removes_a_retired_file_because_it_refuses_first() {
+        for layout in LAYOUTS {
+            let scratch = fixture(layout);
+            let before = snapshot(scratch.dir.path());
+
+            assert_eq!(
+                scratch.store().delete(&loc(LOCAL)),
+                Err(StoreError::UnresolvedNewerState),
+                "{layout:?}"
+            );
+
+            assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}");
+            retired_is_untouched(&scratch);
+        }
+    }
+
+    #[test]
+    fn conditional_delete_never_removes_a_retired_file_because_it_refuses_first() {
+        for layout in LAYOUTS {
+            let scratch = fixture(layout);
+            let before = snapshot(scratch.dir.path());
+
+            // No evidence of this layout can be captured; any other evidence is no
+            // authority either.
+            assert_eq!(
+                scratch
+                    .store()
+                    .delete_if_evidence_matches(&loc(LOCAL), &empty_evidence()),
+                Err(ConditionalDeleteError::Store(
+                    StoreError::UnresolvedNewerState
+                )),
+                "{layout:?}"
+            );
+
+            assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}");
+            retired_is_untouched(&scratch);
+        }
+    }
+
+    #[test]
+    fn a_retired_file_of_another_location_blocks_only_that_location() {
+        let scratch = Scratch::new("legacy-gate-other-retired");
         let other = scratch.retired(OTHER_LOCAL, RETIRED_TOKEN);
 
+        scratch.put(&scratch.record(LOCAL), &primary_bytes());
         scratch.put(&other, RETIRED_BYTES);
 
         let store = scratch.store();
+
+        // This location is not affected: it loads, binds its evidence and its
+        // conditional deletion removes exactly its own files.
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Loaded(Box::new(state(LOCAL)))
+        );
+
         let evidence = store.evidence(&loc(LOCAL)).unwrap();
 
         assert_eq!(
             store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
             Ok(DeleteOutcome::Removed)
         );
+
+        // The other location, which does have a retired file, is refused; its
+        // file is untouched either way.
         assert_eq!(
             store.delete(&loc(OTHER_LOCAL)),
-            Ok(DeleteOutcome::AlreadyAbsent)
+            Err(StoreError::UnresolvedNewerState)
         );
         assert_eq!(fs::read(&other).unwrap(), RETIRED_BYTES);
-        retired_is_untouched(&scratch);
+        assert_eq!(
+            names(&scratch.state_dir()),
+            [format!(
+                "{}.{RETIRED_TOKEN}.retired",
+                record_key(&loc(OTHER_LOCAL))
+            )]
+        );
     }
 }
 
 // ---- B3c-3b-1 v1 non-regression tests (end) ----------------------------------
+
+// ---- B3c-3b-2a golden v1 baseline (begin) ------------------------------------
+
+/// Stage 1U-4 B3c-3b-2a golden baseline: what the legacy (v1) store does for the
+/// ordinary v1 layouts, through every operation, with real files on NTFS.
+///
+/// These assertions were written and run against the **unmodified** production
+/// store before the compatibility gate existed, and are meant to pass unchanged
+/// afterwards: an ordinary v1 layout (no recognized newer-state evidence) must keep
+/// its outcome, its refusals and the exact set of files it leaves behind. Every
+/// operation runs on its own freshly built, uniquely owned scratch directory.
+#[cfg(all(test, windows))]
+mod legacy_v1_golden_tests {
+    use std::fs;
+
+    use localvault_core::{
+        sync::{EnvelopeFingerprint, PushBaseline, PushIntent},
+        sync_state::{BindingId, PendingPush, SyncBase, VaultBindingTag, BINDING_SALT_LEN},
+    };
+
+    use super::b3c3b1_support::{
+        loc, names, state, Scratch, LOCAL, OTHER_LOCAL, RETIRED_TOKEN, TARGET, TOKEN,
+    };
+    use super::*;
+    use crate::vault::handle_ops::test_support::snapshot;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Layout {
+        NoDirectory,
+        EmptyDirectory,
+        V1Primary,
+        PrimaryAndEmptyTmp,
+        PrimaryAndPartialTmp,
+        PrimaryAndCompleteTmp,
+        TmpOnlyEmpty,
+        TmpOnlyPartial,
+        TmpOnlyComplete,
+        CorruptPrimary,
+        OversizedTmp,
+        DirectoryTmp,
+        OtherKeysOnly,
+        PrimaryAndOtherKeys,
+    }
+
+    const LAYOUTS: [Layout; 14] = [
+        Layout::NoDirectory,
+        Layout::EmptyDirectory,
+        Layout::V1Primary,
+        Layout::PrimaryAndEmptyTmp,
+        Layout::PrimaryAndPartialTmp,
+        Layout::PrimaryAndCompleteTmp,
+        Layout::TmpOnlyEmpty,
+        Layout::TmpOnlyPartial,
+        Layout::TmpOnlyComplete,
+        Layout::CorruptPrimary,
+        Layout::OversizedTmp,
+        Layout::DirectoryTmp,
+        Layout::OtherKeysOnly,
+        Layout::PrimaryAndOtherKeys,
+    ];
+
+    /// The same binding as `state(LOCAL)` with a different pending-push revision.
+    fn proposed() -> SyncState {
+        let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+        let intent =
+            PushIntent::new(PushBaseline::Absent, EnvelopeFingerprint::of_bytes(&[2])).unwrap();
+
+        SyncState::new(
+            BindingId::new(Uuid::from_u128(0x1111_1111_2222_3333_4444_5555_5555_5555)).unwrap(),
+            VaultBindingTag::derive(
+                salt,
+                Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef),
+            )
+            .unwrap(),
+            loc(LOCAL),
+            loc(TARGET),
+            SyncBase::Unbased,
+            Some(
+                PendingPush::new(
+                    Uuid::from_u128(0xaaaa_aaaa_bbbb_4ccc_8ddd_eeee_eeee_eeee),
+                    intent,
+                    2,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn complete() -> Vec<u8> {
+        state(LOCAL).encode().unwrap()
+    }
+
+    fn fixture(layout: Layout) -> Scratch {
+        let scratch = Scratch::new("golden-v1");
+        let tmp = scratch.staging(LOCAL, TOKEN);
+        let record = scratch.record(LOCAL);
+
+        match layout {
+            Layout::NoDirectory => {}
+            Layout::EmptyDirectory => fs::create_dir_all(scratch.state_dir()).unwrap(),
+            Layout::V1Primary => scratch.put(&record, &complete()),
+            Layout::PrimaryAndEmptyTmp => {
+                scratch.put(&record, &complete());
+                scratch.put(&tmp, b"");
+            }
+            Layout::PrimaryAndPartialTmp => {
+                scratch.put(&record, &complete());
+                scratch.put(&tmp, &complete()[..20]);
+            }
+            Layout::PrimaryAndCompleteTmp => {
+                scratch.put(&record, &complete());
+                scratch.put(&tmp, &complete());
+            }
+            Layout::TmpOnlyEmpty => scratch.put(&tmp, b""),
+            Layout::TmpOnlyPartial => scratch.put(&tmp, &complete()[..20]),
+            Layout::TmpOnlyComplete => scratch.put(&tmp, &complete()),
+            Layout::CorruptPrimary => scratch.put(&record, b"garbage"),
+            Layout::OversizedTmp => {
+                fs::create_dir_all(scratch.state_dir()).unwrap();
+                let file = fs::File::create(&tmp).unwrap();
+                file.set_len(MAX_SYNC_STATE_BYTES as u64 + 1).unwrap();
+            }
+            Layout::DirectoryTmp => fs::create_dir_all(&tmp).unwrap(),
+            Layout::OtherKeysOnly | Layout::PrimaryAndOtherKeys => {
+                if matches!(layout, Layout::PrimaryAndOtherKeys) {
+                    scratch.put(&record, &complete());
+                }
+                scratch.put(
+                    &scratch.record(OTHER_LOCAL),
+                    &state(OTHER_LOCAL).encode().unwrap(),
+                );
+                scratch.put(&scratch.staging(OTHER_LOCAL, TOKEN), b"other staging");
+                scratch.put(
+                    &scratch.retired(OTHER_LOCAL, RETIRED_TOKEN),
+                    b"other retired",
+                );
+                scratch.put(&scratch.state_dir().join("unrelated.txt"), b"unrelated");
+            }
+        }
+
+        scratch
+    }
+
+    /// The directory's file names with the record keys and tokens abbreviated, so
+    /// the expectations read the same whatever the hashes are.
+    fn listing(scratch: &Scratch) -> String {
+        let dir = scratch.state_dir();
+
+        if !dir.exists() {
+            return "none".to_owned();
+        }
+
+        let key = record_key(&loc(LOCAL));
+        let other = record_key(&loc(OTHER_LOCAL));
+
+        let mut found: Vec<String> = names(&dir)
+            .into_iter()
+            .map(|name| {
+                name.replace(&key, "K")
+                    .replace(&other, "O")
+                    .replace(TOKEN, "T")
+                    .replace(RETIRED_TOKEN, "R")
+            })
+            .collect();
+
+        found.sort();
+
+        if found.is_empty() {
+            "-".to_owned()
+        } else {
+            found.join(",")
+        }
+    }
+
+    fn evidence_text(result: Result<RecordEvidence, EvidenceRefusal>) -> String {
+        match result {
+            Ok(evidence) => format!(
+                "Ok(primary={}, artifacts={})",
+                evidence.primary_present(),
+                evidence.artifact_count()
+            ),
+            Err(refusal) => format!("Err({refusal:?})"),
+        }
+    }
+
+    /// Load, read, create, replace, evidence, delete and conditional delete, each
+    /// on a fresh fixture. The first three read-only operations also prove that
+    /// nothing in the tree moved.
+    fn observe(layout: Layout) -> [String; 7] {
+        let read_only = |run: &dyn Fn(&SyncStateStore) -> String| {
+            let scratch = fixture(layout);
+            let before = snapshot(scratch.dir.path());
+            let text = run(&scratch.store());
+
+            assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}: {text}");
+
+            text
+        };
+        let mutating = |run: &dyn Fn(&Scratch, &SyncStateStore) -> String| {
+            let scratch = fixture(layout);
+            let text = run(&scratch, &scratch.store());
+
+            format!("{text}@{}", listing(&scratch))
+        };
+
+        let load = read_only(&|store| match store.load(&loc(LOCAL)) {
+            StateLoad::Loaded(loaded) => format!("Loaded(same={})", *loaded == state(LOCAL)),
+            other => format!("{other:?}"),
+        });
+
+        let read = {
+            let scratch = fixture(layout);
+            let before = snapshot(scratch.dir.path());
+            let read = scratch.store().read_record(&loc(LOCAL));
+            let text = match &read {
+                RecordRead::Present(present) => format!(
+                    "Present(same_bytes={}, {:?})",
+                    present.bytes() == fs::read(scratch.record(LOCAL)).unwrap(),
+                    present.artifacts()
+                ),
+                other => format!("{other:?}"),
+            };
+
+            assert_eq!(snapshot(scratch.dir.path()), before, "{layout:?}: {text}");
+
+            text
+        };
+
+        let create = mutating(&|_, store| format!("{:?}", store.create(&state(LOCAL))));
+        let replace =
+            mutating(&|_, store| format!("{:?}", store.replace(&state(LOCAL), &proposed())));
+
+        let evidence = read_only(&|store| evidence_text(store.evidence(&loc(LOCAL))));
+
+        let delete = mutating(&|_, store| format!("{:?}", store.delete(&loc(LOCAL))));
+
+        let conditional = mutating(&|_, store| {
+            // A file that cannot be bound is judged against the empty evidence.
+            let expected = match layout {
+                Layout::OversizedTmp | Layout::DirectoryTmp => Scratch::new("golden-empty")
+                    .store()
+                    .evidence(&loc(LOCAL))
+                    .unwrap(),
+                _ => store.evidence(&loc(LOCAL)).unwrap(),
+            };
+
+            format!(
+                "{:?}",
+                store.delete_if_evidence_matches(&loc(LOCAL), &expected)
+            )
+        });
+
+        [load, read, create, replace, evidence, delete, conditional]
+    }
+
+    const OTHERS: &str = "O.R.retired,O.T.tmp,O.json,unrelated.txt";
+
+    fn expected(layout: Layout) -> [String; 7] {
+        let s = |text: &str| text.to_owned();
+        let others = |text: &str| format!("{text},{OTHERS}");
+
+        match layout {
+            Layout::NoDirectory => [
+                s("NotConfigured"),
+                s("NotConfigured"),
+                s("Ok(())@K.json"),
+                s("Err(Missing)@none"),
+                s("Ok(primary=false, artifacts=0)"),
+                s("Ok(AlreadyAbsent)@none"),
+                s("Ok(AlreadyAbsent)@none"),
+            ],
+            Layout::EmptyDirectory => [
+                s("NotConfigured"),
+                s("NotConfigured"),
+                s("Ok(())@K.json"),
+                s("Err(Missing)@-"),
+                s("Ok(primary=false, artifacts=0)"),
+                s("Ok(AlreadyAbsent)@-"),
+                s("Ok(AlreadyAbsent)@-"),
+            ],
+            Layout::V1Primary => [
+                s("Loaded(same=true)"),
+                s("Present(same_bytes=true, None)"),
+                s("Err(AlreadyExists)@K.json"),
+                s("Ok(())@K.json"),
+                s("Ok(primary=true, artifacts=0)"),
+                s("Ok(Removed)@-"),
+                s("Ok(Removed)@-"),
+            ],
+            Layout::PrimaryAndEmptyTmp
+            | Layout::PrimaryAndPartialTmp
+            | Layout::PrimaryAndCompleteTmp => [
+                s("Loaded(same=true)"),
+                s("Present(same_bytes=true, Present)"),
+                s("Err(AlreadyExists)@K.T.tmp,K.json"),
+                s("Ok(())@K.T.tmp,K.json"),
+                s("Ok(primary=true, artifacts=1)"),
+                s("Ok(Removed)@-"),
+                s("Ok(Removed)@-"),
+            ],
+            Layout::TmpOnlyEmpty | Layout::TmpOnlyPartial | Layout::TmpOnlyComplete => [
+                s("Unreadable(UnresolvedArtifacts)"),
+                s("Unreadable(UnresolvedArtifacts)"),
+                s("Err(UnresolvedArtifacts)@K.T.tmp"),
+                s("Err(Missing)@K.T.tmp"),
+                s("Ok(primary=false, artifacts=1)"),
+                s("Ok(Removed)@-"),
+                s("Ok(Removed)@-"),
+            ],
+            Layout::CorruptPrimary => [
+                s("Corrupt(Undecodable)"),
+                s("Present(same_bytes=true, None)"),
+                s("Err(AlreadyExists)@K.json"),
+                s("Err(CurrentCorrupt)@K.json"),
+                s("Ok(primary=true, artifacts=0)"),
+                s("Ok(Removed)@-"),
+                s("Ok(Removed)@-"),
+            ],
+            Layout::OversizedTmp => [
+                s("Unreadable(UnresolvedArtifacts)"),
+                s("Unreadable(UnresolvedArtifacts)"),
+                s("Err(UnresolvedArtifacts)@K.T.tmp"),
+                s("Err(Missing)@K.T.tmp"),
+                s("Err(Oversized)"),
+                s("Ok(Removed)@-"),
+                s("Err(Evidence(Oversized))@K.T.tmp"),
+            ],
+            Layout::DirectoryTmp => [
+                s("Unreadable(UnresolvedArtifacts)"),
+                s("Unreadable(UnresolvedArtifacts)"),
+                s("Err(UnresolvedArtifacts)@K.T.tmp"),
+                s("Err(Missing)@K.T.tmp"),
+                s("Err(UnexpectedObject)"),
+                s("Err(UnexpectedObject)@K.T.tmp"),
+                s("Err(Store(UnexpectedObject))@K.T.tmp"),
+            ],
+            Layout::OtherKeysOnly => [
+                s("NotConfigured"),
+                s("NotConfigured"),
+                format!("Ok(())@{}", others("K.json")),
+                format!("Err(Missing)@{OTHERS}"),
+                s("Ok(primary=false, artifacts=0)"),
+                format!("Ok(AlreadyAbsent)@{OTHERS}"),
+                format!("Ok(AlreadyAbsent)@{OTHERS}"),
+            ],
+            Layout::PrimaryAndOtherKeys => [
+                s("Loaded(same=true)"),
+                s("Present(same_bytes=true, None)"),
+                format!("Err(AlreadyExists)@{}", others("K.json")),
+                format!("Ok(())@{}", others("K.json")),
+                s("Ok(primary=true, artifacts=0)"),
+                format!("Ok(Removed)@{OTHERS}"),
+                format!("Ok(Removed)@{OTHERS}"),
+            ],
+        }
+    }
+
+    #[test]
+    fn ordinary_v1_layouts_keep_their_outcomes_through_every_operation() {
+        for layout in LAYOUTS {
+            assert_eq!(observe(layout), expected(layout), "{layout:?}");
+        }
+    }
+}
+
+// ---- B3c-3b-2a golden v1 baseline (end) --------------------------------------
 
 /// Stage 1U-4 B3c-3b-1 tests of the name grammar and of the read-only
 /// [`SyncStateStore::inspect_v3_layout`]. Real NTFS, synthetic bytes. Fixtures are
@@ -8290,3 +9075,2063 @@ mod v3_layout_tests {
             .any(|part| part.as_os_str() == "sync-state-b3c3b1-tests"));
     }
 }
+
+// ---- B3c-3b-2a test support (begin) ------------------------------------------
+
+/// Shared scaffolding for the Stage 1U-4 B3c-3b-2a tests. Synthetic bytes only; the
+/// scratch directories are the uniquely owned ones of `b3c3b1_support::Scratch`,
+/// under the git-ignored `<repo>/.qa-local/` (never `%TEMP%`).
+#[cfg(all(test, windows))]
+mod b3c3b2a_support {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+    };
+
+    use localvault_core::{
+        sync::{EnvelopeFingerprint, PushBaseline, PushIntent},
+        sync_state::{
+            BindingId, PendingPush, SyncBase, SyncState, VaultBindingTag, BINDING_SALT_LEN,
+        },
+    };
+    use uuid::Uuid;
+
+    use super::b3c3b1_support::{loc, state, Scratch, LOCAL, TARGET};
+    use super::{record_key, RecordEvidence, MAX_SYNC_STATE_BYTES};
+    use crate::vault::handle_ops::test_support::{make_junction, snapshot};
+
+    /// A well-formed token for a `.v3stage` name.
+    pub(super) const STAGE_TOKEN: &str = "0f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
+    const VAULT_ID: Uuid = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+
+    pub(super) fn v3stage(scratch: &Scratch, local: &str, token: &str) -> PathBuf {
+        scratch
+            .state_dir()
+            .join(format!("{}.{token}.v3stage", record_key(&loc(local))))
+    }
+
+    /// A complete version-1 record for `LOCAL`.
+    pub(super) fn v1_bytes() -> Vec<u8> {
+        state(LOCAL).encode().unwrap()
+    }
+
+    /// A complete version-2 (exchange) record for `LOCAL`.
+    pub(super) fn v2_bytes() -> Vec<u8> {
+        state(LOCAL).encode_exchange_record().unwrap()
+    }
+
+    /// A complete, real version-3 (authenticated) record for `LOCAL`: the exact
+    /// output of the core's authenticated encoder for `state(LOCAL)` under a fixed
+    /// synthetic test key, captured once. It is a literal, not a call, because a
+    /// repository scan (in the core crate) forbids naming the authenticated APIs in
+    /// any source file but their one session module. Nothing authenticates it here;
+    /// every test only needs it to be a complete, well-formed record of a version
+    /// this build does not support.
+    const V3_RECORD: &str = r#"{"format":"localvault-sync-state","version":3,"body":"{\"binding_id\":\"11111111-2222-3333-4444-555555555555\",\"vault_tag\":{\"salt\":\"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\",\"digest\":\"533cfabc5ff2073b76dab8c6cb60289e44d95f9dbb67cdbdac12bdcf94025aa8\"},\"local_locator\":\"\\\\\\\\?\\\\C:\\\\Synthetic\\\\Vaults\\\\LOCAL-MARKER.lvault\",\"target_locator\":\"\\\\\\\\?\\\\D:\\\\Synthetic\\\\Remote\\\\TARGET-MARKER.lvault\",\"base\":{\"kind\":\"unbased\"},\"pending_push\":{\"intent_id\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\",\"baseline\":{\"kind\":\"absent\"},\"intended\":\"dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986\",\"intended_revision\":1},\"exchange\":null,\"retained_previous\":[]}","mac":"5de78e8da09519e20b40a22e21b2a63e9b38366539408610e30caf6c8e19191d"}"#;
+
+    pub(super) fn v3_bytes() -> Vec<u8> {
+        V3_RECORD.as_bytes().to_vec()
+    }
+
+    /// The version-1 wrapper of `LOCAL` with its version number rewritten.
+    pub(super) fn tampered_version(version: u64) -> Vec<u8> {
+        let mut value: serde_json::Value = serde_json::from_slice(&v1_bytes()).unwrap();
+
+        value["version"] = serde_json::json!(version);
+
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    /// Same binding as `state(LOCAL)`, different pending-push revision.
+    pub(super) fn proposed_state() -> SyncState {
+        let salt: [u8; BINDING_SALT_LEN] = std::array::from_fn(|i| i as u8);
+        let intent =
+            PushIntent::new(PushBaseline::Absent, EnvelopeFingerprint::of_bytes(&[2])).unwrap();
+
+        SyncState::new(
+            BindingId::new(Uuid::from_u128(0x1111_1111_2222_3333_4444_5555_5555_5555)).unwrap(),
+            VaultBindingTag::derive(salt, VAULT_ID).unwrap(),
+            loc(LOCAL),
+            loc(TARGET),
+            SyncBase::Unbased,
+            Some(
+                PendingPush::new(
+                    Uuid::from_u128(0xaaaa_aaaa_bbbb_4ccc_8ddd_eeee_eeee_eeee),
+                    intent,
+                    2,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    /// The evidence of a store that holds nothing for `LOCAL`.
+    pub(super) fn empty_evidence() -> RecordEvidence {
+        Scratch::new("gate-empty-evidence")
+            .store()
+            .evidence(&loc(LOCAL))
+            .unwrap()
+    }
+
+    /// A sparse file one byte over the supported maximum.
+    pub(super) fn oversized(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let file = fs::File::create(path).unwrap();
+
+        file.set_len(MAX_SYNC_STATE_BYTES as u64 + 1).unwrap();
+    }
+
+    /// A directory at `path` (a plain directory, not a link).
+    pub(super) fn directory(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::write(path.join("inner.txt"), b"keep").unwrap();
+    }
+
+    /// A junction at `path` to a directory kept outside the state directory.
+    pub(super) fn junction(scratch: &Scratch, path: &Path) {
+        let elsewhere = scratch.root().join("junction-target");
+
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+        make_junction(path, &elsewhere);
+    }
+
+    /// Write `bytes` at `dest` from a REAL separate process (`cmd.exe copy`), as a
+    /// non-cooperating program would. The staging source lives outside the state
+    /// directory under `root` and is removed again.
+    pub(super) fn child_puts(root: &Path, dest: &Path, bytes: &[u8]) {
+        let source = root.join("child-source.bin");
+
+        fs::write(&source, bytes).unwrap();
+
+        let output = Command::new("cmd")
+            .arg("/C")
+            .arg("copy")
+            .arg("/Y")
+            .arg(&source)
+            .arg(dest)
+            .output()
+            .unwrap();
+
+        fs::remove_file(&source).unwrap();
+
+        assert!(output.status.success(), "the child process could not write");
+    }
+
+    /// What a refused layout must produce, in all three error types.
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Gate {
+        Newer,
+        Unrecognized,
+        Uncertain,
+    }
+
+    use super::{
+        ArtifactPresence, ConditionalDeleteError, EvidenceRefusal, RecordRead, StateLoad,
+        StoreError, UnreadableReason,
+    };
+
+    /// Every legacy operation refuses `scratch` with the category `gate` names, and
+    /// the whole tree (names, kinds, bytes, timestamps) is the same afterwards. A
+    /// present primary is still returned by `read_record`, with a truthful
+    /// indicator.
+    pub(super) fn assert_gated(scratch: &Scratch, gate: Gate, label: &str) {
+        let store = scratch.store();
+        let before = snapshot(scratch.dir.path());
+
+        let (reason, error, refusal, presence) = match gate {
+            Gate::Newer => (
+                UnreadableReason::UnresolvedNewerState,
+                StoreError::UnresolvedNewerState,
+                EvidenceRefusal::UnresolvedNewerState,
+                ArtifactPresence::Present,
+            ),
+            Gate::Unrecognized => (
+                UnreadableReason::UnrecognizedEntries,
+                StoreError::UnrecognizedEntries,
+                EvidenceRefusal::UnrecognizedEntries,
+                ArtifactPresence::Present,
+            ),
+            Gate::Uncertain => (
+                UnreadableReason::LayoutUncertain,
+                StoreError::LayoutUncertain,
+                EvidenceRefusal::Unreadable,
+                ArtifactPresence::Unknown,
+            ),
+        };
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(reason),
+            "{label}: load"
+        );
+
+        match store.read_record(&loc(LOCAL)) {
+            RecordRead::Unreadable(found) => assert_eq!(found, reason, "{label}: read_record"),
+            RecordRead::Present(present) => {
+                assert_eq!(present.artifacts(), presence, "{label}: read_record")
+            }
+            other => panic!("{label}: read_record gave {other:?}"),
+        }
+
+        assert_eq!(store.create(&state(LOCAL)), Err(error), "{label}: create");
+        assert_eq!(
+            store.replace(&state(LOCAL), &proposed_state()),
+            Err(error),
+            "{label}: replace"
+        );
+        assert_eq!(
+            store.evidence(&loc(LOCAL)).map(|_| ()),
+            Err(refusal),
+            "{label}: evidence"
+        );
+        assert_eq!(store.delete(&loc(LOCAL)), Err(error), "{label}: delete");
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &empty_evidence()),
+            Err(ConditionalDeleteError::Store(error)),
+            "{label}: delete_if_evidence_matches"
+        );
+
+        assert_eq!(
+            snapshot(scratch.dir.path()),
+            before,
+            "{label}: the tree moved"
+        );
+    }
+}
+
+// ---- B3c-3b-2a test support (end) --------------------------------------------
+
+// ---- B3c-3b-2a pure verdict tests (begin) ------------------------------------
+
+/// The gate's decision, on hand-built observations. No filesystem.
+#[cfg(all(test, windows))]
+mod legacy_gate_pure_tests {
+    use std::io;
+
+    use super::b3c3b2a_support::{v1_bytes, v2_bytes, v3_bytes};
+    use super::*;
+
+    fn sibling(kind: SiblingKind, content: SiblingContent) -> LayoutSibling {
+        LayoutSibling { kind, content }
+    }
+
+    fn layout(
+        primary: LayoutPrimary,
+        siblings: Vec<LayoutSibling>,
+        unrecognized: usize,
+    ) -> V3Layout {
+        V3Layout {
+            primary,
+            siblings,
+            unrecognized,
+        }
+    }
+
+    /// One of each kind of sibling content, freshly built (it is not `Clone`).
+    fn every_content() -> Vec<(&'static str, SiblingContent)> {
+        vec![
+            ("v1", SiblingContent::Bytes(v1_bytes())),
+            ("v2", SiblingContent::Bytes(v2_bytes())),
+            ("v3", SiblingContent::Bytes(v3_bytes())),
+            ("junk", SiblingContent::Bytes(b"junk".to_vec())),
+            (
+                "cut short",
+                SiblingContent::Bytes(v3_bytes()[..24].to_vec()),
+            ),
+            ("empty", SiblingContent::Empty),
+            ("too large", SiblingContent::TooLarge),
+            (
+                "unreadable",
+                SiblingContent::Unreadable(io::ErrorKind::PermissionDenied),
+            ),
+            ("unexpected", SiblingContent::Unexpected),
+            ("vanished", SiblingContent::Vanished),
+        ]
+    }
+
+    #[test]
+    fn an_empty_layout_passes_and_the_primary_is_never_judged() {
+        assert_eq!(
+            legacy_verdict(&layout(LayoutPrimary::Absent, vec![], 0)),
+            Ok(())
+        );
+
+        for primary in [
+            LayoutPrimary::Bytes(v1_bytes()),
+            LayoutPrimary::Bytes(v3_bytes()),
+            LayoutPrimary::Bytes(b"garbage".to_vec()),
+            LayoutPrimary::Empty,
+            LayoutPrimary::TooLarge,
+            LayoutPrimary::Unexpected,
+        ] {
+            let label = format!("{primary:?}");
+
+            assert_eq!(
+                legacy_verdict(&layout(primary, vec![], 0)),
+                Ok(()),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retired_or_reserved_staging_sibling_is_newer_state_whatever_it_holds() {
+        for kind in [SiblingKind::Retired, SiblingKind::ReservedStaging] {
+            for (label, content) in every_content() {
+                assert_eq!(
+                    legacy_verdict(&layout(
+                        LayoutPrimary::Absent,
+                        vec![sibling(kind, content)],
+                        0
+                    )),
+                    Err(LegacyGateRefusal::NewerState),
+                    "{kind:?} holding {label}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_staging_sibling_is_judged_by_its_content() {
+        let expected = |label: &str| match label {
+            "v2" | "v3" => Err(LegacyGateRefusal::NewerState),
+            "unreadable" => Err(LegacyGateRefusal::Uncertain(LayoutUncertainty::Io(
+                io::ErrorKind::PermissionDenied,
+            ))),
+            "vanished" => Err(LegacyGateRefusal::Uncertain(
+                LayoutUncertainty::ChangedDuringScan,
+            )),
+            // A complete v1 record, junk, a cut-short record, empty, oversized and
+            // a non-file all keep their legacy meaning.
+            _ => Ok(()),
+        };
+
+        for (label, content) in every_content() {
+            assert_eq!(
+                legacy_verdict(&layout(
+                    LayoutPrimary::Absent,
+                    vec![sibling(SiblingKind::Staging, content)],
+                    0
+                )),
+                expected(label),
+                "staging holding {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_order_of_the_rules_is_fixed() {
+        // A retired sibling beats an unrecognized entry.
+        assert_eq!(
+            legacy_verdict(&layout(
+                LayoutPrimary::Absent,
+                vec![sibling(SiblingKind::Retired, SiblingContent::Empty)],
+                1
+            )),
+            Err(LegacyGateRefusal::NewerState)
+        );
+
+        // An unrecognized entry beats anything a staging file holds.
+        for content in [
+            SiblingContent::Bytes(v3_bytes()),
+            SiblingContent::Unreadable(io::ErrorKind::PermissionDenied),
+            SiblingContent::Vanished,
+        ] {
+            assert_eq!(
+                legacy_verdict(&layout(
+                    LayoutPrimary::Absent,
+                    vec![sibling(SiblingKind::Staging, content)],
+                    2
+                )),
+                Err(LegacyGateRefusal::UnrecognizedEntries)
+            );
+        }
+
+        assert_eq!(
+            legacy_verdict(&layout(LayoutPrimary::Absent, vec![], 1)),
+            Err(LegacyGateRefusal::UnrecognizedEntries)
+        );
+
+        // Among staging files, complete newer-state content is reported before
+        // uncertainty, whatever their order.
+        for newer_first in [true, false] {
+            let mut siblings = vec![
+                sibling(
+                    SiblingKind::Staging,
+                    SiblingContent::Unreadable(io::ErrorKind::PermissionDenied),
+                ),
+                sibling(SiblingKind::Staging, SiblingContent::Bytes(v3_bytes())),
+            ];
+
+            if newer_first {
+                siblings.reverse();
+            }
+
+            assert_eq!(
+                legacy_verdict(&layout(LayoutPrimary::Absent, siblings, 0)),
+                Err(LegacyGateRefusal::NewerState)
+            );
+        }
+
+        // Several harmless staging files stay harmless.
+        assert_eq!(
+            legacy_verdict(&layout(
+                LayoutPrimary::Bytes(v1_bytes()),
+                vec![
+                    sibling(SiblingKind::Staging, SiblingContent::Empty),
+                    sibling(SiblingKind::Staging, SiblingContent::Bytes(v1_bytes())),
+                    sibling(SiblingKind::Staging, SiblingContent::Bytes(b"x".to_vec())),
+                ],
+                0
+            )),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn every_refusal_maps_to_one_fixed_category_in_all_three_error_types() {
+        use LayoutUncertainty as U;
+
+        let kind = io::ErrorKind::PermissionDenied;
+
+        // (refusal, reason, store error, evidence refusal)
+        let table: Vec<(
+            LegacyGateRefusal,
+            UnreadableReason,
+            StoreError,
+            EvidenceRefusal,
+        )> = vec![
+            (
+                LegacyGateRefusal::NewerState,
+                UnreadableReason::UnresolvedNewerState,
+                StoreError::UnresolvedNewerState,
+                EvidenceRefusal::UnresolvedNewerState,
+            ),
+            (
+                LegacyGateRefusal::UnrecognizedEntries,
+                UnreadableReason::UnrecognizedEntries,
+                StoreError::UnrecognizedEntries,
+                EvidenceRefusal::UnrecognizedEntries,
+            ),
+            (
+                LegacyGateRefusal::Uncertain(U::Io(kind)),
+                UnreadableReason::Io(kind),
+                StoreError::Io {
+                    stage: IoStage::Scan,
+                    kind,
+                },
+                EvidenceRefusal::Unreadable,
+            ),
+            (
+                LegacyGateRefusal::Uncertain(U::UnexpectedObject),
+                UnreadableReason::UnexpectedObject,
+                StoreError::UnexpectedObject,
+                EvidenceRefusal::UnexpectedObject,
+            ),
+            (
+                LegacyGateRefusal::Uncertain(U::EntryLimit),
+                UnreadableReason::EntryLimit,
+                StoreError::Io {
+                    stage: IoStage::Scan,
+                    kind: io::ErrorKind::Other,
+                },
+                EvidenceRefusal::EntryLimit,
+            ),
+            (
+                LegacyGateRefusal::Uncertain(U::ChangedDuringScan),
+                UnreadableReason::LayoutUncertain,
+                StoreError::LayoutUncertain,
+                EvidenceRefusal::Unstable,
+            ),
+            (
+                LegacyGateRefusal::Uncertain(U::SiblingLimit),
+                UnreadableReason::LayoutUncertain,
+                StoreError::LayoutUncertain,
+                EvidenceRefusal::Unreadable,
+            ),
+            (
+                LegacyGateRefusal::Uncertain(U::AliasAmbiguity),
+                UnreadableReason::LayoutUncertain,
+                StoreError::LayoutUncertain,
+                EvidenceRefusal::Unreadable,
+            ),
+        ];
+
+        for (refusal, reason, error, evidence) in table {
+            assert_eq!(UnreadableReason::from(refusal), reason, "{refusal:?}");
+            assert_eq!(StoreError::from(refusal), error, "{refusal:?}");
+            assert_eq!(EvidenceRefusal::from(refusal), evidence, "{refusal:?}");
+
+            // No uncertainty or evidence ever becomes confirmed absence.
+            assert_ne!(
+                StateLoad::Unreadable(reason).into_sync_state_load(),
+                SyncStateLoad::NotConfigured
+            );
+        }
+    }
+}
+
+// ---- B3c-3b-2a pure verdict tests (end) --------------------------------------
+
+// ---- B3c-3b-2a real NTFS gate tests (begin) ----------------------------------
+
+/// The compatibility gate through every legacy operation, on real files on NTFS.
+/// Every refusal is proven by comparing a recursive snapshot of the whole tree
+/// before and after: the gate removes, renames, creates and rewrites nothing.
+#[cfg(all(test, windows))]
+mod legacy_gate_ntfs_tests {
+    use std::fs;
+
+    use super::b3c3b1_support::{
+        loc, names, state, Scratch, LOCAL, OTHER_LOCAL, RETIRED_TOKEN, TOKEN,
+    };
+    use super::b3c3b2a_support::{
+        assert_gated, directory, junction, oversized, tampered_version, v1_bytes, v2_bytes,
+        v3_bytes, v3stage, Gate, STAGE_TOKEN,
+    };
+    use super::*;
+    use crate::vault::handle_ops::test_support::snapshot;
+
+    type Build = Box<dyn Fn(&Scratch)>;
+
+    fn run(cases: Vec<(&str, Gate, Build)>) {
+        for (label, gate, build) in cases {
+            let scratch = Scratch::new("legacy-gate-matrix");
+
+            build(&scratch);
+            assert_gated(&scratch, gate, label);
+        }
+    }
+
+    fn retired(s: &Scratch, content: &[u8]) {
+        s.put(&s.retired(LOCAL, RETIRED_TOKEN), content);
+    }
+
+    fn staging(s: &Scratch, content: &[u8]) {
+        s.put(&s.staging(LOCAL, TOKEN), content);
+    }
+
+    fn stage(s: &Scratch, content: &[u8]) {
+        s.put(&v3stage(s, LOCAL, STAGE_TOKEN), content);
+    }
+
+    fn primary(s: &Scratch, content: &[u8]) {
+        s.put(&s.record(LOCAL), content);
+    }
+
+    #[test]
+    fn retained_siblings_refuse_every_operation_whatever_else_is_there() {
+        run(vec![
+            ("retired only", Gate::Newer, Box::new(|s| retired(s, b"r"))),
+            (
+                "retired and a legacy temp",
+                Gate::Newer,
+                Box::new(|s| {
+                    retired(s, b"r");
+                    staging(s, b"staging");
+                }),
+            ),
+            (
+                "retired and a v1 primary",
+                Gate::Newer,
+                Box::new(|s| {
+                    retired(s, b"r");
+                    primary(s, &v1_bytes());
+                }),
+            ),
+            (
+                "retired and a real v3 primary",
+                Gate::Newer,
+                Box::new(|s| {
+                    retired(s, b"r");
+                    primary(s, &v3_bytes());
+                }),
+            ),
+            (
+                "retired and a corrupt primary",
+                Gate::Newer,
+                Box::new(|s| {
+                    retired(s, b"r");
+                    primary(s, b"garbage");
+                }),
+            ),
+            (
+                "retired holding a valid v1 record",
+                Gate::Newer,
+                Box::new(|s| retired(s, &v1_bytes())),
+            ),
+            (
+                "retired holding a real v3 record",
+                Gate::Newer,
+                Box::new(|s| retired(s, &v3_bytes())),
+            ),
+            (
+                "retired holding junk",
+                Gate::Newer,
+                Box::new(|s| retired(s, b"\x00\xff junk")),
+            ),
+            ("retired, empty", Gate::Newer, Box::new(|s| retired(s, b""))),
+            (
+                "retired, oversized",
+                Gate::Newer,
+                Box::new(|s| oversized(&s.retired(LOCAL, RETIRED_TOKEN))),
+            ),
+            (
+                "retired, a directory",
+                Gate::Newer,
+                Box::new(|s| directory(&s.retired(LOCAL, RETIRED_TOKEN))),
+            ),
+            (
+                "retired, a junction",
+                Gate::Newer,
+                Box::new(|s| junction(s, &s.retired(LOCAL, RETIRED_TOKEN))),
+            ),
+            (
+                "retired, an upper-case name",
+                Gate::Newer,
+                Box::new(|s| {
+                    s.put(
+                        &s.state_dir().join(format!(
+                            "{}.{}.RETIRED",
+                            record_key(&loc(LOCAL)).to_ascii_uppercase(),
+                            RETIRED_TOKEN.to_ascii_uppercase()
+                        )),
+                        b"r",
+                    )
+                }),
+            ),
+            (
+                "three retired files",
+                Gate::Newer,
+                Box::new(|s| {
+                    for index in 0..3 {
+                        s.put(&s.retired(LOCAL, &format!("{index:032x}")), b"r");
+                    }
+                }),
+            ),
+            (
+                "sixteen retired files (the sibling read limit itself)",
+                Gate::Newer,
+                Box::new(|s| {
+                    for index in 0..V3_SIBLING_READ_LIMIT {
+                        s.put(&s.retired(LOCAL, &format!("{index:032x}")), b"r");
+                    }
+                }),
+            ),
+            (
+                "seventeen retired files (past the sibling read limit)",
+                Gate::Uncertain,
+                Box::new(|s| {
+                    for index in 0..=V3_SIBLING_READ_LIMIT {
+                        s.put(&s.retired(LOCAL, &format!("{index:032x}")), b"r");
+                    }
+                }),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_complete_newer_record_in_a_legacy_temp_refuses_every_operation() {
+        run(vec![
+            (
+                "complete v3 temp alone",
+                Gate::Newer,
+                Box::new(|s| staging(s, &v3_bytes())),
+            ),
+            (
+                "complete v3 temp beside a v1 primary",
+                Gate::Newer,
+                Box::new(|s| {
+                    primary(s, &v1_bytes());
+                    staging(s, &v3_bytes());
+                }),
+            ),
+            (
+                "complete v3 temp beside a corrupt primary",
+                Gate::Newer,
+                Box::new(|s| {
+                    primary(s, b"garbage");
+                    staging(s, &v3_bytes());
+                }),
+            ),
+            (
+                "complete v2 temp alone",
+                Gate::Newer,
+                Box::new(|s| staging(s, &v2_bytes())),
+            ),
+            (
+                "complete record of a made-up future version",
+                Gate::Newer,
+                Box::new(|s| staging(s, &tampered_version(99))),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn the_reserved_staging_name_refuses_every_operation_whatever_the_file_is() {
+        let cut = v3_bytes()[..24].to_vec();
+
+        run(vec![
+            ("v3stage, empty", Gate::Newer, Box::new(|s| stage(s, b""))),
+            (
+                "v3stage, cut short",
+                Gate::Newer,
+                Box::new(move |s| stage(s, &cut)),
+            ),
+            (
+                "v3stage, oversized",
+                Gate::Newer,
+                Box::new(|s| oversized(&v3stage(s, LOCAL, STAGE_TOKEN))),
+            ),
+            (
+                "v3stage, a valid v3 record",
+                Gate::Newer,
+                Box::new(|s| stage(s, &v3_bytes())),
+            ),
+            (
+                "v3stage, a valid v1 record",
+                Gate::Newer,
+                Box::new(|s| stage(s, &v1_bytes())),
+            ),
+            (
+                "v3stage, malformed",
+                Gate::Newer,
+                Box::new(|s| stage(s, b"{not json at all")),
+            ),
+            (
+                "v3stage, a directory",
+                Gate::Newer,
+                Box::new(|s| directory(&v3stage(s, LOCAL, STAGE_TOKEN))),
+            ),
+            (
+                "v3stage, a junction",
+                Gate::Newer,
+                Box::new(|s| junction(s, &v3stage(s, LOCAL, STAGE_TOKEN))),
+            ),
+            (
+                "v3stage beside a v1 primary",
+                Gate::Newer,
+                Box::new(|s| {
+                    primary(s, &v1_bytes());
+                    stage(s, b"");
+                }),
+            ),
+            (
+                "v3stage beside a real v3 primary",
+                Gate::Newer,
+                Box::new(|s| {
+                    primary(s, &v3_bytes());
+                    stage(s, &v3_bytes());
+                }),
+            ),
+            (
+                "v3stage beside a retired file",
+                Gate::Newer,
+                Box::new(|s| {
+                    retired(s, b"r");
+                    stage(s, b"");
+                }),
+            ),
+            (
+                "v3stage, an upper-case name",
+                Gate::Newer,
+                Box::new(|s| {
+                    s.put(
+                        &s.state_dir().join(format!(
+                            "{}.{}.V3STAGE",
+                            record_key(&loc(LOCAL)).to_ascii_uppercase(),
+                            STAGE_TOKEN.to_ascii_uppercase()
+                        )),
+                        b"",
+                    )
+                }),
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_primary_of_an_unsupported_version_is_read_but_never_removed() {
+        let versions: Vec<(&str, Vec<u8>)> = vec![
+            ("real v3", v3_bytes()),
+            ("real v2", v2_bytes()),
+            ("version-tampered v1", tampered_version(2)),
+            ("made-up future version", tampered_version(99)),
+        ];
+
+        for (label, bytes) in versions {
+            let scratch = Scratch::new("legacy-gate-unsupported");
+            primary(&scratch, &bytes);
+
+            let store = scratch.store();
+            let before = snapshot(scratch.dir.path());
+
+            // Nothing about the siblings refuses the read, the evidence or the
+            // diagnostics: the record is bound by its exact bytes.
+            assert_eq!(
+                store.load(&loc(LOCAL)),
+                StateLoad::UnsupportedVersion,
+                "{label}"
+            );
+
+            let RecordRead::Present(present) = store.read_record(&loc(LOCAL)) else {
+                panic!("{label}: the primary must still be returned");
+            };
+            assert_eq!(present.bytes(), bytes, "{label}");
+            assert_eq!(present.artifacts(), ArtifactPresence::None, "{label}");
+
+            let evidence = store.evidence(&loc(LOCAL)).unwrap();
+            assert!(evidence.primary_present(), "{label}");
+
+            assert_eq!(
+                store.create(&state(LOCAL)),
+                Err(StoreError::AlreadyExists),
+                "{label}"
+            );
+            assert_eq!(
+                store.replace(&state(LOCAL), &super::b3c3b2a_support::proposed_state()),
+                Err(StoreError::CurrentUnsupportedVersion),
+                "{label}"
+            );
+
+            // But it is not something this build may remove.
+            assert_eq!(
+                store.delete(&loc(LOCAL)),
+                Err(StoreError::UnresolvedNewerState),
+                "{label}"
+            );
+            assert_eq!(
+                store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+                Err(ConditionalDeleteError::Store(
+                    StoreError::UnresolvedNewerState
+                )),
+                "{label}"
+            );
+
+            assert_eq!(snapshot(scratch.dir.path()), before, "{label}");
+            assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), bytes, "{label}");
+        }
+    }
+
+    #[test]
+    fn a_partial_v3_like_temp_is_indistinguishable_and_stays_legacy_resettable_known_limit() {
+        // KNOWN LIMIT, not a feature: the codec parses its whole input before it
+        // reads a version, so an empty or cut-short record of a newer version is
+        // byte-for-byte a legacy remnant. This is why the `.v3stage` name exists.
+        let whole = v3_bytes();
+        let text = String::from_utf8(whole.clone()).unwrap();
+        let version = text.find("\"version\":").expect("a version field") + "\"version\":".len();
+
+        let partials: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("cut before the version digit", whole[..version].to_vec()),
+            (
+                "cut right after the version digit",
+                whole[..=version].to_vec(),
+            ),
+            ("cut in the middle", whole[..whole.len() / 2].to_vec()),
+        ];
+
+        for (label, bytes) in partials {
+            let scratch = Scratch::new("legacy-gate-partial-tmp");
+            staging(&scratch, &bytes);
+
+            let store = scratch.store();
+
+            assert_eq!(
+                store.load(&loc(LOCAL)),
+                StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts),
+                "{label}"
+            );
+
+            let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+            assert_eq!(
+                store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+                Ok(DeleteOutcome::Removed),
+                "{label}"
+            );
+            assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured, "{label}");
+        }
+    }
+
+    #[test]
+    fn ordinary_legacy_remnants_are_not_newer_state() {
+        let scratch = Scratch::new("legacy-gate-ordinary");
+
+        // A complete v1 record, an empty file and junk, all as legacy temps, beside
+        // a v1 primary: exactly today's behaviour.
+        primary(&scratch, &v1_bytes());
+        scratch.put(&scratch.staging(LOCAL, TOKEN), &v1_bytes());
+        scratch.put(
+            &scratch.staging(LOCAL, "1111111111111111111111111111111a"),
+            b"",
+        );
+        scratch.put(
+            &scratch.staging(LOCAL, "2222222222222222222222222222222b"),
+            b"junk",
+        );
+
+        let store = scratch.store();
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Loaded(Box::new(state(LOCAL)))
+        );
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        assert_eq!(evidence.artifact_count(), 3);
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+            Ok(DeleteOutcome::Removed)
+        );
+        assert!(names(&scratch.state_dir()).is_empty());
+    }
+
+    #[test]
+    fn files_of_another_record_key_never_block() {
+        // Every shape that blocks THIS key is harmless under ANOTHER key.
+        let scratch = Scratch::new("legacy-gate-other-key");
+        primary(&scratch, &v1_bytes());
+
+        scratch.put(&scratch.retired(OTHER_LOCAL, RETIRED_TOKEN), b"r");
+        scratch.put(&v3stage(&scratch, OTHER_LOCAL, STAGE_TOKEN), b"");
+        scratch.put(&scratch.staging(OTHER_LOCAL, TOKEN), &v3_bytes());
+        scratch.put(&scratch.record(OTHER_LOCAL), &v3_bytes());
+        scratch.put(
+            &scratch
+                .state_dir()
+                .join(format!("{}.json.bak", record_key(&loc(OTHER_LOCAL)))),
+            b"x",
+        );
+        scratch.put(&scratch.state_dir().join("notes.txt"), b"x");
+
+        let store = scratch.store();
+        let before = snapshot(scratch.dir.path());
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Loaded(Box::new(state(LOCAL)))
+        );
+
+        let RecordRead::Present(present) = store.read_record(&loc(LOCAL)) else {
+            panic!("the record must be returned");
+        };
+        assert_eq!(present.artifacts(), ArtifactPresence::None);
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        assert_eq!(snapshot(scratch.dir.path()), before);
+        assert_eq!(
+            store.replace(&state(LOCAL), &super::b3c3b2a_support::proposed_state()),
+            Ok(())
+        );
+        // The replacement changed the record, so the old evidence no longer holds.
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+            Err(ConditionalDeleteError::EvidenceChanged)
+        );
+
+        let fresh = store.evidence(&loc(LOCAL)).unwrap();
+
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &fresh),
+            Ok(DeleteOutcome::Removed)
+        );
+
+        // Only this record's own file went; every other key's file is untouched.
+        assert_eq!(names(&scratch.state_dir()).len(), 6);
+    }
+
+    #[test]
+    fn a_scan_that_cannot_finish_is_a_refusal_never_absence() {
+        // More entries than one observation visits, with a primary that could be
+        // read. Today's load never scanned in that case; it now refuses.
+        let scratch = Scratch::new("legacy-gate-entry-limit");
+        primary(&scratch, &v1_bytes());
+
+        for index in 0..V3_SCAN_ENTRY_LIMIT {
+            fs::write(
+                scratch.state_dir().join(format!("unrelated-{index}.dat")),
+                b"x",
+            )
+            .unwrap();
+        }
+
+        let store = scratch.store();
+        let before = snapshot(scratch.dir.path());
+
+        // The primary plus 10 000 others is one entry over what an observation
+        // visits, so the whole observation is refused.
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::EntryLimit)
+        );
+
+        let RecordRead::Present(present) = store.read_record(&loc(LOCAL)) else {
+            panic!("a present primary is still returned");
+        };
+        assert_eq!(present.artifacts(), ArtifactPresence::Unknown);
+
+        let limit = StoreError::Io {
+            stage: IoStage::Scan,
+            kind: io::ErrorKind::Other,
+        };
+
+        assert_eq!(store.create(&state(LOCAL)), Err(limit));
+        assert_eq!(
+            store.replace(&state(LOCAL), &super::b3c3b2a_support::proposed_state()),
+            Err(limit)
+        );
+        assert_eq!(
+            store.evidence(&loc(LOCAL)).map(|_| ()),
+            Err(EvidenceRefusal::EntryLimit)
+        );
+        assert_eq!(store.delete(&loc(LOCAL)), Err(limit));
+        assert_eq!(
+            store
+                .delete_if_evidence_matches(&loc(LOCAL), &super::b3c3b2a_support::empty_evidence()),
+            Err(ConditionalDeleteError::Store(limit))
+        );
+
+        assert_eq!(snapshot(scratch.dir.path()), before);
+    }
+
+    #[test]
+    fn too_many_legacy_temps_are_a_refusal_at_the_sibling_read_limit() {
+        // INTENTIONAL consequence of observing before acting: sixteen leftover
+        // legacy temps are still handled, seventeen are not, because one observation
+        // reads at most sixteen recognized siblings. Each failed write removes its
+        // own temp, so this is not reachable in normal use.
+        let scratch = Scratch::new("legacy-gate-many-tmp");
+        primary(&scratch, &v1_bytes());
+
+        for index in 0..V3_SIBLING_READ_LIMIT {
+            scratch.put(&scratch.staging(LOCAL, &format!("{index:032x}")), b"");
+        }
+
+        let store = scratch.store();
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Loaded(Box::new(state(LOCAL)))
+        );
+
+        scratch.put(&scratch.staging(LOCAL, &format!("{:032x}", 99)), b"");
+
+        assert_gated(&scratch, Gate::Uncertain, "seventeen legacy temps");
+    }
+
+    #[test]
+    fn a_temp_that_cannot_be_read_is_a_refusal_not_a_removal() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let scratch = Scratch::new("legacy-gate-held-tmp");
+        primary(&scratch, &v1_bytes());
+        staging(&scratch, b"debris");
+
+        let store = scratch.store();
+        let before = snapshot(scratch.dir.path());
+
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(scratch.staging(LOCAL, TOKEN))
+            .unwrap();
+
+        assert!(matches!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::Io(_))
+        ));
+        assert!(matches!(
+            store.create(&state(LOCAL)),
+            Err(StoreError::Io {
+                stage: IoStage::Scan,
+                ..
+            })
+        ));
+        assert!(matches!(
+            store.evidence(&loc(LOCAL)),
+            Err(EvidenceRefusal::Unreadable)
+        ));
+        assert!(matches!(
+            store.delete(&loc(LOCAL)),
+            Err(StoreError::Io {
+                stage: IoStage::Scan,
+                ..
+            })
+        ));
+
+        // The snapshot reads every file, so the hold has to end first.
+        drop(held);
+        assert_eq!(snapshot(scratch.dir.path()), before);
+    }
+
+    #[test]
+    fn two_names_that_fold_to_one_are_a_refusal_where_the_directory_can_hold_both() {
+        let key = record_key(&loc(LOCAL));
+        let scratch = Scratch::new("legacy-gate-alias");
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+
+        let enabled = std::process::Command::new("fsutil.exe")
+            .args(["file", "setCaseSensitiveInfo"])
+            .arg(scratch.state_dir())
+            .arg("enable")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+
+        if !enabled {
+            eprintln!("SKIPPED physical case alias: per-directory case sensitivity is unavailable");
+            return;
+        }
+
+        fs::write(scratch.state_dir().join(format!("{key}.json")), v1_bytes()).unwrap();
+        fs::write(scratch.state_dir().join(format!("{key}.JSON")), v1_bytes()).unwrap();
+
+        if names(&scratch.state_dir()).len() != 2 {
+            eprintln!("SKIPPED physical case alias: the directory stayed case-insensitive");
+            return;
+        }
+
+        assert_gated(&scratch, Gate::Uncertain, "case-sensitive alias");
+    }
+}
+
+// ---- B3c-3b-2a real NTFS gate tests (end) ------------------------------------
+
+// ---- B3c-3b-2a unrecognized entries (U2) tests (begin) -----------------------
+
+/// Decision U2: an entry named after THIS record's key that is none of the
+/// recognized shapes blocks the legacy operations, and is never touched. The same
+/// names under ANOTHER record's key are unrelated and never block.
+#[cfg(all(test, windows))]
+mod legacy_gate_unrecognized_tests {
+    use std::{ffi::OsString, fs, os::windows::ffi::OsStringExt};
+
+    use super::b3c3b1_support::{loc, state, Scratch, LOCAL, OTHER_LOCAL, RETIRED_TOKEN, TOKEN};
+    use super::b3c3b2a_support::{assert_gated, v1_bytes, Gate, STAGE_TOKEN};
+    use super::*;
+    use crate::vault::handle_ops::test_support::snapshot;
+
+    /// What follows the key in each suspicious name.
+    fn suffixes() -> Vec<(&'static str, String)> {
+        vec![
+            ("json backup", ".json.bak".to_owned()),
+            ("notes file", ".notes.txt".to_owned()),
+            ("temp with an extra suffix", format!(".{TOKEN}.tmp.old")),
+            ("temp without a token", ".short.tmp".to_owned()),
+            ("temp with a 31-hex token", format!(".{}.tmp", &TOKEN[..31])),
+            ("temp with a 33-hex token", format!(".{TOKEN}0.tmp")),
+            (
+                "temp with a non-hex token",
+                format!(".{}.tmp", "g".repeat(32)),
+            ),
+            ("temp without a separator", format!("{TOKEN}.tmp")),
+            (
+                "retired with an extra suffix",
+                format!(".{RETIRED_TOKEN}.retired.x"),
+            ),
+            (
+                "retired with a 31-hex token",
+                format!(".{}.retired", &RETIRED_TOKEN[..31]),
+            ),
+            (
+                "reserved staging with an extra suffix",
+                format!(".{STAGE_TOKEN}.v3stage.bak"),
+            ),
+            (
+                "reserved staging with a 31-hex token",
+                format!(".{}.v3stage", &STAGE_TOKEN[..31]),
+            ),
+            (
+                "reserved staging with a 33-hex token",
+                format!(".{STAGE_TOKEN}f.v3stage"),
+            ),
+            ("reserved staging without a token", ".v3stage".to_owned()),
+            ("bare key", String::new()),
+        ]
+    }
+
+    fn named(scratch: &Scratch, local: &str, suffix: &str) -> std::path::PathBuf {
+        scratch
+            .state_dir()
+            .join(format!("{}{suffix}", record_key(&loc(local))))
+    }
+
+    #[test]
+    fn every_suspicious_shape_refuses_every_operation_and_changes_nothing() {
+        for (label, suffix) in suffixes() {
+            // Alone, and beside a readable v1 primary.
+            for with_primary in [false, true] {
+                let scratch = Scratch::new("legacy-gate-u2");
+
+                if with_primary {
+                    scratch.put(&scratch.record(LOCAL), &v1_bytes());
+                }
+                scratch.put(&named(&scratch, LOCAL, &suffix), b"suspicious");
+
+                assert_gated(
+                    &scratch,
+                    Gate::Unrecognized,
+                    &format!("{label} ({with_primary})"),
+                );
+                assert_eq!(
+                    fs::read(named(&scratch, LOCAL, &suffix)).unwrap(),
+                    b"suspicious",
+                    "{label}: the file was touched"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_same_names_under_another_key_do_not_block() {
+        for (label, suffix) in suffixes() {
+            let scratch = Scratch::new("legacy-gate-u2-other");
+
+            scratch.put(&scratch.record(LOCAL), &v1_bytes());
+            scratch.put(&named(&scratch, OTHER_LOCAL, &suffix), b"someone else's");
+
+            let store = scratch.store();
+            let before = snapshot(scratch.dir.path());
+
+            assert_eq!(
+                store.load(&loc(LOCAL)),
+                StateLoad::Loaded(Box::new(state(LOCAL))),
+                "{label}"
+            );
+            assert_eq!(snapshot(scratch.dir.path()), before, "{label}");
+
+            let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+            assert_eq!(
+                store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+                Ok(DeleteOutcome::Removed),
+                "{label}"
+            );
+            assert_eq!(
+                fs::read(named(&scratch, OTHER_LOCAL, &suffix)).unwrap(),
+                b"someone else's",
+                "{label}: another key's file was touched"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrelated_file_that_only_looks_like_a_name_never_blocks() {
+        let scratch = Scratch::new("legacy-gate-u2-unrelated");
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+        scratch.put(&scratch.state_dir().join("readme.txt"), b"x");
+        // Shorter than a key, and a key with one character changed.
+        scratch.put(
+            &scratch.state_dir().join(&record_key(&loc(LOCAL))[..63]),
+            b"x",
+        );
+        let mut changed = record_key(&loc(LOCAL));
+        changed.replace_range(0..1, if changed.starts_with('0') { "1" } else { "0" });
+        scratch.put(&scratch.state_dir().join(format!("{changed}.json")), b"x");
+
+        assert_eq!(
+            scratch.store().load(&loc(LOCAL)),
+            StateLoad::Loaded(Box::new(state(LOCAL)))
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_valid_unicode_but_carries_the_key_refuses() {
+        let scratch = Scratch::new("legacy-gate-u2-non-unicode");
+        std::fs::create_dir_all(scratch.state_dir()).unwrap();
+
+        // A lone surrogate is a legal NTFS name unit and is not valid Unicode.
+        let mut units: Vec<u16> = format!("{}.json", record_key(&loc(LOCAL)))
+            .encode_utf16()
+            .collect();
+        units.push(0xD800);
+        let name = OsString::from_wide(&units);
+
+        if fs::write(scratch.state_dir().join(&name), b"x").is_err() {
+            eprintln!("SKIPPED non-Unicode name: the filesystem refused a lone surrogate");
+            return;
+        }
+
+        assert_gated(&scratch, Gate::Unrecognized, "non-Unicode name");
+    }
+}
+
+// ---- B3c-3b-2a unrecognized entries (U2) tests (end) -------------------------
+
+// ---- B3c-3b-2a reserved staging name (U9) tests (begin) ----------------------
+
+/// Decision U9: `<key>.<32 hex>.v3stage` is reserved for a future authenticated
+/// publisher. This slice only recognizes the name; nothing creates, adopts or
+/// removes such a file.
+#[cfg(all(test, windows))]
+mod v3stage_namespace_tests {
+    use std::fs;
+
+    use super::b3c3b1_support::{loc, Scratch, LOCAL, OTHER_LOCAL, TOKEN};
+    use super::b3c3b2a_support::{
+        directory, junction, oversized, v1_bytes, v3_bytes, v3stage, STAGE_TOKEN,
+    };
+    use super::*;
+
+    fn key() -> String {
+        record_key(&loc(LOCAL))
+    }
+
+    fn class(name: &str) -> V3NameClass {
+        recognize_v3_sibling_name(name, true, &key())
+    }
+
+    #[test]
+    fn only_the_exact_scoped_shape_is_recognized() {
+        let key = key();
+        let reserved = V3NameClass::Sibling(SiblingKind::ReservedStaging);
+
+        assert_eq!(class(&format!("{key}.{STAGE_TOKEN}.v3stage")), reserved);
+        // Either case, and any mix, like the other grammar.
+        assert_eq!(class(&format!("{key}.{STAGE_TOKEN}.V3STAGE")), reserved);
+        assert_eq!(class(&format!("{key}.{STAGE_TOKEN}.V3Stage")), reserved);
+        assert_eq!(
+            class(&format!(
+                "{}.{}.v3stage",
+                key.to_ascii_uppercase(),
+                STAGE_TOKEN.to_ascii_uppercase()
+            )),
+            reserved
+        );
+
+        for wrong in [
+            format!("{key}.{}.v3stage", &STAGE_TOKEN[..31]),
+            format!("{key}.{STAGE_TOKEN}0.v3stage"),
+            format!("{key}.{}.v3stage", "g".repeat(32)),
+            format!("{key}.v3stage"),
+            format!("{key}..v3stage"),
+            format!("{key}{STAGE_TOKEN}.v3stage"),
+            format!("{key}.{STAGE_TOKEN}.v3stage.bak"),
+            format!("{key}.{STAGE_TOKEN}.v3stage "),
+            format!("{key}.{STAGE_TOKEN}.v3stage."),
+            format!("{key}.{STAGE_TOKEN}.v3stag"),
+            format!("{key}.{STAGE_TOKEN}.v3stages"),
+            format!("{key}.{STAGE_TOKEN}.v4stage"),
+        ] {
+            assert_eq!(class(&wrong), V3NameClass::Unrecognized, "{wrong}");
+        }
+
+        // Another key's name, and an unrelated one, are not this key's at all.
+        let other = record_key(&loc(OTHER_LOCAL));
+        assert_eq!(
+            class(&format!("{other}.{STAGE_TOKEN}.v3stage")),
+            V3NameClass::Other
+        );
+        assert_eq!(class("readme.v3stage"), V3NameClass::Other);
+
+        // The old shapes are unchanged.
+        assert_eq!(
+            class(&format!("{key}.{TOKEN}.tmp")),
+            V3NameClass::Sibling(SiblingKind::Staging)
+        );
+        assert_eq!(
+            class(&format!("{key}.{TOKEN}.retired")),
+            V3NameClass::Sibling(SiblingKind::Retired)
+        );
+        assert_eq!(class(&format!("{key}.json")), V3NameClass::Primary);
+
+        // Not valid Unicode, or too long for a path component: never recognized.
+        assert_eq!(
+            recognize_v3_sibling_name(&format!("{key}.{STAGE_TOKEN}.v3stage"), false, &key),
+            V3NameClass::Unrecognized
+        );
+        assert_eq!(
+            class(&format!("{key}.{STAGE_TOKEN}.v3stage{}", "x".repeat(200))),
+            V3NameClass::Unrecognized
+        );
+    }
+
+    #[test]
+    fn the_legacy_artifact_rule_knows_nothing_of_the_reserved_name() {
+        let key = key();
+        let name = format!("{key}.{STAGE_TOKEN}.v3stage");
+
+        assert!(!is_artifact_name(&name, &key));
+        assert!(!is_artifact_name(&name.to_ascii_uppercase(), &key));
+        // The staging grammar still agrees with the unchanged v1 rule for `.tmp`.
+        assert!(is_artifact_name(&format!("{key}.{TOKEN}.tmp"), &key));
+        assert_eq!(ARTIFACT_EXTENSION, "tmp");
+    }
+
+    #[test]
+    fn a_reserved_file_is_recognized_before_its_body_whatever_the_body_is() {
+        type Make = Box<dyn Fn(&Scratch)>;
+
+        let cut = v3_bytes()[..24].to_vec();
+
+        let cases: Vec<(&str, Make)> = vec![
+            (
+                "empty",
+                Box::new(|s| s.put(&v3stage(s, LOCAL, STAGE_TOKEN), b"")),
+            ),
+            (
+                "cut short",
+                Box::new(move |s| s.put(&v3stage(s, LOCAL, STAGE_TOKEN), &cut)),
+            ),
+            (
+                "malformed",
+                Box::new(|s| s.put(&v3stage(s, LOCAL, STAGE_TOKEN), b"{{")),
+            ),
+            (
+                "oversized",
+                Box::new(|s| oversized(&v3stage(s, LOCAL, STAGE_TOKEN))),
+            ),
+            (
+                "a v1 record",
+                Box::new(|s| s.put(&v3stage(s, LOCAL, STAGE_TOKEN), &v1_bytes())),
+            ),
+            (
+                "a v3 record",
+                Box::new(|s| s.put(&v3stage(s, LOCAL, STAGE_TOKEN), &v3_bytes())),
+            ),
+            (
+                "a directory",
+                Box::new(|s| directory(&v3stage(s, LOCAL, STAGE_TOKEN))),
+            ),
+            (
+                "a junction",
+                Box::new(|s| junction(s, &v3stage(s, LOCAL, STAGE_TOKEN))),
+            ),
+        ];
+
+        for (label, make) in cases {
+            let scratch = Scratch::new("v3stage-recognized");
+
+            make(&scratch);
+
+            let before = crate::vault::handle_ops::test_support::snapshot(scratch.dir.path());
+
+            let V3LayoutInspection::Observed(layout) =
+                scratch.store().inspect_v3_layout(&loc(LOCAL))
+            else {
+                panic!("{label}: the observation must complete");
+            };
+
+            let kinds: Vec<SiblingKind> = layout.siblings().iter().map(|s| s.kind()).collect();
+
+            assert_eq!(kinds, [SiblingKind::ReservedStaging], "{label}");
+            assert_eq!(layout.unrecognized(), 0, "{label}");
+            assert_eq!(
+                crate::vault::handle_ops::test_support::snapshot(scratch.dir.path()),
+                before,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_reserved_file_is_still_recognized_and_the_gate_refuses() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let scratch = Scratch::new("v3stage-held");
+        let path = v3stage(&scratch, LOCAL, STAGE_TOKEN);
+        scratch.put(&path, b"held");
+
+        let _held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        let V3LayoutInspection::Observed(layout) = scratch.store().inspect_v3_layout(&loc(LOCAL))
+        else {
+            panic!("the observation must complete");
+        };
+
+        assert_eq!(layout.siblings()[0].kind(), SiblingKind::ReservedStaging);
+        assert!(matches!(
+            layout.siblings()[0].content(),
+            SiblingContent::Unreadable(_)
+        ));
+        assert_eq!(legacy_verdict(&layout), Err(LegacyGateRefusal::NewerState));
+    }
+
+    #[test]
+    fn another_keys_reserved_file_never_blocks_and_this_slice_creates_none() {
+        let scratch = Scratch::new("v3stage-other-key");
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+        scratch.put(&v3stage(&scratch, OTHER_LOCAL, STAGE_TOKEN), b"");
+
+        let store = scratch.store();
+
+        assert!(matches!(store.load(&loc(LOCAL)), StateLoad::Loaded(_)));
+
+        // Every mutating operation that is allowed to run leaves no reserved file.
+        let before: Vec<String> = super::b3c3b1_support::names(&scratch.state_dir());
+
+        assert_eq!(
+            store.replace(
+                &super::b3c3b1_support::state(LOCAL),
+                &super::b3c3b2a_support::proposed_state()
+            ),
+            Ok(())
+        );
+
+        let after = super::b3c3b1_support::names(&scratch.state_dir());
+
+        assert_eq!(before, after);
+        assert_eq!(
+            after
+                .iter()
+                .filter(|name| name.ends_with(".v3stage"))
+                .count(),
+            1,
+            "only the fixture's own file exists"
+        );
+
+        // Creating a record in a fresh store creates no such file either.
+        let fresh = Scratch::new("v3stage-create");
+        fresh
+            .store()
+            .create(&super::b3c3b1_support::state(LOCAL))
+            .unwrap();
+        assert!(super::b3c3b1_support::names(&fresh.state_dir())
+            .iter()
+            .all(|name| !name.ends_with(".v3stage")));
+    }
+
+    #[test]
+    fn the_legacy_artifact_scan_never_lists_a_reserved_file() {
+        let scratch = Scratch::new("v3stage-scan");
+
+        scratch.put(&v3stage(&scratch, LOCAL, STAGE_TOKEN), b"");
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"");
+
+        let found = scratch.store().scan_artifacts(&key()).unwrap();
+        let listed: Vec<String> = found
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(listed, [format!("{}.{TOKEN}.tmp", key())]);
+    }
+}
+
+// ---- B3c-3b-2a reserved staging name (U9) tests (end) ------------------------
+
+// ---- B3c-3b-2a forced race tests (begin) -------------------------------------
+
+/// Late changes at exact points of the existing operations, driven through the
+/// store's test seams with REAL child processes (`cmd.exe copy`) doing the writing,
+/// so the change really comes from outside this process. Each test names what it
+/// shows:
+///
+/// * PREVENTED: the operation could not have gone ahead.
+/// * REFUSED: the operation noticed and stopped before changing anything.
+/// * DETECTED AFTERWARD: the operation completed and a later load now refuses.
+/// * NOT PREVENTED: the operation completed over the late change.
+///
+/// Synthetic fixtures only, under the scratch directory.
+#[cfg(all(test, windows))]
+mod legacy_gate_race_tests {
+    use std::fs;
+
+    use super::b3c3b1_support::{loc, names, state, Scratch, LOCAL, RETIRED_TOKEN, TOKEN};
+    use super::b3c3b2a_support::{child_puts, proposed_state, v1_bytes};
+    use super::*;
+    use crate::vault::handle_ops::test_support::snapshot;
+
+    const LATE: &[u8] = b"a retired record that appeared late";
+    const FOREIGN: &[u8] = b"SYNTHETIC-FOREIGN-BYTES-NOT-A-REAL-RECORD";
+
+    fn late_retired(scratch: &Scratch) -> impl Fn() + Send + 'static {
+        let root = scratch.root();
+        let path = scratch.retired(LOCAL, RETIRED_TOKEN);
+
+        move || child_puts(&root, &path, LATE)
+    }
+
+    fn retired_is_intact(scratch: &Scratch) {
+        assert_eq!(
+            fs::read(scratch.retired(LOCAL, RETIRED_TOKEN)).unwrap(),
+            LATE,
+            "the retired file was touched"
+        );
+    }
+
+    #[test]
+    fn a_retired_file_inserted_before_the_evidence_recheck_refuses_and_removes_nothing() {
+        // REFUSED. The deletion's preconditions have passed; a child process drops a
+        // retired file; the fresh evidence capture now sees it and nothing is removed.
+        let scratch = Scratch::new("race-evidence");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"debris");
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        store.run_before_evidence_recheck_for_test(late_retired(&scratch));
+
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+            Err(ConditionalDeleteError::Evidence(
+                EvidenceRefusal::UnresolvedNewerState
+            ))
+        );
+
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), v1_bytes());
+        assert_eq!(fs::read(scratch.staging(LOCAL, TOKEN)).unwrap(), b"debris");
+        retired_is_intact(&scratch);
+    }
+
+    #[test]
+    fn a_retired_file_inserted_before_the_replace_check_refuses_and_leaves_the_record() {
+        // REFUSED. Inserted at the point just before the second read, so the
+        // re-check before the rename sees it: the record is unchanged and the
+        // replacement's own staging file is gone.
+        let scratch = Scratch::new("race-before-replace");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+
+        let hook = late_retired(&scratch);
+        store
+            .faults
+            .lock()
+            .unwrap()
+            .push((Point::BeforeReplace, Action::Run(Box::new(hook))));
+
+        assert_eq!(
+            store.replace(&state(LOCAL), &proposed_state()),
+            Err(StoreError::UnresolvedNewerState)
+        );
+
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), v1_bytes());
+        retired_is_intact(&scratch);
+        assert_eq!(
+            names(&scratch.state_dir()).len(),
+            2,
+            "own temp must be gone"
+        );
+    }
+
+    #[test]
+    fn a_retired_file_inserted_at_the_rename_itself_is_not_prevented_but_detected_afterward() {
+        // NOT PREVENTED, DETECTED AFTERWARD. After the last re-check and before the
+        // rename nothing can look any more: the replacement completes, and the next
+        // load refuses.
+        let scratch = Scratch::new("race-at-replace");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+
+        let hook = late_retired(&scratch);
+        store
+            .faults
+            .lock()
+            .unwrap()
+            .push((Point::Replace, Action::Run(Box::new(hook))));
+
+        assert_eq!(store.replace(&state(LOCAL), &proposed_state()), Ok(()));
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnresolvedNewerState)
+        );
+        retired_is_intact(&scratch);
+    }
+
+    #[test]
+    fn a_retired_file_inserted_at_publication_is_not_prevented_but_detected_afterward() {
+        // NOT PREVENTED, DETECTED AFTERWARD. `create` checks before it stages; a file
+        // that appears at the no-clobber link is not seen by it. The record is
+        // published, and the very next load refuses (a session's fresh load turns
+        // that into an unverified outcome; see the session tests).
+        let scratch = Scratch::new("race-publish");
+        let store = scratch.store();
+
+        store.run_before_publish_for_test(late_retired(&scratch));
+
+        assert_eq!(store.create(&state(LOCAL)), Ok(()));
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), v1_bytes());
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnresolvedNewerState)
+        );
+        retired_is_intact(&scratch);
+    }
+
+    // ---- KNOWN, UNFIXED RACES (gate G12) -----------------------------------------
+
+    #[test]
+    fn a_primary_replaced_after_the_final_comparison_is_removed_known_unprevented_race_g12() {
+        // KNOWN VULNERABILITY, characterized on synthetic bytes ONLY, and NOT
+        // acceptable behaviour. Gate G12, open, to be fixed in a separate slice that
+        // binds the deletion to a held handle and a file identity.
+        //
+        // The deletion resolves the primary by its CURRENT path. A child process
+        // overwrites it with foreign bytes after the last evidence comparison and
+        // before the removal; nothing re-checks, so the foreign bytes are removed and
+        // the store reports an ordinary successful removal. This test pins the
+        // present behaviour so that a change is noticed; it is not a security
+        // success and not a reason to keep the behaviour.
+        let scratch = Scratch::new("race-g12-store");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        let root = scratch.root();
+        let record = scratch.record(LOCAL);
+
+        store.run_before_primary_removal_for_test(move || child_puts(&root, &record, FOREIGN));
+
+        // Reported as a normal, verified removal ...
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+            Ok(DeleteOutcome::Removed)
+        );
+
+        // ... and the foreign bytes that were put there are gone, with no trace.
+        assert!(!scratch.record(LOCAL).exists());
+        assert!(names(&scratch.state_dir()).is_empty());
+    }
+
+    #[test]
+    fn a_temp_replaced_after_the_final_comparison_is_removed_known_unprevented_race_g12() {
+        // KNOWN VULNERABILITY, same class and same status as the test above, for a
+        // recognized legacy temp file. Synthetic bytes only; not acceptable behaviour.
+        let scratch = Scratch::new("race-g12-temp");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"debris");
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        let root = scratch.root();
+        let temp = scratch.staging(LOCAL, TOKEN);
+
+        store.faults.lock().unwrap().push((
+            Point::RemoveArtifact,
+            Action::Run(Box::new(move || child_puts(&root, &temp, FOREIGN))),
+        ));
+
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+            Ok(DeleteOutcome::Removed)
+        );
+        assert!(names(&scratch.state_dir()).is_empty());
+    }
+
+    #[test]
+    fn the_known_races_never_touch_a_retired_file_even_when_one_is_present_beforehand() {
+        // The gate refuses before any of the above can start, so a retired file that
+        // is already there is never part of a race: nothing is removed at all.
+        let scratch = Scratch::new("race-retired-first");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+        scratch.put(&scratch.retired(LOCAL, RETIRED_TOKEN), LATE);
+
+        let before = snapshot(scratch.dir.path());
+
+        assert!(store
+            .delete_if_evidence_matches(&loc(LOCAL), &super::b3c3b2a_support::empty_evidence())
+            .is_err());
+        assert_eq!(snapshot(scratch.dir.path()), before);
+    }
+}
+
+// ---- B3c-3b-2a forced race tests (end) ---------------------------------------
+
+// ---- B3c-3b-2a isolation tests (begin) ---------------------------------------
+
+/// Source-level proofs about the shape of the change, in the manner of the existing
+/// region scans: the gate region cannot mutate, nothing but the gate calls the
+/// observation, and the legacy deletion grammar is unchanged.
+#[cfg(all(test, windows))]
+mod legacy_gate_isolation_tests {
+    use super::*;
+
+    fn source() -> &'static str {
+        include_str!("sync_state_store.rs")
+    }
+
+    /// Everything before the test modules: the production half of this file.
+    fn production() -> &'static str {
+        let source = source();
+
+        &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the first test module")]
+    }
+
+    fn gate_region() -> &'static str {
+        let source = source();
+        let start = source
+            .find("\n// ---- legacy compatibility gate (read-only)")
+            .expect("the begin marker");
+        let end = start
+            + source[start..]
+                .find("\n// ---- end legacy compatibility gate")
+                .expect("the end marker");
+
+        &source[start..end]
+    }
+
+    /// The text of one method: from its signature to the next method.
+    fn body_of(signature: &str) -> &'static str {
+        let production = production();
+        let start = production
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} not found"));
+        let rest = &production[start + signature.len()..];
+        let end = rest
+            .find("\n    pub fn ")
+            .into_iter()
+            .chain(rest.find("\n    fn "))
+            .chain(rest.find("\n    pub(crate) fn "))
+            .min()
+            .unwrap_or(rest.len());
+
+        &rest[..end]
+    }
+
+    #[test]
+    fn the_gate_region_only_observes() {
+        let region = gate_region();
+
+        assert!(region.contains("fn legacy_verdict"));
+        assert!(region.contains("fn legacy_gate"));
+        // (rustfmt may put the method call on its own line, so no `self` prefix.)
+        assert!(region.contains(".observe_v3_layout("));
+        assert!(!region.contains("#[cfg("));
+
+        for forbidden in [
+            "remove_file",
+            "remove_dir",
+            ".remove(",
+            "rename",
+            "hard_link",
+            "create_new",
+            "write_all",
+            "sync_all",
+            "OpenOptions",
+            "fs::write",
+            "fs::copy",
+            "set_len",
+            "truncate",
+            "unsafe",
+            "allow(",
+            "getrandom",
+            "new_v4",
+            "scan_artifacts",
+            "plan_delete",
+            "execute_delete",
+            "write_temp",
+            "create_temp",
+            "self.hook",
+            "Point::",
+            "thread",
+            "Command",
+            "inspect_v3_layout(",
+            "read_primary",
+            "File::",
+            "fs::",
+        ] {
+            assert!(
+                !region.contains(forbidden),
+                "{forbidden:?} in the gate region"
+            );
+        }
+    }
+
+    #[test]
+    fn no_function_of_the_gate_region_reads_like_a_permission_accessor() {
+        for name in region_function_names(gate_region()) {
+            for word in [
+                "ready", "clean", "safe", "allow", "permit", "may_", "can_", "authoriz", "adopt",
+                "recover", "release", "restore", "write", "delete", "remove", "publish",
+                "finalize", "prefer", "approve", "grant",
+            ] {
+                assert!(!name.contains(word), "{name} looks like a {word} accessor");
+            }
+        }
+    }
+
+    fn region_function_names(region: &str) -> Vec<String> {
+        region
+            .split("fn ")
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_legacy_operation_asks_the_gate_and_the_observation_has_one_production_caller() {
+        for signature in [
+            "pub fn load(&self, local_locator: &Locator) -> StateLoad {",
+            "pub fn read_record(&self, local_locator: &Locator) -> RecordRead {",
+            "pub fn create(&self, state: &SyncState) -> Result<(), StoreError> {",
+            "pub fn evidence(&self, local_locator: &Locator) -> Result<RecordEvidence, EvidenceRefusal> {",
+            "fn plan_delete(&self, local_locator: &Locator) -> Result<Option<DeletePlan>, StoreError> {",
+        ] {
+            assert!(
+                body_of(signature).contains("self.legacy_gate("),
+                "{signature} does not ask the gate"
+            );
+        }
+
+        // `replace` asks twice: before it reads, and again before its rename.
+        let replace = body_of(
+            "pub fn replace(&self, expected: &SyncState, proposed: &SyncState) -> Result<(), StoreError> {",
+        );
+        assert_eq!(replace.matches("self.legacy_gate(").count(), 2);
+        assert!(
+            replace.find("self.legacy_gate(").unwrap()
+                < replace.find("let temp = self.write_temp").unwrap()
+        );
+        assert!(
+            replace.rfind("self.legacy_gate(").unwrap()
+                < replace.find("self.hook(Point::Replace)").unwrap(),
+            "the second check must come before the rename"
+        );
+
+        // `create` asks once and does not touch its temp cleanup.
+        assert_eq!(
+            body_of("pub fn create(&self, state: &SyncState) -> Result<(), StoreError> {")
+                .matches("self.legacy_gate(")
+                .count(),
+            1
+        );
+
+        // The observation: one caller in the gate and one in the dormant diagnostic;
+        // the diagnostic itself is never called by the production half of the store.
+        let production = production();
+
+        assert_eq!(production.matches(".observe_v3_layout(").count(), 2);
+        assert_eq!(production.matches("inspect_v3_layout(").count(), 1);
+    }
+
+    #[test]
+    fn the_legacy_deletion_grammar_is_unchanged_and_names_neither_newer_kind() {
+        let production = production();
+
+        assert!(production.contains("const ARTIFACT_EXTENSION: &str = \"tmp\";"));
+        assert!(!production.contains("ARTIFACT_EXTENSION: &str = \"v3stage\""));
+
+        // The artifact rule's body names neither extension.
+        let start = production
+            .find("fn is_artifact_name(name: &str, key: &str) -> bool {")
+            .unwrap();
+        let body = &production[start..start + production[start..].find("\n}\n").unwrap()];
+
+        assert!(body.contains("ARTIFACT_EXTENSION"));
+        assert!(!body.contains("v3stage"));
+        assert!(!body.contains("retired"));
+
+        // The deletion machinery never mentions the new names.
+        for signature in [
+            "fn scan_artifacts(&self, key: &str) -> Result<Vec<PathBuf>, Fault> {",
+            "fn execute_delete(&self, plan: &DeletePlan) -> Result<DeleteOutcome, StoreError> {",
+        ] {
+            let body = body_of(signature);
+
+            assert!(!body.contains("v3stage"), "{signature}");
+            assert!(!body.contains("retired"), "{signature}");
+            assert!(!body.contains("Reserved"), "{signature}");
+        }
+    }
+
+    #[test]
+    fn nothing_in_production_creates_a_reserved_staging_file_or_adds_unsafe() {
+        let production = production();
+
+        // The reserved extension appears as one literal: the grammar arm.
+        assert_eq!(production.matches("v3stage\"").count(), 1);
+        assert!(production.contains("b\".v3stage\""));
+
+        // No new unsafe, FFI or lint suppression in the production half.
+        assert!(!production.contains("unsafe "));
+        assert!(!production.contains("extern \""));
+        assert!(!production.contains("#[allow("));
+        assert!(!production.contains("#![allow("));
+    }
+
+    #[test]
+    fn the_new_categories_are_fixed_and_reveal_nothing_when_printed() {
+        fn has_hex_run(text: &str, run: usize) -> bool {
+            let mut count = 0;
+
+            for c in text.chars() {
+                if c.is_ascii_hexdigit() {
+                    count += 1;
+                    if count >= run {
+                        return true;
+                    }
+                } else {
+                    count = 0;
+                }
+            }
+
+            false
+        }
+
+        let mut shown = Vec::new();
+
+        for error in [
+            StoreError::UnresolvedNewerState,
+            StoreError::LayoutUncertain,
+            StoreError::UnrecognizedEntries,
+        ] {
+            shown.push(format!("{error}"));
+            shown.push(format!("{error:?}"));
+        }
+        for reason in [
+            UnreadableReason::UnresolvedNewerState,
+            UnreadableReason::LayoutUncertain,
+            UnreadableReason::UnrecognizedEntries,
+        ] {
+            shown.push(format!("{reason:?}"));
+            shown.push(format!("{:?}", StateLoad::Unreadable(reason)));
+            shown.push(format!("{:?}", RecordRead::Unreadable(reason)));
+        }
+        for refusal in [
+            EvidenceRefusal::UnresolvedNewerState,
+            EvidenceRefusal::UnrecognizedEntries,
+        ] {
+            shown.push(format!("{refusal}"));
+            shown.push(format!("{refusal:?}"));
+            shown.push(format!("{}", ConditionalDeleteError::Evidence(refusal)));
+        }
+
+        let key = record_key(&super::b3c3b1_support::loc(super::b3c3b1_support::LOCAL));
+
+        for text in &shown {
+            assert!(!has_hex_run(text, 16), "{text}");
+
+            for mark in [
+                key.as_str(),
+                ".tmp",
+                ".retired",
+                ".v3stage",
+                ".json",
+                "\\",
+                "LOCAL-MARKER",
+            ] {
+                assert!(!text.contains(mark), "{mark} leaked in {text}");
+            }
+        }
+    }
+}
+
+// ---- B3c-3b-2a isolation tests (end) -----------------------------------------
