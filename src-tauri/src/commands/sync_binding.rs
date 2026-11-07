@@ -833,7 +833,8 @@ mod tests {
     use crate::vault::{
         session::BindingResetAmbiguity,
         sync_state_store::{
-            CorruptReason, EvidenceRefusal, StoreError, UnreadableReason, SYNC_STATE_DIRECTORY,
+            CorruptReason, EvidenceRefusal, RemovalRefusal, StoreError, UnreadableReason,
+            SYNC_STATE_DIRECTORY,
         },
     };
 
@@ -2749,6 +2750,10 @@ mod tests {
                 NOTHING_TO_RESET,
             ),
             (C::NotRemoved(StoreError::IncompleteDeletion), RESET_FAILED),
+            (
+                C::NotRemoved(StoreError::RemovalRefused(RemovalRefusal::Busy)),
+                RESET_FAILED,
+            ),
             (
                 C::Ambiguous(BindingResetAmbiguity::IncompleteDeletion),
                 RESET_AMBIGUOUS,

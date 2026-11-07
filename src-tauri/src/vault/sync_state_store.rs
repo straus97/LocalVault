@@ -132,13 +132,25 @@
 //! recovery authority.
 //!
 //! **What this is not.** It is check-then-use, not a lock and not compare-and-swap:
-//! anything can change right after the check. Older binaries are not gated. It does
-//! not make the delete path safe against a replaced primary: deletion still resolves
-//! the primary by its current path with no held handle and no file identity, so a
-//! primary swapped in after the final evidence comparison is removed as it then is
-//! and the removal is reported as a success (known race **G12**, open). `replace`
-//! has the same check-then-rename shape and its re-check before the rename narrows,
-//! but does not close, the window. G2 is not resolved by this gate.
+//! anything can change right after the check. Older binaries are not gated. The
+//! gate itself does not make deletion safe against a replaced primary; since Stage
+//! 1U-4 B3c-3b-2d-1 the deletion is bound to held handles instead (next section).
+//! `replace` still has a check-then-rename shape and its re-check before the rename
+//! narrows, but does not close, the window (**G12-replace, open**). G2 is not
+//! resolved by this gate.
+//!
+//! # Handle-bound deletion (Stage 1U-4 B3c-3b-2d-1; G12 for reset)
+//!
+//! `delete` and `delete_if_evidence_matches` no longer remove anything by path. They
+//! pin the directory, hold every planned file open (`GENERIC_READ | DELETE`,
+//! read-only sharing) before the first removal, compare the bytes read through those
+//! handles with the expected evidence, recheck the layout, and mark each file for
+//! removal through its own handle (see `held_removal`). The grammar of what may be
+//! removed (the record and its recognized `.tmp` artifacts) is unchanged. A refusal
+//! before the first removal is [`StoreError::RemovalRefused`]; a failure after it is
+//! `IncompleteDeletion`; a result is `Removed` only when every mark was proven and
+//! the names were then verified absent. The guarantees and limits are listed on
+//! [`SyncStateStore::delete_if_evidence_matches`].
 //!
 //! # Guarantees and limits
 //!
@@ -189,6 +201,11 @@ use localvault_core::{
 };
 use thiserror::Error;
 use uuid::Uuid;
+
+use super::{
+    file_identity::{facts_of, FileIdentity},
+    held_removal::{DirectoryPin, HeldFile, RemovalMark},
+};
 
 /// Subdirectory of the supplied application-data root that holds all records.
 pub const SYNC_STATE_DIRECTORY: &str = "sync-state";
@@ -469,6 +486,32 @@ pub enum StoreError {
     LayoutUncertain,
     #[error("unrecognized entries exist for this sync-state record; nothing was changed")]
     UnrecognizedEntries,
+    /// The deletion could not hold the files it would remove. Produced **only
+    /// before any removal** in the call that returns it: nothing was removed.
+    #[error("the sync-state files could not be held for removal; nothing was removed")]
+    RemovalRefused(RemovalRefusal),
+}
+
+/// Why a deletion refused to start (B3c-3b-2d-1). Every one of them means this call
+/// removed **nothing**; a failure after the first removal is
+/// [`StoreError::IncompleteDeletion`], never one of these. Categories only: no path,
+/// name, identifier or native status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemovalRefusal {
+    /// Another process has a file open in a way that excludes the hold (no delete
+    /// sharing, or write access). No automatic retry.
+    Busy,
+    /// The sync-state directory is not a plain directory on local NTFS, or it was
+    /// replaced while it was pinned.
+    DirectoryUnsupported,
+    /// A planned file is not something that can be held for removal: not a plain
+    /// file, read-only, not on local NTFS, delete-pending, or otherwise unopenable.
+    FileUnsuitable,
+    /// A planned file has a name outside the plan (a hard link), or its facts
+    /// changed after they were judged.
+    ExtraNames,
+    /// What is in the directory is no longer what was planned.
+    PlanChanged,
 }
 
 /// Outcome of a successful [`SyncStateStore::delete`].
@@ -673,6 +716,12 @@ enum Point {
     RemoveArtifact,
     RemovePrimary,
     BeforeEvidenceRecheck,
+    /// Before the deletion pins the directory and holds its files.
+    BeforeHold,
+    /// After every planned file is held and read, before the layout is rechecked.
+    AfterHold,
+    /// After the last handle has been closed, before the absence is verified.
+    AfterClose,
 }
 
 #[cfg(test)]
@@ -965,11 +1014,28 @@ impl SyncStateStore {
     /// history, not an error. Partial cleanup that leaves artifacts is
     /// `Unreadable`, never absent. Anything that cannot be removed or verified
     /// gone is [`StoreError::IncompleteDeletion`]. Nothing else ever deletes.
+    ///
+    /// # Handle-bound removal (B3c-3b-2d-1, gate G12 for reset)
+    ///
+    /// Every file is removed through a handle it was held by, never by path. After
+    /// the plan is made, the directory is pinned and every planned file is opened
+    /// (`GENERIC_READ | DELETE`, read-only sharing) **before the first removal**;
+    /// the layout is rechecked; and each file is then marked for removal through
+    /// its own handle. A refusal to hold or recheck is
+    /// [`StoreError::RemovalRefused`] and removed **nothing**; a failure after the
+    /// first removal, or an unproven mark, is `IncompleteDeletion`. There is no
+    /// retry and no path-based fallback. This variant reads no bytes, so it binds
+    /// no content; the caller that needs that is
+    /// [`delete_if_evidence_matches`](Self::delete_if_evidence_matches).
     pub fn delete(&self, local_locator: &Locator) -> Result<DeleteOutcome, StoreError> {
-        match self.plan_delete(local_locator)? {
-            None => Ok(DeleteOutcome::AlreadyAbsent),
-            Some(plan) => self.execute_delete(&plan),
-        }
+        let Some(plan) = self.plan_delete(local_locator)? else {
+            return Ok(DeleteOutcome::AlreadyAbsent);
+        };
+
+        let held = self.hold_for_removal(&plan)?;
+
+        self.recheck_held(&plan, &held)?;
+        self.execute_delete(&plan, held)
     }
 
     /// Capture exact, read-only [`RecordEvidence`] of everything the store holds
@@ -1045,24 +1111,41 @@ impl SyncStateStore {
     /// state that `expected` describes for `local_locator`.
     ///
     /// In order: the same preconditions as `delete` (directory, artifact scan,
-    /// every target a plain file), then **immediately before the first removal**
-    /// fresh evidence is captured and compared with `expected`; any difference,
-    /// or any failure to capture it, refuses with nothing removed. Only then are
-    /// the artifacts and finally the record removed and the removal verified,
-    /// exactly as `delete` does. Nothing outside this location's record and its
-    /// recognized artifacts is touched, and nothing is followed through a reparse
-    /// point.
+    /// every target a plain file); fresh evidence by path, compared with `expected`;
+    /// then the directory is pinned and **every planned file is held and read
+    /// through its own handle**, and the bytes read there are compared with
+    /// `expected` again. **That comparison, on the handles that will remove the
+    /// files, is the one that matters**: the earlier path comparison only fails
+    /// early. Any difference refuses with nothing removed. Then the layout is
+    /// rechecked and the files are marked for removal through the same handles,
+    /// artifacts first and the record last, and the removal is verified.
+    ///
+    /// # What `Removed` means
+    ///
+    /// The planned names were removed through handles whose bytes were verified and
+    /// which were held with read-only sharing from the read to the removal, and
+    /// afterwards neither the record name nor any recognized artifact remained. It
+    /// does **not** mean the bytes are erased: removing a name is not erasing a file,
+    /// and a hard link created in the single call gap before a mark keeps the file
+    /// object (the mark is then not `Marked`, and the result is
+    /// `IncompleteDeletion`). It is not power-loss durable, and a multi-file removal
+    /// is not atomic: a partial removal is `IncompleteDeletion`, never success.
     ///
     /// # What this is not
     ///
-    /// It is **not** compare-and-swap, and not atomic against another process:
-    /// the evidence is read, then the files are removed, and a writer that is not
-    /// bound by the exclusive per-vault session lock can still change them in
-    /// between (the window is narrowed to the few calls between the comparison and
-    /// the first removal, not closed). A file that changes after the comparison is
-    /// either removed as it then is, or makes the final verification report
-    /// `IncompleteDeletion`. The unlocked vault session lock must be held by the
-    /// caller, as for every state operation.
+    /// It is **not** compare-and-swap. Sharing modes bind ordinary processes only;
+    /// administrators, backup-privileged processes, kernel components and filter
+    /// drivers can bypass them, writable mapped views are not addressed, and the
+    /// driver's reported facts are trusted. When the record is a second name of a
+    /// recovery artifact (the `create` remnant) the record's own name is **not**
+    /// protected by the hold on the artifact (measured: another process can rename
+    /// or unlink it); it is reopened and re-verified after the artifact is removed,
+    /// and a mismatch is `IncompleteDeletion`. The legacy replacement is unchanged
+    /// and still has the check-then-rename shape (G12-replace, open).
+    ///
+    /// New refusals, all before any removal ([`StoreError::RemovalRefused`]): a
+    /// planned file is open elsewhere in a way that excludes the hold, has a name
+    /// outside the plan, is read-only, or the directory is not on local NTFS.
     ///
     /// `Ok(AlreadyAbsent)` is returned only when the store holds nothing **and**
     /// `expected` is the empty evidence.
@@ -1089,12 +1172,32 @@ impl SyncStateStore {
             return Err(ConditionalDeleteError::EvidenceChanged);
         }
 
-        match plan {
-            None => Ok(DeleteOutcome::AlreadyAbsent),
-            Some(plan) => self
-                .execute_delete(&plan)
-                .map_err(ConditionalDeleteError::Store),
+        let Some(plan) = plan else {
+            return Ok(DeleteOutcome::AlreadyAbsent);
+        };
+
+        if self.hook(Point::BeforeHold).is_err() {
+            return Err(ConditionalDeleteError::Evidence(
+                EvidenceRefusal::Unreadable,
+            ));
         }
+
+        let mut held = self
+            .hold_for_removal(&plan)
+            .map_err(ConditionalDeleteError::Store)?;
+
+        // The comparison that matters: the bytes of the held files, read through the
+        // handles that will remove them.
+        match self.held_evidence(&plan, &mut held) {
+            Some(evidence) if evidence == *expected => {}
+            _ => return Err(ConditionalDeleteError::EvidenceChanged),
+        }
+
+        self.recheck_held(&plan, &held)
+            .map_err(ConditionalDeleteError::Store)?;
+
+        self.execute_delete(&plan, held)
+            .map_err(ConditionalDeleteError::Store)
     }
 
     /// Everything `delete` checks before it removes anything. `None` is verified
@@ -1168,24 +1271,311 @@ impl SyncStateStore {
         }))
     }
 
-    /// The removal and its verification. Artifacts first, the record last.
-    fn execute_delete(&self, plan: &DeletePlan) -> Result<DeleteOutcome, StoreError> {
-        for artifact in &plan.artifacts {
-            self.remove(Point::RemoveArtifact, artifact)?;
-        }
-        if plan.record_present {
-            self.remove(Point::RemovePrimary, &plan.record)?;
+    /// Pin the directory and hold every planned file, **before anything is
+    /// removed**. Any refusal returns with nothing removed.
+    ///
+    /// Link rule, exact: a planned file with one name is accepted. A planned
+    /// artifact with exactly two names is accepted only as the `create` remnant: the
+    /// record is planned and a read-only probe shows the artifact and the record are
+    /// the same file, and no other artifact is such an alias. Everything else
+    /// (including a record with an outside name, and two artifacts that are names of
+    /// each other) is `ExtraNames` (or `Busy`, when the sharing mode of the first
+    /// hold already excludes the second name). The record of an alias remnant is not
+    /// held here; see [`HeldPrimary::Deferred`].
+    fn hold_for_removal(&self, plan: &DeletePlan) -> Result<HeldFiles, StoreError> {
+        use RemovalRefusal as Refusal;
+
+        let refuse = StoreError::RemovalRefused;
+
+        let pin = DirectoryPin::acquire(&self.directory).map_err(refuse)?;
+
+        // After the pin, so a redirection installed before it is caught here.
+        if self.confirm_ancestors().is_err() {
+            return Err(refuse(Refusal::DirectoryUnsupported));
         }
 
-        // Verify, treating "cannot tell" as incomplete.
-        match fs::symlink_metadata(&plan.record) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            _ => return Err(StoreError::IncompleteDeletion),
+        let mut artifacts: Vec<HeldArtifact> = Vec::with_capacity(plan.artifacts.len());
+
+        for path in &plan.artifacts {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_ascii_lowercase)
+                .ok_or(refuse(Refusal::FileUnsuitable))?;
+            let file = HeldFile::open(path).map_err(refuse)?;
+
+            let alias = match link_verdict(file.link_count()) {
+                LinkVerdict::Single => false,
+                LinkVerdict::Pair => {
+                    if plan.record_present
+                        && !artifacts.iter().any(|held| held.alias)
+                        && self.is_second_name_of_record(plan, &file)
+                    {
+                        true
+                    } else {
+                        return Err(refuse(Refusal::ExtraNames));
+                    }
+                }
+                LinkVerdict::Refuse => return Err(refuse(Refusal::ExtraNames)),
+            };
+
+            artifacts.push(HeldArtifact { name, file, alias });
         }
-        match self.scan_artifacts(&plan.key) {
-            Ok(remaining) if remaining.is_empty() => Ok(DeleteOutcome::Removed),
+
+        let primary = if !plan.record_present {
+            HeldPrimary::None
+        } else if let Some(alias) = artifacts.iter().find(|held| held.alias) {
+            HeldPrimary::Deferred {
+                identity: alias.file.identity(),
+                expected: None,
+            }
+        } else {
+            let file = HeldFile::open(&plan.record).map_err(refuse)?;
+
+            if link_verdict(file.link_count()) != LinkVerdict::Single {
+                return Err(refuse(Refusal::ExtraNames));
+            }
+
+            HeldPrimary::Held(file)
+        };
+
+        Ok(HeldFiles {
+            pin,
+            artifacts,
+            primary,
+        })
+    }
+
+    /// Whether the record's name reaches the very file `held` is a handle to: a
+    /// read-only, fully shared, no-follow probe, judged on its own handle.
+    fn is_second_name_of_record(&self, plan: &DeletePlan, held: &HeldFile) -> bool {
+        let Ok(probe) = open_no_follow(&plan.record) else {
+            return false;
+        };
+
+        probe
+            .metadata()
+            .is_ok_and(|metadata| is_plain_file(&metadata))
+            && facts_of(&probe).is_ok_and(|facts| facts.identity() == held.identity())
+    }
+
+    /// Rebuild the evidence of what is held from the bytes read **through the held
+    /// handles**. `None` when any file cannot be read in full within the bound. The
+    /// record of an alias remnant has the bytes of its held alias; they are kept for
+    /// the later reopen.
+    fn held_evidence(&self, plan: &DeletePlan, held: &mut HeldFiles) -> Option<RecordEvidence> {
+        let limit = MAX_SYNC_STATE_BYTES as u64;
+
+        let mut artifacts = Vec::with_capacity(held.artifacts.len());
+        let mut alias_evidence = None;
+
+        for artifact in &held.artifacts {
+            let file = FileEvidence::of(&artifact.file.read_bounded(limit)?);
+
+            if artifact.alias {
+                alias_evidence = Some(file.clone());
+            }
+
+            artifacts.push(ArtifactEvidence {
+                name: artifact.name.clone(),
+                file,
+            });
+        }
+
+        artifacts.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let primary = match &mut held.primary {
+            HeldPrimary::None => None,
+            HeldPrimary::Held(file) => Some(FileEvidence::of(&file.read_bounded(limit)?)),
+            HeldPrimary::Deferred { expected, .. } => {
+                let evidence = alias_evidence?;
+
+                *expected = Some(evidence.clone());
+
+                Some(evidence)
+            }
+        };
+
+        Some(RecordEvidence {
+            key: plan.key.clone(),
+            primary,
+            artifacts,
+        })
+    }
+
+    /// The directory still holds exactly what was planned: the compatibility gate
+    /// passes, the recognized artifacts are exactly `expected_artifacts` (lowercased
+    /// names) and the record is present exactly if it was planned. Observes only.
+    fn recheck_layout(
+        &self,
+        plan: &DeletePlan,
+        expected_artifacts: &[String],
+    ) -> Result<(), StoreError> {
+        let layout = self.legacy_gate(&plan.key).map_err(StoreError::from)?;
+
+        let record_present = match layout.primary() {
+            LayoutPrimary::Absent => false,
+            LayoutPrimary::Unexpected => {
+                return Err(StoreError::RemovalRefused(RemovalRefusal::PlanChanged))
+            }
+            _ => true,
+        };
+
+        let mut names: Vec<String> = self
+            .scan_artifacts(&plan.key)
+            .map_err(|fault| fault.into_store_error(IoStage::Scan))?
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .map(str::to_ascii_lowercase)
+            .collect();
+        let mut expected: Vec<String> = expected_artifacts.to_vec();
+
+        names.sort();
+        expected.sort();
+
+        if names != expected || record_present != plan.record_present {
+            return Err(StoreError::RemovalRefused(RemovalRefusal::PlanChanged));
+        }
+
+        Ok(())
+    }
+
+    /// R1, before the first removal: the layout is as planned, the pinned directory
+    /// is still the one the path reaches, and every held file still has exactly the
+    /// facts it was judged with (a new name is noticed here). Nothing is removed on
+    /// failure.
+    fn recheck_held(&self, plan: &DeletePlan, held: &HeldFiles) -> Result<(), StoreError> {
+        if let Err(error) = self.hook(Point::AfterHold) {
+            return Err(StoreError::Io {
+                stage: IoStage::Inspect,
+                kind: error.kind(),
+            });
+        }
+
+        let names: Vec<String> = held
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.name.clone())
+            .collect();
+
+        self.recheck_layout(plan, &names)?;
+
+        if !held.pin.still_names(&self.directory) {
+            return Err(StoreError::RemovalRefused(
+                RemovalRefusal::DirectoryUnsupported,
+            ));
+        }
+
+        let primary_unchanged = match &held.primary {
+            HeldPrimary::Held(file) => file.unchanged(),
+            HeldPrimary::None | HeldPrimary::Deferred { .. } => true,
+        };
+
+        if !primary_unchanged || !held.artifacts.iter().all(|a| a.file.unchanged()) {
+            return Err(StoreError::RemovalRefused(RemovalRefusal::ExtraNames));
+        }
+
+        Ok(())
+    }
+
+    /// The removal and its verification. Artifacts first, the record last, each
+    /// through its own handle; the handle of a file is closed when it is marked.
+    ///
+    /// A failure before the first mark that is a refusal (a changed fact) is
+    /// `RemovalRefused`; once any mark has been attempted, every failure and every
+    /// mark that is not proven is `IncompleteDeletion`. The final namespace check
+    /// is mandatory: a successful mark alone is never success.
+    fn execute_delete(
+        &self,
+        plan: &DeletePlan,
+        held: HeldFiles,
+    ) -> Result<DeleteOutcome, StoreError> {
+        let HeldFiles {
+            pin,
+            artifacts,
+            primary,
+        } = held;
+        let mut removed_any = false;
+
+        for artifact in artifacts {
+            self.hook(Point::RemoveArtifact)
+                .map_err(|_| StoreError::IncompleteDeletion)?;
+
+            if !artifact.file.unchanged() {
+                return Err(changed_fact(removed_any));
+            }
+
+            match artifact.file.mark_for_removal() {
+                RemovalMark::Marked => removed_any = true,
+                RemovalMark::NotMarked | RemovalMark::Unknown => {
+                    return Err(StoreError::IncompleteDeletion)
+                }
+            }
+        }
+
+        // The record of an alias remnant: its own name was not held. Open it now that
+        // the artifact's handle is closed, and require the very same file, now with
+        // one name, and (when bytes were verified) the very same bytes.
+        let primary = match primary {
+            HeldPrimary::None => None,
+            HeldPrimary::Held(file) => Some(file),
+            HeldPrimary::Deferred { identity, expected } => {
+                let file =
+                    HeldFile::open(&plan.record).map_err(|_| StoreError::IncompleteDeletion)?;
+                let same_bytes = expected.as_ref().is_none_or(|evidence| {
+                    file.read_bounded(MAX_SYNC_STATE_BYTES as u64)
+                        .is_some_and(|bytes| FileEvidence::of(&bytes) == *evidence)
+                });
+
+                if file.identity() != identity || file.link_count() != 1 || !same_bytes {
+                    return Err(StoreError::IncompleteDeletion);
+                }
+
+                Some(file)
+            }
+        };
+
+        // R2: nothing new appeared while the artifacts went.
+        if removed_any
+            && (self.recheck_layout(plan, &[]).is_err() || !pin.still_names(&self.directory))
+        {
+            return Err(StoreError::IncompleteDeletion);
+        }
+
+        if let Some(file) = primary {
+            self.hook(Point::RemovePrimary)
+                .map_err(|_| StoreError::IncompleteDeletion)?;
+
+            if !file.unchanged() {
+                return Err(changed_fact(removed_any));
+            }
+
+            match file.mark_for_removal() {
+                RemovalMark::Marked => {}
+                RemovalMark::NotMarked | RemovalMark::Unknown => {
+                    return Err(StoreError::IncompleteDeletion)
+                }
+            }
+        }
+
+        self.hook(Point::AfterClose)
+            .map_err(|_| StoreError::IncompleteDeletion)?;
+
+        // Verify while the directory is still pinned, treating "cannot tell" as
+        // incomplete.
+        let outcome = match fs::symlink_metadata(&plan.record) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                match self.scan_artifacts(&plan.key) {
+                    Ok(remaining) if remaining.is_empty() => Ok(DeleteOutcome::Removed),
+                    _ => Err(StoreError::IncompleteDeletion),
+                }
+            }
             _ => Err(StoreError::IncompleteDeletion),
-        }
+        };
+
+        drop(pin);
+
+        outcome
     }
 
     // ---- internals ---------------------------------------------------------
@@ -1418,15 +1808,6 @@ impl SyncStateStore {
         }
     }
 
-    fn remove(&self, point: Point, path: &Path) -> Result<(), StoreError> {
-        match self.hook(point).and_then(|()| fs::remove_file(path)) {
-            Ok(()) => Ok(()),
-            // Already gone is the goal; the final verification decides.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(StoreError::IncompleteDeletion),
-        }
-    }
-
     /// Test seam for the session's tests (the fault hooks are private): run
     /// `run` inside [`delete_if_evidence_matches`](Self::delete_if_evidence_matches)
     /// after its preconditions and before its evidence comparison, which is the
@@ -1457,6 +1838,27 @@ impl SyncStateStore {
             .lock()
             .unwrap()
             .push((Point::RemovePrimary, Action::Run(Box::new(run))));
+    }
+
+    /// Test seam: run `run` inside [`delete_if_evidence_matches`](Self::delete_if_evidence_matches)
+    /// after the evidence comparison by path and before the directory is pinned and
+    /// the files are held: the window in which a file can still be swapped.
+    #[cfg(test)]
+    pub(crate) fn run_before_hold_for_test(&self, run: impl Fn() + Send + 'static) {
+        self.faults
+            .lock()
+            .unwrap()
+            .push((Point::BeforeHold, Action::Run(Box::new(run))));
+    }
+
+    /// Test seam: run `run` inside the deletion after every file was removed and its
+    /// handle closed, before the absence is verified.
+    #[cfg(test)]
+    pub(crate) fn run_after_close_for_test(&self, run: impl Fn() + Send + 'static) {
+        self.faults
+            .lock()
+            .unwrap()
+            .push((Point::AfterClose, Action::Run(Box::new(run))));
     }
 
     #[cfg(not(test))]
@@ -1494,6 +1896,68 @@ pub(crate) fn path_identity_eq(left: &str, right: &str) -> bool {
 /// dependency); the value is not an envelope fingerprint.
 fn record_key(locator: &Locator) -> String {
     EnvelopeFingerprint::of_bytes(locator.as_str().to_ascii_lowercase().as_bytes()).to_hex()
+}
+
+/// A held file whose facts changed after it was judged: a refusal while nothing has
+/// been removed, otherwise part of a partial removal.
+fn changed_fact(removed_any: bool) -> StoreError {
+    if removed_any {
+        StoreError::IncompleteDeletion
+    } else {
+        StoreError::RemovalRefused(RemovalRefusal::ExtraNames)
+    }
+}
+
+/// What the number of names of a planned file allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkVerdict {
+    /// One name: accepted.
+    Single,
+    /// Two names: accepted only for the `create` remnant (an artifact that is also
+    /// the record), which the caller must show.
+    Pair,
+    /// Zero, or three or more: refused.
+    Refuse,
+}
+
+fn link_verdict(links: u32) -> LinkVerdict {
+    match links {
+        1 => LinkVerdict::Single,
+        2 => LinkVerdict::Pair,
+        _ => LinkVerdict::Refuse,
+    }
+}
+
+/// One planned artifact, held.
+struct HeldArtifact {
+    /// ASCII-lowercased file name (the store's own artifact-name rule).
+    name: String,
+    file: HeldFile,
+    /// The one artifact that is a second name of the record (the `create` remnant).
+    alias: bool,
+}
+
+/// The record's side of a deletion.
+enum HeldPrimary {
+    /// No record is planned.
+    None,
+    Held(HeldFile),
+    /// The record is the second name of a held artifact. It is **not** held: a
+    /// second hold would be refused by the first one's sharing mode. It is opened
+    /// after the artifact's handle closes and must then be the same file with one
+    /// name and (when bytes were compared) the same bytes.
+    Deferred {
+        identity: FileIdentity,
+        expected: Option<FileEvidence>,
+    },
+}
+
+/// Everything a deletion holds, acquired before the first removal. Dropping it
+/// closes every handle and removes nothing.
+struct HeldFiles {
+    pin: DirectoryPin,
+    artifacts: Vec<HeldArtifact>,
+    primary: HeldPrimary,
 }
 
 fn is_artifact_name(name: &str, key: &str) -> bool {
@@ -3487,7 +3951,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn real_windows_deletion_failure_is_reported_as_incomplete() {
+    fn real_windows_busy_files_refuse_the_deletion_before_anything_is_removed() {
+        // REAL NTFS. Formerly `real_windows_deletion_failure_is_reported_as_incomplete`.
         let scratch = Scratch::new("delete-real-failure");
         let store = scratch.store();
         let state = based(LOCAL, 9);
@@ -3509,27 +3974,30 @@ mod tests {
         }
         assert_eq!(loaded(store.load(&loc(LOCAL))), state);
 
-        // The removal failure itself is still exercised with a file that can be
-        // read but not deleted.
+        // B3c-3b-2d-1: a file that can be read but is open without delete sharing can
+        // no longer be held for removal. The deletion is refused (`Busy`) before the
+        // first removal; formerly this reached the removal and was `IncompleteDeletion`.
         {
             let _guard = hold_against_removal(&scratch.record(LOCAL));
             assert_eq!(
                 store.delete(&loc(LOCAL)),
-                Err(StoreError::IncompleteDeletion)
+                Err(StoreError::RemovalRefused(RemovalRefusal::Busy))
             );
             assert!(scratch.record(LOCAL).exists());
         }
         assert_eq!(loaded(store.load(&loc(LOCAL))), state);
 
-        // With an artifact held instead, the record must survive.
+        // With an artifact held instead, nothing is removed: the record survives, and
+        // so does the artifact (formerly the artifact failed mid-way).
         scratch.put(&scratch.artifact(LOCAL, STALE_TOKEN), b"debris");
         {
             let _guard = hold_against_removal(&scratch.artifact(LOCAL, STALE_TOKEN));
             assert_eq!(
                 store.delete(&loc(LOCAL)),
-                Err(StoreError::IncompleteDeletion)
+                Err(StoreError::RemovalRefused(RemovalRefusal::Busy))
             );
             assert_eq!(loaded(store.load(&loc(LOCAL))), state);
+            assert!(scratch.artifact(LOCAL, STALE_TOKEN).exists());
         }
         assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
     }
@@ -5914,6 +6382,9 @@ mod tests {
             StoreError::UnresolvedArtifacts,
             StoreError::NoClobberUnsupported,
             StoreError::IncompleteDeletion,
+            // Produced only by a deletion; fails closed here.
+            StoreError::RemovalRefused(RemovalRefusal::Busy),
+            StoreError::RemovalRefused(RemovalRefusal::PlanChanged),
         ] {
             assert!(ambiguous(uncertain), "{uncertain:?}");
         }
@@ -7371,9 +7842,13 @@ mod legacy_v1_golden_tests {
         DirectoryTmp,
         OtherKeysOnly,
         PrimaryAndOtherKeys,
+        /// The `create` remnant (F2): the primary and one `.tmp` are two names
+        /// (hard links) of ONE file. Added in B3c-3b-2d-1 and run on the unmodified
+        /// path-based deletion first.
+        AliasRemnant,
     }
 
-    const LAYOUTS: [Layout; 14] = [
+    const LAYOUTS: [Layout; 15] = [
         Layout::NoDirectory,
         Layout::EmptyDirectory,
         Layout::V1Primary,
@@ -7388,6 +7863,7 @@ mod legacy_v1_golden_tests {
         Layout::DirectoryTmp,
         Layout::OtherKeysOnly,
         Layout::PrimaryAndOtherKeys,
+        Layout::AliasRemnant,
     ];
 
     /// The same binding as `state(LOCAL)` with a different pending-push revision.
@@ -7442,6 +7918,10 @@ mod legacy_v1_golden_tests {
             Layout::PrimaryAndCompleteTmp => {
                 scratch.put(&record, &complete());
                 scratch.put(&tmp, &complete());
+            }
+            Layout::AliasRemnant => {
+                scratch.put(&record, &complete());
+                fs::hard_link(&record, &tmp).unwrap();
             }
             Layout::TmpOnlyEmpty => scratch.put(&tmp, b""),
             Layout::TmpOnlyPartial => scratch.put(&tmp, &complete()[..20]),
@@ -7621,7 +8101,8 @@ mod legacy_v1_golden_tests {
             ],
             Layout::PrimaryAndEmptyTmp
             | Layout::PrimaryAndPartialTmp
-            | Layout::PrimaryAndCompleteTmp => [
+            | Layout::PrimaryAndCompleteTmp
+            | Layout::AliasRemnant => [
                 s("Loaded(same=true)"),
                 s("Present(same_bytes=true, Present)"),
                 s("Err(AlreadyExists)@K.T.tmp,K.json"),
@@ -9222,6 +9703,30 @@ mod b3c3b2a_support {
         assert!(output.status.success(), "the child process could not write");
     }
 
+    /// The same real `cmd.exe copy`, but the write must be REFUSED by the kernel
+    /// (the destination is held). The staging source is removed again either way.
+    pub(super) fn child_put_fails(root: &Path, dest: &Path, bytes: &[u8]) {
+        let source = root.join("child-source.bin");
+
+        fs::write(&source, bytes).unwrap();
+
+        let output = Command::new("cmd")
+            .arg("/C")
+            .arg("copy")
+            .arg("/Y")
+            .arg(&source)
+            .arg(dest)
+            .output()
+            .unwrap();
+
+        fs::remove_file(&source).unwrap();
+
+        assert!(
+            !output.status.success(),
+            "the child process WROTE to a held file: the hold did not prevent it"
+        );
+    }
+
     /// What a refused layout must produce, in all three error types.
     #[derive(Clone, Copy, Debug)]
     pub(super) enum Gate {
@@ -10642,7 +11147,7 @@ mod legacy_gate_race_tests {
     use std::fs;
 
     use super::b3c3b1_support::{loc, names, state, Scratch, LOCAL, RETIRED_TOKEN, TOKEN};
-    use super::b3c3b2a_support::{child_puts, proposed_state, v1_bytes};
+    use super::b3c3b2a_support::{child_put_fails, child_puts, proposed_state, v1_bytes};
     use super::*;
     use crate::vault::handle_ops::test_support::snapshot;
 
@@ -10766,20 +11271,21 @@ mod legacy_gate_race_tests {
         retired_is_intact(&scratch);
     }
 
-    // ---- KNOWN, UNFIXED RACES (gate G12) -----------------------------------------
+    // ---- G12-RESET: held-handle removal (B3c-3b-2d-1) -----------------------------
+    //
+    // These three tests used to pin a KNOWN VULNERABILITY: the deletion resolved the
+    // primary by path, a child process could overwrite it after the last comparison,
+    // and the foreign bytes were removed under a normal "removed" result. The removal
+    // now goes through handles that were held (read-only sharing) from the byte
+    // comparison to the removal, so the same child write is REFUSED BY THE KERNEL. It
+    // holds for ordinary processes only (see `held_removal`). The legacy REPLACE has
+    // the old shape and is still open (G12-replace); its characterization is at the
+    // end of this module.
 
     #[test]
-    fn a_primary_replaced_after_the_final_comparison_is_removed_known_unprevented_race_g12() {
-        // KNOWN VULNERABILITY, characterized on synthetic bytes ONLY, and NOT
-        // acceptable behaviour. Gate G12, open, to be fixed in a separate slice that
-        // binds the deletion to a held handle and a file identity.
-        //
-        // The deletion resolves the primary by its CURRENT path. A child process
-        // overwrites it with foreign bytes after the last evidence comparison and
-        // before the removal; nothing re-checks, so the foreign bytes are removed and
-        // the store reports an ordinary successful removal. This test pins the
-        // present behaviour so that a change is noticed; it is not a security
-        // success and not a reason to keep the behaviour.
+    fn a_primary_overwrite_after_the_hold_is_refused_by_the_kernel_g12_reset() {
+        // REAL NTFS, real child process, synthetic bytes. Formerly
+        // `a_primary_replaced_after_the_final_comparison_is_removed_known_unprevented_race_g12`.
         let scratch = Scratch::new("race-g12-store");
         let store = scratch.store();
 
@@ -10788,24 +11294,29 @@ mod legacy_gate_race_tests {
         let evidence = store.evidence(&loc(LOCAL)).unwrap();
         let root = scratch.root();
         let record = scratch.record(LOCAL);
+        let hook_record = record.clone();
 
-        store.run_before_primary_removal_for_test(move || child_puts(&root, &record, FOREIGN));
+        store.run_before_primary_removal_for_test(move || {
+            // The child cannot write; the verified object is still exactly what was verified.
+            child_put_fails(&root, &hook_record, FOREIGN);
+            assert_eq!(fs::read(&hook_record).unwrap(), v1_bytes());
+        });
 
-        // Reported as a normal, verified removal ...
         assert_eq!(
             store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
             Ok(DeleteOutcome::Removed)
         );
 
-        // ... and the foreign bytes that were put there are gone, with no trace.
-        assert!(!scratch.record(LOCAL).exists());
+        // Only the verified object existed, and it is the one that went.
+        assert!(!record.exists());
         assert!(names(&scratch.state_dir()).is_empty());
+        assert!(!scratch.root().join("child-source.bin").exists());
     }
 
     #[test]
-    fn a_temp_replaced_after_the_final_comparison_is_removed_known_unprevented_race_g12() {
-        // KNOWN VULNERABILITY, same class and same status as the test above, for a
-        // recognized legacy temp file. Synthetic bytes only; not acceptable behaviour.
+    fn a_temp_overwrite_after_the_hold_is_refused_by_the_kernel_g12_reset() {
+        // REAL NTFS, same for a recognized legacy temp file. Formerly
+        // `a_temp_replaced_after_the_final_comparison_is_removed_known_unprevented_race_g12`.
         let scratch = Scratch::new("race-g12-temp");
         let store = scratch.store();
 
@@ -10818,7 +11329,10 @@ mod legacy_gate_race_tests {
 
         store.faults.lock().unwrap().push((
             Point::RemoveArtifact,
-            Action::Run(Box::new(move || child_puts(&root, &temp, FOREIGN))),
+            Action::Run(Box::new(move || {
+                child_put_fails(&root, &temp, FOREIGN);
+                assert_eq!(fs::read(&temp).unwrap(), b"debris");
+            })),
         ));
 
         assert_eq!(
@@ -10829,9 +11343,10 @@ mod legacy_gate_race_tests {
     }
 
     #[test]
-    fn the_known_races_never_touch_a_retired_file_even_when_one_is_present_beforehand() {
-        // The gate refuses before any of the above can start, so a retired file that
-        // is already there is never part of a race: nothing is removed at all.
+    fn a_retired_file_present_beforehand_is_never_part_of_any_removal() {
+        // The gate refuses before any hold, so a retired file that is already there is
+        // never part of a removal: nothing is removed at all. Formerly
+        // `the_known_races_never_touch_a_retired_file_even_when_one_is_present_beforehand`.
         let scratch = Scratch::new("race-retired-first");
         let store = scratch.store();
 
@@ -10845,9 +11360,1060 @@ mod legacy_gate_race_tests {
             .is_err());
         assert_eq!(snapshot(scratch.dir.path()), before);
     }
+
+    // ---- KNOWN UNFIXED G12-REPLACE (characterization, not a fix) ------------------
+
+    #[test]
+    fn a_primary_replaced_at_the_rename_is_overwritten_known_unprevented_race_g12_replace() {
+        // KNOWN UNFIXED G12-REPLACE, gate OPEN, NOT ACCEPTABLE behaviour, and NOT a
+        // passing security property. REAL NTFS, synthetic bytes only. The legacy
+        // replacement checks the primary, then renames its staging file over whatever
+        // the name holds at that instant, with no handle held on the primary. A child
+        // process overwrites the primary at `Point::Replace`; `replace` returns Ok and
+        // the foreign bytes are gone. No registered command reaches `replace` today.
+        // This test pins the present behaviour so a change is noticed; the fix is the
+        // separate slice 2d-2 (decision U11), not this one.
+        let scratch = Scratch::new("race-g12-replace");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+
+        let root = scratch.root();
+        let record = scratch.record(LOCAL);
+        let hook_record = record.clone();
+
+        store.faults.lock().unwrap().push((
+            Point::Replace,
+            Action::Run(Box::new(move || child_puts(&root, &hook_record, FOREIGN))),
+        ));
+
+        assert_eq!(store.replace(&state(LOCAL), &proposed_state()), Ok(()));
+        assert_eq!(
+            fs::read(&record).unwrap(),
+            proposed_state().encode().unwrap(),
+            "the foreign bytes were overwritten without a trace"
+        );
+    }
 }
 
 // ---- B3c-3b-2a forced race tests (end) ---------------------------------------
+
+// ---- B3c-3b-2d-1 handle-bound reset tests (begin) -----------------------------------
+
+/// Stage 1U-4 B3c-3b-2d-1. The handle-bound legacy reset (G12-reset).
+///
+/// Every test labels its class: **REAL NTFS** (real files, handles and, where a foreign
+/// writer is needed, a real child `cmd.exe`), **INJECTED** (a test-only fault or a
+/// substituted native status), **PURE** (no filesystem) or **UNAVAILABLE** (documented
+/// as not exercised). Scratch is under `.qa-local` only; the bytes are synthetic. A
+/// kernel refusal shown here binds ordinary processes only; nothing here is a stress
+/// test and none claims a race-prevention guarantee beyond what the sharing model
+/// gives.
+#[cfg(all(test, windows))]
+mod held_reset_tests {
+    use std::{
+        fs,
+        os::windows::fs::OpenOptionsExt,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+    };
+
+    use super::b3c3b1_support::{
+        loc, names, state, Scratch, LOCAL, OTHER_LOCAL, RETIRED_TOKEN, TOKEN,
+    };
+    use super::b3c3b2a_support::{child_puts, v1_bytes};
+    use super::*;
+    use crate::vault::handle_ops::{
+        inject_delete_status,
+        test_support::{make_junction, snapshot},
+    };
+
+    const FOREIGN: &[u8] = b"SYNTHETIC-FOREIGN-BYTES-NOT-A-REAL-RECORD";
+    const TOKEN2: &str = "fedcba9876543210fedcba9876543210";
+    const DENIED: i32 = 0xC000_0022_u32 as i32;
+
+    type Conditional = Result<DeleteOutcome, ConditionalDeleteError>;
+
+    fn at(store: &SyncStateStore, point: Point, run: impl Fn() + Send + 'static) {
+        store
+            .faults
+            .lock()
+            .unwrap()
+            .push((point, Action::Run(Box::new(run))));
+    }
+
+    fn refused(refusal: RemovalRefusal) -> Conditional {
+        Err(ConditionalDeleteError::Store(StoreError::RemovalRefused(
+            refusal,
+        )))
+    }
+
+    fn incomplete() -> Conditional {
+        Err(ConditionalDeleteError::Store(
+            StoreError::IncompleteDeletion,
+        ))
+    }
+
+    /// Run a real child `cmd.exe` and report whether it succeeded.
+    fn cmd(args: &[&std::ffi::OsStr]) -> bool {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    /// A record and one `.tmp`, the evidence of both.
+    fn record_and_tmp(name: &str) -> (Scratch, SyncStateStore, RecordEvidence) {
+        let scratch = Scratch::new(name);
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"debris");
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        (scratch, store, evidence)
+    }
+
+    /// The `create` remnant: the record and one `.tmp` are two names of ONE file.
+    fn alias_remnant(name: &str) -> (Scratch, SyncStateStore, RecordEvidence) {
+        let scratch = Scratch::new(name);
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+        fs::hard_link(scratch.record(LOCAL), scratch.staging(LOCAL, TOKEN)).unwrap();
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        (scratch, store, evidence)
+    }
+
+    fn delete(store: &SyncStateStore, evidence: &RecordEvidence) -> Conditional {
+        store.delete_if_evidence_matches(&loc(LOCAL), evidence)
+    }
+
+    /// Name and exact bytes of every file that does not belong to this location.
+    fn neighbours(scratch: &Scratch) -> Vec<(String, Vec<u8>)> {
+        let key = record_key(&loc(LOCAL));
+
+        names(&scratch.state_dir())
+            .into_iter()
+            .filter(|name| !name.starts_with(&key))
+            .map(|name| {
+                let bytes = fs::read(scratch.state_dir().join(&name)).unwrap();
+
+                (name, bytes)
+            })
+            .collect()
+    }
+
+    // ---- ordinary resets --------------------------------------------------------------
+
+    #[test]
+    fn real_a_single_file_and_a_multi_file_reset_remove_exactly_this_locations_files() {
+        // REAL NTFS.
+        let scratch = Scratch::new("2d1-single");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        assert_eq!(delete(&store, &evidence), Ok(DeleteOutcome::Removed));
+        assert!(names(&scratch.state_dir()).is_empty());
+
+        // Multi-file, with another location's files and an unrelated file beside.
+        let (scratch, store, _) = record_and_tmp("2d1-multi");
+        scratch.put(&scratch.staging(LOCAL, TOKEN2), b"");
+        scratch.put(
+            &scratch.record(OTHER_LOCAL),
+            &state(OTHER_LOCAL).encode().unwrap(),
+        );
+        scratch.put(&scratch.staging(OTHER_LOCAL, TOKEN), b"other staging");
+        scratch.put(&scratch.state_dir().join("unrelated.txt"), b"unrelated");
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        let others = neighbours(&scratch);
+
+        assert_eq!(others.len(), 3);
+        assert_eq!(delete(&store, &evidence), Ok(DeleteOutcome::Removed));
+        assert_eq!(neighbours(&scratch), others, "another key's files moved");
+        assert_eq!(names(&scratch.state_dir()).len(), 3);
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+
+        // The unconditional variant too.
+        let (scratch, store, _) = record_and_tmp("2d1-multi-delete");
+
+        assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
+        assert!(names(&scratch.state_dir()).is_empty());
+    }
+
+    #[test]
+    fn real_an_upper_case_primary_name_is_removed_by_handle() {
+        // REAL NTFS. NTFS resolves the case variant to the same object.
+        let scratch = Scratch::new("2d1-upper");
+        let store = scratch.store();
+        let key = record_key(&loc(LOCAL));
+        let upper = scratch
+            .state_dir()
+            .join(format!("{}.JSON", key.to_ascii_uppercase()));
+
+        scratch.put(&upper, &v1_bytes());
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        assert!(evidence.primary_present());
+        assert_eq!(delete(&store, &evidence), Ok(DeleteOutcome::Removed));
+        assert!(names(&scratch.state_dir()).is_empty());
+    }
+
+    // ---- holds refused ------------------------------------------------------------------
+
+    #[test]
+    fn real_a_file_open_elsewhere_without_delete_sharing_refuses_with_nothing_removed() {
+        // REAL NTFS. A reader that shares only reading, and a writer, both refuse as
+        // Busy; an exclusive handle cannot even be read, so evidence refuses.
+        for target in ["record", "tmp"] {
+            for (label, share, write) in [("read-share only", 1u32, false), ("writer", 7, true)] {
+                let (scratch, store, evidence) = record_and_tmp("2d1-busy");
+                let path = if target == "record" {
+                    scratch.record(LOCAL)
+                } else {
+                    scratch.staging(LOCAL, TOKEN)
+                };
+                let before = snapshot(scratch.dir.path());
+
+                {
+                    let _other = fs::OpenOptions::new()
+                        .read(true)
+                        .write(write)
+                        .share_mode(share)
+                        .open(&path)
+                        .unwrap();
+
+                    assert_eq!(
+                        delete(&store, &evidence),
+                        refused(RemovalRefusal::Busy),
+                        "{target} {label}"
+                    );
+                }
+
+                assert_eq!(snapshot(scratch.dir.path()), before, "{target} {label}");
+            }
+
+            let (scratch, store, evidence) = record_and_tmp("2d1-exclusive");
+            let path = if target == "record" {
+                scratch.record(LOCAL)
+            } else {
+                scratch.staging(LOCAL, TOKEN)
+            };
+            let before = snapshot(scratch.dir.path());
+
+            {
+                let _other = fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(&path)
+                    .unwrap();
+
+                assert!(
+                    matches!(
+                        delete(&store, &evidence),
+                        Err(ConditionalDeleteError::Evidence(_))
+                            | Err(ConditionalDeleteError::Store(StoreError::Io { .. }))
+                    ),
+                    "{target} exclusive"
+                );
+            }
+
+            assert_eq!(snapshot(scratch.dir.path()), before, "{target} exclusive");
+        }
+    }
+
+    #[test]
+    fn real_a_reader_that_shares_everything_does_not_block_the_removal() {
+        // REAL NTFS. The reader is opened inside the removal and kept past it.
+        let (scratch, store, evidence) = record_and_tmp("2d1-reader");
+        let kept: Arc<Mutex<Vec<fs::File>>> = Arc::default();
+        let held_open = Arc::clone(&kept);
+        let record = scratch.record(LOCAL);
+        let temp = scratch.staging(LOCAL, TOKEN);
+
+        at(&store, Point::RemoveArtifact, move || {
+            held_open
+                .lock()
+                .unwrap()
+                .push(fs::File::open(&temp).unwrap());
+            held_open
+                .lock()
+                .unwrap()
+                .push(fs::File::open(&record).unwrap());
+        });
+
+        assert_eq!(delete(&store, &evidence), Ok(DeleteOutcome::Removed));
+        assert!(names(&scratch.state_dir()).is_empty());
+        assert_eq!(kept.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn real_a_name_outside_the_plan_refuses_with_all_names_intact() {
+        // REAL NTFS. U10b: a hard link outside the plan refuses.
+        for target in ["record", "tmp"] {
+            let (scratch, store, evidence) = record_and_tmp("2d1-outside-link");
+            let path = if target == "record" {
+                scratch.record(LOCAL)
+            } else {
+                scratch.staging(LOCAL, TOKEN)
+            };
+
+            fs::hard_link(&path, scratch.root().join("outside-link.bin")).unwrap();
+
+            let before = snapshot(scratch.dir.path());
+
+            assert_eq!(
+                delete(&store, &evidence),
+                refused(RemovalRefusal::ExtraNames),
+                "{target}"
+            );
+            assert_eq!(
+                store.delete(&loc(LOCAL)),
+                Err(StoreError::RemovalRefused(RemovalRefusal::ExtraNames)),
+                "{target}"
+            );
+            assert_eq!(snapshot(scratch.dir.path()), before, "{target}");
+        }
+    }
+
+    // ---- the create alias remnant -----------------------------------------------------------
+
+    #[test]
+    fn real_the_create_alias_remnant_stays_resettable_and_both_names_go() {
+        // REAL NTFS. The primary and one `.tmp` are two names of one file (links = 2).
+        let (scratch, store, evidence) = alias_remnant("2d1-alias");
+        scratch.put(
+            &scratch.record(OTHER_LOCAL),
+            &state(OTHER_LOCAL).encode().unwrap(),
+        );
+        let others = neighbours(&scratch);
+
+        assert!(evidence.primary_present());
+        assert_eq!(evidence.artifact_count(), 1);
+        assert_eq!(delete(&store, &evidence), Ok(DeleteOutcome::Removed));
+        assert_eq!(neighbours(&scratch), others);
+        assert_eq!(names(&scratch.state_dir()).len(), 1);
+        assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+
+        // The unconditional variant (no bytes read).
+        let (scratch, store, _) = alias_remnant("2d1-alias-delete");
+
+        assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
+        assert!(names(&scratch.state_dir()).is_empty());
+
+        // The alias beside another, ordinary `.tmp`.
+        let (scratch, store, _) = alias_remnant("2d1-alias-plus");
+        scratch.put(&scratch.staging(LOCAL, TOKEN2), b"debris");
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        assert_eq!(evidence.artifact_count(), 2);
+        assert_eq!(delete(&store, &evidence), Ok(DeleteOutcome::Removed));
+        assert!(names(&scratch.state_dir()).is_empty());
+    }
+
+    #[test]
+    fn real_an_alias_whose_record_name_is_unlinked_after_the_hold_is_refused_before_removal() {
+        // REAL NTFS. Measured: the other name of a held file is NOT protected from an
+        // unlink. Done at AfterHold, the recheck sees the record gone (PlanChanged).
+        let (scratch, store, evidence) = alias_remnant("2d1-alias-unlink");
+        let record = scratch.record(LOCAL);
+
+        at(&store, Point::AfterHold, move || {
+            fs::remove_file(&record).unwrap();
+        });
+
+        assert_eq!(
+            delete(&store, &evidence),
+            refused(RemovalRefusal::PlanChanged)
+        );
+        assert!(
+            scratch.staging(LOCAL, TOKEN).exists(),
+            "nothing was removed"
+        );
+        assert_eq!(fs::read(scratch.staging(LOCAL, TOKEN)).unwrap(), v1_bytes());
+    }
+
+    #[test]
+    fn real_an_alias_whose_record_name_is_swapped_after_its_artifact_went_preserves_the_foreign_file(
+    ) {
+        // REAL NTFS. Two artifacts, the alias first. After the alias `.tmp` was marked
+        // and closed, and before the record is reopened, a foreign file takes the
+        // record's name. The reopen must find a different file: IncompleteDeletion and
+        // the foreign file is preserved.
+        let scratch = Scratch::new("2d1-alias-swap");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+        fs::hard_link(scratch.record(LOCAL), scratch.staging(LOCAL, TOKEN)).unwrap();
+        scratch.put(&scratch.staging(LOCAL, TOKEN2), b"debris");
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        let root = scratch.root();
+        let record = scratch.record(LOCAL);
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        at(&store, Point::RemoveArtifact, move || {
+            // The second artifact's hook runs after the alias was marked and closed.
+            if hits.fetch_add(1, Ordering::SeqCst) == 1 {
+                fs::remove_file(&record).unwrap();
+                child_puts(&root, &record, FOREIGN);
+            }
+        });
+
+        let result = delete(&store, &evidence);
+
+        assert_eq!(result, incomplete());
+        assert!(result.unwrap_err().removal_may_have_started());
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), FOREIGN);
+        // Both held artifacts went (the second one's hook runs before its own mark);
+        // the foreign file at the record's name was never touched.
+        assert!(!scratch.staging(LOCAL, TOKEN).exists());
+        assert!(!scratch.staging(LOCAL, TOKEN2).exists());
+        assert_eq!(names(&scratch.state_dir()).len(), 1);
+    }
+
+    #[test]
+    fn real_two_temp_names_of_one_file_are_refused() {
+        // REAL NTFS. Two `.tmp` aliases of each other (and no record): refused, nothing
+        // removed. (The sharing mode of the first hold excludes the second name, so the
+        // refusal is Busy or ExtraNames.)
+        let scratch = Scratch::new("2d1-two-tmp");
+        let store = scratch.store();
+
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"debris");
+        fs::hard_link(
+            scratch.staging(LOCAL, TOKEN),
+            scratch.staging(LOCAL, TOKEN2),
+        )
+        .unwrap();
+
+        let before = snapshot(scratch.dir.path());
+        let result = store.delete(&loc(LOCAL));
+
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::RemovalRefused(
+                    RemovalRefusal::Busy | RemovalRefusal::ExtraNames
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_eq!(snapshot(scratch.dir.path()), before);
+    }
+
+    // ---- swaps and substitutions before the hold --------------------------------------------
+
+    #[test]
+    fn real_a_foreign_file_swapped_in_before_the_hold_is_detected_and_left_intact() {
+        // REAL NTFS, real child. Done at BeforeHold, after the path evidence matched.
+        for target in ["record", "tmp"] {
+            let (scratch, store, evidence) = record_and_tmp("2d1-swap");
+            let root = scratch.root();
+            let path = if target == "record" {
+                scratch.record(LOCAL)
+            } else {
+                scratch.staging(LOCAL, TOKEN)
+            };
+            let hook_path = path.clone();
+
+            at(&store, Point::BeforeHold, move || {
+                fs::remove_file(&hook_path).unwrap();
+                child_puts(&root, &hook_path, FOREIGN);
+            });
+
+            let result = delete(&store, &evidence);
+
+            assert_eq!(
+                result,
+                Err(ConditionalDeleteError::EvidenceChanged),
+                "{target}"
+            );
+            assert!(!result.unwrap_err().removal_may_have_started());
+            assert_eq!(fs::read(&path).unwrap(), FOREIGN, "{target}: foreign bytes");
+            assert_eq!(names(&scratch.state_dir()).len(), 2, "{target}");
+        }
+    }
+
+    #[test]
+    fn real_a_file_that_grew_past_the_bound_before_the_hold_is_a_changed_file() {
+        // REAL NTFS. The held read is bounded: a longer file is "changed", never a
+        // truncated read.
+        let (scratch, store, evidence) = record_and_tmp("2d1-grown");
+        let temp = scratch.staging(LOCAL, TOKEN);
+        let grown = temp.clone();
+
+        at(&store, Point::BeforeHold, move || {
+            let file = fs::OpenOptions::new().write(true).open(&grown).unwrap();
+
+            file.set_len(MAX_SYNC_STATE_BYTES as u64 + 1).unwrap();
+        });
+
+        assert_eq!(
+            delete(&store, &evidence),
+            Err(ConditionalDeleteError::EvidenceChanged)
+        );
+        assert!(scratch.record(LOCAL).exists());
+        assert!(temp.exists());
+    }
+
+    #[test]
+    fn real_a_junction_or_directory_or_symlink_at_a_name_before_the_hold_is_refused() {
+        // REAL NTFS. The foreign contents behind each are untouched.
+        for (label, target_name) in [("junction", "tmp"), ("directory", "record")] {
+            let (scratch, store, evidence) = record_and_tmp("2d1-unsuitable");
+            let path = if target_name == "record" {
+                scratch.record(LOCAL)
+            } else {
+                scratch.staging(LOCAL, TOKEN)
+            };
+            let elsewhere = scratch.root().join("elsewhere");
+            let hook_path = path.clone();
+            let hook_elsewhere = elsewhere.clone();
+            let junction = label == "junction";
+
+            fs::create_dir_all(&elsewhere).unwrap();
+            fs::write(elsewhere.join("inside.bin"), b"keep").unwrap();
+
+            at(&store, Point::BeforeHold, move || {
+                fs::remove_file(&hook_path).unwrap();
+
+                if junction {
+                    make_junction(&hook_path, &hook_elsewhere);
+                } else {
+                    fs::create_dir(&hook_path).unwrap();
+                    fs::write(hook_path.join("inside.bin"), b"keep").unwrap();
+                }
+            });
+
+            assert_eq!(
+                delete(&store, &evidence),
+                refused(RemovalRefusal::FileUnsuitable),
+                "{label}"
+            );
+            assert_eq!(
+                fs::read(elsewhere.join("inside.bin")).unwrap(),
+                b"keep",
+                "{label}"
+            );
+        }
+
+        // A file symlink needs a privilege this account may lack: UNAVAILABLE if so.
+        let (scratch, store, evidence) = record_and_tmp("2d1-symlink");
+        let temp = scratch.staging(LOCAL, TOKEN);
+        let foreign = scratch.root().join("symlink-target.bin");
+
+        fs::write(&foreign, b"keep").unwrap();
+        fs::remove_file(&temp).unwrap();
+
+        if std::os::windows::fs::symlink_file(&foreign, &temp).is_err() {
+            println!("UNAVAILABLE: this account cannot create a file symlink; case not run");
+
+            return;
+        }
+
+        // The evidence refused it already (a reparse point), before any hold.
+        assert!(store.evidence(&loc(LOCAL)).is_err());
+        assert!(delete(&store, &evidence).is_err());
+        assert_eq!(fs::read(&foreign).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn real_a_state_directory_replaced_by_a_junction_before_the_hold_is_refused() {
+        // REAL NTFS. The directory is moved away and a junction to it takes its place at
+        // BeforeHold; the pin refuses it and the contents are intact.
+        let (scratch, store, evidence) = record_and_tmp("2d1-dir-junction");
+        let state_dir = scratch.state_dir();
+        let moved = scratch.root().join("moved-state");
+        let hook_state = state_dir.clone();
+        let hook_moved = moved.clone();
+
+        at(&store, Point::BeforeHold, move || {
+            fs::rename(&hook_state, &hook_moved).unwrap();
+            make_junction(&hook_state, &hook_moved);
+        });
+
+        assert_eq!(
+            delete(&store, &evidence),
+            refused(RemovalRefusal::DirectoryUnsupported)
+        );
+        assert_eq!(
+            fs::read(moved.join(format!("{}.json", record_key(&loc(LOCAL))))).unwrap(),
+            v1_bytes()
+        );
+        assert_eq!(names(&moved).len(), 2);
+    }
+
+    #[test]
+    fn real_the_state_directory_cannot_be_renamed_while_it_is_pinned() {
+        // REAL NTFS, real child `ren` at AfterHold.
+        let (scratch, store, evidence) = record_and_tmp("2d1-dir-rename");
+        let state_dir = scratch.state_dir();
+        let renamed = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&renamed);
+
+        at(&store, Point::AfterHold, move || {
+            flag.store(
+                cmd(&[
+                    std::ffi::OsStr::new("ren"),
+                    state_dir.as_os_str(),
+                    std::ffi::OsStr::new("renamed-state"),
+                ]),
+                Ordering::SeqCst,
+            );
+        });
+
+        assert_eq!(delete(&store, &evidence), Ok(DeleteOutcome::Removed));
+        assert!(
+            !renamed.load(Ordering::SeqCst),
+            "the child renamed the directory"
+        );
+        assert!(scratch.state_dir().exists());
+        assert!(!scratch.root().join("renamed-state").exists());
+    }
+
+    // ---- changes after the hold ---------------------------------------------------------------
+
+    #[test]
+    fn real_a_new_name_or_new_entry_after_the_hold_refuses_with_nothing_removed() {
+        // REAL NTFS, at AfterHold (before the first removal).
+        // A hard link to the record (a new name) -> ExtraNames.
+        let (scratch, store, evidence) = record_and_tmp("2d1-new-link");
+        let record = scratch.record(LOCAL);
+        let outside = scratch.root().join("late-link.bin");
+
+        at(&store, Point::AfterHold, move || {
+            fs::hard_link(&record, &outside).unwrap();
+        });
+
+        assert_eq!(
+            delete(&store, &evidence),
+            refused(RemovalRefusal::ExtraNames)
+        );
+        assert_eq!(names(&scratch.state_dir()).len(), 2);
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), v1_bytes());
+
+        // A new `.tmp` -> PlanChanged.
+        let (scratch, store, evidence) = record_and_tmp("2d1-new-tmp");
+        let new_tmp = scratch.staging(LOCAL, TOKEN2);
+
+        at(&store, Point::AfterHold, move || {
+            fs::write(&new_tmp, b"late").unwrap()
+        });
+
+        assert_eq!(
+            delete(&store, &evidence),
+            refused(RemovalRefusal::PlanChanged)
+        );
+        assert_eq!(names(&scratch.state_dir()).len(), 3);
+
+        // A primary appearing on a remnant-only plan -> PlanChanged, remnants intact.
+        let scratch = Scratch::new("2d1-new-primary");
+        let store = scratch.store();
+
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"debris");
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        let record = scratch.record(LOCAL);
+        let root = scratch.root();
+
+        at(&store, Point::AfterHold, move || {
+            child_puts(&root, &record, FOREIGN)
+        });
+
+        assert_eq!(
+            delete(&store, &evidence),
+            refused(RemovalRefusal::PlanChanged)
+        );
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), FOREIGN);
+        assert_eq!(fs::read(scratch.staging(LOCAL, TOKEN)).unwrap(), b"debris");
+    }
+
+    #[test]
+    fn real_newer_state_that_appears_after_the_hold_refuses_with_nothing_removed() {
+        // REAL NTFS. U2 and U9: a retired file, a reserved staging name or an
+        // unrecognized key-prefixed entry is never part of a plan; if one appears after
+        // the hold, the recheck refuses.
+        let key = record_key(&loc(LOCAL));
+
+        for (label, name, expected) in [
+            (
+                "retired",
+                format!("{key}.{RETIRED_TOKEN}.retired"),
+                StoreError::UnresolvedNewerState,
+            ),
+            (
+                "reserved staging",
+                format!("{key}.{RETIRED_TOKEN}.v3stage"),
+                StoreError::UnresolvedNewerState,
+            ),
+            (
+                "unrecognized",
+                format!("{key}.notes.txt"),
+                StoreError::UnrecognizedEntries,
+            ),
+        ] {
+            let (scratch, store, evidence) = record_and_tmp("2d1-newer");
+            let late = scratch.state_dir().join(name);
+            let hook_late = late.clone();
+
+            at(&store, Point::AfterHold, move || {
+                fs::write(&hook_late, b"late").unwrap()
+            });
+
+            assert_eq!(
+                delete(&store, &evidence),
+                Err(ConditionalDeleteError::Store(expected)),
+                "{label}"
+            );
+            assert_eq!(fs::read(&late).unwrap(), b"late", "{label}: never touched");
+            assert_eq!(
+                fs::read(scratch.record(LOCAL)).unwrap(),
+                v1_bytes(),
+                "{label}"
+            );
+            assert_eq!(
+                fs::read(scratch.staging(LOCAL, TOKEN)).unwrap(),
+                b"debris",
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_a_hard_link_created_just_before_the_primary_mark_is_refused_and_the_primary_intact() {
+        // REAL NTFS, at RemovePrimary (after every check but the facts recheck).
+        // Without artifacts nothing has been removed: a refusal.
+        let scratch = Scratch::new("2d1-link-primary");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        let record = scratch.record(LOCAL);
+        let outside = scratch.root().join("late-link.bin");
+
+        store.run_before_primary_removal_for_test(move || {
+            fs::hard_link(&record, &outside).unwrap();
+        });
+
+        assert_eq!(
+            delete(&store, &evidence),
+            refused(RemovalRefusal::ExtraNames)
+        );
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), v1_bytes());
+
+        // With an artifact already removed, the same event is a partial removal.
+        let (scratch, store, evidence) = record_and_tmp("2d1-link-primary-partial");
+        let record = scratch.record(LOCAL);
+        let outside = scratch.root().join("late-link.bin");
+
+        store.run_before_primary_removal_for_test(move || {
+            fs::hard_link(&record, &outside).unwrap();
+        });
+
+        let result = delete(&store, &evidence);
+
+        assert_eq!(result, incomplete());
+        assert!(result.unwrap_err().removal_may_have_started());
+        assert!(!scratch.staging(LOCAL, TOKEN).exists());
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), v1_bytes());
+    }
+
+    #[test]
+    fn real_a_foreign_file_at_the_name_after_the_handles_closed_is_preserved_and_not_success() {
+        // REAL NTFS, real child, at AfterClose. The removal is verified by name AFTER
+        // the handles closed: a file there is IncompleteDeletion, never Removed.
+        let (scratch, store, evidence) = record_and_tmp("2d1-after-close");
+        let root = scratch.root();
+        let record = scratch.record(LOCAL);
+
+        store.run_after_close_for_test(move || child_puts(&root, &record, FOREIGN));
+
+        let result = delete(&store, &evidence);
+
+        assert_eq!(result, incomplete());
+        assert!(result.unwrap_err().removal_may_have_started());
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), FOREIGN);
+        assert!(!scratch.staging(LOCAL, TOKEN).exists());
+
+        // The same for a new recognized artifact at the same point.
+        let (scratch, store, evidence) = record_and_tmp("2d1-after-close-tmp");
+        let late = scratch.staging(LOCAL, TOKEN2);
+
+        store.run_after_close_for_test({
+            let late = late.clone();
+
+            move || fs::write(&late, b"late").unwrap()
+        });
+
+        assert_eq!(delete(&store, &evidence), incomplete());
+        assert_eq!(fs::read(&late).unwrap(), b"late");
+    }
+
+    #[test]
+    fn real_a_second_reset_inside_the_first_is_refused_as_busy() {
+        // REAL NTFS. A second store instance runs the conditional deletion inside the
+        // first's AfterHold: the files are held, so it gets Busy and removes nothing;
+        // the first completes.
+        let (scratch, store, evidence) = record_and_tmp("2d1-concurrent");
+        let second = scratch.store();
+        let inner: Arc<Mutex<Option<Conditional>>> = Arc::default();
+        let slot = Arc::clone(&inner);
+        let expected = evidence.clone();
+
+        at(&store, Point::AfterHold, move || {
+            *slot.lock().unwrap() = Some(second.delete_if_evidence_matches(&loc(LOCAL), &expected));
+        });
+
+        assert_eq!(delete(&store, &evidence), Ok(DeleteOutcome::Removed));
+        assert_eq!(
+            inner.lock().unwrap().take(),
+            Some(refused(RemovalRefusal::Busy))
+        );
+        assert!(names(&scratch.state_dir()).is_empty());
+    }
+
+    // ---- INJECTED: partial results and unknown statuses ----------------------------------------
+
+    #[test]
+    fn injected_a_failure_after_one_artifact_is_a_partial_removal_never_a_success() {
+        // INJECTED. The second artifact's handle delete reports an error status.
+        let scratch = Scratch::new("2d1-inj-second");
+        let store = scratch.store();
+
+        scratch.put(&scratch.record(LOCAL), &v1_bytes());
+        scratch.put(&scratch.staging(LOCAL, TOKEN), b"one");
+        scratch.put(&scratch.staging(LOCAL, TOKEN2), b"two");
+
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        at(&store, Point::RemoveArtifact, move || {
+            if hits.fetch_add(1, Ordering::SeqCst) == 1 {
+                inject_delete_status(DENIED);
+            }
+        });
+
+        let result = delete(&store, &evidence);
+
+        assert_eq!(result, incomplete());
+        assert!(result.unwrap_err().removal_may_have_started());
+        assert!(!scratch.staging(LOCAL, TOKEN).exists());
+        assert_eq!(fs::read(scratch.staging(LOCAL, TOKEN2)).unwrap(), b"two");
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), v1_bytes());
+        assert_ne!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+    }
+
+    #[test]
+    fn injected_a_failure_before_the_primary_leaves_the_artifacts_gone_and_the_primary_intact() {
+        // INJECTED.
+        let (scratch, store, evidence) = record_and_tmp("2d1-inj-primary");
+
+        store.run_before_primary_removal_for_test(|| inject_delete_status(DENIED));
+
+        let result = delete(&store, &evidence);
+
+        assert_eq!(result, incomplete());
+        assert!(result.unwrap_err().removal_may_have_started());
+        assert!(!scratch.staging(LOCAL, TOKEN).exists());
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), v1_bytes());
+    }
+
+    #[test]
+    fn injected_an_error_status_marks_nothing_and_a_silent_success_is_unknown() {
+        // INJECTED. Both are IncompleteDeletion, neither is retried, nothing but the
+        // verified file is ever removed.
+        for status in [DENIED, 0xC000_0001_u32 as i32, 0xC000_0043_u32 as i32, 1, 0] {
+            let scratch = Scratch::new("2d1-inj-status");
+            let store = scratch.store();
+
+            scratch.put(&scratch.record(LOCAL), &v1_bytes());
+
+            let evidence = store.evidence(&loc(LOCAL)).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+
+            store.run_before_primary_removal_for_test(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                inject_delete_status(status);
+            });
+
+            let result = delete(&store, &evidence);
+
+            assert_eq!(result, incomplete(), "status {status:#x}");
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry");
+            assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), v1_bytes());
+        }
+    }
+
+    #[test]
+    fn injected_hook_faults_before_any_mark_keep_their_incomplete_meaning() {
+        // INJECTED. The pre-existing contract of the removal hooks is unchanged.
+        let (scratch, store, evidence) = record_and_tmp("2d1-hook-fault");
+
+        store.faults.lock().unwrap().push((
+            Point::RemoveArtifact,
+            Action::Fail(io::ErrorKind::PermissionDenied),
+        ));
+
+        assert_eq!(delete(&store, &evidence), incomplete());
+        assert_eq!(names(&scratch.state_dir()).len(), 2);
+    }
+
+    // ---- PURE ---------------------------------------------------------------------------------
+
+    #[test]
+    fn pure_the_link_rule_is_exact() {
+        // PURE.
+        assert_eq!(link_verdict(0), LinkVerdict::Refuse);
+        assert_eq!(link_verdict(1), LinkVerdict::Single);
+        assert_eq!(link_verdict(2), LinkVerdict::Pair);
+
+        for links in [3, 4, 255, u32::MAX] {
+            assert_eq!(link_verdict(links), LinkVerdict::Refuse, "{links}");
+        }
+    }
+
+    #[test]
+    fn pure_a_changed_fact_is_a_refusal_only_while_nothing_has_been_removed() {
+        // PURE.
+        assert_eq!(
+            changed_fact(false),
+            StoreError::RemovalRefused(RemovalRefusal::ExtraNames)
+        );
+        assert_eq!(changed_fact(true), StoreError::IncompleteDeletion);
+    }
+
+    #[test]
+    fn pure_a_refusal_is_not_an_incomplete_deletion_and_reveals_nothing() {
+        // PURE. A refusal never claims a removal may have started; its text is fixed.
+        for refusal in [
+            RemovalRefusal::Busy,
+            RemovalRefusal::DirectoryUnsupported,
+            RemovalRefusal::FileUnsuitable,
+            RemovalRefusal::ExtraNames,
+            RemovalRefusal::PlanChanged,
+        ] {
+            let error = ConditionalDeleteError::Store(StoreError::RemovalRefused(refusal));
+
+            assert!(!error.removal_may_have_started());
+            assert_eq!(
+                StoreError::RemovalRefused(refusal).to_string(),
+                "the sync-state files could not be held for removal; nothing was removed"
+            );
+
+            let shown = format!("{error} {error:?} {refusal:?}");
+
+            for mark in [".tmp", ".json", "\\", ".qa-local", "0x"] {
+                assert!(!shown.contains(mark), "{mark} in {shown}");
+            }
+        }
+
+        assert!(
+            ConditionalDeleteError::Store(StoreError::IncompleteDeletion)
+                .removal_may_have_started()
+        );
+    }
+
+    #[test]
+    fn pure_no_path_based_removal_remains_in_the_deletion() {
+        // PURE source scan of the production half.
+        let production = include_str!("sync_state_store.rs");
+        let production = &production[..production.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+
+        fn body(production: &str, signature: &str) -> String {
+            let start = production
+                .find(signature)
+                .unwrap_or_else(|| panic!("{signature}"));
+            let rest = &production[start + signature.len()..];
+            let end = ["\n    pub fn ", "\n    fn ", "\n    pub(crate) fn "]
+                .iter()
+                .filter_map(|marker| rest.find(marker))
+                .min()
+                .unwrap_or(rest.len());
+
+            rest[..end].to_owned()
+        }
+
+        for signature in [
+            "pub fn delete(&self, local_locator: &Locator) -> Result<DeleteOutcome, StoreError> {",
+            "pub fn delete_if_evidence_matches(",
+            "fn execute_delete(",
+            "fn hold_for_removal(",
+            "fn recheck_held(",
+            "fn recheck_layout(",
+            "fn held_evidence(",
+        ] {
+            let text = body(production, signature);
+
+            for forbidden in [
+                "remove_file",
+                "remove_dir",
+                "hard_link",
+                "fs::rename",
+                "fs::write",
+                "unsafe",
+                "extern",
+                "getrandom",
+                ".remove(",
+                "retired",
+                "v3stage",
+                "Reserved",
+            ] {
+                assert!(!text.contains(forbidden), "{forbidden:?} in {signature}");
+            }
+        }
+
+        assert!(!production.contains("fn remove(&self, point"));
+        assert_eq!(
+            production.matches("remove_file").count(),
+            3,
+            "only create, replace, write_temp"
+        );
+        assert_eq!(production.matches("mark_for_removal()").count(), 2);
+    }
+
+    #[test]
+    fn pure_the_deletion_plan_still_names_only_the_primary_and_tmp_artifacts() {
+        // PURE. U2 / U9: nothing newer can enter a plan.
+        let key = "a".repeat(64);
+
+        for name in [format!("{key}.{TOKEN}.tmp"), format!("{}.{TOKEN}.TMP", key)] {
+            assert!(is_artifact_name(&name, &key), "{name}");
+        }
+        for name in [
+            format!("{key}.{TOKEN}.retired"),
+            format!("{key}.{TOKEN}.v3stage"),
+            format!("{key}.json"),
+            format!("{key}.notes.txt"),
+            format!("{key}.{TOKEN}.tmp.retired"),
+            format!("{key}.{TOKEN}.tmp "),
+        ] {
+            assert!(!is_artifact_name(&name, &key), "{name}");
+        }
+    }
+
+    // UNAVAILABLE / NOT TESTED: ReFS, SMB and FAT volumes (refusal rests on the
+    // file-identity facts, tested purely in `held_removal`); 8.3 short names (none are
+    // generated on this volume); case-sensitive directories; writable mapped views;
+    // process kill, OS crash and power loss; and behaviour on the `C:` AppData volume.
+}
+
+// ---- B3c-3b-2d-1 handle-bound reset tests (end) -------------------------------------
 
 // ---- B3c-3b-2a isolation tests (begin) ---------------------------------------
 
@@ -11042,7 +12608,7 @@ mod legacy_gate_isolation_tests {
         // The deletion machinery never mentions the new names.
         for signature in [
             "fn scan_artifacts(&self, key: &str) -> Result<Vec<PathBuf>, Fault> {",
-            "fn execute_delete(&self, plan: &DeletePlan) -> Result<DeleteOutcome, StoreError> {",
+            "fn execute_delete(\n        &self,\n        plan: &DeletePlan,\n        held: HeldFiles,\n    ) -> Result<DeleteOutcome, StoreError> {",
         ] {
             let body = body_of(signature);
 

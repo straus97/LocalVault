@@ -4,10 +4,19 @@
 //! Exists for one purpose: publishing a freshly written, still-open staging file
 //! under its final name in an already-pinned directory, **without ever replacing
 //! anything** and without a second, path-based resolution of either name; and
-//! removing that staging file again through the very handle that created it.
-//! `std` offers neither (its rename, hard-link and remove all resolve a path at
-//! the instant of the call), so this module makes exactly two native calls to one
-//! `ntdll` function, `NtSetInformationFile`:
+//! removing a file again through the very handle that holds it. `std` offers
+//! neither (its rename, hard-link and remove all resolve a path at the instant of
+//! the call), so this module makes exactly two native calls to one `ntdll`
+//! function, `NtSetInformationFile`.
+//!
+//! Callers of [`delete_by_handle`]: `new_copy_file` removes its own staging file
+//! with it, and, since Stage 1U-4 B3c-3b-2d-1, `held_removal` removes legacy
+//! sync-state files with it, each through a handle it held and verified. That second
+//! use added no native code here. It reads the result from the same handle:
+//! **Observed (build 19045, local NTFS):** after a successful call the handle reports
+//! delete-pending and one link fewer (`1 -> 0` for a single-name file, `2 -> 1` for
+//! one of two names), the name stays visible until the handle closes, and the other
+//! name of a two-name file survives with its bytes. The two calls:
 //!
 //! * [`rename_into_directory_no_replace`]: information class
 //!   `FileRenameInformation` (10) with `ReplaceIfExists` FALSE, `RootDirectory` the

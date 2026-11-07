@@ -2101,13 +2101,30 @@ impl UnlockedVaultSession {
     ///   the fresh load did not confirm absence. Never reported as success, never
     ///   retried; the binding is not rebuilt and nothing is published.
     ///
+    /// # Handle-bound removal (B3c-3b-2d-1, gate G12 for reset)
+    ///
+    /// The store no longer removes by path. It pins the directory, holds every file
+    /// it will remove (read-only sharing), compares the bytes read **through those
+    /// handles** with the prepared evidence, and removes through the same handles. A
+    /// foreign file swapped in before the hold is `Stale(RecordChanged)`; a file that
+    /// cannot be held (open elsewhere without delete sharing, an outside hard link,
+    /// read-only, not local NTFS) is `NotRemoved(RemovalRefused(_))` with **nothing
+    /// removed**; a failure after the first removal, an unproven mark, or a name that
+    /// is present after the handles closed is `Ambiguous(IncompleteDeletion)`. No
+    /// outcome is retried.
+    ///
     /// # Not guaranteed
     ///
-    /// This is a read-compare-delete sequence, **not** an atomic cross-process
-    /// compare-and-swap. The exclusive session lock keeps other LocalVault
-    /// sessions out of this vault, but a process that ignores it can still change
-    /// the files between the comparison and the removal. The vault, its `.backup`
-    /// and `.lock`, and any remote or selected sync file are never touched.
+    /// This is **not** an atomic cross-process compare-and-swap. The kernel's sharing
+    /// modes refuse writes, renames and deletes of a held file from ordinary
+    /// processes only; administrators, backup-privileged processes, kernel components
+    /// and filter drivers can bypass them, writable mapped views are not addressed,
+    /// and a hard link created in the single call gap before a mark keeps the file
+    /// object (reported as `Ambiguous`). The exclusive session lock keeps other
+    /// LocalVault sessions out of this vault. A removal is not power-loss durable and
+    /// a multi-file removal is not atomic. The vault, its `.backup` and `.lock`, and
+    /// any remote or selected sync file are never touched. The legacy replacement is
+    /// unchanged (G12-replace, open).
     pub fn confirm_binding_reset(
         &mut self,
         root: &SyncStateRoot,
@@ -2594,6 +2611,9 @@ pub(crate) fn replace_error_may_follow_publication(error: StoreError) -> bool {
         | StoreError::AlreadyExists
         | StoreError::UnresolvedArtifacts
         | StoreError::NoClobberUnsupported
+        // Only the deletion produces it (and only before any removal); neither
+        // `replace` nor `create` can, so an unexpected one fails closed.
+        | StoreError::RemovalRefused(_)
         | StoreError::IncompleteDeletion => true,
     }
 }
@@ -2648,6 +2668,8 @@ pub(crate) fn create_error_may_follow_publication(error: StoreError) -> bool {
         | StoreError::LocatorMismatch
         | StoreError::BindingIdentityChanged
         | StoreError::TrustedHistoryRegression
+        // Only the deletion produces it; `create` cannot, so it fails closed.
+        | StoreError::RemovalRefused(_)
         | StoreError::IncompleteDeletion => true,
     }
 }
@@ -6640,6 +6662,8 @@ mod tests {
                 StoreError::BindingIdentityChanged,
                 StoreError::TrustedHistoryRegression,
                 StoreError::IncompleteDeletion,
+                // Produced only by a deletion; fails closed here.
+                StoreError::RemovalRefused(crate::vault::sync_state_store::RemovalRefusal::Busy),
             ] {
                 assert!(
                     create_error_may_follow_publication(ambiguous),
@@ -7828,6 +7852,30 @@ mod tests {
                     assert!(output.status.success(), "the child process could not write");
                 }
 
+                /// The same real `cmd.exe copy`; the write must be REFUSED by the
+                /// kernel (the destination is held).
+                fn child_put_fails(root: &Path, dest: &Path, bytes: &[u8]) {
+                    let source = root.join("child-source.bin");
+
+                    fs::write(&source, bytes).unwrap();
+
+                    let output = std::process::Command::new("cmd")
+                        .arg("/C")
+                        .arg("copy")
+                        .arg("/Y")
+                        .arg(&source)
+                        .arg(dest)
+                        .output()
+                        .unwrap();
+
+                    fs::remove_file(&source).unwrap();
+
+                    assert!(
+                        !output.status.success(),
+                        "the child process WROTE to a held file: the hold did not prevent it"
+                    );
+                }
+
                 fn cases() -> Vec<Case> {
                     vec![
                         (
@@ -8219,16 +8267,16 @@ mod tests {
                 }
 
                 #[test]
-                fn a_primary_replaced_after_the_final_comparison_is_reset_as_if_nothing_happened_known_race_g12(
+                fn a_primary_overwrite_after_the_hold_is_refused_and_the_reset_is_of_the_verified_object_g12_reset(
                 ) {
-                    // KNOWN VULNERABILITY (gate G12, OPEN), characterized on a
-                    // synthetic stand-in ONLY, and not acceptable behaviour: the
-                    // legacy deletion resolves the primary by its current path, with
-                    // no held handle and no identity check. A child process overwrites
-                    // the primary after the last comparison; it is removed as it then
-                    // is, and the session reports a verified reset. This pins the
-                    // present behaviour so a change is noticed; it is not a security
-                    // success and is to be corrected in a separate slice.
+                    // REAL NTFS, real child process, synthetic bytes. Formerly
+                    // `a_primary_replaced_after_the_final_comparison_is_reset_as_if_nothing_happened_known_race_g12`,
+                    // which pinned a KNOWN VULNERABILITY (gate G12): the deletion
+                    // resolved the primary by path, so a child's overwrite after the
+                    // last comparison was removed and reported as a verified reset.
+                    // The removal now goes through a handle held from the byte
+                    // comparison on, so the child's write is REFUSED BY THE KERNEL
+                    // (ordinary processes only). G12-replace remains open.
                     let mut bx = Bx::new("gate-race-g12");
 
                     bx.publish(&bx.based());
@@ -8238,8 +8286,91 @@ mod tests {
                     let root = bx.dir.path().to_path_buf();
                     let record = record_path(&bx);
                     let hook_record = record.clone();
+                    let verified = fs::read(&record).unwrap();
+                    let expected = verified.clone();
 
                     store.run_before_primary_removal_for_test(move || {
+                        child_put_fails(
+                            &root,
+                            &hook_record,
+                            b"SYNTHETIC-FOREIGN-BYTES-NOT-A-REAL-RECORD",
+                        );
+                        assert_eq!(fs::read(&hook_record).unwrap(), expected);
+                    });
+
+                    let result = bx.session.confirm_binding_reset_in(
+                        &store,
+                        &id,
+                        &mut |store, locator| store.load(locator),
+                        Instant::now(),
+                    );
+
+                    // The reset is of the verified object only.
+                    assert_eq!(result, Ok(Done::ResetAndVerified));
+                    assert!(!record.exists());
+                    assert!(!verified.is_empty());
+                }
+
+                #[test]
+                fn a_primary_swapped_in_before_the_hold_is_stale_and_the_foreign_file_is_untouched()
+                {
+                    // REAL NTFS, real child, synthetic bytes. After the path evidence
+                    // matched and before the files are held, a foreign file takes the
+                    // primary's name: the bytes read through the held handle differ, so
+                    // the reset is stale and removes nothing.
+                    let mut bx = Bx::new("2d1-swap-before-hold");
+
+                    bx.publish(&bx.based());
+
+                    let id = prepared(&mut bx);
+                    let store = bx.store();
+                    let root = bx.dir.path().to_path_buf();
+                    let record = record_path(&bx);
+                    let hook_record = record.clone();
+
+                    store.run_before_hold_for_test(move || {
+                        fs::remove_file(&hook_record).unwrap();
+                        child_puts(
+                            &root,
+                            &hook_record,
+                            b"SYNTHETIC-FOREIGN-BYTES-NOT-A-REAL-RECORD",
+                        );
+                    });
+
+                    let result = bx.session.confirm_binding_reset_in(
+                        &store,
+                        &id,
+                        &mut |store, locator| store.load(locator),
+                        Instant::now(),
+                    );
+
+                    assert_eq!(result, Err(Confirm::Stale(Stale::RecordChanged)));
+                    assert_eq!(
+                        fs::read(&record).unwrap(),
+                        b"SYNTHETIC-FOREIGN-BYTES-NOT-A-REAL-RECORD"
+                    );
+                }
+
+                #[test]
+                fn a_foreign_file_at_the_name_after_the_handles_closed_is_ambiguous_never_a_reset()
+                {
+                    // REAL NTFS, real child. The files were marked and their handles
+                    // closed; a foreign file then appears at the record's name. The
+                    // mandatory namespace check refuses to call that a removal, the
+                    // session reports an ambiguous result without a reload, and the
+                    // foreign file is preserved.
+                    let mut bx = Bx::new("2d1-after-close");
+
+                    bx.publish(&bx.based());
+
+                    let id = prepared(&mut bx);
+                    let store = bx.store();
+                    let root = bx.dir.path().to_path_buf();
+                    let record = record_path(&bx);
+                    let hook_record = record.clone();
+                    let loads = Cell::new(0usize);
+
+                    store.run_after_close_for_test(move || {
                         child_puts(
                             &root,
                             &hook_record,
@@ -8250,12 +8381,25 @@ mod tests {
                     let result = bx.session.confirm_binding_reset_in(
                         &store,
                         &id,
-                        &mut |store, locator| store.load(locator),
+                        &mut |store, locator| {
+                            loads.set(loads.get() + 1);
+
+                            store.load(locator)
+                        },
                         Instant::now(),
                     );
 
-                    assert_eq!(result, Ok(Done::ResetAndVerified));
-                    assert!(!record.exists(), "the foreign bytes are gone");
+                    assert_eq!(
+                        result,
+                        Err(Confirm::Ambiguous(
+                            BindingResetAmbiguity::IncompleteDeletion
+                        ))
+                    );
+                    assert_eq!(loads.get(), 0);
+                    assert_eq!(
+                        fs::read(&record).unwrap(),
+                        b"SYNTHETIC-FOREIGN-BYTES-NOT-A-REAL-RECORD"
+                    );
                 }
             }
 
@@ -8400,6 +8544,30 @@ mod tests {
                     UnlockedVaultSession::unlock(&bx.vault, test_password()),
                     Err(SessionError::InUse)
                 ));
+            }
+
+            #[test]
+            fn the_create_alias_remnant_is_reset_and_both_names_are_gone() {
+                // REAL NTFS, GOLDEN. Written and run on the unmodified, path-based
+                // deletion BEFORE B3c-3b-2d-1 and required to hold unchanged after it.
+                // `create` publishes by hard link and then removes its temp by path
+                // (ignoring the result), so a crash leaves the primary and one `.tmp`
+                // as two names of ONE file. That remnant has always been resettable.
+                let mut bx = Bx::new("2d1-alias-golden");
+
+                bx.publish(&bx.based());
+                fs::hard_link(record_path(&bx), artifact_path(&bx, STALE_TOKEN)).unwrap();
+
+                let id = prepared(&mut bx);
+
+                assert_eq!(confirm(&mut bx, &id), Ok(Done::ResetAndVerified));
+                assert!(!record_path(&bx).exists());
+                assert!(!artifact_path(&bx, STALE_TOKEN).exists());
+                assert!(names(&bx.state_dir()).is_empty());
+                assert_eq!(
+                    bx.session.load_sync_state(&bx.root),
+                    SessionSyncState::NotConfigured
+                );
             }
 
             #[test]
@@ -9218,29 +9386,34 @@ mod tests {
 
             #[cfg(windows)]
             #[test]
-            fn an_incomplete_deletion_is_ambiguous_and_is_never_retried() {
-                // An artifact that cannot be removed: artifacts go first, so the
-                // record is still intact.
-                let mut bx = Bx::new("b1i-incomplete-artifact");
+            fn a_file_held_by_someone_else_refuses_the_reset_with_nothing_removed_and_is_never_retried(
+            ) {
+                // REAL NTFS. Formerly the two real-failure halves of
+                // `an_incomplete_deletion_is_ambiguous_and_is_never_retried`. A file
+                // that is open without delete sharing can no longer be held for
+                // removal, so the reset is refused BEFORE the first removal
+                // (`NotRemoved(RemovalRefused(Busy))`), not left half done.
+                let mut bx = Bx::new("b1i-busy-artifact");
                 bx.publish(&bx.based());
                 put(&bx, &artifact_path(&bx, STALE_TOKEN), b"debris");
                 let record = bx.record_bytes();
                 let id = prepared(&mut bx);
                 let loads = Cell::new(0usize);
                 let outside = untouchable(&bx);
+                let busy = Err(Confirm::NotRemoved(StoreError::RemovalRefused(
+                    crate::vault::sync_state_store::RemovalRefusal::Busy,
+                )));
 
                 {
                     let _guard = hold_against_removal(&artifact_path(&bx, STALE_TOKEN));
 
                     assert_eq!(
                         confirm_with(&mut bx, &id, Instant::now(), &loads, None),
-                        Err(Confirm::Ambiguous(
-                            BindingResetAmbiguity::IncompleteDeletion
-                        ))
+                        busy
                     );
                 }
 
-                assert_eq!(loads.get(), 0, "no verification is claimed after a failure");
+                assert_eq!(loads.get(), 0, "no verification is claimed after a refusal");
                 assert_eq!(bx.record_bytes(), record);
                 assert!(artifact_path(&bx, STALE_TOKEN).exists());
                 assert_eq!(untouchable(&bx), outside);
@@ -9258,9 +9431,8 @@ mod tests {
 
                 assert_eq!(confirm(&mut bx, &id), Ok(Done::ResetAndVerified));
 
-                // The record itself cannot be removed after the artifacts went:
-                // a partial state, reported as ambiguous.
-                let mut bx = Bx::new("b1i-incomplete-record");
+                // The record held instead: the artifact is NOT removed either.
+                let mut bx = Bx::new("b1i-busy-record");
                 bx.publish(&bx.based());
                 put(&bx, &artifact_path(&bx, STALE_TOKEN), b"debris");
                 let record = bx.record_bytes();
@@ -9269,18 +9441,61 @@ mod tests {
                 {
                     let _guard = hold_against_removal(&record_path(&bx));
 
-                    assert_eq!(
-                        confirm(&mut bx, &id),
-                        Err(Confirm::Ambiguous(
-                            BindingResetAmbiguity::IncompleteDeletion
-                        ))
-                    );
+                    assert_eq!(confirm(&mut bx, &id), busy);
                 }
 
+                assert!(artifact_path(&bx, STALE_TOKEN).exists());
+                assert_eq!(bx.record_bytes(), record);
+                assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(bx.record_bytes(), record);
+            }
+
+            #[cfg(windows)]
+            #[test]
+            fn an_incomplete_deletion_is_ambiguous_and_is_never_retried() {
+                // INJECTED native failure (the only way left to reach a half-done
+                // removal on demand): the artifact is marked and removed, then the
+                // handle-bound removal of the record reports an error status and
+                // marks nothing. The result is ambiguous, never a reset, no
+                // verification is claimed and nothing is retried.
+                let mut bx = Bx::new("b1i-incomplete-record");
+                bx.publish(&bx.based());
+                put(&bx, &artifact_path(&bx, STALE_TOKEN), b"debris");
+                let record = bx.record_bytes();
+                let id = prepared(&mut bx);
+                let store = bx.store();
+                let loads = Cell::new(0usize);
+
+                store.run_before_primary_removal_for_test(|| {
+                    crate::vault::handle_ops::inject_delete_status(0xC000_0022_u32 as i32)
+                });
+
+                let result = bx.session.confirm_binding_reset_in(
+                    &store,
+                    &id,
+                    &mut |store, locator| {
+                        loads.set(loads.get() + 1);
+
+                        store.load(locator)
+                    },
+                    Instant::now(),
+                );
+
+                assert_eq!(
+                    result,
+                    Err(Confirm::Ambiguous(
+                        BindingResetAmbiguity::IncompleteDeletion
+                    ))
+                );
+                assert_eq!(loads.get(), 0, "no verification is claimed after a failure");
                 assert!(!artifact_path(&bx, STALE_TOKEN).exists());
                 assert_eq!(bx.record_bytes(), record);
                 assert_eq!(confirm(&mut bx, &id), Err(stale(Stale::NoPendingReset)));
                 assert_eq!(bx.record_bytes(), record);
+                assert!(matches!(
+                    bx.session.binding_status(&bx.root).state(),
+                    BindingState::Linked(_)
+                ));
             }
 
             // -- lifetime -----------------------------------------------------

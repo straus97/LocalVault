@@ -162,6 +162,12 @@ impl HandleFacts {
         self.links == 1
     }
 
+    /// The exact number of hard links (names) the file had when the facts were read
+    /// (B3c-3b-2d-1). Existing fact, new accessor: nothing is queried here.
+    pub(crate) fn link_count(&self) -> u32 {
+        self.links
+    }
+
     pub(crate) fn is_delete_pending(&self) -> bool {
         self.delete_pending
     }
@@ -749,6 +755,17 @@ mod tests {
         assert!(!facts(0, false).has_single_link());
         assert!(facts(1, true).is_delete_pending());
         assert!(!facts(1, false).is_delete_pending());
+    }
+
+    #[test]
+    fn the_link_count_accessor_reports_the_exact_count_and_nothing_else() {
+        // PURE (B3c-3b-2d-1).
+        for links in [0u32, 1, 2, 3, u32::MAX] {
+            let facts = HandleFacts::for_test(7, [1; 16], links, false, FileSystemKind::Ntfs, true);
+
+            assert_eq!(facts.link_count(), links);
+            assert_eq!(facts.has_single_link(), links == 1);
+        }
     }
 
     // ---- 12. redaction --------------------------------------------------------
