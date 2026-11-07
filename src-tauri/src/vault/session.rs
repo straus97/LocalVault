@@ -9498,6 +9498,194 @@ mod tests {
                 ));
             }
 
+            // -- an unexpected hard link outside the removal plan (G12-reset) ---
+            //
+            // REAL NTFS, synthetic files only, inside the uniquely owned fixture
+            // root under `.qa-local/`. The refusal is produced by the store's
+            // hold (`ExtraNames`) and mapped by the real session confirmation to
+            // `NotRemoved`. Not claimed: power-loss durability, protection from
+            // privileged processes, or anything about G12-replace.
+
+            /// The number of names the file behind `path` has, read from an open
+            /// handle on NTFS.
+            #[cfg(windows)]
+            fn links_of(path: &Path) -> u32 {
+                crate::vault::file_identity::facts_of(&fs::File::open(path).unwrap())
+                    .expect("handle facts")
+                    .link_count()
+            }
+
+            #[cfg(windows)]
+            fn extra_names_refusal() -> Result<Done, Confirm> {
+                Err(Confirm::NotRemoved(StoreError::RemovalRefused(
+                    crate::vault::sync_state_store::RemovalRefusal::ExtraNames,
+                )))
+            }
+
+            /// Confirm `id` through the real session API and require the
+            /// `ExtraNames` refusal: no success, no reload claimed, not one name,
+            /// byte or timestamp under the fixture root changed, and no automatic
+            /// retry. Call it after the outside link exists.
+            #[cfg(windows)]
+            fn confirm_is_refused_for_an_extra_name(bx: &mut Bx, id: &str) {
+                let before = snapshot(bx.dir.path());
+                let loads = Cell::new(0usize);
+
+                let result = confirm_with(bx, id, Instant::now(), &loads, None);
+
+                assert_ne!(result, Ok(Done::ResetAndVerified));
+                assert_eq!(result, extra_names_refusal());
+                assert_eq!(loads.get(), 0, "no verification is claimed after a refusal");
+                assert_eq!(snapshot(bx.dir.path()), before);
+
+                // Nothing retries on its own; the preparation was spent.
+                assert_eq!(confirm(bx, id), Err(stale(Stale::NoPendingReset)));
+                assert_eq!(snapshot(bx.dir.path()), before);
+            }
+
+            #[cfg(windows)]
+            #[test]
+            fn a_foreign_hard_link_to_the_primary_refuses_the_session_reset_and_is_untouched() {
+                // CASE A. REAL NTFS. The record has exactly one name when the reset
+                // is prepared; another name appears outside the plan (inside the
+                // fixture root, outside the sync-state directory) before the
+                // confirmation.
+                let mut bx = Bx::new("g12-session-link-primary");
+
+                bx.publish(&bx.based());
+
+                let record = record_path(&bx);
+                let bytes = bx.record_bytes();
+
+                assert_eq!(links_of(&record), 1);
+
+                let id = prepared(&mut bx);
+                let foreign = bx.dir.path().join("foreign-link.bin");
+
+                fs::hard_link(&record, &foreign).unwrap();
+
+                assert_eq!(links_of(&record), 2);
+                assert_eq!(links_of(&foreign), 2);
+
+                confirm_is_refused_for_an_extra_name(&mut bx, &id);
+
+                // Both names, the exact bytes and the status survive.
+                assert_eq!(fs::read(&record).unwrap(), bytes);
+                assert_eq!(fs::read(&foreign).unwrap(), bytes);
+                assert_eq!((links_of(&record), links_of(&foreign)), (2, 2));
+                assert_eq!(names(&bx.state_dir()).len(), 1);
+                assert!(matches!(
+                    bx.session.binding_status(&bx.root).state(),
+                    BindingState::Linked(_)
+                ));
+
+                // Positive control: the extra name was the only obstacle. Only a new,
+                // explicit preparation and confirmation resets, once it is gone.
+                fs::remove_file(&foreign).unwrap();
+
+                assert_eq!(links_of(&record), 1);
+
+                let id = prepared(&mut bx);
+
+                assert_eq!(confirm(&mut bx, &id), Ok(Done::ResetAndVerified));
+                assert!(names(&bx.state_dir()).is_empty());
+            }
+
+            #[cfg(windows)]
+            #[test]
+            fn a_third_name_beside_the_legacy_alias_remnant_refuses_the_session_reset() {
+                // CASE B. REAL NTFS. The supported legacy layout is the record and
+                // one `.tmp` as two names of one file. A third name outside the plan
+                // appears after preparation: the layout is no longer the permitted
+                // one.
+                let mut bx = Bx::new("g12-session-link-alias");
+
+                bx.publish(&bx.based());
+
+                let record = record_path(&bx);
+                let artifact = artifact_path(&bx, STALE_TOKEN);
+                let bytes = bx.record_bytes();
+
+                fs::hard_link(&record, &artifact).unwrap();
+
+                assert_eq!((links_of(&record), links_of(&artifact)), (2, 2));
+
+                let id = prepared(&mut bx);
+                let foreign = bx.dir.path().join("foreign-link.bin");
+
+                fs::hard_link(&record, &foreign).unwrap();
+
+                assert_eq!(links_of(&foreign), 3);
+
+                confirm_is_refused_for_an_extra_name(&mut bx, &id);
+
+                for path in [&record, &artifact, &foreign] {
+                    assert_eq!(fs::read(path).unwrap(), bytes);
+                    assert_eq!(links_of(path), 3);
+                }
+
+                assert_eq!(names(&bx.state_dir()).len(), 2);
+
+                // Positive control, and the permitted two-name layout again: with the
+                // third name gone, the alias remnant is reset as before.
+                fs::remove_file(&foreign).unwrap();
+
+                assert_eq!((links_of(&record), links_of(&artifact)), (2, 2));
+
+                let id = prepared(&mut bx);
+
+                assert_eq!(confirm(&mut bx, &id), Ok(Done::ResetAndVerified));
+                assert!(names(&bx.state_dir()).is_empty());
+            }
+
+            #[cfg(windows)]
+            #[test]
+            fn a_foreign_hard_link_beside_a_distinct_temp_refuses_the_session_reset() {
+                // CASE C. REAL NTFS. The record and a distinct legacy `.tmp` (two
+                // different files). An outside name for either one refuses the reset
+                // and nothing is removed, including the file that has one name only.
+                for linked in ["temp", "record"] {
+                    let mut bx = Bx::new("g12-session-link-temp");
+
+                    bx.publish(&bx.based());
+                    put(&bx, &artifact_path(&bx, STALE_TOKEN), b"debris");
+
+                    let record = record_path(&bx);
+                    let artifact = artifact_path(&bx, STALE_TOKEN);
+                    let record_bytes = bx.record_bytes();
+                    let id = prepared(&mut bx);
+                    let foreign = bx.dir.path().join("foreign-link.bin");
+                    let (source, source_bytes): (&Path, &[u8]) = if linked == "temp" {
+                        (&artifact, b"debris")
+                    } else {
+                        (&record, &record_bytes)
+                    };
+
+                    fs::hard_link(source, &foreign).unwrap();
+
+                    assert_eq!(links_of(&foreign), 2, "{linked}");
+
+                    confirm_is_refused_for_an_extra_name(&mut bx, &id);
+
+                    assert_eq!(fs::read(&foreign).unwrap(), source_bytes, "{linked}");
+                    assert_eq!(fs::read(&record).unwrap(), record_bytes, "{linked}");
+                    assert_eq!(fs::read(&artifact).unwrap(), b"debris", "{linked}");
+                    assert_eq!(names(&bx.state_dir()).len(), 2, "{linked}");
+
+                    // Positive control.
+                    fs::remove_file(&foreign).unwrap();
+
+                    let id = prepared(&mut bx);
+
+                    assert_eq!(
+                        confirm(&mut bx, &id),
+                        Ok(Done::ResetAndVerified),
+                        "{linked}"
+                    );
+                    assert!(names(&bx.state_dir()).is_empty(), "{linked}");
+                }
+            }
+
             // -- lifetime -----------------------------------------------------
 
             #[test]
