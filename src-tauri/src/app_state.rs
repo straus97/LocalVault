@@ -17,11 +17,16 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
 use localvault_core::sync_state::Locator;
 use serde::Serialize;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use crate::vault::session::{
+    RemoteObservationOutcome, RemoteObservationRefusal, RemoteTargetRefusal,
+};
 use crate::vault::{
     backup::BackupError,
     lifecycle::VaultLifecycleError,
@@ -29,8 +34,7 @@ use crate::vault::{
         BindingResetConfirmRefusal, BindingResetOutcome, BindingResetPreview, BindingResetRefusal,
         BindingStatus, CopyCreationConfirmRefusal, CopyCreationOutcome, CopyCreationPreview,
         CopyCreationRefusal, InitialBindingApproval, InitialBindingConfirmRefusal,
-        InitialBindingOutcome, InitialBindingPreview, InitialBindingRefusal,
-        RemoteObservationOutcome, RemoteObservationRefusal, RemoteTargetRefusal, SessionError,
+        InitialBindingOutcome, InitialBindingPreview, InitialBindingRefusal, SessionError,
         SessionSyncState, UnlockedVaultSession, UpdateReadiness,
     },
     sync_file_adapter::SyncFileTarget,
@@ -417,6 +421,10 @@ impl AppState {
     /// The application-state mutex, and with it the session and its exclusive
     /// OS lock, is held for the whole operation. Like `load_sync_state`, it
     /// observes expiry but does not count as user activity.
+    ///
+    /// **Unit-test builds only since Stage 1U-4 D4**; see
+    /// [`UnlockedVaultSession::record_remote_observation`].
+    #[cfg(test)]
     pub fn record_remote_observation(
         &self,
         root: &SyncStateRoot,
@@ -450,6 +458,10 @@ impl AppState {
     /// concurrent lock, expiry or save cannot interleave. Like `load_sync_state`
     /// and `record_remote_observation`, it observes expiry but does not count as
     /// user activity: an internal check must never keep a vault unlocked.
+    ///
+    /// **Unit-test builds only since Stage 1U-4 D4**; see
+    /// [`UnlockedVaultSession::observe_remote_target`].
+    #[cfg(test)]
     pub fn observe_remote_target(
         &self,
         root: &SyncStateRoot,

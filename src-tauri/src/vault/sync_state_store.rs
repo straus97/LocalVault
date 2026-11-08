@@ -65,8 +65,9 @@
 //! by an explicit [`SyncStateStore::delete`]. Nothing else is ever deleted, and
 //! nothing is deleted automatically: files that merely share the prefix are
 //! unrelated and ignored. A primary record is authoritative regardless of
-//! leftover artifacts (an unpublished temp can never be adopted), so `load` and
-//! `replace` tolerate them.
+//! leftover artifacts (an unpublished temp can never be adopted), so `load`
+//! tolerates them, and so does `replace`, which is unit-test only since Stage 1U-4
+//! D4.
 //!
 //! # Reset evidence (Stage 1U-4 B1i)
 //!
@@ -99,9 +100,9 @@
 //!
 //! # Legacy compatibility gate (Stage 1U-4 B3c-3b-2a)
 //!
-//! **Refuse-only.** `load`, `read_record`, `create`, `replace`, `evidence` and the
-//! deletion planning (so `delete` and `delete_if_evidence_matches` too) ask the gate
-//! first. The gate only observes: it creates, removes, renames, replaces and adopts
+//! **Refuse-only.** `load`, `read_record`, `create`, `replace` (unit-test builds only
+//! since Stage 1U-4 D4), `evidence` and the deletion planning (so `delete` and
+//! `delete_if_evidence_matches` too) ask the gate first. The gate only observes: it creates, removes, renames, replaces and adopts
 //! nothing, it never authenticates a version-1 record as anything else, and it adds
 //! no deletion target. It can only take permissions away. For the current record
 //! key it refuses when:
@@ -135,9 +136,11 @@
 //! anything can change right after the check. Older binaries are not gated. The
 //! gate itself does not make deletion safe against a replaced primary; since Stage
 //! 1U-4 B3c-3b-2d-1 the deletion is bound to held handles instead (next section).
-//! `replace` still has a check-then-rename shape and its re-check before the rename
-//! narrows, but does not close, the window (**G12-replace, open**). G2 is not
-//! resolved by this gate.
+//! `replace` keeps its check-then-rename shape, and its re-check before the rename
+//! narrows, but does not close, the window. Since Stage 1U-4 D4 it is compiled only in
+//! unit-test builds: **G12-replace is closed for normal and release builds by
+//! exclusion, not by a fix**, and nothing here makes the legacy replacement safe. G2 is
+//! not resolved by this gate.
 //!
 //! # Handle-bound deletion (Stage 1U-4 B3c-3b-2d-1; G12 for reset)
 //!
@@ -160,11 +163,12 @@
 //!   destination, so check-then-rename would be a race. A filesystem without
 //!   hard links yields [`StoreError::NoClobberUnsupported`]; there is no
 //!   fallback to an overwriting rename.
-//! * **Replace** is a re-read, compare, temp-write, re-read, rename sequence. It
-//!   is **not** compare-and-swap against an arbitrary competing process: another
-//!   writer can still slip in between the last read and the rename. It is safe
-//!   only under the exclusive per-vault session lock, which the future
-//!   integration must hold for every state operation. This module adds no
+//! * **Replace** (unit-test builds only since Stage 1U-4 D4; normal and release
+//!   builds contain no store replacement) is a re-read, compare, temp-write, re-read,
+//!   rename sequence. It is **not** compare-and-swap against an arbitrary competing
+//!   process: another writer can still slip in between the last read and the rename,
+//!   and the foreign bytes are then overwritten. It is kept as a characterization of
+//!   that hazardous behaviour, not as an available operation. This module adds no
 //!   cross-process locking.
 //! * Temp contents are flushed (`sync_all`) before publication and every write is
 //!   verified by reading the record back and decoding it. Directory entries are
@@ -193,11 +197,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(test)]
+use localvault_core::sync_state::SyncBase;
 use localvault_core::{
     sync::EnvelopeFingerprint,
-    sync_state::{
-        Locator, SyncBase, SyncState, SyncStateEncodeError, SyncStateLoad, MAX_SYNC_STATE_BYTES,
-    },
+    sync_state::{Locator, SyncState, SyncStateEncodeError, SyncStateLoad, MAX_SYNC_STATE_BYTES},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -710,7 +714,9 @@ enum Primary {
 enum Point {
     TempSync,
     Publish,
+    #[cfg(test)]
     BeforeReplace,
+    #[cfg(test)]
     Replace,
     Verify,
     RemoveArtifact,
@@ -919,6 +925,13 @@ impl SyncStateStore {
         self.verify(&record, &bytes, state)
     }
 
+    /// **Unit-test builds only (Stage 1U-4 D4).** This method is compiled solely under
+    /// `cfg(test)`; normal and release builds contain no store replacement, and a
+    /// production call to it does not compile. It keeps its historical shape as a
+    /// characterization of a hazardous behaviour and has the known foreign-overwrite race
+    /// (G12-replace): its final step overwrites whatever the primary name holds at that
+    /// instant, with no handle on the primary. It was excluded, not repaired.
+    ///
     /// Replace the record that currently holds `expected` with `proposed`.
     ///
     /// See the module documentation: this is read-compare-write, not
@@ -927,6 +940,7 @@ impl SyncStateStore {
     /// vault tag, both locators) and must not lower the trusted high-water mark
     /// or drop the checkpoint; resetting a binding is [`delete`](Self::delete)
     /// followed by a new binding.
+    #[cfg(test)]
     pub fn replace(&self, expected: &SyncState, proposed: &SyncState) -> Result<(), StoreError> {
         check_replacement(expected, proposed)?;
 
@@ -1140,8 +1154,10 @@ impl SyncStateStore {
     /// recovery artifact (the `create` remnant) the record's own name is **not**
     /// protected by the hold on the artifact (measured: another process can rename
     /// or unlink it); it is reopened and re-verified after the artifact is removed,
-    /// and a mismatch is `IncompleteDeletion`. The legacy replacement is unchanged
-    /// and still has the check-then-rename shape (G12-replace, open).
+    /// and a mismatch is `IncompleteDeletion`. The legacy replacement is unchanged,
+    /// still has the check-then-rename shape, and is compiled only in unit-test builds
+    /// since Stage 1U-4 D4 (G12-replace is closed for normal and release builds by
+    /// exclusion, not by a fix).
     ///
     /// New refusals, all before any removal ([`StoreError::RemovalRefused`]): a
     /// planned file is open elsewhere in a way that excludes the hold, has a name
@@ -2003,6 +2019,7 @@ fn classify(requested: &Locator, bytes: &[u8]) -> StateLoad {
     }
 }
 
+#[cfg(test)]
 fn check_replacement(expected: &SyncState, proposed: &SyncState) -> Result<(), StoreError> {
     if !path_identity_eq(
         expected.local_locator().as_str(),
@@ -11279,8 +11296,9 @@ mod legacy_gate_race_tests {
     // now goes through handles that were held (read-only sharing) from the byte
     // comparison to the removal, so the same child write is REFUSED BY THE KERNEL. It
     // holds for ordinary processes only (see `held_removal`). The legacy REPLACE has
-    // the old shape and is still open (G12-replace); its characterization is at the
-    // end of this module.
+    // the old shape and was not repaired: since Stage 1U-4 D4 it is excluded from
+    // normal and release builds (G12-replace), and its UNSAFE TEST-ONLY characterization
+    // is at the end of this module.
 
     #[test]
     fn a_primary_overwrite_after_the_hold_is_refused_by_the_kernel_g12_reset() {
@@ -11365,14 +11383,16 @@ mod legacy_gate_race_tests {
 
     #[test]
     fn a_primary_replaced_at_the_rename_is_overwritten_known_unprevented_race_g12_replace() {
-        // KNOWN UNFIXED G12-REPLACE, gate OPEN, NOT ACCEPTABLE behaviour, and NOT a
-        // passing security property. REAL NTFS, synthetic bytes only. The legacy
-        // replacement checks the primary, then renames its staging file over whatever
-        // the name holds at that instant, with no handle held on the primary. A child
-        // process overwrites the primary at `Point::Replace`; `replace` returns Ok and
-        // the foreign bytes are gone. No registered command reaches `replace` today.
-        // This test pins the present behaviour so a change is noticed; the fix is the
-        // separate slice 2d-2 (decision U11), not this one.
+        // UNSAFE TEST-ONLY BEHAVIOUR. KNOWN UNFIXED G12-REPLACE, NOT acceptable
+        // behaviour, and NOT a passing security property. REAL NTFS, synthetic bytes
+        // only. The legacy replacement checks the primary, then renames its staging
+        // file over whatever the name holds at that instant, with no handle held on the
+        // primary. A child process overwrites the primary at `Point::Replace`;
+        // `replace` returns Ok and the foreign bytes are gone. Since Stage 1U-4 D4
+        // `replace` is compiled only for unit tests: normal and release builds exclude
+        // it, so the race is closed there by exclusion and not by a fix. This test
+        // pins the historical behaviour so a change is noticed; it is not a
+        // production guarantee of any kind.
         let scratch = Scratch::new("race-g12-replace");
         let store = scratch.store();
 
@@ -12696,6 +12716,144 @@ mod legacy_gate_isolation_tests {
             ] {
                 assert!(!text.contains(mark), "{mark} leaked in {text}");
             }
+        }
+    }
+
+    // ---- Stage 1U-4 D4: the legacy replacement is excluded from normal builds ------
+
+    const REPLACE_SIGNATURE: &str =
+        "pub fn replace(&self, expected: &SyncState, proposed: &SyncState) -> Result<(), StoreError> {";
+
+    #[test]
+    fn d4_the_replacing_rename_is_compiled_only_for_unit_tests() {
+        // PURE source scan of the production half. The method, its only helper, its two
+        // fault-injection points and the import its helper needs are all compiled for
+        // unit tests only, so a production call site would not compile.
+        let production = production();
+
+        for gated in [
+            "    #[cfg(test)]\n    pub fn replace(&self, expected: &SyncState, proposed: &SyncState) -> Result<(), StoreError> {",
+            "#[cfg(test)]\nfn check_replacement(",
+            "    #[cfg(test)]\n    BeforeReplace,\n",
+            "    #[cfg(test)]\n    Replace,\n",
+            "#[cfg(test)]\nuse localvault_core::sync_state::SyncBase;\n",
+        ] {
+            assert_eq!(production.matches(gated).count(), 1, "{gated}");
+        }
+
+        // The one overwriting rename of the production half is inside `replace`, and
+        // `create` (which stays compiled everywhere) has none.
+        assert_eq!(production.matches("fs::rename(").count(), 1);
+        assert!(body_of(REPLACE_SIGNATURE).contains("fs::rename("));
+        assert!(
+            !body_of("pub fn create(&self, state: &SyncState) -> Result<(), StoreError> {")
+                .contains("fs::rename(")
+        );
+
+        // The historical race test keeps its name and its assertions, and says that it
+        // pins UNSAFE TEST-ONLY BEHAVIOUR rather than a security property.
+        let source = source();
+        let start = source
+            .find("fn a_primary_replaced_at_the_rename_is_overwritten_known_unprevented_race_g12_replace() {")
+            .expect("the historical race test");
+        let test = &source[start..start + source[start..].find("\n    }\n").unwrap()];
+
+        assert!(test.contains("UNSAFE TEST-ONLY BEHAVIOUR"));
+        assert!(
+            test.contains("assert_eq!(store.replace(&state(LOCAL), &proposed_state()), Ok(()));")
+        );
+        assert!(test.contains("the foreign bytes were overwritten without a trace"));
+    }
+
+    /// The production half of a sibling source file.
+    fn cut_at_tests(text: &'static str) -> &'static str {
+        &text[..text
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the first test module")]
+    }
+
+    #[test]
+    fn d4_every_wrapper_is_compiled_only_for_unit_tests() {
+        // PURE source scan of the session and of `AppState`.
+        let session = cut_at_tests(include_str!("session.rs"));
+        let app = cut_at_tests(include_str!("../app_state.rs"));
+
+        for gated in [
+            "#[cfg(test)]\npub enum RemoteObservationOutcome {",
+            "#[cfg(test)]\npub enum RemoteObservationRefusal {",
+            "#[cfg(test)]\npub enum RemoteTargetRefusal {",
+            "    #[cfg(test)]\n    pub fn record_remote_observation(\n",
+            "    #[cfg(test)]\n    pub(crate) fn record_remote_observation_in(\n",
+            "    #[cfg(test)]\n    pub fn observe_remote_target(\n",
+            "    #[cfg(test)]\n    fn observe_remote_target_with(\n",
+            "#[cfg(test)]\npub(crate) fn replace_error_may_follow_publication(",
+            "#[cfg(test)]\nfn persisted_matches(",
+            "#[cfg(test)]\nuse localvault_core::sync_state::{record_remote_observation, HighWaterOutcome, SyncBase};\n",
+        ] {
+            assert_eq!(session.matches(gated).count(), 1, "session: {gated}");
+        }
+
+        for gated in [
+            "    #[cfg(test)]\n    pub fn record_remote_observation(\n",
+            "    #[cfg(test)]\n    pub fn observe_remote_target(\n",
+            "#[cfg(test)]\nuse localvault_core::sync_state::Locator;\n",
+            "#[cfg(test)]\nuse crate::vault::session::{",
+        ] {
+            assert_eq!(app.matches(gated).count(), 1, "app state: {gated}");
+        }
+
+        // The store replacement is called once in the session, from inside the gated
+        // persistence method, and never from `AppState`.
+        let call = session.find("store.replace(").expect("the session call");
+
+        assert_eq!(session.matches("store.replace(").count(), 1);
+        assert!(
+            call > session
+                .find("    #[cfg(test)]\n    pub(crate) fn record_remote_observation_in(\n")
+                .unwrap()
+                && call < session.find("    pub fn observe_remote_target(\n").unwrap(),
+            "the call lies inside the gated persistence method"
+        );
+        assert_eq!(app.matches("store.replace(").count(), 0);
+        assert_eq!(app.matches(".replace(").count(), 0);
+    }
+
+    #[test]
+    fn d4_the_working_legacy_operations_stay_compiled_everywhere() {
+        // PURE source scan: the exclusion must not have switched off an operation that
+        // initial binding, the read-only assessment or the evidence-based reset use.
+        fn assert_compiled_everywhere(text: &str, signature: &str) {
+            assert_eq!(text.matches(signature).count(), 1, "{signature}");
+
+            let before = &text[..text.find(signature).unwrap()];
+
+            assert!(
+                !before.trim_end().ends_with("#[cfg(test)]"),
+                "{signature} is compiled for unit tests only"
+            );
+        }
+
+        let production = production();
+
+        for signature in [
+            "pub fn load(&self, local_locator: &Locator) -> StateLoad {",
+            "pub fn read_record(&self, local_locator: &Locator) -> RecordRead {",
+            "pub fn create(&self, state: &SyncState) -> Result<(), StoreError> {",
+            "pub fn evidence(&self, local_locator: &Locator) -> Result<RecordEvidence, EvidenceRefusal> {",
+            "pub fn delete(&self, local_locator: &Locator) -> Result<DeleteOutcome, StoreError> {",
+            "pub fn delete_if_evidence_matches(",
+        ] {
+            assert_compiled_everywhere(production, signature);
+        }
+
+        let session = cut_at_tests(include_str!("session.rs"));
+
+        for signature in [
+            "pub fn load_sync_state(&self, root: &SyncStateRoot) -> SessionSyncState {",
+            "fn current_local_raw(",
+            "fn effective_local_locator(",
+        ] {
+            assert_compiled_everywhere(session, signature);
         }
     }
 }

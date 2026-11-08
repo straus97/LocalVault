@@ -37,9 +37,8 @@ use localvault_core::{
         EnvelopeFingerprint,
     },
     sync_state::{
-        bind_identical_remote, record_remote_observation, BindingMismatch, HighWaterOutcome,
-        Locator, NewBinding, RemoteEvidence, SyncBase, SyncState, SyncStateLoad, TransitionRefusal,
-        UserApproval, BINDING_SALT_LEN,
+        bind_identical_remote, BindingMismatch, Locator, NewBinding, RemoteEvidence, SyncState,
+        SyncStateLoad, TransitionRefusal, UserApproval, BINDING_SALT_LEN,
     },
     vault::{
         data::{VaultData, VaultDataError},
@@ -49,6 +48,9 @@ use localvault_core::{
         },
     },
 };
+
+#[cfg(test)]
+use localvault_core::sync_state::{record_remote_observation, HighWaterOutcome, SyncBase};
 
 use super::{
     file_identity::{compare, facts_of, FileIdentity, HandleFacts, IdentityError, PhysicalVerdict},
@@ -191,6 +193,7 @@ pub enum SessionSyncState {
 /// push or a pull.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
+#[cfg(test)]
 pub enum RemoteObservationOutcome {
     /// The authenticated remote revision was above the trusted high-water mark.
     /// The raised record was published by guarded replacement, read back
@@ -211,6 +214,7 @@ pub enum RemoteObservationOutcome {
 /// `PersistenceUnverified` (and after [`NotPersisted`](Self::NotPersisted)) any
 /// later decision must start with a fresh load; nothing is retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[cfg(test)]
 pub enum RemoteObservationRefusal {
     /// The session's own vault or location cannot serve as the binding anchor.
     #[error("the session's vault or sync-state location is unavailable")]
@@ -265,6 +269,7 @@ pub enum RemoteObservationRefusal {
 /// B1c. Nothing is retried, and none of these lowers the high-water mark,
 /// clears a pending push or creates a record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[cfg(test)]
 pub enum RemoteTargetRefusal {
     /// Refused by the binding check made **before** the target was read, or by
     /// the B1c observation (authentication, transition, persistence) after it.
@@ -1112,6 +1117,10 @@ impl UnlockedVaultSession {
     /// command, event or UI is attached, and no user-facing synchronization
     /// operation is enabled by it.
     ///
+    /// **Unit-test builds only since Stage 1U-4 D4.** It persists a raised mark
+    /// through the legacy store replacement, which is itself compiled only for unit
+    /// tests; normal and release builds contain neither.
+    ///
     /// What it does, in order, all inside one `&self` borrow of the unlocked
     /// session (so the exclusive OS lock held by `_lock_file` is held for the
     /// whole call, and a closed session has nothing to call it on):
@@ -1168,6 +1177,7 @@ impl UnlockedVaultSession {
     /// the exclusive per-vault lock; a non-cooperating external writer of the
     /// state file can still win a race, which the store detects only
     /// opportunistically. Power-loss durability is not claimed.
+    #[cfg(test)]
     pub fn record_remote_observation(
         &self,
         root: &SyncStateRoot,
@@ -1182,6 +1192,7 @@ impl UnlockedVaultSession {
 
     /// [`record_remote_observation`](Self::record_remote_observation) over an
     /// explicit store. Split out only so tests can inject store faults.
+    #[cfg(test)]
     pub(crate) fn record_remote_observation_in(
         &self,
         store: &SyncStateStore,
@@ -1255,6 +1266,9 @@ impl UnlockedVaultSession {
     /// B1e). Internal: no command, event, UI or automatic caller exists, and no
     /// user-facing synchronization is enabled by it.
     ///
+    /// **Unit-test builds only since Stage 1U-4 D4**, because the persistence path it
+    /// ends in is compiled only for unit tests.
+    ///
     /// This joins the read-only filesystem adapter (B1d) to the authenticated
     /// high-water observation (B1c) without re-implementing either. In order,
     /// all inside one `&self` borrow of the unlocked session (so the exclusive OS
@@ -1293,6 +1307,7 @@ impl UnlockedVaultSession {
     /// * Nothing is written to the target, the vault, its `.backup` or its lock
     ///   file; the synchronized baseline never moves; nothing is uploaded; and
     ///   no completed provider upload is asserted.
+    #[cfg(test)]
     pub fn observe_remote_target(
         &self,
         root: &SyncStateRoot,
@@ -1306,6 +1321,7 @@ impl UnlockedVaultSession {
     /// substitute the read: tests use it to prove the read does not happen before
     /// the binding check, happens exactly once afterwards, and runs under the
     /// session lock.
+    #[cfg(test)]
     fn observe_remote_target_with(
         &self,
         root: &SyncStateRoot,
@@ -2578,6 +2594,7 @@ fn read_vault_file_bytes(path: &Path) -> Option<Vec<u8>> {
 /// `VerificationFailed` is by construction post-publication. The match is
 /// exhaustive on purpose; anything `replace` does not produce, or that is not
 /// understood, fails closed as ambiguous.
+#[cfg(test)]
 pub(crate) fn replace_error_may_follow_publication(error: StoreError) -> bool {
     use super::sync_state_store::IoStage;
 
@@ -2700,6 +2717,7 @@ fn fresh_load_confirms_binding(
 
 /// A freshly loaded record is the persisted state only if it is exactly the
 /// proposed one.
+#[cfg(test)]
 fn persisted_matches(load: StateLoad, proposed: &SyncState) -> bool {
     matches!(load, StateLoad::Loaded(current) if *current == *proposed)
 }

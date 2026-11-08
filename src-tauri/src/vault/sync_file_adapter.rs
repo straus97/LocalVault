@@ -80,9 +80,9 @@
 //! device locality; see `file_identity`) are queried through Windows FFI **on
 //! the same handle that produced the bytes**, and stored privately in the
 //! [`PresentFile`]. They never influence classification: a failed lookup is kept
-//! as an error beside the bytes, not turned into `Unavailable`, and
-//! [`observe_remote_target`](super::session::UnlockedVaultSession::observe_remote_target)
-//! never reads them. They are not a snapshot either; they describe the handle at
+//! as an error beside the bytes, not turned into `Unavailable`, and the session
+//! method `observe_remote_target` (compiled only for unit tests since Stage 1U-4 D4,
+//! hence not linked here) never reads them. They are not a snapshot either; they describe the handle at
 //! the instant they were read. Every
 //! check here is check-then-use: a completed read does not prove the path still
 //! refers to the same object, and the ancestor guards do not stop a redirection
@@ -94,10 +94,13 @@
 //!
 //! A later slice must resolve the user-selected target, compare it with the
 //! binding's retained target locator, read it with this adapter, pass
-//! [`PresentFile::target`] and [`PresentFile::candidate_raw`] to the
-//! session-bound `record_remote_observation`, re-check identity as the provider
-//! requires and persist only a core-approved transition. This module must not be
-//! reachable from the frontend.
+//! [`PresentFile::target`] and [`PresentFile::candidate_raw`] onward, re-check
+//! identity as the provider requires and persist only a core-approved transition.
+//! No production persistence of an observation exists in this build: the
+//! session-bound `record_remote_observation` and the legacy store replacement it
+//! used are compiled only for unit tests since Stage 1U-4 D4, so a future writer
+//! needs its own decision and slice. This module must not be reachable from the
+//! frontend.
 //!
 //! Errors and `Debug` output carry fixed categories and `io::ErrorKind` only:
 //! never a path, locator, vault identifier or file content.
