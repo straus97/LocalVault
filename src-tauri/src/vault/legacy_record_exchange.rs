@@ -4159,7 +4159,11 @@ mod tests {
 
         assert_eq!(
             mentioning,
-            ["vault/legacy_record_exchange.rs", "vault/mod.rs"]
+            [
+                "vault/legacy_layout_assessment.rs",
+                "vault/legacy_record_exchange.rs",
+                "vault/mod.rs"
+            ]
         );
 
         let (_, declaration) = sources
