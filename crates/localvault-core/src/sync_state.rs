@@ -167,6 +167,64 @@
 //! capacity rule, and the product retention policy is undecided. Acknowledging a
 //! missing previous version and releasing retained entries are not implemented.
 //! The persisted store stays version 1 and cannot hold these states.
+//!
+//! # Succession records (slice G2-P1)
+//!
+//! [`encode_genesis_record`], [`encode_successor_record`],
+//! [`SuccessionRecord::decode`] and [`verify_succession`] are a third
+//! **dormant** codec, version [`SYNC_STATE_SUCCESSION_VERSION`] (4). A record
+//! has the version-3 outer wrapper (HMAC-SHA256 under the same
+//! [`SyncStateMacKey`], with the version inside the MAC input), the body of
+//! version 2 and one more required field, `succession`: an explicit generation,
+//! a publication id and a predecessor (a genesis marker, or the domain-separated
+//! SHA-256 of the *exact bytes* of the predecessor record). Version 3 is
+//! unchanged and stays frozen; no other decoder accepts version 4.
+//!
+//! The functions are compiled, public core APIs with **no caller anywhere**.
+//! They perform no I/O, read no clock and generate no randomness (publication
+//! ids are supplied), and they cannot publish, recover, migrate or delete
+//! anything. A version-4 record is never produced or read by any production
+//! flow, the storage adapter cannot load or write one, and this module grants
+//! no recovery authority.
+//!
+//! **What a passed [`verify_succession`] proves.** Both exact byte strings
+//! carry valid MACs under the one key that was supplied, and its vault id,
+//! during that call, and the second names exactly the first as its
+//! predecessor, one generation later, with unchanged binding, vault tag and
+//! locators. Nothing else.
+//!
+//! **What it does not prove.**
+//!
+//! * MAC authentication is not freshness. An older chain, or a whole older
+//!   directory of records, still verifies; a consistent replay is not detected.
+//! * A predecessor relationship is not a completed publication, and a record
+//!   cannot attest its own publication: a truthful "published" flag would need
+//!   different bytes, which would be a different record.
+//! * The generation is a link counter, not an anti-rollback anchor. It is
+//!   writable and replayable beside the records it describes.
+//! * Two valid successors may name one predecessor. Both verify; this module
+//!   cannot tell which, if either, was ever published.
+//! * Anyone holding the Vault Key can forge an authenticated record, including
+//!   a competing chain. The Vault Key is never rotated.
+//! * Physical durability of anything is unproven, and nothing here is
+//!   permission to write, rename, delete, recover or synchronize.
+//! * [`SyncStateMacKey::derive`] cannot prove that its vault id belongs to its
+//!   Vault Key. The pair is the caller's assertion.
+//!
+//! **Keys.** The digest alone links byte strings and says nothing about keys.
+//! Same-key evidence exists only because [`verify_succession`] and
+//! [`encode_successor_record`] decode *every* record they are given under the
+//! single key they are given, inside that one call. A [`SuccessionRecord`]
+//! carries no key evidence: two records decoded separately are not known to
+//! share a key, and the type offers no way to compare them. The expected vault
+//! id is taken from the supplied key and never from record contents. A genesis
+//! record has no predecessor to check against, so [`encode_genesis_record`]
+//! cannot refuse a foreign key whose vault id matches the state's tag; the real
+//! key later refuses such a record at decoding.
+//!
+//! **Legacy records.** A version-1, version-2 or version-3 record is never a
+//! predecessor or a successor. Version 1 and 2 are reported as unauthenticated
+//! and version 3 as predating succession, without any import of their contents.
 
 use std::fmt;
 
@@ -197,6 +255,10 @@ pub const SYNC_STATE_EXCHANGE_VERSION: u32 = 2;
 /// [`SyncState::decode`], [`SyncStateLoad::from_bytes`] or
 /// [`SyncState::decode_exchange_record`].
 pub const SYNC_STATE_AUTHENTICATED_VERSION: u32 = 3;
+/// Dormant tag of the succession codec ([`encode_genesis_record`],
+/// [`encode_successor_record`], [`SuccessionRecord::decode`]). Not accepted by
+/// any other decoder in this module.
+pub const SYNC_STATE_SUCCESSION_VERSION: u32 = 4;
 pub const MAX_SYNC_STATE_BYTES: usize = 65_536;
 pub const MAX_LOCATOR_BYTES: usize = 4_096;
 /// Longest accepted [`ObjectAnchor`], in bytes.
@@ -211,6 +273,7 @@ pub const BINDING_SALT_LEN: usize = 32;
 const BINDING_DIGEST_LEN: usize = 32;
 const BINDING_TAG_DOMAIN: &[u8] = b"LocalVault/sync-binding-tag/v1";
 const RECORD_MAC_DOMAIN: &[u8] = b"LocalVault/sync-state-record-mac/v1";
+const RECORD_DIGEST_DOMAIN: &[u8] = b"LocalVault/sync-state-record-digest/v1";
 
 /// Why a state, or one of its parts, was rejected. Fixed variants only: no
 /// locator, identity, salt, digest or deserializer detail is ever carried.
@@ -2954,6 +3017,638 @@ fn parse_canonical_uuid(text: &str) -> Option<Uuid> {
     let id = Uuid::parse_str(text).ok()?;
     (id.hyphenated().to_string() == text).then_some(id)
 }
+
+// SUCCESSION-CODEC-BEGIN (slice G2-P1)
+//
+// Dormant, pure version-4 records. See "Succession records (slice G2-P1)" in the
+// module documentation for what is and is not established. Nothing in this
+// block touches the file system, a clock or a source of randomness.
+
+/// Why a link between two succession records, or the shape of one record, was
+/// refused. Fixed categories only; no value is ever carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SuccessionFault {
+    #[error("the publication id must not be nil")]
+    NilPublicationId,
+    #[error("the generation and the genesis marker disagree")]
+    GenerationGenesisMismatch,
+    #[error("a genesis record must not carry exchange records")]
+    GenesisHasExchangeRecords,
+    #[error("a genesis record has an invalid base")]
+    GenesisInvalidBase,
+    #[error("a genesis record's high-water revision must equal its synced revision")]
+    GenesisHighWaterNotAtSynced,
+    #[error("the binding identity changed")]
+    BindingIdChanged,
+    #[error("the vault binding tag changed")]
+    VaultTagChanged,
+    #[error("a locator changed")]
+    LocatorChanged,
+    #[error("the successor is a genesis record")]
+    SuccessorIsGenesis,
+    #[error("the generation does not advance by exactly one")]
+    GenerationNotConsecutive,
+    #[error("the generation cannot advance without overflow")]
+    GenerationOverflow,
+    #[error("the successor does not name the supplied predecessor bytes")]
+    PredecessorDigestMismatch,
+    #[error("the publication identity was reused")]
+    PublicationIdReused,
+    #[error("the remote high-water revision regressed")]
+    HighWaterRegressed,
+    #[error("a synchronized state regressed to an unbased state")]
+    BaseRegressed,
+}
+
+/// Why [`SuccessionRecord::decode`] failed. None of these variants carries
+/// input content. A wrong key, a wrong vault id and any modification of the
+/// authenticated content are one indistinguishable outcome,
+/// [`AuthenticationFailed`](Self::AuthenticationFailed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SuccessionDecodeError {
+    #[error("sync state exceeds the size limit")]
+    TooLarge,
+    #[error("sync state is not a well-formed wrapper")]
+    Malformed,
+    #[error("unsupported sync state format")]
+    UnsupportedFormat,
+    /// A version-1 or version-2 record: it has no MAC and is never a record of
+    /// this codec.
+    #[error("sync state is a legacy unauthenticated record")]
+    LegacyUnauthenticated,
+    /// A version-3 record: authenticated, but without succession fields. It is
+    /// reported without checking its MAC and is never converted.
+    #[error("sync state predates succession records")]
+    PredatesSuccession,
+    #[error("unsupported sync state version")]
+    UnsupportedVersion,
+    #[error("sync state is not in its canonical form")]
+    NonCanonical,
+    #[error("sync state authentication failed")]
+    AuthenticationFailed,
+    #[error("sync state body is malformed")]
+    InvalidBody,
+    #[error("sync state is inconsistent: {0}")]
+    InvalidState(SyncStateError),
+    #[error("sync state succession is inconsistent: {0}")]
+    InvalidLink(SuccessionFault),
+    #[error("the state is bound to a different vault than the authentication key")]
+    VaultMismatch,
+}
+
+/// Why [`encode_genesis_record`] or [`encode_successor_record`] failed. Fixed
+/// categories only; no bytes are produced on failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SuccessionEncodeError {
+    #[error("sync state is invalid: {0}")]
+    InvalidState(SyncStateError),
+    #[error("the state is bound to a different vault than the authentication key")]
+    VaultMismatch,
+    #[error("the predecessor record is refused: {0}")]
+    Predecessor(SuccessionDecodeError),
+    #[error("the succession is refused: {0}")]
+    Link(SuccessionFault),
+    #[error("encoded sync state exceeds the size limit")]
+    TooLarge,
+    #[error("sync state could not be serialized")]
+    Serialization,
+    #[error("sync state could not be authenticated")]
+    Authentication,
+}
+
+/// Why [`verify_succession`] refused a pair of records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SuccessionVerifyError {
+    #[error("the predecessor record is refused: {0}")]
+    Predecessor(SuccessionDecodeError),
+    #[error("the successor record is refused: {0}")]
+    Successor(SuccessionDecodeError),
+    #[error("the link between the records is refused: {0}")]
+    Link(SuccessionFault),
+}
+
+/// Digest of the exact bytes of one record. Private: no accessor, never shown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RecordDigest([u8; 32]);
+
+impl fmt::Debug for RecordDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RecordDigest(<redacted>)")
+    }
+}
+
+/// `SHA-256(domain || 0x00 || u64_be(len) || exact record bytes)`.
+///
+/// Computed from the supplied bytes and never from a re-encoding, so it covers
+/// the version and the MAC, and depends on no parser or encoder.
+fn record_digest(record_bytes: &[u8]) -> RecordDigest {
+    let mut hasher = Sha256::new();
+    hasher.update(RECORD_DIGEST_DOMAIN);
+    hasher.update([0u8]);
+    hasher.update((record_bytes.len() as u64).to_be_bytes());
+    hasher.update(record_bytes);
+    RecordDigest(hasher.finalize().into())
+}
+
+/// What a record names as its predecessor. Private, no accessor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Predecessor {
+    Genesis,
+    Record(RecordDigest),
+}
+
+impl fmt::Debug for Predecessor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Predecessor(<redacted>)")
+    }
+}
+
+/// The authenticated succession fields of one record.
+#[derive(Clone, Copy)]
+struct Succession {
+    generation: u64,
+    publication_id: Uuid,
+    predecessor: Predecessor,
+}
+
+/// A version-4 record that passed MAC verification under the key given to
+/// [`decode`](Self::decode), and whose body, state, vault tag and succession
+/// shape are valid. The only way to obtain one is that successful decoding.
+///
+/// It carries **no key evidence**: two records decoded separately are not known
+/// to share a key, and nothing here can compare them. It is not proof that the
+/// record was ever persisted, that it is the latest, or that it is permitted to
+/// drive any action. `Debug` shows nothing.
+pub struct SuccessionRecord {
+    state: SyncState,
+    generation: u64,
+    publication_id: Uuid,
+    predecessor: Predecessor,
+    /// Digest of the exact bytes this record was decoded from.
+    digest: RecordDigest,
+}
+
+impl SuccessionRecord {
+    /// Strictly decode and authenticate a version-4 record under `key`.
+    ///
+    /// Fixed order, and the body is not parsed until its MAC has verified:
+    /// size, wrapper probe, format, version (1 and 2 are
+    /// [`SuccessionDecodeError::LegacyUnauthenticated`], 3 is
+    /// [`SuccessionDecodeError::PredatesSuccession`] without checking its MAC,
+    /// anything but 4 is unsupported), strict wrapper, MAC encoding, canonical
+    /// wrapper bytes, MAC, then the body (parse, state invariants, canonical
+    /// form), the vault identity and last the succession shape. There is no
+    /// fallback to any other decoder.
+    pub fn decode(bytes: &[u8], key: &SyncStateMacKey) -> Result<Self, SuccessionDecodeError> {
+        use SuccessionDecodeError as E;
+
+        if bytes.len() > MAX_SYNC_STATE_BYTES {
+            return Err(E::TooLarge);
+        }
+
+        let probe: Probe = serde_json::from_slice(bytes).map_err(|_| E::Malformed)?;
+        if probe.format != SYNC_STATE_FORMAT {
+            return Err(E::UnsupportedFormat);
+        }
+        if probe.version == u64::from(SYNC_STATE_VERSION)
+            || probe.version == u64::from(SYNC_STATE_EXCHANGE_VERSION)
+        {
+            return Err(E::LegacyUnauthenticated);
+        }
+        if probe.version == u64::from(SYNC_STATE_AUTHENTICATED_VERSION) {
+            return Err(E::PredatesSuccession);
+        }
+        if probe.version != u64::from(SYNC_STATE_SUCCESSION_VERSION) {
+            return Err(E::UnsupportedVersion);
+        }
+
+        let outer: AuthenticatedOuterWire =
+            serde_json::from_slice(bytes).map_err(|_| E::Malformed)?;
+        let tag = decode_hex32(&outer.mac).ok_or(E::Malformed)?;
+
+        // Accepted bytes are exactly the written bytes: no outer malleability.
+        let canonical = serde_json::to_vec(&outer).map_err(|_| E::Malformed)?;
+        if canonical != bytes {
+            return Err(E::NonCanonical);
+        }
+
+        let message = state_mac_input(SYNC_STATE_SUCCESSION_VERSION, &key.vault_id, &outer.body);
+        if !state_mac::verify_state_mac(&key.key, &message, &tag) {
+            return Err(E::AuthenticationFailed);
+        }
+
+        // Authenticated from here on: the parsed body is the MACed string.
+        let wire: SuccessionBodyWire =
+            serde_json::from_str(&outer.body).map_err(|_| E::InvalidBody)?;
+        let (state, succession) = wire.into_parts()?;
+
+        let canonical_body =
+            encode_succession_body(&state, &succession).map_err(|_| E::InvalidBody)?;
+        if canonical_body != outer.body {
+            return Err(E::InvalidBody);
+        }
+
+        if !state.vault_tag.matches_vault(key.vault_id) {
+            return Err(E::VaultMismatch);
+        }
+
+        check_succession_shape(&state, &succession).map_err(E::InvalidLink)?;
+
+        Ok(Self {
+            state,
+            generation: succession.generation,
+            publication_id: succession.publication_id,
+            predecessor: succession.predecessor,
+            digest: record_digest(bytes),
+        })
+    }
+
+    /// The authenticated state. Read-only.
+    pub fn state(&self) -> &SyncState {
+        &self.state
+    }
+
+    /// The record's generation: a link counter, **not** an anti-rollback anchor.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The publication identity of this record (never the exchange identity of
+    /// a pending push).
+    pub fn publication_id(&self) -> Uuid {
+        self.publication_id
+    }
+
+    /// Whether the record names no predecessor.
+    pub fn is_genesis(&self) -> bool {
+        matches!(self.predecessor, Predecessor::Genesis)
+    }
+}
+
+// Nothing identifying is ever printed.
+impl fmt::Debug for SuccessionRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SuccessionRecord(<redacted>)")
+    }
+}
+
+/// Canonical bytes of a genesis record (generation 0, no predecessor) for
+/// `state`, signed under `key`. Returns bytes only: the result has no authority
+/// until it has been decoded again under the real key.
+///
+/// Checked in order: the state's invariants, its vault tag against the vault
+/// id inside `key`, a non-nil `publication_id`, the genesis shape, then size,
+/// serialization and the MAC. A genesis has no predecessor to check against, so
+/// a foreign key whose vault id matches the state's tag is signed
+/// ([`SuccessionDecodeError::AuthenticationFailed`] at the first decode under
+/// the real key). Nothing is imported from any earlier record.
+pub fn encode_genesis_record(
+    state: &SyncState,
+    publication_id: Uuid,
+    key: &SyncStateMacKey,
+) -> Result<Vec<u8>, SuccessionEncodeError> {
+    use SuccessionEncodeError as E;
+
+    state.validate().map_err(E::InvalidState)?;
+    if !state.vault_tag.matches_vault(key.vault_id) {
+        return Err(E::VaultMismatch);
+    }
+    if publication_id.is_nil() {
+        return Err(E::Link(SuccessionFault::NilPublicationId));
+    }
+
+    let succession = Succession {
+        generation: 0,
+        publication_id,
+        predecessor: Predecessor::Genesis,
+    };
+    check_succession_shape(state, &succession).map_err(E::Link)?;
+
+    seal_succession(state, &succession, key)
+}
+
+/// Canonical bytes of the successor of `prev_bytes`, carrying `proposed`,
+/// signed under `key`. Returns bytes only.
+///
+/// `prev_bytes` is decoded and MAC-verified under `key` *here*, before anything
+/// is signed: a key or vault id that did not produce the predecessor is
+/// [`SuccessionEncodeError::Predecessor`] with
+/// [`SuccessionDecodeError::AuthenticationFailed`], and no bytes are produced.
+/// A version-1, 2 or 3 predecessor is refused the same way (never a link).
+///
+/// Checked in order: the invariants of `proposed`, its vault tag against `key`,
+/// a non-nil `publication_id`, the predecessor, an unchanged binding (identity,
+/// vault tag, locators), a new publication id, no high-water or base
+/// regression, then the generation (`prev + 1`, checked), then size,
+/// serialization and the MAC.
+///
+/// Success is not publication: it says nothing about whether the predecessor
+/// was durably written or whether another successor of it exists.
+pub fn encode_successor_record(
+    prev_bytes: &[u8],
+    proposed: &SyncState,
+    publication_id: Uuid,
+    key: &SyncStateMacKey,
+) -> Result<Vec<u8>, SuccessionEncodeError> {
+    use SuccessionEncodeError as E;
+
+    proposed.validate().map_err(E::InvalidState)?;
+    if !proposed.vault_tag.matches_vault(key.vault_id) {
+        return Err(E::VaultMismatch);
+    }
+    if publication_id.is_nil() {
+        return Err(E::Link(SuccessionFault::NilPublicationId));
+    }
+
+    let prev = SuccessionRecord::decode(prev_bytes, key).map_err(E::Predecessor)?;
+
+    check_same_binding(&prev.state, proposed).map_err(E::Link)?;
+    check_progress(&prev.state, prev.publication_id, proposed, publication_id).map_err(E::Link)?;
+    let generation = prev
+        .generation
+        .checked_add(1)
+        .ok_or(E::Link(SuccessionFault::GenerationOverflow))?;
+
+    let succession = Succession {
+        generation,
+        publication_id,
+        predecessor: Predecessor::Record(prev.digest),
+    };
+    seal_succession(proposed, &succession, key)
+}
+
+/// Whether `next_bytes` is an authenticated, intended successor of
+/// `prev_bytes` under `key`.
+///
+/// Both byte strings are decoded and MAC-verified under the **one** supplied
+/// key inside this call (the predecessor first, then the successor), so a pair
+/// signed under different keys is always refused. Then, in order: identical
+/// binding identity, vault tag and both locators; the successor is not a
+/// genesis; its generation is the predecessor's plus one (checked); it names
+/// exactly `prev_bytes` as its predecessor; the publication ids differ; the
+/// high-water revision did not fall; a synchronized state did not become
+/// unbased.
+///
+/// `Ok` means authenticated intended succession during this call and nothing
+/// more: not published, not most recent, not durable, not approved for
+/// recovery or synchronization, and not a statement that no competing successor
+/// of the same predecessor exists.
+#[must_use = "a refused link must not be ignored"]
+pub fn verify_succession(
+    prev_bytes: &[u8],
+    next_bytes: &[u8],
+    key: &SyncStateMacKey,
+) -> Result<(), SuccessionVerifyError> {
+    use SuccessionVerifyError as E;
+
+    let prev = SuccessionRecord::decode(prev_bytes, key).map_err(E::Predecessor)?;
+    let next = SuccessionRecord::decode(next_bytes, key).map_err(E::Successor)?;
+
+    check_same_binding(&prev.state, &next.state).map_err(E::Link)?;
+    if next.is_genesis() {
+        return Err(E::Link(SuccessionFault::SuccessorIsGenesis));
+    }
+
+    let expected = prev
+        .generation
+        .checked_add(1)
+        .ok_or(E::Link(SuccessionFault::GenerationOverflow))?;
+    if next.generation != expected {
+        return Err(E::Link(SuccessionFault::GenerationNotConsecutive));
+    }
+    if next.predecessor != Predecessor::Record(prev.digest) {
+        return Err(E::Link(SuccessionFault::PredecessorDigestMismatch));
+    }
+
+    check_progress(
+        &prev.state,
+        prev.publication_id,
+        &next.state,
+        next.publication_id,
+    )
+    .map_err(E::Link)
+}
+
+/// Same binding identity, vault tag (salt and digest) and both locators.
+fn check_same_binding(prev: &SyncState, next: &SyncState) -> Result<(), SuccessionFault> {
+    if prev.binding_id != next.binding_id {
+        return Err(SuccessionFault::BindingIdChanged);
+    }
+    if prev.vault_tag != next.vault_tag {
+        return Err(SuccessionFault::VaultTagChanged);
+    }
+    if prev.local_locator != next.local_locator || prev.target_locator != next.target_locator {
+        return Err(SuccessionFault::LocatorChanged);
+    }
+    Ok(())
+}
+
+/// A new publication identity, no high-water fall between two based states and
+/// no based state turning unbased.
+fn check_progress(
+    prev: &SyncState,
+    prev_publication_id: Uuid,
+    next: &SyncState,
+    next_publication_id: Uuid,
+) -> Result<(), SuccessionFault> {
+    if next_publication_id == prev_publication_id {
+        return Err(SuccessionFault::PublicationIdReused);
+    }
+    match (&prev.base, &next.base) {
+        (SyncBase::Based(_), SyncBase::Unbased) => Err(SuccessionFault::BaseRegressed),
+        (SyncBase::Based(before), SyncBase::Based(after))
+            if after.high_water.revision() < before.high_water.revision() =>
+        {
+            Err(SuccessionFault::HighWaterRegressed)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A non-nil publication id, generation 0 exactly when the predecessor is the
+/// genesis marker, and the genesis shape for a genesis.
+fn check_succession_shape(
+    state: &SyncState,
+    succession: &Succession,
+) -> Result<(), SuccessionFault> {
+    if succession.publication_id.is_nil() {
+        return Err(SuccessionFault::NilPublicationId);
+    }
+    match (succession.generation, succession.predecessor) {
+        (0, Predecessor::Genesis) => check_genesis_shape(state),
+        (_, Predecessor::Genesis) | (0, Predecessor::Record(_)) => {
+            Err(SuccessionFault::GenerationGenesisMismatch)
+        }
+        (_, Predecessor::Record(_)) => Ok(()),
+    }
+}
+
+/// No exchange records; either a based state with no pending push whose
+/// high-water revision equals its synced revision, or an unbased state with its
+/// pending initial publication (already required by the state invariants and
+/// re-checked here).
+fn check_genesis_shape(state: &SyncState) -> Result<(), SuccessionFault> {
+    if state.has_exchange_records() {
+        return Err(SuccessionFault::GenesisHasExchangeRecords);
+    }
+    match (&state.base, &state.pending_push) {
+        (SyncBase::Unbased, Some(_)) => Ok(()),
+        (SyncBase::Unbased, None) | (SyncBase::Based(_), Some(_)) => {
+            Err(SuccessionFault::GenesisInvalidBase)
+        }
+        (SyncBase::Based(checkpoint), None) => {
+            if checkpoint.high_water.revision() == checkpoint.synced_revision {
+                Ok(())
+            } else {
+                Err(SuccessionFault::GenesisHighWaterNotAtSynced)
+            }
+        }
+    }
+}
+
+/// The body of a version-4 record: every [`ExchangeBodyWire`] field, unchanged
+/// and in the same order, then the required `succession` field. Fields are
+/// declared explicitly: `flatten` conflicts with `deny_unknown_fields`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuccessionBodyWire {
+    binding_id: String,
+    vault_tag: TagWire,
+    local_locator: String,
+    target_locator: String,
+    base: BaseWire,
+    #[serde(deserialize_with = "required_option")]
+    pending_push: Option<PendingWire>,
+    #[serde(deserialize_with = "required_option")]
+    exchange: Option<ExchangeWire>,
+    retained_previous: Vec<RetainedWire>,
+    succession: SuccessionWire,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuccessionWire {
+    generation: u64,
+    publication_id: String,
+    predecessor: PredecessorWire,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PredecessorWire {
+    Genesis {},
+    Record { digest: String },
+}
+
+impl SuccessionBodyWire {
+    fn new(state: &SyncState, succession: &Succession) -> Self {
+        let ExchangeBodyWire {
+            binding_id,
+            vault_tag,
+            local_locator,
+            target_locator,
+            base,
+            pending_push,
+            exchange,
+            retained_previous,
+        } = ExchangeBodyWire::from(state);
+
+        Self {
+            binding_id,
+            vault_tag,
+            local_locator,
+            target_locator,
+            base,
+            pending_push,
+            exchange,
+            retained_previous,
+            succession: SuccessionWire {
+                generation: succession.generation,
+                publication_id: succession.publication_id.hyphenated().to_string(),
+                predecessor: match succession.predecessor {
+                    Predecessor::Genesis => PredecessorWire::Genesis {},
+                    Predecessor::Record(digest) => PredecessorWire::Record {
+                        digest: HEXLOWER.encode(&digest.0),
+                    },
+                },
+            },
+        }
+    }
+
+    /// Rebuild the state through the existing body conversion and parse the
+    /// succession fields. Syntax only: the shape rules run afterwards.
+    fn into_parts(self) -> Result<(SyncState, Succession), SuccessionDecodeError> {
+        use SuccessionDecodeError as E;
+
+        let state = ExchangeBodyWire {
+            binding_id: self.binding_id,
+            vault_tag: self.vault_tag,
+            local_locator: self.local_locator,
+            target_locator: self.target_locator,
+            base: self.base,
+            pending_push: self.pending_push,
+            exchange: self.exchange,
+            retained_previous: self.retained_previous,
+        }
+        .into_state()
+        .map_err(|error| match error {
+            SyncStateDecodeError::InvalidState(state_error) => E::InvalidState(state_error),
+            _ => E::InvalidBody,
+        })?;
+
+        let predecessor = match self.succession.predecessor {
+            PredecessorWire::Genesis {} => Predecessor::Genesis,
+            PredecessorWire::Record { digest } => {
+                Predecessor::Record(RecordDigest(decode_hex32(&digest).ok_or(E::InvalidBody)?))
+            }
+        };
+        let succession = Succession {
+            generation: self.succession.generation,
+            publication_id: parse_canonical_uuid(&self.succession.publication_id)
+                .ok_or(E::InvalidBody)?,
+            predecessor,
+        };
+        Ok((state, succession))
+    }
+}
+
+fn encode_succession_body(
+    state: &SyncState,
+    succession: &Succession,
+) -> Result<String, SyncStateEncodeError> {
+    serde_json::to_string(&SuccessionBodyWire::new(state, succession))
+        .map_err(|_| SyncStateEncodeError::Serialization)
+}
+
+/// Sign a body that already passed every check of the calling encoder.
+fn seal_succession(
+    state: &SyncState,
+    succession: &Succession,
+    key: &SyncStateMacKey,
+) -> Result<Vec<u8>, SuccessionEncodeError> {
+    use SuccessionEncodeError as E;
+
+    let body = encode_succession_body(state, succession).map_err(|_| E::Serialization)?;
+    let tag = state_mac::state_mac(
+        &key.key,
+        &state_mac_input(SYNC_STATE_SUCCESSION_VERSION, &key.vault_id, &body),
+    )
+    .map_err(|_| E::Authentication)?;
+
+    let outer = AuthenticatedOuterWire {
+        format: SYNC_STATE_FORMAT.to_owned(),
+        version: SYNC_STATE_SUCCESSION_VERSION,
+        body,
+        mac: HEXLOWER.encode(&tag),
+    };
+    let bytes = serde_json::to_vec(&outer).map_err(|_| E::Serialization)?;
+    if bytes.len() > MAX_SYNC_STATE_BYTES {
+        return Err(E::TooLarge);
+    }
+    Ok(bytes)
+}
+
+// SUCCESSION-CODEC-END (slice G2-P1)
 
 /// Synthetic values only. No committed fixture is read or modified.
 #[cfg(test)]
@@ -10341,5 +11036,2252 @@ mod transition_tests {
                 "{forbidden:?} in the exchange transitions"
             );
         }
+    }
+}
+
+/// Stage 1U-4 G2-P1 tests of the dormant succession codec. Synthetic values
+/// only; no committed fixture, user data or application directory is read.
+///
+/// Kept apart, as in the version-3 tests:
+///  * cryptographic correctness: pinned vectors recomputed independently of the
+///    encoder (Python `hmac`/`hashlib`), MAC-before-parse, one-key succession;
+///  * format: strict wire, canonical bytes, version routing, the untouched
+///    older codecs;
+///  * DOCUMENTED LIMITATIONS, which are *not* protections: consistent replay,
+///    competing chains and forked successors all verify.
+#[cfg(test)]
+mod succession_tests {
+    use super::*;
+
+    const LOCAL: &str = "synthetic/local/LOCAL-MARKER.lvault";
+    const TARGET: &str = "synthetic/remote/TARGET-MARKER.lvault";
+    const MOVED: &str = "synthetic/moved/MOVED-MARKER.lvault";
+
+    /// Vault A and vault B.
+    const ID_A: Uuid = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+    const ID_B: Uuid = Uuid::from_u128(0x0f0f_0f0f_0f0f_0f0f_0f0f_0f0f_0f0f_0f0f);
+    const BINDING: Uuid = Uuid::from_u128(0x1111_1111_2222_3333_4444_5555_5555_5555);
+    const BINDING_2: Uuid = Uuid::from_u128(0x2222_2222_3333_4444_5555_6666_6666_6666);
+    const INTENT: Uuid = Uuid::from_u128(0xaaaa_aaaa_bbbb_4ccc_8ddd_eeee_eeee_eeee);
+    const RETAINED_ID: Uuid = Uuid::from_u128(0xbbbb_bbbb_cccc_4ddd_8eee_ffff_ffff_ffff);
+
+    // Assembled by hand (Python `hmac`/`hashlib`/`struct`) from the documented
+    // framing, with HKDF-SHA256 of the vault key 00..1f; not taken from this
+    // module's encoder. Genesis: based, synced revision 7, high-water 7,
+    // publication c0c0c0c0-0000-4000-8000-000000000001.
+    const GOLDEN_GENESIS: &str = r#"{"format":"localvault-sync-state","version":4,"body":"{\"binding_id\":\"11111111-2222-3333-4444-555555555555\",\"vault_tag\":{\"salt\":\"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\",\"digest\":\"533cfabc5ff2073b76dab8c6cb60289e44d95f9dbb67cdbdac12bdcf94025aa8\"},\"local_locator\":\"synthetic/local/LOCAL-MARKER.lvault\",\"target_locator\":\"synthetic/remote/TARGET-MARKER.lvault\",\"base\":{\"kind\":\"based\",\"synced\":\"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a\",\"synced_revision\":7,\"high_water\":7},\"pending_push\":null,\"exchange\":null,\"retained_previous\":[],\"succession\":{\"generation\":0,\"publication_id\":\"c0c0c0c0-0000-4000-8000-000000000001\",\"predecessor\":{\"kind\":\"genesis\"}}}","mac":"80e3b2192b954a92e1489fdf6aced991860ecee28032db7cf09d1b248e0f02b5"}"#;
+    const GOLDEN_GENESIS_MAC: &str =
+        "80e3b2192b954a92e1489fdf6aced991860ecee28032db7cf09d1b248e0f02b5";
+    const GOLDEN_GENESIS_DIGEST: &str =
+        "71b46fbd5fad039cd65002da70730c37a4d84a17ac53c12961e37e6831a7499f";
+
+    // Successor of the genesis above: the exchange-shaped body of the version-3
+    // golden plus the succession object (generation 1, publication
+    // c0c0c0c0-0000-4000-8000-000000000002, digest of the genesis bytes).
+    const GOLDEN_SUCCESSOR: &str = r#"{"format":"localvault-sync-state","version":4,"body":"{\"binding_id\":\"11111111-2222-3333-4444-555555555555\",\"vault_tag\":{\"salt\":\"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\",\"digest\":\"533cfabc5ff2073b76dab8c6cb60289e44d95f9dbb67cdbdac12bdcf94025aa8\"},\"local_locator\":\"synthetic/local/LOCAL-MARKER.lvault\",\"target_locator\":\"synthetic/remote/TARGET-MARKER.lvault\",\"base\":{\"kind\":\"based\",\"synced\":\"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a\",\"synced_revision\":7,\"high_water\":9},\"pending_push\":{\"intent_id\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\",\"baseline\":{\"kind\":\"present\",\"fingerprint\":\"4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a\"},\"intended\":\"dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986\",\"intended_revision\":10},\"exchange\":{\"scheme\":\"retain_and_publish_v1\",\"target_anchor\":\"1011121314151617\",\"directory_anchor\":\"a0a1a2a3\"},\"retained_previous\":[{\"exchange_id\":\"bbbbbbbb-cccc-4ddd-8eee-ffffffffffff\",\"fingerprint\":\"084fed08b978af4d7d196a7446a86b58009e636b611db16211b65a9aadff29c5\",\"revision\":5,\"object_anchor\":\"202122232425262728292a2b2c2d2e2f\",\"directory_anchor\":\"b0b1b2b3\"}],\"succession\":{\"generation\":1,\"publication_id\":\"c0c0c0c0-0000-4000-8000-000000000002\",\"predecessor\":{\"kind\":\"record\",\"digest\":\"71b46fbd5fad039cd65002da70730c37a4d84a17ac53c12961e37e6831a7499f\"}}}","mac":"40ac82b45c4ccbf3afeb6a9c7218c65f0b54c8fa1c651c1573e09a7536b8a00c"}"#;
+    const GOLDEN_SUCCESSOR_MAC: &str =
+        "40ac82b45c4ccbf3afeb6a9c7218c65f0b54c8fa1c651c1573e09a7536b8a00c";
+    const GOLDEN_SUCCESSOR_DIGEST: &str =
+        "bab426442df59978083ead08fbb4d10c1b6fdf2c7b524cc0b3177bb4af830f84";
+
+    const K_STATE_HEX: &str = "a5d1adbbf9c6f329fce9f5a6bfede16fea8c873974f429bc6e48a4b8e67e2f98";
+
+    // ---- keys ------------------------------------------------------------------------
+
+    /// `0x00 0x01 .. 0x1f`.
+    fn vk1() -> SecretKey {
+        Zeroizing::new(std::array::from_fn(|i| i as u8))
+    }
+
+    /// A second, distinct Vault Key.
+    fn vk2() -> SecretKey {
+        Zeroizing::new(std::array::from_fn(|i| 0xa0u8.wrapping_add(i as u8)))
+    }
+
+    fn key(vault_key: &SecretKey, vault_id: Uuid) -> SyncStateMacKey {
+        SyncStateMacKey::derive(vault_key, vault_id).unwrap()
+    }
+
+    fn k1a() -> SyncStateMacKey {
+        key(&vk1(), ID_A)
+    }
+
+    fn k1b() -> SyncStateMacKey {
+        key(&vk1(), ID_B)
+    }
+
+    fn k2a() -> SyncStateMacKey {
+        key(&vk2(), ID_A)
+    }
+
+    fn k2b() -> SyncStateMacKey {
+        key(&vk2(), ID_B)
+    }
+
+    // ---- states ----------------------------------------------------------------------
+
+    fn salt(seed: u8) -> [u8; BINDING_SALT_LEN] {
+        std::array::from_fn(|i| seed.wrapping_add(i as u8))
+    }
+
+    fn tag_salted(vault_id: Uuid, seed: u8) -> VaultBindingTag {
+        VaultBindingTag::derive(salt(seed), vault_id).unwrap()
+    }
+
+    fn tag(vault_id: Uuid) -> VaultBindingTag {
+        tag_salted(vault_id, 0)
+    }
+
+    fn fp(byte: u8) -> EnvelopeFingerprint {
+        EnvelopeFingerprint::of_bytes(&[byte])
+    }
+
+    fn anchor(start: u8, len: usize) -> ObjectAnchor {
+        let bytes: Vec<u8> = (0..len).map(|i| start.wrapping_add(i as u8)).collect();
+        ObjectAnchor::new(&bytes).unwrap()
+    }
+
+    /// Synced revision 7 with the given high-water.
+    fn based_at(high_water: u64) -> SyncBase {
+        SyncBase::Based(SyncCheckpoint::new(fp(1), 7, RemoteHighWater::new(high_water)).unwrap())
+    }
+
+    fn absent_pending() -> PendingPush {
+        PendingPush::new(
+            INTENT,
+            PushIntent::new(PushBaseline::Absent, fp(2)).unwrap(),
+            1,
+        )
+        .unwrap()
+    }
+
+    fn present_pending() -> PendingPush {
+        PendingPush::new(
+            INTENT,
+            PushIntent::new(PushBaseline::Present(fp(1)), fp(2)).unwrap(),
+            10,
+        )
+        .unwrap()
+    }
+
+    fn exchange_intent() -> ExchangeIntent {
+        ExchangeIntent::new(
+            ExchangeScheme::RetainAndPublishV1,
+            anchor(0x10, 8),
+            anchor(0xa0, 4),
+        )
+    }
+
+    fn retained() -> RetainedPrevious {
+        RetainedPrevious::new(RETAINED_ID, fp(3), 5, anchor(0x20, 16), anchor(0xb0, 4)).unwrap()
+    }
+
+    #[derive(Clone)]
+    struct Spec {
+        tag: VaultBindingTag,
+        binding: Uuid,
+        local: &'static str,
+        target: &'static str,
+        base: SyncBase,
+        pending: Option<PendingPush>,
+        exchange: Option<ExchangeIntent>,
+        retained: Vec<RetainedPrevious>,
+    }
+
+    impl Spec {
+        fn build(&self) -> SyncState {
+            SyncState::new_with_exchange_records(
+                BindingId::new(self.binding).unwrap(),
+                self.tag,
+                Locator::new(self.local).unwrap(),
+                Locator::new(self.target).unwrap(),
+                self.base,
+                self.pending,
+                self.exchange.clone(),
+                self.retained.clone(),
+            )
+            .unwrap()
+        }
+    }
+
+    /// A genesis-shaped state of vault `vault_id`: based, synced revision 7 and
+    /// high-water 7, no pending push, no exchange records.
+    fn spec(vault_id: Uuid) -> Spec {
+        Spec {
+            tag: tag(vault_id),
+            binding: BINDING,
+            local: LOCAL,
+            target: TARGET,
+            base: based_at(7),
+            pending: None,
+            exchange: None,
+            retained: Vec::new(),
+        }
+    }
+
+    fn spec_hw(high_water: u64) -> Spec {
+        Spec {
+            base: based_at(high_water),
+            ..spec(ID_A)
+        }
+    }
+
+    fn unbased_spec() -> Spec {
+        Spec {
+            base: SyncBase::Unbased,
+            pending: Some(absent_pending()),
+            ..spec(ID_A)
+        }
+    }
+
+    /// High-water 9, a pending push, an exchange intent and a retained entry.
+    fn exchange_spec(vault_id: Uuid) -> Spec {
+        Spec {
+            base: based_at(9),
+            pending: Some(present_pending()),
+            exchange: Some(exchange_intent()),
+            retained: vec![retained()],
+            ..spec(vault_id)
+        }
+    }
+
+    fn state_a() -> SyncState {
+        spec(ID_A).build()
+    }
+
+    // ---- records ---------------------------------------------------------------------
+
+    fn publication(n: u128) -> Uuid {
+        Uuid::from_u128(0xc0c0_c0c0_0000_4000_8000_0000_0000_0000 + n)
+    }
+
+    /// Sign any succession whatever, bypassing every encoder check: what any
+    /// holder of the key can do.
+    fn sign(
+        key: &SyncStateMacKey,
+        state: &SyncState,
+        generation: u64,
+        publication_id: Uuid,
+        predecessor: Predecessor,
+    ) -> Vec<u8> {
+        seal_succession(
+            state,
+            &Succession {
+                generation,
+                publication_id,
+                predecessor,
+            },
+            key,
+        )
+        .unwrap()
+    }
+
+    fn link(record_bytes: &[u8]) -> Predecessor {
+        Predecessor::Record(record_digest(record_bytes))
+    }
+
+    fn genesis_of(key: &SyncStateMacKey, state: &SyncState) -> Vec<u8> {
+        encode_genesis_record(state, publication(1), key).unwrap()
+    }
+
+    fn successor_of(prev: &[u8], state: &SyncState, n: u128, key: &SyncStateMacKey) -> Vec<u8> {
+        encode_successor_record(prev, state, publication(n), key).unwrap()
+    }
+
+    /// A genesis (hw 7) followed by a successor (hw 9), both under (VK1, A).
+    fn chain() -> (Vec<u8>, Vec<u8>) {
+        let key = k1a();
+        let g0 = genesis_of(&key, &state_a());
+        let g1 = successor_of(&g0, &spec_hw(9).build(), 2, &key);
+        (g0, g1)
+    }
+
+    fn outer_of(bytes: &[u8]) -> AuthenticatedOuterWire {
+        serde_json::from_slice(bytes).unwrap()
+    }
+
+    fn body_of(bytes: &[u8]) -> String {
+        outer_of(bytes).body
+    }
+
+    fn with_outer(bytes: &[u8], mutate: impl FnOnce(&mut AuthenticatedOuterWire)) -> Vec<u8> {
+        let mut outer = outer_of(bytes);
+        mutate(&mut outer);
+        serde_json::to_vec(&outer).unwrap()
+    }
+
+    fn replace_once(text: &str, from: &str, to: &str) -> String {
+        assert_eq!(text.matches(from).count(), 1, "{from:?} must occur once");
+        text.replacen(from, to, 1)
+    }
+
+    /// Sign an arbitrary body under an arbitrary version, written independently
+    /// of the encoder's own sealing function.
+    fn seal_body(key: &SyncStateMacKey, version: u32, body: &str) -> Vec<u8> {
+        let tag =
+            state_mac::state_mac(&key.key, &state_mac_input(version, &key.vault_id, body)).unwrap();
+        serde_json::to_vec(&AuthenticatedOuterWire {
+            format: SYNC_STATE_FORMAT.to_owned(),
+            version,
+            body: body.to_owned(),
+            mac: HEXLOWER.encode(&tag),
+        })
+        .unwrap()
+    }
+
+    /// Re-sign `record`'s body, after one textual replacement, under `key`.
+    fn resigned(key: &SyncStateMacKey, record: &[u8], from: &str, to: &str) -> Vec<u8> {
+        seal_body(
+            key,
+            SYNC_STATE_SUCCESSION_VERSION,
+            &replace_once(&body_of(record), from, to),
+        )
+    }
+
+    fn position_of(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .unwrap()
+    }
+
+    fn decode_a(bytes: &[u8]) -> Result<SuccessionRecord, SuccessionDecodeError> {
+        SuccessionRecord::decode(bytes, &k1a())
+    }
+
+    fn decode_err(bytes: &[u8]) -> SuccessionDecodeError {
+        decode_a(bytes).unwrap_err()
+    }
+
+    fn link_fault(prev: &[u8], next: &[u8]) -> SuccessionFault {
+        match verify_succession(prev, next, &k1a()) {
+            Err(SuccessionVerifyError::Link(fault)) => fault,
+            other => panic!("expected a link fault, got {other:?}"),
+        }
+    }
+
+    fn v1_bytes() -> Vec<u8> {
+        state_a().encode().unwrap()
+    }
+
+    fn v2_bytes() -> Vec<u8> {
+        exchange_spec(ID_A)
+            .build()
+            .encode_exchange_record()
+            .unwrap()
+    }
+
+    fn v3_bytes() -> Vec<u8> {
+        exchange_spec(ID_A)
+            .build()
+            .encode_authenticated(&k1a())
+            .unwrap()
+    }
+
+    // ---- A. Decode matrix, rows 1-5 ----------------------------------------------------
+
+    #[test]
+    fn matrix_01_decode_with_the_correct_key_and_vault_id_succeeds() {
+        let record = genesis_of(&k1a(), &state_a());
+        let decoded = SuccessionRecord::decode(&record, &k1a()).unwrap();
+        assert_eq!(decoded.state(), &state_a());
+    }
+
+    #[test]
+    fn matrix_02_decode_with_a_wrong_key_and_the_right_vault_id_fails_authentication() {
+        let record = genesis_of(&k1a(), &state_a());
+        assert_eq!(
+            SuccessionRecord::decode(&record, &k2a()).unwrap_err(),
+            SuccessionDecodeError::AuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn matrix_03_decode_with_the_right_key_and_a_wrong_vault_id_fails_authentication() {
+        let record = genesis_of(&k1a(), &state_a());
+        // The key bytes are equal; only the framing differs.
+        assert_eq!(k1a().key[..], k1b().key[..]);
+        assert_eq!(
+            SuccessionRecord::decode(&record, &k1b()).unwrap_err(),
+            SuccessionDecodeError::AuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn matrix_04_decode_with_both_wrong_fails_authentication() {
+        let record = genesis_of(&k1a(), &state_a());
+        assert_eq!(
+            SuccessionRecord::decode(&record, &k2b()).unwrap_err(),
+            SuccessionDecodeError::AuthenticationFailed
+        );
+    }
+
+    #[test]
+    fn matrix_05_the_three_failures_are_one_variant_with_identical_text_and_no_leak() {
+        let record = genesis_of(&k1a(), &state_a());
+        let errors: Vec<SuccessionDecodeError> = [k2a(), k1b(), k2b()]
+            .iter()
+            .map(|key| SuccessionRecord::decode(&record, key).unwrap_err())
+            .collect();
+
+        for error in &errors {
+            assert_eq!(*error, SuccessionDecodeError::AuthenticationFailed);
+            assert_eq!(error.to_string(), errors[0].to_string());
+            assert_eq!(format!("{error:?}"), "AuthenticationFailed");
+        }
+        for text in errors
+            .iter()
+            .flat_map(|error| [error.to_string(), format!("{error:?}")])
+        {
+            for marker in [
+                "LOCAL-MARKER",
+                "TARGET-MARKER",
+                GOLDEN_GENESIS_MAC,
+                K_STATE_HEX,
+                "0123456789abcdef",
+                "01234567-89ab",
+            ] {
+                assert!(!text.contains(marker), "{marker:?} leaked");
+            }
+        }
+    }
+
+    // ---- B. Verify matrix, rows 6-15 ---------------------------------------------------
+
+    #[test]
+    fn matrix_06_verify_with_one_correct_key_succeeds() {
+        let (g0, g1) = chain();
+        assert_eq!(verify_succession(&g0, &g1, &k1a()), Ok(()));
+    }
+
+    /// Records for rows 7-9: a (VK1, A) predecessor and a successor that copies
+    /// its binding and names the correct digest, but is signed under (VK2, A).
+    fn cross_key_pair() -> (Vec<u8>, Vec<u8>) {
+        let g0 = genesis_of(&k1a(), &state_a());
+        let g1 = sign(&k2a(), &spec_hw(9).build(), 1, publication(2), link(&g0));
+        (g0, g1)
+    }
+
+    #[test]
+    fn matrix_07_a_successor_signed_under_another_key_is_refused_as_the_successor() {
+        let (g0, g1) = cross_key_pair();
+        assert_eq!(
+            verify_succession(&g0, &g1, &k1a()),
+            Err(SuccessionVerifyError::Successor(
+                SuccessionDecodeError::AuthenticationFailed
+            ))
+        );
+    }
+
+    #[test]
+    fn matrix_08_the_same_pair_under_the_successors_key_is_refused_as_the_predecessor() {
+        let (g0, g1) = cross_key_pair();
+        assert_eq!(
+            verify_succession(&g0, &g1, &k2a()),
+            Err(SuccessionVerifyError::Predecessor(
+                SuccessionDecodeError::AuthenticationFailed
+            ))
+        );
+    }
+
+    #[test]
+    fn matrix_09_each_cross_key_record_decodes_alone_under_its_own_key() {
+        // The separately decoded case exists: this is why `SuccessionRecord`
+        // is not a link input and verification decodes both under one key.
+        let (g0, g1) = cross_key_pair();
+        let first = SuccessionRecord::decode(&g0, &k1a()).unwrap();
+        let second = SuccessionRecord::decode(&g1, &k2a()).unwrap();
+        assert_eq!(first.generation() + 1, second.generation());
+
+        // Nothing else is wrong with the pair: signed under one key, it links.
+        let same_key = sign(&k1a(), &spec_hw(9).build(), 1, publication(2), link(&g0));
+        assert_eq!(verify_succession(&g0, &same_key, &k1a()), Ok(()));
+    }
+
+    #[test]
+    fn matrix_10_a_successor_of_another_vault_and_key_is_refused() {
+        let g0 = genesis_of(&k1a(), &state_a());
+        let foreign = sign(&k2b(), &spec(ID_B).build(), 1, publication(2), link(&g0));
+        assert_eq!(
+            verify_succession(&g0, &foreign, &k1a()),
+            Err(SuccessionVerifyError::Successor(
+                SuccessionDecodeError::AuthenticationFailed
+            ))
+        );
+    }
+
+    #[test]
+    fn matrix_11_a_successor_of_the_same_key_and_another_vault_is_refused() {
+        let g0 = genesis_of(&k1a(), &state_a());
+        let foreign = sign(&k1b(), &spec(ID_B).build(), 1, publication(2), link(&g0));
+        assert_eq!(
+            verify_succession(&g0, &foreign, &k1a()),
+            Err(SuccessionVerifyError::Successor(
+                SuccessionDecodeError::AuthenticationFailed
+            ))
+        );
+    }
+
+    #[test]
+    fn matrix_12_a_pair_checked_under_the_wrong_key_is_refused_as_the_predecessor() {
+        let (g0, g1) = chain();
+        assert_eq!(
+            verify_succession(&g0, &g1, &k2b()),
+            Err(SuccessionVerifyError::Predecessor(
+                SuccessionDecodeError::AuthenticationFailed
+            ))
+        );
+    }
+
+    #[test]
+    fn matrix_13_legacy_version_one_and_two_records_are_never_a_predecessor() {
+        let (_, g1) = chain();
+        for legacy in [v1_bytes(), v2_bytes()] {
+            assert_eq!(
+                verify_succession(&legacy, &g1, &k1a()),
+                Err(SuccessionVerifyError::Predecessor(
+                    SuccessionDecodeError::LegacyUnauthenticated
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_14_a_version_three_record_is_never_a_predecessor() {
+        let (_, g1) = chain();
+        assert_eq!(
+            verify_succession(&v3_bytes(), &g1, &k1a()),
+            Err(SuccessionVerifyError::Predecessor(
+                SuccessionDecodeError::PredatesSuccession
+            ))
+        );
+    }
+
+    #[test]
+    fn matrix_15_a_version_three_record_is_never_a_successor() {
+        let (g0, _) = chain();
+        assert_eq!(
+            verify_succession(&g0, &v3_bytes(), &k1a()),
+            Err(SuccessionVerifyError::Successor(
+                SuccessionDecodeError::PredatesSuccession
+            ))
+        );
+        for legacy in [v1_bytes(), v2_bytes()] {
+            assert_eq!(
+                verify_succession(&g0, &legacy, &k1a()),
+                Err(SuccessionVerifyError::Successor(
+                    SuccessionDecodeError::LegacyUnauthenticated
+                ))
+            );
+        }
+    }
+
+    // ---- C. Successor encoder, rows 16-23 -----------------------------------------------
+
+    #[test]
+    fn matrix_16_the_successor_encoder_with_the_right_key_verifies() {
+        let g0 = genesis_of(&k1a(), &state_a());
+        let g1 = encode_successor_record(&g0, &spec_hw(9).build(), publication(2), &k1a()).unwrap();
+
+        assert_eq!(verify_succession(&g0, &g1, &k1a()), Ok(()));
+        let decoded = SuccessionRecord::decode(&g1, &k1a()).unwrap();
+        assert_eq!(decoded.generation(), 1);
+        assert_eq!(decoded.publication_id(), publication(2));
+        assert!(!decoded.is_genesis());
+    }
+
+    #[test]
+    fn matrix_17_the_successor_encoder_refuses_another_key_with_the_right_id() {
+        let g0 = genesis_of(&k1a(), &state_a());
+        assert_eq!(
+            encode_successor_record(&g0, &spec_hw(9).build(), publication(2), &k2a()).unwrap_err(),
+            SuccessionEncodeError::Predecessor(SuccessionDecodeError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn matrix_18_the_successor_encoder_refuses_the_right_key_with_another_id() {
+        let g0 = genesis_of(&k1a(), &state_a());
+        assert_eq!(
+            encode_successor_record(&g0, &spec(ID_B).build(), publication(2), &k1b()).unwrap_err(),
+            SuccessionEncodeError::Predecessor(SuccessionDecodeError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn matrix_19_the_successor_encoder_refuses_both_wrong() {
+        let g0 = genesis_of(&k1a(), &state_a());
+        assert_eq!(
+            encode_successor_record(&g0, &spec(ID_B).build(), publication(2), &k2b()).unwrap_err(),
+            SuccessionEncodeError::Predecessor(SuccessionDecodeError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn matrix_20_the_successor_encoder_refuses_a_state_of_another_vault() {
+        let g0 = genesis_of(&k1a(), &state_a());
+        assert_eq!(
+            encode_successor_record(&g0, &spec(ID_B).build(), publication(2), &k1a()).unwrap_err(),
+            SuccessionEncodeError::VaultMismatch
+        );
+    }
+
+    #[test]
+    fn matrix_21_the_vault_check_comes_before_the_predecessor_check() {
+        let g0 = genesis_of(&k1a(), &state_a());
+        // Key (VK2, B) could not verify `g0` either, but the tag check is first.
+        assert_eq!(
+            encode_successor_record(&g0, &spec_hw(9).build(), publication(2), &k2b()).unwrap_err(),
+            SuccessionEncodeError::VaultMismatch
+        );
+    }
+
+    #[test]
+    fn matrix_22_the_successor_encoder_refuses_a_state_with_another_tag_salt() {
+        let g0 = genesis_of(&k1a(), &state_a());
+        let resalted = Spec {
+            tag: tag_salted(ID_A, 9),
+            base: based_at(9),
+            ..spec(ID_A)
+        }
+        .build();
+        // The tag still names vault A, so the vault check passes.
+        assert!(resalted.vault_tag().matches_vault(ID_A));
+        assert_eq!(
+            encode_successor_record(&g0, &resalted, publication(2), &k1a()).unwrap_err(),
+            SuccessionEncodeError::Link(SuccessionFault::VaultTagChanged)
+        );
+    }
+
+    #[test]
+    fn matrix_23_the_successor_encoder_refuses_legacy_predecessors() {
+        let proposed = spec_hw(9).build();
+        for legacy in [v1_bytes(), v2_bytes()] {
+            assert_eq!(
+                encode_successor_record(&legacy, &proposed, publication(2), &k1a()).unwrap_err(),
+                SuccessionEncodeError::Predecessor(SuccessionDecodeError::LegacyUnauthenticated)
+            );
+        }
+        assert_eq!(
+            encode_successor_record(&v3_bytes(), &proposed, publication(2), &k1a()).unwrap_err(),
+            SuccessionEncodeError::Predecessor(SuccessionDecodeError::PredatesSuccession)
+        );
+    }
+
+    // ---- D. Genesis encoder, rows 24-26 -------------------------------------------------
+
+    #[test]
+    fn matrix_24_the_genesis_encoder_with_the_right_key_succeeds() {
+        let record = encode_genesis_record(&state_a(), publication(1), &k1a()).unwrap();
+        let decoded = SuccessionRecord::decode(&record, &k1a()).unwrap();
+        assert!(decoded.is_genesis());
+        assert_eq!(decoded.generation(), 0);
+    }
+
+    #[test]
+    fn matrix_25_the_genesis_encoder_refuses_a_key_of_another_vault_id() {
+        assert_eq!(
+            encode_genesis_record(&state_a(), publication(1), &k1b()).unwrap_err(),
+            SuccessionEncodeError::VaultMismatch
+        );
+    }
+
+    #[test]
+    fn matrix_26_documented_limitation_a_genesis_under_a_foreign_key_with_a_matching_id_is_signed()
+    {
+        // No predecessor exists to check the key against, so the encoder cannot
+        // refuse (SyncStateMacKey::derive cannot prove an id belongs to a Vault
+        // Key either). The real key refuses the record when it is decoded.
+        let record = encode_genesis_record(&state_a(), publication(1), &k2a()).unwrap();
+
+        assert!(SuccessionRecord::decode(&record, &k2a()).is_ok());
+        assert_eq!(
+            SuccessionRecord::decode(&record, &k1a()).unwrap_err(),
+            SuccessionDecodeError::AuthenticationFailed
+        );
+    }
+
+    // ---- E. Goldens, framing and canonical form -----------------------------------------
+
+    #[test]
+    fn the_genesis_golden_is_pinned_and_independently_recomputed() {
+        let key = k1a();
+        assert_eq!(HEXLOWER.encode(&key.key[..]), K_STATE_HEX);
+
+        let bytes = encode_genesis_record(&state_a(), publication(1), &key).unwrap();
+        assert_eq!(String::from_utf8(bytes.clone()).unwrap(), GOLDEN_GENESIS);
+
+        let outer = outer_of(GOLDEN_GENESIS.as_bytes());
+        assert_eq!(outer.version, 4);
+        assert_eq!(outer.mac, GOLDEN_GENESIS_MAC);
+        assert!(!GOLDEN_GENESIS.contains("body_sha256"));
+        assert_eq!(outer.body.len(), 641);
+        assert_eq!(bytes.len(), 826);
+
+        let decoded = decode_a(GOLDEN_GENESIS.as_bytes()).unwrap();
+        assert_eq!(decoded.state(), &state_a());
+        assert_eq!(decoded.generation(), 0);
+        assert_eq!(decoded.publication_id(), publication(1));
+        assert!(decoded.is_genesis());
+        assert_eq!(HEXLOWER.encode(&decoded.digest.0), GOLDEN_GENESIS_DIGEST);
+    }
+
+    #[test]
+    fn the_successor_golden_is_pinned_and_independently_recomputed() {
+        let key = k1a();
+        let bytes = encode_successor_record(
+            GOLDEN_GENESIS.as_bytes(),
+            &exchange_spec(ID_A).build(),
+            publication(2),
+            &key,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), GOLDEN_SUCCESSOR);
+
+        let outer = outer_of(GOLDEN_SUCCESSOR.as_bytes());
+        assert_eq!(outer.mac, GOLDEN_SUCCESSOR_MAC);
+        assert_eq!(outer.body.len(), 1300);
+        assert_eq!(GOLDEN_SUCCESSOR.len(), 1539);
+        // The digest inside the body is the one of the pinned genesis bytes.
+        assert!(outer.body.contains(GOLDEN_GENESIS_DIGEST));
+
+        let decoded = decode_a(GOLDEN_SUCCESSOR.as_bytes()).unwrap();
+        assert_eq!(decoded.state(), &exchange_spec(ID_A).build());
+        assert_eq!(decoded.generation(), 1);
+        assert_eq!(decoded.publication_id(), publication(2));
+        assert!(!decoded.is_genesis());
+        assert_eq!(HEXLOWER.encode(&decoded.digest.0), GOLDEN_SUCCESSOR_DIGEST);
+
+        assert_eq!(
+            verify_succession(GOLDEN_GENESIS.as_bytes(), GOLDEN_SUCCESSOR.as_bytes(), &key),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_mac_input_and_the_digest_follow_the_documented_framing() {
+        let key = k1a();
+        let body = body_of(GOLDEN_GENESIS.as_bytes());
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"LocalVault/sync-state-record-mac/v1");
+        expected.push(0x00);
+        expected.extend_from_slice(&21u64.to_be_bytes());
+        expected.extend_from_slice(b"localvault-sync-state");
+        expected.extend_from_slice(&4u32.to_be_bytes());
+        expected.extend_from_slice(ID_A.as_bytes());
+        expected.extend_from_slice(&(body.len() as u64).to_be_bytes());
+        expected.extend_from_slice(body.as_bytes());
+
+        let actual = state_mac_input(SYNC_STATE_SUCCESSION_VERSION, &ID_A, &body);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            HEXLOWER.encode(&state_mac::state_mac(&key.key, &expected).unwrap()),
+            GOLDEN_GENESIS_MAC
+        );
+        // The version and the vault id are inside the message.
+        assert_ne!(actual, state_mac_input(3, &ID_A, &body));
+        assert_ne!(
+            actual,
+            state_mac_input(SYNC_STATE_SUCCESSION_VERSION, &ID_B, &body)
+        );
+
+        let record = GOLDEN_GENESIS.as_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(b"LocalVault/sync-state-record-digest/v1");
+        hasher.update([0u8]);
+        hasher.update((record.len() as u64).to_be_bytes());
+        hasher.update(record);
+        let by_hand: [u8; 32] = hasher.finalize().into();
+        assert_eq!(HEXLOWER.encode(&by_hand), GOLDEN_GENESIS_DIGEST);
+        assert_eq!(record_digest(record).0, by_hand);
+
+        // The domain and the length prefix matter: a plain hash differs.
+        let plain: [u8; 32] = Sha256::digest(record).into();
+        assert_ne!(plain, by_hand);
+    }
+
+    #[test]
+    fn the_digest_is_over_the_exact_bytes() {
+        let record = GOLDEN_GENESIS.as_bytes();
+        let base = record_digest(record);
+
+        for index in 0..record.len() {
+            let mut altered = record.to_vec();
+            altered[index] ^= 0x01;
+            assert_ne!(record_digest(&altered), base, "byte {index}");
+        }
+        let mut longer = record.to_vec();
+        longer.push(b'\n');
+        assert_ne!(record_digest(&longer), base);
+        assert_ne!(record_digest(&record[..record.len() - 1]), base);
+    }
+
+    #[test]
+    fn encoding_is_deterministic_and_round_trips_for_every_state_shape() {
+        let key = k1a();
+        for genesis_spec in [spec(ID_A), unbased_spec()] {
+            let state = genesis_spec.build();
+            let first = encode_genesis_record(&state, publication(1), &key).unwrap();
+            assert_eq!(
+                encode_genesis_record(&state, publication(1), &key).unwrap(),
+                first
+            );
+            let decoded = SuccessionRecord::decode(&first, &key).unwrap();
+            assert_eq!(decoded.state(), &state);
+            assert!(decoded.is_genesis());
+        }
+
+        let (_, g1) = chain();
+        for proposed in [
+            exchange_spec(ID_A).build(),
+            Spec {
+                retained: vec![retained()],
+                ..spec_hw(9)
+            }
+            .build(),
+            Spec {
+                pending: Some(present_pending()),
+                ..spec_hw(9)
+            }
+            .build(),
+        ] {
+            let bytes = successor_of(&g1, &proposed, 3, &key);
+            assert_eq!(successor_of(&g1, &proposed, 3, &key), bytes);
+            let decoded = SuccessionRecord::decode(&bytes, &key).unwrap();
+            assert_eq!(decoded.state(), &proposed);
+            assert_eq!(decoded.generation(), 2);
+        }
+    }
+
+    #[test]
+    fn a_successor_may_become_based_from_unbased_and_stay_unbased() {
+        let key = k1a();
+        let g0 = genesis_of(&key, &unbased_spec().build());
+
+        let to_based = successor_of(&g0, &spec_hw(9).build(), 2, &key);
+        assert_eq!(verify_succession(&g0, &to_based, &key), Ok(()));
+
+        let stay = successor_of(&g0, &unbased_spec().build(), 2, &key);
+        assert_eq!(verify_succession(&g0, &stay, &key), Ok(()));
+    }
+
+    // ---- F. Tamper, truncation and wrapper strictness -----------------------------------
+
+    #[test]
+    fn tampering_with_any_authenticated_field_fails_authentication() {
+        let record = GOLDEN_SUCCESSOR.as_bytes();
+        let altered_digest = GOLDEN_GENESIS_DIGEST.replace('7', "8");
+
+        for (from, to) in [
+            ("\"generation\":1", "\"generation\":2"),
+            (
+                "c0c0c0c0-0000-4000-8000-000000000002",
+                "c0c0c0c0-0000-4000-8000-000000000003",
+            ),
+            (GOLDEN_GENESIS_DIGEST, altered_digest.as_str()),
+            ("LOCAL-MARKER", "LOCAL-MARKEQ"),
+            ("\"high_water\":9", "\"high_water\":10"),
+            ("\"kind\":\"record\"", "\"kind\":\"recorD\""),
+        ] {
+            let tampered = with_outer(record, |o| o.body = replace_once(&o.body, from, to));
+            assert_eq!(
+                decode_err(&tampered),
+                SuccessionDecodeError::AuthenticationFailed,
+                "{from}"
+            );
+        }
+
+        for position in [0usize, 31, 63] {
+            let tampered = with_outer(record, |o| {
+                let mut chars: Vec<char> = o.mac.chars().collect();
+                chars[position] = if chars[position] == '0' { '1' } else { '0' };
+                o.mac = chars.into_iter().collect();
+            });
+            assert_eq!(
+                decode_err(&tampered),
+                SuccessionDecodeError::AuthenticationFailed
+            );
+        }
+    }
+
+    #[test]
+    fn flipping_any_single_byte_of_a_valid_record_never_decodes() {
+        for record in [GOLDEN_GENESIS, GOLDEN_SUCCESSOR] {
+            let record = record.as_bytes();
+            for index in 0..record.len() {
+                let mut damaged = record.to_vec();
+                damaged[index] ^= 0x01;
+                assert!(decode_a(&damaged).is_err(), "byte {index}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_truncation_prefix_is_refused_as_malformed() {
+        for record in [GOLDEN_GENESIS, GOLDEN_SUCCESSOR] {
+            let record = record.as_bytes();
+            for length in 0..record.len() {
+                assert_eq!(
+                    decode_err(&record[..length]),
+                    SuccessionDecodeError::Malformed,
+                    "prefix {length}"
+                );
+            }
+            assert!(decode_a(record).is_ok());
+        }
+    }
+
+    #[test]
+    fn oversized_and_non_json_input_is_refused_before_anything_else() {
+        assert_eq!(
+            decode_err(&[b' '; MAX_SYNC_STATE_BYTES + 1]),
+            SuccessionDecodeError::TooLarge
+        );
+        for junk in [&b""[..], b"x", b"[]", b"null", b"{}", b"\xff\xfe"] {
+            assert_eq!(decode_err(junk), SuccessionDecodeError::Malformed);
+        }
+    }
+
+    #[test]
+    fn the_wrapper_must_be_exactly_the_canonical_bytes() {
+        let record = GOLDEN_GENESIS;
+
+        // Whitespace, a reordered wrapper, an equivalent escape and trailing
+        // whitespace are all valid JSON for the same wrapper, and all refused.
+        let spaced = record.replacen("\"version\":4", "\"version\": 4", 1);
+        assert_eq!(
+            decode_err(spaced.as_bytes()),
+            SuccessionDecodeError::NonCanonical
+        );
+
+        let outer = outer_of(record.as_bytes());
+        let reordered = format!(
+            "{{\"version\":4,\"format\":\"localvault-sync-state\",\"body\":{},\"mac\":\"{}\"}}",
+            serde_json::to_string(&outer.body).unwrap(),
+            outer.mac
+        );
+        assert_eq!(
+            decode_err(reordered.as_bytes()),
+            SuccessionDecodeError::NonCanonical
+        );
+
+        let escaped = record.replacen("\"mac\"", "\"m\\u0061c\"", 1);
+        assert_eq!(
+            decode_err(escaped.as_bytes()),
+            SuccessionDecodeError::NonCanonical
+        );
+
+        let mut trailing_space = record.as_bytes().to_vec();
+        trailing_space.push(b'\n');
+        assert_eq!(
+            decode_err(&trailing_space),
+            SuccessionDecodeError::NonCanonical
+        );
+
+        let mut trailing_junk = record.as_bytes().to_vec();
+        trailing_junk.push(b'x');
+        assert_eq!(decode_err(&trailing_junk), SuccessionDecodeError::Malformed);
+    }
+
+    #[test]
+    fn a_wrapper_with_wrong_fields_or_a_malformed_mac_is_malformed() {
+        let record = GOLDEN_GENESIS;
+        let outer = outer_of(record.as_bytes());
+
+        let unknown = record.replacen("\"mac\"", "\"extra\":1,\"mac\"", 1);
+        assert_eq!(
+            decode_err(unknown.as_bytes()),
+            SuccessionDecodeError::Malformed
+        );
+        let missing = format!(
+            "{{\"format\":\"localvault-sync-state\",\"version\":4,\"body\":{}}}",
+            serde_json::to_string(&outer.body).unwrap()
+        );
+        assert_eq!(
+            decode_err(missing.as_bytes()),
+            SuccessionDecodeError::Malformed
+        );
+
+        for bad_mac in [
+            outer.mac.to_uppercase(),
+            outer.mac[..62].to_owned(),
+            format!("{}00", outer.mac),
+            "g".repeat(64),
+            String::new(),
+        ] {
+            let bytes = with_outer(record.as_bytes(), |o| o.mac = bad_mac.clone());
+            assert_eq!(decode_err(&bytes), SuccessionDecodeError::Malformed);
+        }
+
+        let format = with_outer(record.as_bytes(), |o| {
+            o.format = "localvault-sync-statf".to_owned();
+        });
+        assert_eq!(
+            decode_err(&format),
+            SuccessionDecodeError::UnsupportedFormat
+        );
+    }
+
+    // ---- G. Versions and the older codecs -----------------------------------------------
+
+    #[test]
+    fn versions_are_routed_without_any_fallback() {
+        let record = GOLDEN_GENESIS.as_bytes();
+
+        for legacy in [1, 2] {
+            let bytes = with_outer(record, |o| o.version = legacy);
+            assert_eq!(
+                decode_err(&bytes),
+                SuccessionDecodeError::LegacyUnauthenticated
+            );
+        }
+        let predates = with_outer(record, |o| o.version = 3);
+        assert_eq!(
+            decode_err(&predates),
+            SuccessionDecodeError::PredatesSuccession
+        );
+        for unknown in [0, 5, 6, u32::MAX] {
+            let bytes = with_outer(record, |o| o.version = unknown);
+            assert_eq!(
+                decode_err(&bytes),
+                SuccessionDecodeError::UnsupportedVersion
+            );
+        }
+        let huge = GOLDEN_GENESIS.replacen("\"version\":4", "\"version\":4294967300", 1);
+        assert_eq!(
+            decode_err(huge.as_bytes()),
+            SuccessionDecodeError::UnsupportedVersion
+        );
+        // An unknown version is judged before the rest of the wrapper.
+        let future = r#"{"format":"localvault-sync-state","version":5,"anything":[1]}"#;
+        assert_eq!(
+            decode_err(future.as_bytes()),
+            SuccessionDecodeError::UnsupportedVersion
+        );
+    }
+
+    #[test]
+    fn version_three_relabelled_four_and_four_relabelled_three_are_refused() {
+        // A version-3 record with its version changed: the MAC covers it.
+        let v3 = v3_bytes();
+        let relabelled = with_outer(&v3, |o| o.version = 4);
+        assert_eq!(
+            decode_err(&relabelled),
+            SuccessionDecodeError::AuthenticationFailed
+        );
+
+        // A version-4 record relabelled 3: reported as predating succession by
+        // this codec and as an authentication failure by the version-3 codec.
+        let v4 = GOLDEN_GENESIS.as_bytes();
+        let as_three = with_outer(v4, |o| o.version = 3);
+        assert_eq!(
+            decode_err(&as_three),
+            SuccessionDecodeError::PredatesSuccession
+        );
+        assert_eq!(
+            SyncState::decode_authenticated(&as_three, &k1a()).unwrap_err(),
+            AuthenticatedDecodeError::AuthenticationFailed
+        );
+
+        // A version-4 body re-signed as version 3 is not a version-3 body, and
+        // a version-3 body re-signed as version 4 lacks the succession field.
+        let resealed = seal_body(&k1a(), 3, &body_of(v4));
+        assert_eq!(
+            SyncState::decode_authenticated(&resealed, &k1a()).unwrap_err(),
+            AuthenticatedDecodeError::InvalidBody
+        );
+        let resealed = seal_body(&k1a(), 4, &body_of(&v3));
+        assert_eq!(decode_err(&resealed), SuccessionDecodeError::InvalidBody);
+    }
+
+    #[test]
+    fn a_version_four_body_relabelled_version_one_is_never_a_record() {
+        let v4 = GOLDEN_GENESIS.as_bytes();
+
+        // Stripped of its MAC and given a checksum, as a version-1 writer would.
+        let body = body_of(v4);
+        let v1 = serde_json::to_vec(&OuterWire {
+            format: SYNC_STATE_FORMAT.to_owned(),
+            version: SYNC_STATE_VERSION,
+            body_sha256: HEXLOWER.encode(&Sha256::digest(body.as_bytes())),
+            body: body.clone(),
+        })
+        .unwrap();
+        assert_eq!(
+            decode_err(&v1),
+            SuccessionDecodeError::LegacyUnauthenticated
+        );
+        assert_eq!(
+            SyncState::decode(&v1).unwrap_err(),
+            SyncStateDecodeError::InvalidBody
+        );
+        assert_eq!(SyncStateLoad::from_bytes(&v1), SyncStateLoad::Corrupt);
+
+        // The same for version 2.
+        let v2 = serde_json::to_vec(&OuterWire {
+            format: SYNC_STATE_FORMAT.to_owned(),
+            version: SYNC_STATE_EXCHANGE_VERSION,
+            body_sha256: HEXLOWER.encode(&Sha256::digest(body.as_bytes())),
+            body,
+        })
+        .unwrap();
+        assert_eq!(
+            decode_err(&v2),
+            SuccessionDecodeError::LegacyUnauthenticated
+        );
+        assert_eq!(
+            SyncState::decode_exchange_record(&v2).unwrap_err(),
+            SyncStateDecodeError::InvalidBody
+        );
+
+        // The record relabelled in place keeps its `mac` and lacks a checksum.
+        let relabelled = with_outer(v4, |o| o.version = 1);
+        assert_eq!(
+            decode_err(&relabelled),
+            SuccessionDecodeError::LegacyUnauthenticated
+        );
+        assert_eq!(
+            SyncState::decode(&relabelled).unwrap_err(),
+            SyncStateDecodeError::Malformed
+        );
+    }
+
+    #[test]
+    fn every_older_decoder_still_rejects_version_four() {
+        for record in [GOLDEN_GENESIS, GOLDEN_SUCCESSOR] {
+            let bytes = record.as_bytes();
+
+            assert_eq!(
+                SyncState::decode(bytes).unwrap_err(),
+                SyncStateDecodeError::UnsupportedVersion
+            );
+            assert_eq!(
+                SyncState::decode_exchange_record(bytes).unwrap_err(),
+                SyncStateDecodeError::UnsupportedVersion
+            );
+            assert_eq!(
+                SyncState::decode_authenticated(bytes, &k1a()).unwrap_err(),
+                AuthenticatedDecodeError::UnsupportedVersion
+            );
+            assert_eq!(
+                AuthenticatedSyncState::decode(bytes, &k1a()).unwrap_err(),
+                AuthenticatedDecodeError::UnsupportedVersion
+            );
+            assert_eq!(
+                SyncStateLoad::from_bytes(bytes),
+                SyncStateLoad::UnsupportedVersion
+            );
+        }
+    }
+
+    #[test]
+    fn the_new_codec_leaves_the_older_encoders_and_versions_unchanged() {
+        assert_eq!(SYNC_STATE_VERSION, 1);
+        assert_eq!(SYNC_STATE_EXCHANGE_VERSION, 2);
+        assert_eq!(SYNC_STATE_AUTHENTICATED_VERSION, 3);
+        assert_eq!(SYNC_STATE_SUCCESSION_VERSION, 4);
+
+        let checksummed_version =
+            |bytes: &[u8]| serde_json::from_slice::<OuterWire>(bytes).unwrap().version;
+        assert_eq!(checksummed_version(&v1_bytes()), 1);
+        assert_eq!(checksummed_version(&v2_bytes()), 2);
+        assert_eq!(outer_of(&v3_bytes()).version, 3);
+        // No older encoder emits a succession field.
+        for older in [v1_bytes(), v2_bytes(), v3_bytes()] {
+            assert!(!String::from_utf8(older).unwrap().contains("succession"));
+        }
+        assert_eq!(SyncState::decode(&v1_bytes()).unwrap(), state_a());
+    }
+
+    // ---- H. Valid MAC, invalid body ------------------------------------------------------
+
+    /// Re-sign the genesis golden body after one textual replacement.
+    fn genesis_with(from: &str, to: &str) -> Vec<u8> {
+        resigned(&k1a(), GOLDEN_GENESIS.as_bytes(), from, to)
+    }
+
+    fn successor_with(from: &str, to: &str) -> Vec<u8> {
+        resigned(&k1a(), GOLDEN_SUCCESSOR.as_bytes(), from, to)
+    }
+
+    #[test]
+    fn a_valid_mac_cannot_make_an_unparseable_or_misshapen_body_acceptable() {
+        let succession = "\"succession\":{\"generation\":0,\"publication_id\":\"c0c0c0c0-0000-4000-8000-000000000001\",\"predecessor\":{\"kind\":\"genesis\"}}";
+
+        let not_json = seal_body(&k1a(), 4, "not json");
+        assert_eq!(decode_err(&not_json), SuccessionDecodeError::InvalidBody);
+        let not_object = seal_body(&k1a(), 4, "[]");
+        assert_eq!(decode_err(&not_object), SuccessionDecodeError::InvalidBody);
+
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            (
+                "unknown top-level field",
+                genesis_with(succession, &format!("{succession},\"extra\":1")),
+            ),
+            (
+                "unknown succession field",
+                genesis_with(
+                    "\"predecessor\":{\"kind\":\"genesis\"}}",
+                    "\"predecessor\":{\"kind\":\"genesis\"},\"extra\":1}",
+                ),
+            ),
+            (
+                "unknown predecessor field",
+                genesis_with(
+                    "{\"kind\":\"genesis\"}",
+                    "{\"kind\":\"genesis\",\"digest\":\"00\"}",
+                ),
+            ),
+            (
+                "missing succession",
+                genesis_with(&format!(",{succession}"), ""),
+            ),
+            ("missing generation", genesis_with("\"generation\":0,", "")),
+            (
+                "missing publication id",
+                genesis_with(
+                    "\"publication_id\":\"c0c0c0c0-0000-4000-8000-000000000001\",",
+                    "",
+                ),
+            ),
+            (
+                "missing predecessor",
+                genesis_with(",\"predecessor\":{\"kind\":\"genesis\"}", ""),
+            ),
+            (
+                "missing pending_push",
+                genesis_with("\"pending_push\":null,", ""),
+            ),
+            ("missing exchange", genesis_with("\"exchange\":null,", "")),
+            (
+                "missing retained_previous",
+                genesis_with("\"retained_previous\":[],", ""),
+            ),
+            (
+                "duplicate generation",
+                genesis_with("\"generation\":0,", "\"generation\":0,\"generation\":0,"),
+            ),
+            (
+                "duplicate succession",
+                genesis_with(succession, &format!("{succession},{succession}")),
+            ),
+            (
+                "duplicate kind",
+                genesis_with(
+                    "{\"kind\":\"genesis\"}",
+                    "{\"kind\":\"genesis\",\"kind\":\"genesis\"}",
+                ),
+            ),
+            (
+                "unknown predecessor kind",
+                genesis_with("\"kind\":\"genesis\"", "\"kind\":\"other\""),
+            ),
+            ("missing kind", genesis_with("{\"kind\":\"genesis\"}", "{}")),
+            (
+                "record without digest",
+                genesis_with("{\"kind\":\"genesis\"}", "{\"kind\":\"record\"}"),
+            ),
+            (
+                "generation as text",
+                genesis_with("\"generation\":0", "\"generation\":\"0\""),
+            ),
+            (
+                "negative generation",
+                genesis_with("\"generation\":0", "\"generation\":-1"),
+            ),
+            (
+                "fractional generation",
+                genesis_with("\"generation\":0", "\"generation\":0.0"),
+            ),
+            (
+                "generation above u64",
+                genesis_with("\"generation\":0", "\"generation\":18446744073709551616"),
+            ),
+            (
+                "null succession",
+                genesis_with(succession, "\"succession\":null"),
+            ),
+        ];
+        for (label, record) in cases {
+            assert_eq!(
+                decode_err(&record),
+                SuccessionDecodeError::InvalidBody,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn digests_must_be_exactly_sixty_four_lowercase_hex_characters() {
+        for (label, replacement) in [
+            ("uppercase", GOLDEN_GENESIS_DIGEST.to_uppercase()),
+            ("short", GOLDEN_GENESIS_DIGEST[..62].to_owned()),
+            ("long", format!("{GOLDEN_GENESIS_DIGEST}00")),
+            ("non-hex", "g".repeat(64)),
+            ("empty", String::new()),
+            ("prefixed", format!("0x{}", &GOLDEN_GENESIS_DIGEST[2..])),
+        ] {
+            let record = successor_with(GOLDEN_GENESIS_DIGEST, &replacement);
+            assert_eq!(
+                decode_err(&record),
+                SuccessionDecodeError::InvalidBody,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn publication_ids_must_be_canonical_and_non_nil() {
+        let id = "c0c0c0c0-0000-4000-8000-000000000001";
+        for (label, replacement) in [
+            ("uppercase", id.to_uppercase()),
+            ("simple", id.replace('-', "")),
+            ("braced", format!("{{{id}}}")),
+            ("urn", format!("urn:uuid:{id}")),
+            ("short", id[..35].to_owned()),
+            ("empty", String::new()),
+        ] {
+            let record = genesis_with(id, &replacement);
+            assert_eq!(
+                decode_err(&record),
+                SuccessionDecodeError::InvalidBody,
+                "{label}"
+            );
+        }
+
+        let nil = genesis_with(id, "00000000-0000-0000-0000-000000000000");
+        assert_eq!(
+            decode_err(&nil),
+            SuccessionDecodeError::InvalidLink(SuccessionFault::NilPublicationId)
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_body_is_refused_even_under_a_valid_mac() {
+        let id = "\"publication_id\":\"c0c0c0c0-0000-4000-8000-000000000001\"";
+
+        // The `succession` object moved to the front of the body.
+        let succession_first = {
+            let body = body_of(GOLDEN_GENESIS.as_bytes());
+            let (head, tail) = body.split_once(",\"succession\":").unwrap();
+            let tail = tail.strip_suffix('}').unwrap();
+            format!("{{\"succession\":{tail},{}}}", &head[1..])
+        };
+
+        for (label, record) in [
+            (
+                "whitespace",
+                genesis_with("\"kind\":\"genesis\"", "\"kind\": \"genesis\""),
+            ),
+            (
+                "escaped tag value",
+                genesis_with("\"kind\":\"genesis\"", "\"kind\":\"gen\\u0065sis\""),
+            ),
+            (
+                "field order in the succession",
+                genesis_with(
+                    &format!("\"generation\":0,{id}"),
+                    &format!("{id},\"generation\":0"),
+                ),
+            ),
+            ("succession first", seal_body(&k1a(), 4, &succession_first)),
+            (
+                "escaped solidus",
+                genesis_with("synthetic/local", "synthetic\\/local"),
+            ),
+        ] {
+            assert_eq!(
+                decode_err(&record),
+                SuccessionDecodeError::InvalidBody,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_invariants_are_enforced_under_a_valid_mac() {
+        let below_synced = genesis_with("\"high_water\":7", "\"high_water\":6");
+        assert_eq!(
+            decode_err(&below_synced),
+            SuccessionDecodeError::InvalidState(SyncStateError::CheckpointRevisionAboveHighWater)
+        );
+        let nil_binding = genesis_with(
+            "11111111-2222-3333-4444-555555555555",
+            "00000000-0000-0000-0000-000000000000",
+        );
+        assert_eq!(
+            decode_err(&nil_binding),
+            SuccessionDecodeError::InvalidState(SyncStateError::NilBindingId)
+        );
+        let same_locators = genesis_with(
+            "synthetic/remote/TARGET-MARKER",
+            "synthetic/local/LOCAL-MARKER",
+        );
+        assert_eq!(
+            decode_err(&same_locators),
+            SuccessionDecodeError::InvalidState(SyncStateError::IdenticalLocators)
+        );
+    }
+
+    #[test]
+    fn a_tag_of_another_vault_under_a_valid_mac_is_a_vault_mismatch() {
+        // Signed by (VK1, A) over a state whose tag names vault B.
+        let foreign_state = spec(ID_B).build();
+        let record = sign(
+            &k1a(),
+            &foreign_state,
+            0,
+            publication(1),
+            Predecessor::Genesis,
+        );
+        assert_eq!(decode_err(&record), SuccessionDecodeError::VaultMismatch);
+
+        // Under the key of its own vault it is a record: the MAC and the tag
+        // are checked separately.
+        let own = sign(
+            &k1b(),
+            &foreign_state,
+            0,
+            publication(1),
+            Predecessor::Genesis,
+        );
+        assert!(SuccessionRecord::decode(&own, &k1b()).is_ok());
+    }
+
+    #[test]
+    fn the_genesis_shape_is_enforced_under_a_valid_mac() {
+        let key = k1a();
+        let genesis =
+            |state: &SyncState| sign(&key, state, 0, publication(1), Predecessor::Genesis);
+        let refused = |fault: SuccessionFault| SuccessionDecodeError::InvalidLink(fault);
+
+        assert_eq!(
+            decode_err(&genesis(&exchange_spec(ID_A).build())),
+            refused(SuccessionFault::GenesisHasExchangeRecords)
+        );
+        let retained_only = Spec {
+            retained: vec![retained()],
+            ..spec(ID_A)
+        };
+        assert_eq!(
+            decode_err(&genesis(&retained_only.build())),
+            refused(SuccessionFault::GenesisHasExchangeRecords)
+        );
+        let based_with_pending = Spec {
+            pending: Some(present_pending()),
+            ..spec(ID_A)
+        };
+        assert_eq!(
+            decode_err(&genesis(&based_with_pending.build())),
+            refused(SuccessionFault::GenesisInvalidBase)
+        );
+        assert_eq!(
+            decode_err(&genesis(&spec_hw(9).build())),
+            refused(SuccessionFault::GenesisHighWaterNotAtSynced)
+        );
+        // A valid unbased genesis, and a based one at its synced revision.
+        assert!(SuccessionRecord::decode(&genesis(&unbased_spec().build()), &key).is_ok());
+        assert!(SuccessionRecord::decode(&genesis(&state_a()), &key).is_ok());
+    }
+
+    #[test]
+    fn the_generation_and_the_genesis_marker_must_agree() {
+        let key = k1a();
+        let state = state_a();
+        let some_digest = Predecessor::Record(RecordDigest([7; 32]));
+
+        let zero_with_record = sign(&key, &state, 0, publication(1), some_digest);
+        assert_eq!(
+            decode_err(&zero_with_record),
+            SuccessionDecodeError::InvalidLink(SuccessionFault::GenerationGenesisMismatch)
+        );
+        for generation in [1, 5, u64::MAX] {
+            let positive_genesis = sign(
+                &key,
+                &state,
+                generation,
+                publication(1),
+                Predecessor::Genesis,
+            );
+            assert_eq!(
+                decode_err(&positive_genesis),
+                SuccessionDecodeError::InvalidLink(SuccessionFault::GenerationGenesisMismatch)
+            );
+        }
+        // A non-genesis record at the largest generation is well formed.
+        let largest = sign(&key, &state, u64::MAX, publication(1), some_digest);
+        assert_eq!(decode_a(&largest).unwrap().generation(), u64::MAX);
+    }
+
+    #[test]
+    fn the_link_shape_check_orders_nil_before_genesis_mismatch_before_genesis_shape() {
+        let key = k1a();
+        let nil_and_mismatch = sign(&key, &state_a(), 3, Uuid::nil(), Predecessor::Genesis);
+        assert_eq!(
+            decode_err(&nil_and_mismatch),
+            SuccessionDecodeError::InvalidLink(SuccessionFault::NilPublicationId)
+        );
+        let mismatch_and_shape = sign(
+            &key,
+            &exchange_spec(ID_A).build(),
+            3,
+            publication(1),
+            Predecessor::Genesis,
+        );
+        assert_eq!(
+            decode_err(&mismatch_and_shape),
+            SuccessionDecodeError::InvalidLink(SuccessionFault::GenerationGenesisMismatch)
+        );
+    }
+
+    #[test]
+    fn the_genesis_shape_check_also_refuses_a_state_it_could_not_normally_see() {
+        // `Unbased` without its pending initial publication violates the state
+        // invariants already; the shape check re-checks it defensively.
+        let mut unbased_without_pending = unbased_spec().build();
+        unbased_without_pending.pending_push = None;
+        assert_eq!(
+            check_genesis_shape(&unbased_without_pending),
+            Err(SuccessionFault::GenesisInvalidBase)
+        );
+    }
+
+    // ---- I. Encoder refusals --------------------------------------------------------------
+
+    #[test]
+    fn the_encoders_revalidate_the_state_before_anything_else() {
+        let mut invalid = spec(ID_B).build();
+        invalid.target_locator = invalid.local_locator.clone();
+
+        let g0 = genesis_of(&k1a(), &state_a());
+        // Invalid state wins over the vault mismatch, the nil id and the key.
+        assert_eq!(
+            encode_genesis_record(&invalid, Uuid::nil(), &k1a()).unwrap_err(),
+            SuccessionEncodeError::InvalidState(SyncStateError::IdenticalLocators)
+        );
+        assert_eq!(
+            encode_successor_record(&g0, &invalid, Uuid::nil(), &k2a()).unwrap_err(),
+            SuccessionEncodeError::InvalidState(SyncStateError::IdenticalLocators)
+        );
+    }
+
+    #[test]
+    fn a_nil_publication_id_is_refused_before_the_predecessor_is_read() {
+        let g0 = genesis_of(&k1a(), &state_a());
+        assert_eq!(
+            encode_genesis_record(&state_a(), Uuid::nil(), &k1a()).unwrap_err(),
+            SuccessionEncodeError::Link(SuccessionFault::NilPublicationId)
+        );
+        // The wrong key would otherwise be an authentication failure.
+        assert_eq!(
+            encode_successor_record(&g0, &spec_hw(9).build(), Uuid::nil(), &k2a()).unwrap_err(),
+            SuccessionEncodeError::Link(SuccessionFault::NilPublicationId)
+        );
+        // The vault check is still first.
+        assert_eq!(
+            encode_genesis_record(&spec(ID_B).build(), Uuid::nil(), &k1a()).unwrap_err(),
+            SuccessionEncodeError::VaultMismatch
+        );
+    }
+
+    #[test]
+    fn the_genesis_encoder_refuses_every_misshapen_genesis() {
+        let key = k1a();
+        let cases = [
+            (
+                exchange_spec(ID_A),
+                SuccessionFault::GenesisHasExchangeRecords,
+            ),
+            (
+                Spec {
+                    retained: vec![retained()],
+                    ..spec(ID_A)
+                },
+                SuccessionFault::GenesisHasExchangeRecords,
+            ),
+            (
+                Spec {
+                    pending: Some(present_pending()),
+                    ..spec(ID_A)
+                },
+                SuccessionFault::GenesisInvalidBase,
+            ),
+            (spec_hw(9), SuccessionFault::GenesisHighWaterNotAtSynced),
+        ];
+        for (state, fault) in cases {
+            assert_eq!(
+                encode_genesis_record(&state.build(), publication(1), &key).unwrap_err(),
+                SuccessionEncodeError::Link(fault)
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_record_is_refused_by_the_sealing_step() {
+        // No valid state can reach the limit, so the check is exercised with a
+        // state that bypasses the constructors.
+        let mut huge = state_a();
+        huge.local_locator = Locator("\\".repeat(20_000));
+
+        let sealed = seal_succession(
+            &huge,
+            &Succession {
+                generation: 0,
+                publication_id: publication(1),
+                predecessor: Predecessor::Genesis,
+            },
+            &k1a(),
+        );
+        assert_eq!(sealed.unwrap_err(), SuccessionEncodeError::TooLarge);
+    }
+
+    // ---- J. Link faults: verify and encode agree ----------------------------------------
+
+    #[test]
+    fn verify_succession_reports_each_link_fault_and_the_encoder_agrees() {
+        let key = k1a();
+        let (_, g1) = chain();
+
+        // Each case is a proposed g2 that breaks exactly one rule against g1
+        // (generation 1, publication 2, high-water 9).
+        let cases: Vec<(&str, SyncState, u128, SuccessionFault)> = vec![
+            (
+                "binding id",
+                Spec {
+                    binding: BINDING_2,
+                    ..spec_hw(9)
+                }
+                .build(),
+                3,
+                SuccessionFault::BindingIdChanged,
+            ),
+            (
+                "tag salt",
+                Spec {
+                    tag: tag_salted(ID_A, 9),
+                    ..spec_hw(9)
+                }
+                .build(),
+                3,
+                SuccessionFault::VaultTagChanged,
+            ),
+            (
+                "local locator",
+                Spec {
+                    local: MOVED,
+                    ..spec_hw(9)
+                }
+                .build(),
+                3,
+                SuccessionFault::LocatorChanged,
+            ),
+            (
+                "target locator",
+                Spec {
+                    target: MOVED,
+                    ..spec_hw(9)
+                }
+                .build(),
+                3,
+                SuccessionFault::LocatorChanged,
+            ),
+            (
+                "reused publication id",
+                spec_hw(9).build(),
+                2,
+                SuccessionFault::PublicationIdReused,
+            ),
+            (
+                "falling high-water",
+                spec_hw(8).build(),
+                3,
+                SuccessionFault::HighWaterRegressed,
+            ),
+            (
+                "based to unbased",
+                unbased_spec().build(),
+                3,
+                SuccessionFault::BaseRegressed,
+            ),
+        ];
+
+        for (label, proposed, n, fault) in cases {
+            let signed = sign(&key, &proposed, 2, publication(n), link(&g1));
+            assert_eq!(link_fault(&g1, &signed), fault, "verify: {label}");
+            assert_eq!(
+                encode_successor_record(&g1, &proposed, publication(n), &key).unwrap_err(),
+                SuccessionEncodeError::Link(fault),
+                "encode: {label}"
+            );
+        }
+
+        // An equal or higher high-water is fine.
+        for high_water in [9, 10, 100] {
+            let next = successor_of(&g1, &spec_hw(high_water).build(), 3, &key);
+            assert_eq!(verify_succession(&g1, &next, &key), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_successor_must_not_be_a_genesis() {
+        let key = k1a();
+        let (g0, _) = chain();
+        let other_genesis = encode_genesis_record(&state_a(), publication(2), &key).unwrap();
+        assert_eq!(
+            link_fault(&g0, &other_genesis),
+            SuccessionFault::SuccessorIsGenesis
+        );
+        // A record is not its own successor.
+        assert_eq!(link_fault(&g0, &g0), SuccessionFault::SuccessorIsGenesis);
+    }
+
+    #[test]
+    fn the_generation_must_advance_by_exactly_one() {
+        let key = k1a();
+        let (_, g1) = chain();
+        let state = spec_hw(9).build();
+
+        for generation in [1, 3, 4, u64::MAX] {
+            let next = sign(&key, &state, generation, publication(3), link(&g1));
+            assert_eq!(
+                link_fault(&g1, &next),
+                SuccessionFault::GenerationNotConsecutive,
+                "{generation}"
+            );
+        }
+        // A successor claiming no predecessor at a positive generation never decodes.
+        let no_predecessor = sign(&key, &state, 2, publication(3), Predecessor::Genesis);
+        assert_eq!(
+            verify_succession(&g1, &no_predecessor, &key),
+            Err(SuccessionVerifyError::Successor(
+                SuccessionDecodeError::InvalidLink(SuccessionFault::GenerationGenesisMismatch)
+            ))
+        );
+        // g1 is not the successor of itself.
+        assert_eq!(
+            link_fault(&g1, &g1),
+            SuccessionFault::GenerationNotConsecutive
+        );
+    }
+
+    #[test]
+    fn the_generation_cannot_overflow_in_verify_or_encode() {
+        let key = k1a();
+        let state = spec_hw(9).build();
+        let at_max = sign(
+            &key,
+            &state,
+            u64::MAX,
+            publication(5),
+            Predecessor::Record(RecordDigest([7; 32])),
+        );
+
+        assert_eq!(
+            encode_successor_record(&at_max, &state, publication(6), &key).unwrap_err(),
+            SuccessionEncodeError::Link(SuccessionFault::GenerationOverflow)
+        );
+        let next = sign(&key, &state, u64::MAX, publication(6), link(&at_max));
+        assert_eq!(
+            link_fault(&at_max, &next),
+            SuccessionFault::GenerationOverflow
+        );
+
+        // One below the maximum still advances, exactly to the maximum.
+        let below = sign(
+            &key,
+            &state,
+            u64::MAX - 1,
+            publication(5),
+            Predecessor::Record(RecordDigest([7; 32])),
+        );
+        let top = successor_of(&below, &state, 6, &key);
+        assert_eq!(decode_a(&top).unwrap().generation(), u64::MAX);
+        assert_eq!(verify_succession(&below, &top, &key), Ok(()));
+    }
+
+    #[test]
+    fn the_successor_must_name_the_exact_predecessor_bytes() {
+        let key = k1a();
+        let (g0, g1) = chain();
+        let state = spec_hw(9).build();
+
+        // One byte of g1 altered (inside the authenticated body), the
+        // grandparent, an unrelated record, a zero digest and g1 with a
+        // trailing byte: none is the digest of g1.
+        let mut altered = g1.clone();
+        altered[position_of(&g1, b"LOCAL-MARKER")] ^= 0x01;
+        assert_ne!(altered, g1);
+        let unrelated = genesis_of(
+            &key,
+            &Spec {
+                local: MOVED,
+                ..spec(ID_A)
+            }
+            .build(),
+        );
+        let mut longer = g1.clone();
+        longer.push(b' ');
+        for (label, predecessor) in [
+            ("altered byte", link(&altered)),
+            ("grandparent", link(&g0)),
+            ("unrelated record", link(&unrelated)),
+            ("zero digest", Predecessor::Record(RecordDigest([0; 32]))),
+            ("trailing byte", link(&longer)),
+        ] {
+            let next = sign(&key, &state, 2, publication(3), predecessor);
+            assert_eq!(
+                link_fault(&g1, &next),
+                SuccessionFault::PredecessorDigestMismatch,
+                "{label}"
+            );
+        }
+
+        // The right digest links; an altered *supplied* predecessor does not
+        // even decode.
+        let good = successor_of(&g1, &state, 3, &key);
+        assert_eq!(verify_succession(&g1, &good, &key), Ok(()));
+        assert_eq!(
+            verify_succession(&altered, &good, &key),
+            Err(SuccessionVerifyError::Predecessor(
+                SuccessionDecodeError::AuthenticationFailed
+            ))
+        );
+        // And a predecessor with a trailing byte is not canonical.
+        assert_eq!(
+            verify_succession(&longer, &good, &key),
+            Err(SuccessionVerifyError::Predecessor(
+                SuccessionDecodeError::NonCanonical
+            ))
+        );
+    }
+
+    #[test]
+    fn verify_reports_the_first_failing_rule_in_the_documented_order() {
+        let key = k1a();
+        let (g0, g1) = chain();
+
+        // Binding before the genesis, generation, digest and publication rules.
+        let other_binding_genesis = sign(
+            &key,
+            &Spec {
+                binding: BINDING_2,
+                ..spec(ID_A)
+            }
+            .build(),
+            0,
+            publication(1),
+            Predecessor::Genesis,
+        );
+        assert_eq!(
+            link_fault(&g0, &other_binding_genesis),
+            SuccessionFault::BindingIdChanged
+        );
+
+        // Generation before digest before publication id before high-water.
+        let state = spec_hw(8).build();
+        let wrong_everything = sign(&key, &state, 7, publication(2), link(&g0));
+        assert_eq!(
+            link_fault(&g1, &wrong_everything),
+            SuccessionFault::GenerationNotConsecutive
+        );
+        let wrong_digest = sign(&key, &state, 2, publication(2), link(&g0));
+        assert_eq!(
+            link_fault(&g1, &wrong_digest),
+            SuccessionFault::PredecessorDigestMismatch
+        );
+        let reused = sign(&key, &state, 2, publication(2), link(&g1));
+        assert_eq!(
+            link_fault(&g1, &reused),
+            SuccessionFault::PublicationIdReused
+        );
+        let regressed = sign(&key, &state, 2, publication(3), link(&g1));
+        assert_eq!(
+            link_fault(&g1, &regressed),
+            SuccessionFault::HighWaterRegressed
+        );
+
+        // The predecessor is judged before the successor.
+        assert_eq!(
+            verify_succession(&[], &[], &key),
+            Err(SuccessionVerifyError::Predecessor(
+                SuccessionDecodeError::Malformed
+            ))
+        );
+        assert_eq!(
+            verify_succession(&g0, &[], &key),
+            Err(SuccessionVerifyError::Successor(
+                SuccessionDecodeError::Malformed
+            ))
+        );
+    }
+
+    // ---- K. Documented limitations (not protections) -------------------------------------
+
+    #[test]
+    fn documented_limitation_an_older_valid_chain_still_verifies_after_a_newer_one_exists() {
+        let key = k1a();
+        let (g0, g1) = chain();
+        let g2 = successor_of(&g1, &spec_hw(10).build(), 3, &key);
+        let g3 = successor_of(&g2, &spec_hw(11).build(), 4, &key);
+
+        // The whole chain verifies, and so does every older link, replayed
+        // after the newest record exists: nothing marks the old pair as stale.
+        assert_eq!(verify_succession(&g0, &g1, &key), Ok(()));
+        assert_eq!(verify_succession(&g1, &g2, &key), Ok(()));
+        assert_eq!(verify_succession(&g2, &g3, &key), Ok(()));
+        assert_eq!(decode_a(&g0).unwrap().generation(), 0);
+        assert_eq!(decode_a(&g3).unwrap().generation(), 3);
+        // A replayed older record decodes exactly as before.
+        assert_eq!(decode_a(&g1).unwrap().state(), &spec_hw(9).build());
+    }
+
+    #[test]
+    fn documented_limitation_two_successors_of_one_predecessor_both_verify() {
+        let key = k1a();
+        let (g0, _) = chain();
+
+        let left = successor_of(&g0, &spec_hw(9).build(), 2, &key);
+        let right = successor_of(&g0, &spec_hw(12).build(), 3, &key);
+
+        assert_ne!(left, right);
+        assert_eq!(verify_succession(&g0, &left, &key), Ok(()));
+        assert_eq!(verify_succession(&g0, &right, &key), Ok(()));
+        // Both are generation one: nothing here says which, if either, was
+        // ever published.
+        assert_eq!(decode_a(&left).unwrap().generation(), 1);
+        assert_eq!(decode_a(&right).unwrap().generation(), 1);
+        // And the two are not successors of each other.
+        assert_eq!(
+            link_fault(&left, &right),
+            SuccessionFault::GenerationNotConsecutive
+        );
+    }
+
+    #[test]
+    fn documented_limitation_a_key_holder_can_author_a_competing_authenticated_chain() {
+        let key = k1a();
+        let (_, g1) = chain();
+
+        let rival_genesis = encode_genesis_record(&state_a(), publication(9), &key).unwrap();
+        let rival_next = successor_of(&rival_genesis, &spec_hw(9).build(), 10, &key);
+
+        assert!(decode_a(&rival_genesis).unwrap().is_genesis());
+        assert_eq!(verify_succession(&rival_genesis, &rival_next, &key), Ok(()));
+        // The rival chain is as authentic as the original and the two are not
+        // linked to each other.
+        assert_ne!(rival_next, g1);
+        assert!(verify_succession(&g1, &rival_next, &key).is_err());
+    }
+
+    #[test]
+    fn documented_limitation_a_link_does_not_say_the_predecessor_was_ever_published() {
+        // Encoding is pure: it can sign a successor of a record that was never
+        // written anywhere. Nothing here can observe persistence.
+        let key = k1a();
+        let never_written = genesis_of(&key, &state_a());
+        let successor = successor_of(&never_written, &spec_hw(9).build(), 2, &key);
+        assert_eq!(verify_succession(&never_written, &successor, &key), Ok(()));
+    }
+
+    // ---- L. Accessors and redaction -------------------------------------------------------
+
+    #[test]
+    fn the_accessors_report_the_authenticated_fields() {
+        let (g0, g1) = chain();
+        let first = decode_a(&g0).unwrap();
+        let second = decode_a(&g1).unwrap();
+
+        assert!(first.is_genesis());
+        assert!(!second.is_genesis());
+        assert_eq!((first.generation(), second.generation()), (0, 1));
+        assert_eq!(first.publication_id(), publication(1));
+        assert_eq!(second.publication_id(), publication(2));
+        assert_eq!(first.state(), &state_a());
+        assert_eq!(second.state(), &spec_hw(9).build());
+        // The record's own digest is the digest of its exact bytes.
+        assert_eq!(first.digest, record_digest(&g0));
+        assert_eq!(second.predecessor, Predecessor::Record(first.digest));
+    }
+
+    #[test]
+    fn debug_and_display_of_every_new_type_and_error_leak_nothing() {
+        let record = decode_a(GOLDEN_SUCCESSOR.as_bytes()).unwrap();
+        let mut texts = vec![
+            format!("{record:?}"),
+            format!("{:?}", record.digest),
+            format!("{:?}", record.predecessor),
+            format!("{:?}", Predecessor::Genesis),
+        ];
+        assert_eq!(texts[0], "SuccessionRecord(<redacted>)");
+
+        let faults = [
+            SuccessionFault::NilPublicationId,
+            SuccessionFault::GenerationGenesisMismatch,
+            SuccessionFault::GenesisHasExchangeRecords,
+            SuccessionFault::GenesisInvalidBase,
+            SuccessionFault::GenesisHighWaterNotAtSynced,
+            SuccessionFault::BindingIdChanged,
+            SuccessionFault::VaultTagChanged,
+            SuccessionFault::LocatorChanged,
+            SuccessionFault::SuccessorIsGenesis,
+            SuccessionFault::GenerationNotConsecutive,
+            SuccessionFault::GenerationOverflow,
+            SuccessionFault::PredecessorDigestMismatch,
+            SuccessionFault::PublicationIdReused,
+            SuccessionFault::HighWaterRegressed,
+            SuccessionFault::BaseRegressed,
+        ];
+        let decode_errors = [
+            SuccessionDecodeError::TooLarge,
+            SuccessionDecodeError::Malformed,
+            SuccessionDecodeError::UnsupportedFormat,
+            SuccessionDecodeError::LegacyUnauthenticated,
+            SuccessionDecodeError::PredatesSuccession,
+            SuccessionDecodeError::UnsupportedVersion,
+            SuccessionDecodeError::NonCanonical,
+            SuccessionDecodeError::AuthenticationFailed,
+            SuccessionDecodeError::InvalidBody,
+            SuccessionDecodeError::InvalidState(SyncStateError::NilBindingId),
+            SuccessionDecodeError::InvalidLink(SuccessionFault::NilPublicationId),
+            SuccessionDecodeError::VaultMismatch,
+        ];
+        for fault in faults {
+            texts.push(format!("{fault} | {fault:?}"));
+            texts.push(format!(
+                "{0} | {0:?}",
+                SuccessionDecodeError::InvalidLink(fault)
+            ));
+            texts.push(format!("{0} | {0:?}", SuccessionEncodeError::Link(fault)));
+            texts.push(format!("{0} | {0:?}", SuccessionVerifyError::Link(fault)));
+        }
+        for error in decode_errors {
+            texts.push(format!("{error} | {error:?}"));
+            texts.push(format!(
+                "{0} | {0:?}",
+                SuccessionEncodeError::Predecessor(error)
+            ));
+            texts.push(format!(
+                "{0} | {0:?}",
+                SuccessionVerifyError::Predecessor(error)
+            ));
+            texts.push(format!(
+                "{0} | {0:?}",
+                SuccessionVerifyError::Successor(error)
+            ));
+        }
+        for error in [
+            SuccessionEncodeError::InvalidState(SyncStateError::NilBindingId),
+            SuccessionEncodeError::VaultMismatch,
+            SuccessionEncodeError::TooLarge,
+            SuccessionEncodeError::Serialization,
+            SuccessionEncodeError::Authentication,
+        ] {
+            texts.push(format!("{error} | {error:?}"));
+        }
+
+        let forbidden = [
+            "LOCAL-MARKER",
+            "TARGET-MARKER",
+            "11111111-2222-3333-4444-555555555555",
+            "c0c0c0c0",
+            "0123456789abcdef",
+            GOLDEN_GENESIS_DIGEST,
+            GOLDEN_GENESIS_MAC,
+            GOLDEN_SUCCESSOR_DIGEST,
+            GOLDEN_SUCCESSOR_MAC,
+            K_STATE_HEX,
+            "533cfabc",
+            "4bf5122f",
+        ];
+        for text in &texts {
+            for marker in forbidden {
+                assert!(!text.contains(marker), "{marker:?} in {text:?}");
+            }
+        }
+        assert_eq!(format!("{:?}", k1a()), "SyncStateMacKey(<redacted>)");
+    }
+
+    // ---- M. Source isolation ---------------------------------------------------------------
+
+    /// The new public symbols no other file may name.
+    const NEW_SYMBOLS: [&str; 9] = [
+        "SYNC_STATE_SUCCESSION_VERSION",
+        "SuccessionRecord",
+        "encode_genesis_record",
+        "encode_successor_record",
+        "verify_succession",
+        "SuccessionFault",
+        "SuccessionDecodeError",
+        "SuccessionEncodeError",
+        "SuccessionVerifyError",
+    ];
+
+    fn is_identifier_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// Whether `text` names `symbol` as a whole identifier.
+    fn names(text: &str, symbol: &str) -> bool {
+        text.match_indices(symbol).any(|(start, matched)| {
+            let before = text[..start].chars().next_back();
+            let after = text[start + matched.len()..].chars().next();
+            !before.is_some_and(is_identifier_char) && !after.is_some_and(is_identifier_char)
+        })
+    }
+
+    fn symbols_in(text: &str) -> Vec<&'static str> {
+        NEW_SYMBOLS
+            .iter()
+            .copied()
+            .filter(|symbol| names(text, symbol))
+            .collect()
+    }
+
+    #[test]
+    fn no_other_source_file_names_the_succession_api() {
+        fn scan(
+            dir: &std::path::Path,
+            own: &std::path::Path,
+            scanned: &mut usize,
+            hits: &mut Vec<String>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    scan(&path, own, scanned, hits);
+                } else if path.extension().is_some_and(|ext| ext == "rs") && path != own {
+                    *scanned += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    for symbol in symbols_in(&text) {
+                        hits.push(format!("{} names {symbol}", path.display()));
+                    }
+                }
+            }
+        }
+
+        let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = core.parent().unwrap().parent().unwrap();
+        let own = core.join("src").join("sync_state.rs");
+        assert!(own.is_file());
+
+        let mut hits = Vec::new();
+        for dir in [
+            core.join("src"),
+            workspace.join("src-tauri").join("src"),
+            workspace.join("src-tauri").join("tests"),
+            workspace
+                .join("crates")
+                .join("localvault-android-bridge")
+                .join("src"),
+        ] {
+            assert!(dir.is_dir(), "{} must exist", dir.display());
+            let mut scanned = 0;
+            scan(&dir, &own, &mut scanned, &mut hits);
+            assert!(scanned > 0, "{} held no source file", dir.display());
+        }
+        assert!(hits.is_empty(), "{hits:#?}");
+
+        // Negative self-check: every symbol is found as a whole identifier,
+        // longer or embedded identifiers are not, and the scan is not vacuous.
+        for symbol in NEW_SYMBOLS {
+            assert_eq!(symbols_in(&format!("use x::{symbol};")), [symbol]);
+            assert_eq!(symbols_in(&format!("{symbol}(")), [symbol]);
+            assert!(symbols_in(&format!("{symbol}2")).is_empty());
+            assert!(symbols_in(&format!("my_{symbol}")).is_empty());
+            assert!(symbols_in(&format!("{symbol}_x")).is_empty());
+        }
+        assert!(symbols_in("mod sync_state;").is_empty());
+        assert_eq!(
+            symbols_in("fn a() { verify_succession(); SuccessionFault::X }"),
+            ["verify_succession", "SuccessionFault"]
+        );
+    }
+
+    const FORBIDDEN_IN_PURE_CODE: [&str; 13] = [
+        "std::fs",
+        "std::io",
+        "std::env",
+        "std::time",
+        "std::thread",
+        "std::process",
+        "SystemTime",
+        "Instant",
+        "getrandom",
+        "rand::",
+        "unsafe",
+        "#[allow",
+        "println!",
+    ];
+
+    fn forbidden_in_pure_code(section: &str) -> Vec<&'static str> {
+        FORBIDDEN_IN_PURE_CODE
+            .iter()
+            .copied()
+            .filter(|forbidden| section.contains(forbidden))
+            .collect()
+    }
+
+    #[test]
+    fn the_succession_code_uses_no_io_clock_randomness_unsafe_or_lint_override() {
+        // The markers are assembled here so that this test does not find itself.
+        let begin = concat!("// SUCCESSION-CODEC-", "BEGIN (slice G2-P1)");
+        let end = concat!("// SUCCESSION-CODEC-", "END (slice G2-P1)");
+
+        let source = include_str!("sync_state.rs");
+        assert_eq!(source.matches(begin).count(), 1);
+        assert_eq!(source.matches(end).count(), 1);
+        let start = source.find(begin).unwrap();
+        let stop = source.find(end).unwrap();
+        assert!(start < stop);
+
+        let section = &source[start..stop];
+        // Not vacuous: the section is the codec.
+        assert!(section.len() > 8_000);
+        for needle in [
+            "pub fn verify_succession",
+            "pub fn encode_genesis_record",
+            "pub fn encode_successor_record",
+            "pub fn decode(",
+            "fn seal_succession",
+        ] {
+            assert!(section.contains(needle), "{needle:?} missing");
+        }
+
+        assert_eq!(
+            forbidden_in_pure_code(section),
+            Vec::<&str>::new(),
+            "the succession codec must stay pure"
+        );
+
+        // Negative self-check: every forbidden token is found.
+        for forbidden in FORBIDDEN_IN_PURE_CODE {
+            assert_eq!(
+                forbidden_in_pure_code(&format!("fn a() {{ {forbidden} }}")),
+                [forbidden]
+            );
+        }
+        assert!(forbidden_in_pure_code("fn a() { let x = 1; }").is_empty());
+    }
+
+    #[test]
+    fn the_new_code_stays_clear_of_the_exchange_transition_markers() {
+        // An existing source test locates its section with `source.find` on the
+        // first occurrence of two literal lines (and itself names them, so they
+        // occur more than once). The first occurrence of each must remain the
+        // real marker line, in order, and the new code must come after both.
+        let source = include_str!("sync_state.rs");
+        let begin = concat!("// Exchange transitions (Stage 1U-4, ", "slice B3c-2)");
+        let end = concat!("// End of the exchange transitions (", "slice B3c-2).");
+        let first_begin = source.find(begin).unwrap();
+        let first_end = source.find(end).unwrap();
+        assert!(source[..first_begin].ends_with('\n'));
+        assert!(source[..first_end].ends_with('\n'));
+        assert!(first_begin < first_end);
+
+        let codec = source
+            .find(concat!("// SUCCESSION-CODEC-", "BEGIN (slice G2-P1)"))
+            .unwrap();
+        assert!(first_end < codec);
     }
 }
