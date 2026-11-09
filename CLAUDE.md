@@ -4,16 +4,24 @@ Stable rules for working on LocalVault. This file intentionally does not contain
 
 ## Required reading by task type
 
-- Starting or resuming development in a new session: begin with `@docs/HANDOFF_1T_COMPLETE.md` (Android 1T closeout: current checkpoint, accepted features, residual limits, startup checklist), then `@docs/PROJECT_STATUS.md`
+- Starting or resuming development in a new session: begin with `@docs/HANDOFF_1U_PROGRESS.md` (current 1U sync-foundation handoff: baseline, reachability, formats, gates and decisions, next target, protected artifacts, new-conversation starter), then `@docs/PROJECT_STATUS.md`. For Android work also read `@docs/HANDOFF_1T_COMPLETE.md` (Android 1T closeout: accepted features, residual limits, startup checklist)
 - Starting any task: `@docs/PROJECT_STATUS.md` (current branch/HEAD, what's done, what's next)
 - Planning new work / sequencing stages: `@docs/ROADMAP.md`
 - Touching module boundaries, crate structure, or mobile/sync prep: `@docs/ARCHITECTURE.md`
-- Touching crypto, clipboard, lock behavior, TOTP, or anything secret-handling: `@docs/SECURITY_MODEL.md`
+- Touching crypto, clipboard, lock behavior, TOTP, or anything secret-handling: `@docs/SECURITY_MODEL.md` (also holds the sync-state format notes and the gate/decision registry)
+- Touching sync state, bindings, encrypted-copy creation, or anything under `src-tauri/src/vault/` that reads or mutates files: `@docs/HANDOFF_1U_PROGRESS.md`, `@docs/SECURITY_MODEL.md`, and the module header of the file you change
 - Historical only (not a starting point): `@docs/HANDOFF_1R_COMPLETE.md` (1R TOTP milestone), `@docs/HANDOFF_1S_COMPLETE.md` (1S core extraction), `@docs/HANDOFF_1T_PROGRESS.md` (B4-era Android narrative; superseded by the 1T closeout handoff)
 
 ## What LocalVault is
 
-A local-first encrypted password manager. Frontend: Tauri 2 + React + TypeScript. Backend/security core: Rust. Currently Windows desktop only; Android and encrypted multi-device synchronization are planned (see ROADMAP.md). The existing `v1.0.0` Windows release (`D:\LocalVault_Release\LocalVault.exe`, tag `v1.0.0`, commit `04b6220`) must never be overwritten or rewritten by redesign work.
+A local-first encrypted password manager. Frontend: Tauri 2 + React + TypeScript. Backend/security core: Rust. Windows desktop is the primary client; an Android client exists as an engineering milestone (1T, debug-signed, not a production release). **Synchronization is not implemented** (stage 1U is in progress; see ROADMAP.md and the 1U handoff). The existing `v1.0.0` Windows release (tag `v1.0.0`, commit `04b6220`; protected executables listed below; the older documented path `D:\LocalVault_Release` does not exist and must not be created) must never be overwritten or rewritten by redesign work.
+
+## Protected artifacts and test environment
+
+- Never overwrite `%USERPROFILE%\Desktop\LocalVault.exe` or `src-tauri\target\release\LocalVault.exe` (both SHA256 `A5707B9901607BD61D7881734478D5D5A2FB3D9CE965D41B7D9863ABF256C481`). Do not run `cargo build --release` or `tauri build` unless a separate, explicitly approved release task requires it.
+- Never modify the Android QA master `.qa-local\LocalVault-Android-Smoke-300.lvault`, the preserved B1/B2/B3 synthetic fixtures, or the preserved acceptance evidence under `%LOCALAPPDATA%\LocalVault-G12-Reset-Acceptance`. Hashes and the full list: `@docs/HANDOFF_1U_PROGRESS.md` section 14.
+- Synthetic test scratch goes under `.qa-local` (git-ignored), never `%TEMP%`. Never touch real user vault data in synthetic tests; never terminate the user's running debug app without approval.
+- Dormant and test-only sync components (v2/v3/v4 sync-state codecs, exchange experiments, legacy record exchange and layout classifier) must not be wired into production or described as available. No production v3/v4 writer without an approved decision.
 
 ## Non-negotiable security rules
 

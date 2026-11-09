@@ -12,7 +12,8 @@ Current module layout:
 
 ```
 crates/localvault-core/src/
-  crypto/                              # cipher, kdf, keys — intentionally private (mod, not pub mod);
+  crypto/                              # cipher, kdf, keys, state_mac (HKDF/HMAC for dormant sync-state v3/v4 records)
+                                        # — intentionally private (mod, not pub mod);
                                         # only narrow types it must expose flow out through vault::format
   vault/
     data.rs                            # persisted VaultData/VaultEntry/VaultCategory/SiteIcon,
@@ -21,7 +22,8 @@ crates/localvault-core/src/
     format.rs                          # VaultEnvelope: authenticated create/open/reseal/rewrap
   sync.rs                              # pure envelope-fingerprint + sync-state classifier (1U-1) and authenticated
                                         # remote/local inspection bound to raw envelope bytes (1U-3); no I/O
-  sync_state.rs                        # device-local sync-state model, codec and pure transitions (1U-4 A1/A2b); no I/O
+  sync_state.rs                        # device-local sync-state model, codecs v1-v4 and pure transitions
+                                        # (1U-4 A1/A2b; dormant v2/v3 B3c, dormant v4 G2-P1); no I/O
   site.rs                              # derived, non-persisted site_key(url) -> Option<String> (Android grouping)
   totp.rs                              # RFC 6238 parser + generator (bare Base32 / otpauth:// URI,
                                         # SHA1/SHA256/SHA512, caller-supplied time, no system clock)
@@ -39,7 +41,11 @@ src-tauri/src/
                                        # plus the Windows sync adapters (1U-4): sync_state_store.rs,
                                        # sync_file_adapter.rs, file_identity.rs, and for B2 new_copy_file.rs,
                                        # handle_ops.rs, session/copy_creation.rs (see "Sync binding architecture"
-                                       # and "Encrypted-copy creation architecture")
+                                       # and "Encrypted-copy creation architecture"); held_removal.rs (handle-bound
+                                       # reset); dormant B3 modules target_exchange.rs, session/target_update.rs,
+                                       # session/exchange_recovery.rs, session/authenticated_state.rs; and the
+                                       # test-only legacy_record_exchange.rs / legacy_layout_assessment.rs (see
+                                       # "Sync-state formats and dormant exchange components")
   password_generator.rs
   recent_vaults.rs
   secure_clipboard.rs                 # Windows clipboard integration
@@ -56,7 +62,7 @@ android/                               # native Kotlin app (1T-B1b onward) — n
 ```
 
 Key dependencies:
-- `crates/localvault-core/Cargo.toml`: `argon2` (KDF), `chacha20poly1305` (AEAD), `data-encoding`/`hmac`/`sha1`/`sha2` (TOTP), `url` (TOTP-URI query decoding via `form_urlencoded` only — not networking), `base64`, `serde`, `thiserror`, `uuid`, `zeroize`. No `tauri`, no async runtime, no networking client.
+- `crates/localvault-core/Cargo.toml`: `argon2` (KDF), `chacha20poly1305` (AEAD), `data-encoding`/`hmac`/`sha1`/`sha2` (TOTP; `hmac`/`sha2` also serve the dormant sync-state MAC), `hkdf` (`=0.12.4`, added in B3c-2a `691d3f9` for the dormant sync-state MAC key derivation only), `url` (TOTP-URI query decoding via `form_urlencoded` only — not networking), `base64`, `serde`, `thiserror`, `uuid`, `zeroize`. No `tauri`, no async runtime, no networking client.
 - `src-tauri/Cargo.toml`: `tauri`/`tauri-plugin-dialog` (desktop shell), `localvault-core` (path dependency), `zeroize`, `atomic-write-file`, `reqwest`+`tokio`+`url`+`scraper`+`image` (favicon fetch only), `clipboard-win` (Windows-only, `cfg(windows)` gated). `argon2`/`chacha20poly1305`/`data-encoding`/`hmac`/`sha1`/`sha2` were removed from `src-tauri` once their only production/test use moved into `localvault-core`.
 
 `app_state/`, `commands/`, `vault/session.rs`, `vault/storage.rs`, `vault/backup.rs`, `vault/lifecycle.rs`, `password_generator.rs`, and `secure_clipboard.rs` remain in `src-tauri` — session orchestration, filesystem/backup I/O, clipboard, and Tauri command glue have not been extracted, and (aside from TOTP's config/error types) neither has password health or the password generator. See "What still remains outside core" below for the accurate, current boundary.
@@ -127,6 +133,29 @@ Components:
 **Destination policy.** B2 creation accepts only a local NTFS destination (stricter than the B1g binding identity policy, which also recognizes ReFS and is unchanged). The source session must have no unsaved changes, be schema 3 (a legacy vault is refused) and have a confirmed `NotConfigured` sync state.
 
 A pre-extraction compatibility safety net (1S-B1, `bcdb1ad`; `src-tauri/tests/compat_baseline.rs` plus committed schema-1/schema-2 fixtures) exercises real persisted-format compatibility — including the v1→v2 upgrade-on-write path and the fixed-time TOTP vector — through every extraction step. `src-tauri/tests/data_storage_integration.rs` separately covers the encrypted-storage round trip for the persisted data model against desktop storage.
+
+## Sync-state formats and dormant exchange components (Stage 1U-4 B3, G12, G2-P1)
+
+Source authority: `crates/localvault-core/src/sync_state.rs`, `crypto/state_mac.rs`, `src-tauri/src/vault/{sync_state_store,held_removal,target_exchange,legacy_record_exchange,legacy_layout_assessment}.rs`, `src-tauri/src/vault/session/{target_update,exchange_recovery,authenticated_state}.rs`, `vault/mod.rs`. Security semantics: `@docs/SECURITY_MODEL.md`. Resumption summary: `@docs/HANDOFF_1U_PROGRESS.md`.
+
+**Record versions** (format string `localvault-sync-state`, JSON wrapper, at most 65,536 bytes):
+
+| Version | Wrapper fields | Integrity | Who can read or write it |
+|---|---|---|---|
+| 1 | `format, version, body_sha256, body` | checksum, not a MAC | the production store (`SyncStateStore`) only |
+| 2 | same wrapper; body adds `exchange`, `retained_previous` | checksum | dormant core codec; the store reports it as unsupported |
+| 3 | `format, version, body, mac` | HMAC-SHA256, key = HKDF-SHA256(Vault Key) | dormant core codec and read-only loader/diagnostic; no writer |
+| 4 | v3 wrapper; body adds `succession {generation, publication_id, predecessor}` | HMAC-SHA256 as v3 | dormant pure core API; no store support, no caller |
+
+**Production vs dormant vs test-only (module level):**
+
+- *Production-reachable:* `sync_state_store.rs` (v1 `load`, `create`, handle-bound `delete`, evidence, refuse-only legacy gate), `held_removal.rs` (handle-bound removal used by reset), `sync_file_adapter.rs` (read-only), `file_identity.rs`, `new_copy_file.rs`/`handle_ops.rs`/`session/copy_creation.rs` (B2). Exposed only through the ten registered commands.
+- *Dormant, compiled into normal builds, no command or UI caller:* `target_exchange.rs` (B3b-1 experiment), `session/target_update.rs` (B3a read-only readiness diagnostic), `session/exchange_recovery.rs` (B3b-2a read-only classifier), `session/authenticated_state.rs` (B3c-3a/3b-1 v3 loader and diagnostic), and in core the v2/v3 codecs, the exchange transitions and the v4 succession API.
+- *Test-only (`cfg(test)` or `cfg(all(test, windows))`; absent from normal and release builds):* the legacy `SyncStateStore::replace` and the wrappers that reached it (Stage 1U-4 D4), `legacy_record_exchange.rs` (G12R-1) and `legacy_layout_assessment.rs` (G12R-R1).
+
+**Boundary rules these modules keep:** core computes proposals and verdicts and performs no I/O, reads no clock and generates no randomness; the Windows layer supplies identity, handles and persistence; nothing in the dormant or test-only set creates an approval, consent or recovery-authority type. A passing assessment is a diagnostic snapshot, never permission. Promoting a dormant or test-only component to a reachable flow requires its own approved slice and decision (see the registry in `@docs/SECURITY_MODEL.md`).
+
+**Known production-reachable weakness (G12-temp, open):** `SyncStateStore::create` and `write_temp` still remove their own staging file by pathname (details in `@docs/SECURITY_MODEL.md`). The handle-bound pattern already used for reset (`held_removal.rs`) is the existing reference for the fix; no change is made here.
 
 ## What still remains outside core (not yet extracted, and not all destined for core)
 
@@ -234,4 +263,4 @@ Full toolchain pins (Rust/NDK/AGP/Gradle/Kotlin/UniFFI/JNA versions), the storag
 
 ## Future sync abstraction
 
-Sync (1U/1V) is a provider-abstracted transport for **encrypted** vault state only — see `@docs/SECURITY_MODEL.md` for what must never leave the device unencrypted. The sync layer needs, at minimum, before implementation: stable vault identity, revision/version semantics, device identity where required, conflict detection, atomic update rules, offline-first behavior, a recovery strategy, backup interaction, and migration/version compatibility. Of these, the revision semantics, a device-local binding state and authenticated inspection exist (1U-2 … 1U-4 B1i), with user-reachable existing-copy binding (B1j) and separate encrypted-copy creation (B2); the rest, including safe update of an already bound target, is open. This design work belongs in the core (sync metadata, merge/conflict semantics) with the actual transport (WebDAV, cloud-storage provider, OS-synced folder, etc.) implemented as a swappable adapter — not hard-coded into the core.
+Sync (1U/1V) is a provider-abstracted transport for **encrypted** vault state only — see `@docs/SECURITY_MODEL.md` for what must never leave the device unencrypted. The sync layer needs, at minimum, before implementation: stable vault identity, revision/version semantics, device identity where required, conflict detection, atomic update rules, offline-first behavior, a recovery strategy, backup interaction, and migration/version compatibility. Of these, the revision semantics, a device-local binding state and authenticated inspection exist (1U-2 … 1U-4 B1i), with user-reachable existing-copy binding (B1j) and separate encrypted-copy creation (B2); dormant, unreachable experiments and codecs for authenticated state, succession and exchange exist (B3, G2-P1; see "Sync-state formats and dormant exchange components"); the rest, including safe update of an already bound target, is open. This design work belongs in the core (sync metadata, merge/conflict semantics) with the actual transport (WebDAV, cloud-storage provider, OS-synced folder, etc.) implemented as a swappable adapter — not hard-coded into the core.

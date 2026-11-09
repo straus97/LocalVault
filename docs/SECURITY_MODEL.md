@@ -109,14 +109,14 @@ Through B1i this was dormant internal code. Since B1j-2 the initial-binding, sta
 - **Driver trust.** Filesystem name and device characteristics come from the driver stack and are not independently verified.
 - **No real sync.** No transport, provider authority, publication, push, pull, adoption, merge or automatic synchronization exists. Binding, status and local reset are user-facing (B1j); none of the others is.
 - **Existing B1j reset limitations carry over unchanged:** reset removes only the local record (the vault, backups, the encrypted files and the remote target are untouched and not proven absent), is guarded by evidence that is itself a narrowed read-then-act sequence, and an ambiguous removal is reported as ambiguous rather than retried.
-- **G12-reset: handle-bound in code (B3c-3b-2d-1); manual acceptance on the `C:` application-data volume is still pending, so the gate is not closed.** Earlier builds resolved the primary by its path at removal; a primary put in place after the final evidence comparison was removed and the reset still reported success. Reset now removes only files held and byte-verified through the same handle (see "Reset removes through held handles"). What this does **not** give, stated plainly:
+- **G12-reset: CLOSED within its documented supported threat model (local Windows NTFS, ordinary processes).** Handle-bound code `24fc685` (B3c-3b-2d-1), session-level hard-link refusal tests `61decb7`, and the `C:` application-data-volume synthetic acceptance: 136 tests passed in six groups, 0 failed, 0 ignored (run at `24fc685`; evidence archive described in `@docs/HANDOFF_1U_PROGRESS.md` section 14, summary read during 1U-DOCSYNC). Closed does not mean unconditional: the limits below stand, and this gate covers **reset only**. Earlier builds resolved the primary by its path at removal; a primary put in place after the final evidence comparison was removed and the reset still reported success. Reset now removes only files held and byte-verified through the same handle (see "Reset removes through held handles"). What this does **not** give, stated plainly:
   - Sharing modes bind ordinary processes only. Administrators, backup-privileged processes, kernel components and filesystem filter drivers can bypass them; writable mapped views created before the hold are not addressed; the filesystem name and the file facts come from the driver stack and are trusted.
   - Removing a name is not erasing a file. A hard link created in the single call gap between the last facts check and the mark is not prevented; the other name keeps the file, the mark is then not proven, and the result is ambiguous, never a verified reset. Measured: the **second** name of a file held through one name is not protected from a rename or an unlink by another process, so the alias remnant's record name is reopened and re-verified (identity, one name, exact bytes) after its `.tmp` goes, and any mismatch is a partial removal that preserves what is there.
   - Multi-file removal is not atomic and not power-loss durable. A partial result is `Ambiguous`, is never reported as a reset and is never retried.
   - The hold, the pin and the post-pin checks open by path (no handle-relative open exists here): a redirection that wins before them is narrowed, not eliminated.
-  - Behaviour was measured on Windows 10 build 19045 on the `D:` NTFS volume only. ReFS, SMB, FAT, 8.3 aliases, case-sensitive directories, process kill and power loss were not exercised.
+  - Behaviour was measured on Windows 10 build 19045 on the `D:` NTFS volume, and the reset-path suites were additionally run on the `C:` application-data volume (acceptance run; the file-symlink subcases could not run because the test account cannot create file symlinks, so only the junction and directory subcases ran). ReFS, SMB, FAT, 8.3 aliases, case-sensitive directories, process kill and power loss were not exercised.
 - **G12-replace: closed for normal and release builds by exclusion, not by a fix (Stage 1U-4 D4).** The legacy replacement still has its check-then-rename race and a unit test still pins the foreign overwrite as unsafe behaviour, but `SyncStateStore::replace`, its helpers, and every wrapper that reached it (the high-water observation in the session and in `AppState`) now compile only in unit-test builds, so a new production call site does not compile. As a result, no normal or release build contains a sync-state record replacement, and none can persist a raised high-water mark through this path. This removes authority; it does not provide a safe replacement and it does not repair the legacy algorithm. The race stays reproduced by unit tests. That no writer is compiled in is not evidence of crash or power-loss durability. The handle-bound G12R-1 experiment stays test-only, and any future writer needs its own decision and slice.
-- **G12-temp (OPEN).** `create` and its staging helper `write_temp` still remove their own temp file by path, and both are reachable through initial binding. G12 as a whole and G2 remain open. D4 gives no replay protection, power-loss durability, crash-safe publication, freshness guarantee or recovery authorization, and this build enables no production publication of authenticated version-3 or version-4 state.
+- **G12-temp (OPEN; the next development target).** `create` and its staging helper `write_temp` still remove their own temp file by path, and both are reachable through initial binding (verified in source at the 1U-DOCSYNC baseline: `fs::remove_file(&temp)` after the hard-link publication in `create`, and `fs::remove_file(&path)` on a failed write in `write_temp`). A file object that was verified earlier is not the same thing as a pathname that is used later for a mutation: another process able to write the sync-state directory can put a foreign object under that pathname in between, and the path-based removal would then delete it. G12 as a whole and G2 remain open. D4 gives no replay protection, power-loss durability, crash-safe publication, freshness guarantee or recovery authorization, and this build enables no production publication of authenticated version-3 or version-4 state.
 - **The gate is check-then-use, not a lock and not compare-and-swap.** It reports what was observed at one instant. A file added right after the check, a change that is undone between its two passes, and evidence that was moved or deleted so that it no longer carries the record's key are not detected. A `.retired` file that appears late is not prevented; at best the fresh load that follows a binding or a reset now refuses and the outcome is reported as unverified or ambiguous.
 - **A partial version-3 `.tmp` is not identified by content.** The codec parses its whole input before reading a version, so an empty or cut-short record of a newer version is byte-for-byte indistinguishable from a legacy remnant and stays resettable. This is defence in depth only, and the reason the `.v3stage` name is reserved. No code in this build creates a `.v3stage` file, no writer of authenticated version-3 state exists, no bound `.lvault` replacement exists, and there is no automatic recovery or legacy migration.
 - **Older binaries are not gated.** A build from before this gate ignores `.retired` and `.v3stage` files, can still bind a new version-1 record beside them, and can reset a `.tmp`.
@@ -151,6 +151,73 @@ Structure: `@docs/ARCHITECTURE.md`, "Encrypted-copy creation architecture". B2 w
 - **Restricted to local NTFS.** Other filesystems (ReFS, FAT/exFAT, SMB/network redirectors, removable or virtual volumes) are refused for creation. Their refusal was not manually tested on those volumes.
 - **No remote-provider authority.** A path in a synchronized folder is not evidence that a provider received, accepted or holds the file, or that it is current.
 - **No conflict resolution, push or pull.** B2 neither detects nor resolves divergence and transmits nothing.
+
+## Sync-state record formats v1-v4 (Stage 1U-4; Windows store plus dormant core codecs)
+
+Authority: `crates/localvault-core/src/sync_state.rs`, `crypto/state_mac.rs`, `src-tauri/src/vault/sync_state_store.rs`. Wire shape and reachability are tabulated in `@docs/ARCHITECTURE.md` ("Sync-state formats and dormant exchange components"); this section records what each version does and does not establish.
+
+- **Version 1 (the only version the production store reads or writes).** Unauthenticated. Its SHA-256 body checksum detects accidental corruption only and is not a MAC; any process able to rewrite local application data can forge, alter or roll back a record. Its contents are never promoted to trusted history.
+- **Version 2 (dormant, unauthenticated).** An exchange-record codec in core with no caller. It carries a checksum, not a MAC. The store and `SyncState::decode` report it as an unsupported version; nothing loads or writes it.
+- **Version 3 (dormant, authenticated).** HMAC-SHA256 under a key derived from the Vault Key by HKDF-SHA256, covering the format, the version, the authenticated vault id (supplied by the caller, never read from the record) and the body; verified before the body is parsed. No production writer. Read-only loading and layout-diagnostic code exists and has no command caller.
+- **Version 4 (dormant, authenticated succession).** The version-3 wrapper plus a required `succession` object: `generation`, `publication_id`, and a predecessor that is a genesis marker or a domain-separated SHA-256 of the exact bytes of the predecessor record. Pure core API (G2-P1, `a962da3`); no caller anywhere; no store support. Versions 1-3 are never a v4 predecessor or successor.
+- **What authentication and authenticated succession do NOT establish:** freshness; non-rollback (an older chain or a whole older directory still verifies); completed publication (a record cannot attest its own publication); user consent; physical durability; recovery authority. A locally stored generation counter is not an independent anti-rollback anchor: if all relevant local state can be replayed together, a consistent older state verifies. Two valid successors may name the same predecessor, and nothing says which, if either, was published. Anyone holding the Vault Key can forge a record, including a competing chain, and the Vault Key is not rotated.
+- **No production v3 or v4 writer is enabled**, and the reserved `<key>.<32 hex>.v3stage` name is never created by this build.
+
+## Production gates and open decisions (registry, as of the 1U-DOCSYNC baseline `4dd1ba6`)
+
+Evidence classes: **SOURCE** (checked in code), **GIT** (checked in history), **REPORTED** (stated in the task or by an implementing session; not independently verified here), **UNRESOLVED** (no evidence in the repository). The summary used by a new assistant is `@docs/HANDOFF_1U_PROGRESS.md` section 11.
+
+| Gate / slice | State | Evidence |
+|---|---|---|
+| G12-reset | CLOSED within the supported local Windows NTFS threat model (reset only) | GIT `24fc685`, `61decb7`; REPORTED C: acceptance (136/136, archive summary read) |
+| G12R-1 | CLOSED as a **test-only** held-handle legacy record exchange experiment (`cfg(all(test, windows))`); authorizes nothing | GIT `ee87f0a`; SOURCE |
+| G12R-R1 | CLOSED as a **test-only** read-only interrupted-layout classifier; authorizes nothing | GIT `f592e61`; SOURCE |
+| G12R-R2 | NO-GO: unauthenticated legacy v1 candidates must not become historical trusted records without independent trusted evidence | REPORTED (analysis decision; no commit) |
+| G2-P1 | CLOSED: dormant authenticated v4 succession codec | GIT `a962da3`; SOURCE |
+| G2 overall | OPEN (freshness, publication, recovery, migration and consent are not resolved) | SOURCE |
+| D4 | CLOSED by compile-time exclusion of the legacy replacement; the algorithm is not repaired | GIT `4dd1ba6`; SOURCE |
+| G12-replace | closed for normal and release builds by exclusion, not by a fix | SOURCE |
+| G12-temp | OPEN (see above) | SOURCE |
+| G12 overall | OPEN | SOURCE |
+| G-AUTH | unresolved (cited in `session/exchange_recovery.rs`; v1 records are unauthenticated) | SOURCE |
+| G1, G3-G11, G13 | NOT CLOSED. Not defined in the repository; descriptions below are REPORTED / HISTORICAL design labels | see "Historical design gate labels" |
+
+| Decision | State | Evidence |
+|---|---|---|
+| D1 separate v4 format | approved; implemented dormant as G2-P1 | REPORTED + GIT |
+| D2 / D3 freshness and rollback policy | OPEN | REPORTED |
+| D4 legacy v1 replacement | retired from normal/release builds | GIT + SOURCE |
+| D5 legacy migration | OPEN; no migration exists | REPORTED |
+| D6 retention policy | OPEN; `MAX_RETAINED_PREVIOUS = 8` is a technical bound only | SOURCE |
+| D7 older-client handling | OPEN; older binaries are not gated | REPORTED + SOURCE |
+| D8 recovery mutation | OPEN; no recovery authority exists | REPORTED |
+| D9 production publication | OPEN; nothing publishes authenticated state | REPORTED |
+
+Naming note: the repository defines no D1-D9 list. The identifiers come from the design review that preceded the documentation sync. In source, `D4` is also a slice name (Stage 1U-4 D4), and decisions inside slice B3c-3b-2a use a separate `U2`/`U9` family (unrecognized key-prefixed entries refuse; the `.v3stage` name is reserved). No open item above is approved by documentation.
+
+**Historical design gate labels (REPORTED / HISTORICAL; not a verified canonical registry).** These are the working gate descriptions retained from the earlier architecture reviews, supplied to 1U-DOCSYNC. The repository itself defines none of them (only G2, G12, G-AUTH and the slice names G2-P1, G12R-1, G12R-R1 appear in code or docs), so they are recorded as labels and are **not** source-confirmed requirements. No gate is marked closed because related tests, experiments or dormant code exist; "related repository evidence" below describes what exists and closes nothing.
+
+| Label | Historical description | State | Related repository evidence (closes nothing) |
+|---|---|---|---|
+| G1 | Physical sync-state publication strategy and no-clobber protocol | NOT CLOSED | v1 `create` publishes by no-clobber hard link; `.v3stage` name reserved; no authenticated publication exists |
+| G2 | Authentication, trust and legacy/new-format interoperability | **OPEN** (G2-P1 codec done, dormant) | v3/v4 codecs; legacy v1 stays unauthenticated; no interoperability or migration policy |
+| G3 | Retention of previous versions | NOT CLOSED (policy D6 open) | `MAX_RETAINED_PREVIOUS = 8` is a technical bound only |
+| G4 | User-approved authenticated creation or re-establishment | NOT CLOSED | none for authenticated state; only v1 binding approval exists |
+| G5 | Physical trusted-anchor policy | NOT CLOSED | `ObjectAnchor` values are opaque observations, not a policy |
+| G6 | Actual state-volume and NTFS requirements | NOT CLOSED for production publication | the `C:` synthetic acceptance covers the **reset** path only; it does not close G6 |
+| G7 | Fault injection, cross-process and interruption testing | NOT CLOSED | experiments and tests exist for reset and test-only exchange; process kill and power loss not exercised |
+| G8 | Security documentation | NOT CLOSED (ongoing) | this file; updating it does not close the gate |
+| G9 | Missing-primary recovery | NOT CLOSED (D8 open) | read-only classifiers only; no recovery authority |
+| G10 | Historical lineage and authenticated succession | NOT CLOSED | v4 succession codec (dormant); replay, freshness and publication unresolved |
+| G11 | Older-client compatibility | NOT CLOSED (D7 open) | older binaries are not gated |
+| G12 | Foreign-file race and mutation safety (reset, replace, temporary files) | **OPEN** | G12-reset CLOSED; G12-replace closed by D4 exclusion; **G12-temp OPEN** |
+| G13 | Staging namespace and artifact reservation | NOT CLOSED | `.v3stage` name reserved (U9), never created by this build |
+
+`G-AUTH` (cited in source) is not among the thirteen labels; whether it corresponds to G2 is unknown.
+
+**Historical decisions (REPORTED / HISTORICAL; no decision date or approval record is invented).** The repository holds no canonical decision record. Meanings are as supplied from the design reviews: D1 new authenticated sync-state format v4, approved, G2-P1 done; D2/D3 freshness and rollback policy, open (their exact individual meanings could not be verified in the repository, so they are kept together and not separated); D4 legacy v1 replace retirement, approved and implemented (`4dd1ba6`); D5 legacy migration, open; D6 retention policy, open; D7 older-client policy, open; D8 recovery mutation, open; D9 production publication, open.
+
+**Executables are not rebuilt.** The protected Desktop and release-target `LocalVault.exe` files (SHA256 `A5707B99…C481`) were **not** rebuilt, so they are the preserved `v1.0.0` build and do **not** contain D4, the v4 codec or any other post-`v1.0.0` change. The D4 "excluded from normal and release builds" statement describes the current source and its build configuration (`cfg(test)`), verified in source only; it is not a claim about any existing executable. The current development build and the preserved release executable are different artifacts.
 
 ## Known threat-model limitations
 
