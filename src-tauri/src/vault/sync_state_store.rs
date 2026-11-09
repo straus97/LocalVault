@@ -12859,3 +12859,1164 @@ mod legacy_gate_isolation_tests {
 }
 
 // ---- B3c-3b-2a isolation tests (end) -----------------------------------------
+
+#[cfg(all(test, windows))]
+mod g12_temp_characterization_tests {
+    // KNOWN VULNERABILITY (G12-temp): the C-tests pin unsafe current behaviour of
+    // SyncStateStore::create. They document it, they do not approve it. A later slice
+    // inverts them. The N-tests measure native facts of a held staging handle; they do
+    // not add any production operation. All bytes are synthetic. Sharing modes bind
+    // ordinary processes only.
+    //
+    // Every test is REAL NTFS under the git-ignored `.qa-local` scratch (the shared
+    // `Scratch` refuses `%TEMP%`). Results marked `OBSERVED` are printed with
+    // `eprintln!`; run with `--nocapture` to read them. A measured result is valid for
+    // the tested Windows / local NTFS configuration only and is not generalized.
+
+    use std::{
+        ffi::OsStr,
+        fs::{self, File, OpenOptions},
+        io::{self, Read, Write},
+        os::windows::fs::OpenOptionsExt,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{Arc, Barrier, Mutex},
+    };
+
+    use super::b3c3b1_support::{loc, names, state, Scratch, LOCAL, OTHER_LOCAL, TOKEN};
+    use super::b3c3b2a_support::{child_put_fails, v1_bytes};
+    use super::*;
+    use crate::vault::{
+        file_identity::{facts_of, FileIdentity},
+        handle_ops::{
+            delete_by_handle, rename_into_directory_no_replace, take_last_rename_status,
+            test_support::{make_junction, snapshot},
+            DefiniteRefusal, RenameStatus,
+        },
+        new_copy_file::open_directory_pin,
+        session::create_error_may_follow_publication,
+    };
+
+    const FOREIGN: &[u8] = b"SYNTHETIC-FOREIGN-BYTES-NOT-A-REAL-RECORD";
+    const COMPETITOR: &[u8] = b"SYNTHETIC-COMPETITOR-RECORD-BYTES";
+    const THIRD_LOCAL: &str = r"\\?\C:\Synthetic\Vaults\THIRD-MARKER.lvault";
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+
+    // ---- helpers ----------------------------------------------------------------
+
+    fn fail_at(store: &SyncStateStore, point: Point, kind: io::ErrorKind) {
+        store
+            .faults
+            .lock()
+            .unwrap()
+            .push((point, Action::Fail(kind)));
+    }
+
+    fn run_at(store: &SyncStateStore, point: Point, run: impl Fn() + Send + 'static) {
+        store
+            .faults
+            .lock()
+            .unwrap()
+            .push((point, Action::Run(Box::new(run))));
+    }
+
+    /// The single entry of `dir` that is a staging artifact of `key`; panics unless
+    /// there is exactly one.
+    fn the_temp(dir: &Path, key: &str) -> PathBuf {
+        let found: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| is_artifact_name(name, key))
+            })
+            .map(|entry| entry.path())
+            .collect();
+
+        assert_eq!(found.len(), 1, "exactly one staging temp was expected");
+
+        found.into_iter().next().unwrap()
+    }
+
+    fn record_leaf() -> String {
+        format!("{}.json", record_key(&loc(LOCAL)))
+    }
+
+    fn file_name_of(path: &Path) -> String {
+        path.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    fn sorted(mut list: Vec<String>) -> Vec<String> {
+        list.sort();
+
+        list
+    }
+
+    fn identity_of(path: &Path) -> FileIdentity {
+        facts_of(&File::open(path).unwrap()).unwrap().identity()
+    }
+
+    /// The snapshot lines of `dir` that mention any of `needles`.
+    fn lines_with(dir: &Path, needles: &[&str]) -> Vec<String> {
+        snapshot(dir)
+            .into_iter()
+            .filter(|line| needles.iter().any(|needle| line.contains(needle)))
+            .collect()
+    }
+
+    fn describe<T>(result: &io::Result<T>) -> String {
+        match result {
+            Ok(_) => "ok".to_owned(),
+            Err(error) => format!("err kind={:?} os={:?}", error.kind(), error.raw_os_error()),
+        }
+    }
+
+    /// A pinned state directory and a staging file held the way the planned fix would
+    /// hold it: `create_new`, read + write + delete access, read-only sharing, bytes
+    /// written, flushed and synced. Returns `(pin, staging, path)`.
+    fn held_staging_with(scratch: &Scratch, token: &str, bytes: &[u8]) -> (File, File, PathBuf) {
+        fs::create_dir_all(scratch.state_dir()).unwrap();
+
+        let pin = open_directory_pin(&scratch.state_dir()).unwrap();
+        let path = scratch.staging(LOCAL, token);
+        let mut staging = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ)
+            .open(&path)
+            .unwrap();
+
+        staging.write_all(bytes).unwrap();
+        staging.flush().unwrap();
+        staging.sync_all().unwrap();
+
+        (pin, staging, path)
+    }
+
+    fn held_staging(scratch: &Scratch, bytes: &[u8]) -> (File, File, PathBuf) {
+        held_staging_with(scratch, TOKEN, bytes)
+    }
+
+    // ---- C: characterization of the CURRENT, path-based `create` ---------------------
+
+    #[test]
+    fn known_race_write_failure_cleanup_deletes_a_foreign_file_at_the_temp_name() {
+        // KNOWN VULNERABILITY V1/V3. The open temp may be renamed away; the failed-write
+        // cleanup then deletes by NAME whatever holds that name.
+        let scratch = Scratch::new("g12t-c1");
+        let store = scratch.store();
+        let dir = scratch.state_dir();
+        let key = record_key(&loc(LOCAL));
+        let aside = scratch.root().join("aside.bin");
+
+        let (hook_dir, hook_key, hook_aside) = (dir.clone(), key.clone(), aside.clone());
+
+        run_at(&store, Point::TempSync, move || {
+            let temp = the_temp(&hook_dir, &hook_key);
+
+            fs::rename(&temp, &hook_aside).unwrap();
+            fs::write(&temp, FOREIGN).unwrap();
+        });
+        fail_at(&store, Point::TempSync, io::ErrorKind::Other);
+
+        assert_eq!(
+            store.create(&state(LOCAL)),
+            Err(StoreError::Io {
+                stage: IoStage::Sync,
+                kind: io::ErrorKind::Other
+            })
+        );
+
+        eprintln!(
+            "OBSERVED C1 state-dir entries after create={:?}",
+            names(&dir)
+        );
+
+        assert!(
+            names(&dir).is_empty(),
+            "the foreign file at the temp name was deleted and no record exists"
+        );
+        assert_eq!(fs::read(&aside).unwrap(), v1_bytes());
+        assert!(!scratch.record(LOCAL).exists());
+    }
+
+    #[test]
+    fn known_race_foreign_bytes_at_the_temp_name_are_published() {
+        // KNOWN VULNERABILITY V4. The link source is resolved by name at call time.
+        let scratch = Scratch::new("g12t-c2");
+        let store = scratch.store();
+        let dir = scratch.state_dir();
+        let key = record_key(&loc(LOCAL));
+        let (hook_dir, hook_key) = (dir.clone(), key.clone());
+
+        run_at(&store, Point::Publish, move || {
+            let temp = the_temp(&hook_dir, &hook_key);
+
+            fs::remove_file(&temp).unwrap();
+            fs::write(&temp, FOREIGN).unwrap();
+        });
+
+        let result = store.create(&state(LOCAL));
+
+        assert_eq!(result, Err(StoreError::VerificationFailed));
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), FOREIGN);
+        assert_eq!(names(&dir), vec![record_leaf()], "the temp name is gone");
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Corrupt(CorruptReason::Undecodable)
+        );
+        assert!(create_error_may_follow_publication(result.unwrap_err()));
+    }
+
+    #[derive(Default)]
+    struct Captured {
+        ours: Option<FileIdentity>,
+        theirs: Option<FileIdentity>,
+        temp_equals_encoded: Option<bool>,
+        foreign_equals_encoded: Option<bool>,
+    }
+
+    #[test]
+    fn known_race_a_byte_identical_foreign_object_is_reported_as_verified_success() {
+        // KNOWN VULNERABILITY V6. A different physical object with the same bytes is
+        // swapped in; `create` returns Ok and the record is NOT the object it wrote.
+        let scratch = Scratch::new("g12t-c3");
+        let store = scratch.store();
+        let dir = scratch.state_dir();
+        let key = record_key(&loc(LOCAL));
+        let foreign = scratch.root().join("foreign.bin");
+        let encoded = state(LOCAL).encode().unwrap();
+        let captured: Arc<Mutex<Captured>> = Arc::default();
+
+        let (hook_dir, hook_key, hook_foreign, sink) = (
+            dir.clone(),
+            key.clone(),
+            foreign.clone(),
+            Arc::clone(&captured),
+        );
+        let hook_encoded = encoded.clone();
+
+        run_at(&store, Point::Publish, move || {
+            let temp = the_temp(&hook_dir, &hook_key);
+            // Prerequisite 1: the staged candidate really is the encoded state.
+            let temp_equals_encoded = fs::read(&temp).unwrap() == hook_encoded;
+            let ours = facts_of(&File::open(&temp).unwrap()).unwrap().identity();
+
+            fs::write(&hook_foreign, &hook_encoded).unwrap();
+
+            // Prerequisite 2: the foreign object's bytes are the encoded state too.
+            let foreign_equals_encoded = fs::read(&hook_foreign).unwrap() == hook_encoded;
+            let theirs = facts_of(&File::open(&hook_foreign).unwrap())
+                .unwrap()
+                .identity();
+
+            fs::remove_file(&temp).unwrap();
+            fs::rename(&hook_foreign, &temp).unwrap();
+
+            let mut captured = sink.lock().unwrap();
+
+            captured.ours = Some(ours);
+            captured.theirs = Some(theirs);
+            captured.temp_equals_encoded = Some(temp_equals_encoded);
+            captured.foreign_equals_encoded = Some(foreign_equals_encoded);
+        });
+
+        let result = store.create(&state(LOCAL));
+        let captured = captured.lock().unwrap();
+
+        // The reproduction is only meaningful if both prerequisites held.
+        assert_eq!(
+            captured.temp_equals_encoded,
+            Some(true),
+            "prerequisite: the staged temp is the encoded state"
+        );
+        assert_eq!(
+            captured.foreign_equals_encoded,
+            Some(true),
+            "prerequisite: the foreign object is byte-identical to the encoded state"
+        );
+
+        let ours = captured.ours.expect("our identity was captured");
+        let theirs = captured.theirs.expect("their identity was captured");
+
+        assert_ne!(ours, theirs, "prerequisite: two different physical objects");
+        assert_eq!(result, Ok(()), "create reported verified success");
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), encoded);
+        assert_eq!(
+            identity_of(&scratch.record(LOCAL)),
+            theirs,
+            "the record is the foreign object"
+        );
+        assert_ne!(identity_of(&scratch.record(LOCAL)), ours);
+        assert_eq!(names(&dir), vec![record_leaf()]);
+    }
+
+    #[test]
+    fn known_race_refused_publication_cleanup_deletes_a_foreign_file_at_the_temp_name() {
+        // KNOWN VULNERABILITY V5. The unconditional cleanup after a refused link
+        // deletes by name whatever is at the temp name.
+        let scratch = Scratch::new("g12t-c4");
+        let store = scratch.store();
+        let dir = scratch.state_dir();
+        let key = record_key(&loc(LOCAL));
+        let record = scratch.record(LOCAL);
+        let (hook_dir, hook_key, hook_record) = (dir.clone(), key.clone(), record.clone());
+
+        run_at(&store, Point::Publish, move || {
+            let temp = the_temp(&hook_dir, &hook_key);
+
+            fs::write(&hook_record, COMPETITOR).unwrap();
+            fs::remove_file(&temp).unwrap();
+            fs::write(&temp, FOREIGN).unwrap();
+        });
+
+        assert_eq!(store.create(&state(LOCAL)), Err(StoreError::AlreadyExists));
+        assert_eq!(fs::read(&record).unwrap(), COMPETITOR);
+        assert_eq!(
+            names(&dir),
+            vec![record_leaf()],
+            "the foreign file at the temp name was deleted"
+        );
+    }
+
+    #[test]
+    fn known_race_cleanup_failure_after_publication_is_silently_ignored() {
+        // KNOWN VULNERABILITY V5 (ignored result). Another handle without delete
+        // sharing makes the cleanup `remove_file` fail; `create` discards that result.
+        // Either outcome below is accepted; which one occurred is printed.
+        let scratch = Scratch::new("g12t-c5");
+        let store = scratch.store();
+        let dir = scratch.state_dir();
+        let key = record_key(&loc(LOCAL));
+        let record = scratch.record(LOCAL);
+        let held: Arc<Mutex<Option<File>>> = Arc::default();
+        let (hook_dir, hook_key, sink) = (dir.clone(), key.clone(), Arc::clone(&held));
+
+        run_at(&store, Point::Publish, move || {
+            let temp = the_temp(&hook_dir, &hook_key);
+            let file = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&temp)
+                .unwrap();
+
+            *sink.lock().unwrap() = Some(file);
+        });
+
+        let result = store.create(&state(LOCAL));
+        let temp = the_temp(&dir, &key);
+
+        eprintln!("OBSERVED C5 result={result:?}");
+
+        match result {
+            Ok(()) => {
+                // (a) published, and the failed cleanup was silently ignored.
+                assert_eq!(fs::read(&record).unwrap(), v1_bytes());
+                assert_eq!(fs::read(&temp).unwrap(), v1_bytes());
+                assert_eq!(identity_of(&record), identity_of(&temp));
+
+                let guard = held.lock().unwrap();
+                let facts = facts_of(guard.as_ref().expect("the extra handle")).unwrap();
+
+                assert_eq!(facts.link_count(), 2, "one file object with two names");
+                eprintln!("OBSERVED C5 branch=(a) published; cleanup failure ignored; links=2");
+            }
+            Err(StoreError::Io {
+                stage: IoStage::Replace,
+                ..
+            }) => {
+                // (b) the link itself was refused before publication.
+                assert!(!record.exists(), "no record was published");
+                eprintln!("OBSERVED C5 branch=(b) publication refused; temp left; no record");
+            }
+            other => panic!("C5: unexpected result {other:?}"),
+        }
+
+        assert!(temp.exists(), "the temp name still exists after create");
+
+        held.lock().unwrap().take();
+    }
+
+    #[test]
+    fn known_race_failed_write_cleanup_failure_is_classified_as_definite() {
+        // KNOWN VULNERABILITY V7. A temp survives a failed write, but the error is
+        // classified "definite, nothing created".
+        let scratch = Scratch::new("g12t-c6");
+        let store = scratch.store();
+        let dir = scratch.state_dir();
+        let key = record_key(&loc(LOCAL));
+        let held: Arc<Mutex<Option<File>>> = Arc::default();
+        let (hook_dir, hook_key, sink) = (dir.clone(), key.clone(), Arc::clone(&held));
+
+        run_at(&store, Point::TempSync, move || {
+            let temp = the_temp(&hook_dir, &hook_key);
+            let file = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .open(&temp)
+                .unwrap();
+
+            *sink.lock().unwrap() = Some(file);
+        });
+        fail_at(&store, Point::TempSync, io::ErrorKind::Other);
+
+        let error = store.create(&state(LOCAL)).unwrap_err();
+
+        assert_eq!(
+            error,
+            StoreError::Io {
+                stage: IoStage::Sync,
+                kind: io::ErrorKind::Other
+            }
+        );
+        assert!(
+            the_temp(&dir, &key).exists(),
+            "a temp artifact survived the failed write"
+        );
+        assert!(
+            !create_error_may_follow_publication(error),
+            "and the error is still classified as definite"
+        );
+        assert_eq!(
+            scratch.store().load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts)
+        );
+
+        held.lock().unwrap().take();
+    }
+
+    #[test]
+    fn known_race_the_open_temp_allows_a_foreign_writer() {
+        // KNOWN VULNERABILITY V1. The temp is opened with default (full) sharing, so a
+        // second writer can overwrite it while `create` still has it open.
+        let scratch = Scratch::new("g12t-c7");
+        let store = scratch.store();
+        let dir = scratch.state_dir();
+        let key = record_key(&loc(LOCAL));
+        let junk = vec![b'J'; v1_bytes().len()];
+        let (hook_dir, hook_key, hook_junk) = (dir.clone(), key.clone(), junk.clone());
+
+        run_at(&store, Point::TempSync, move || {
+            let temp = the_temp(&hook_dir, &hook_key);
+            let mut writer = OpenOptions::new().write(true).open(&temp).unwrap();
+
+            writer.write_all(&hook_junk).unwrap();
+        });
+
+        assert_eq!(
+            store.create(&state(LOCAL)),
+            Err(StoreError::VerificationFailed)
+        );
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), junk);
+        assert_eq!(names(&dir), vec![record_leaf()]);
+    }
+
+    // ---- N: native facts of a held staging handle ------------------------------------
+
+    #[test]
+    fn staging_fact_substitution_attempts_on_a_held_staging_are_refused() {
+        let scratch = Scratch::new("g12t-n1");
+        let bytes = v1_bytes();
+        let (_pin, staging, path) = held_staging(&scratch, &bytes);
+        let saved = facts_of(&staging).unwrap();
+        let decoy = scratch.root().join("decoy.bin");
+        let aside = scratch.root().join("aside.bin");
+
+        fs::write(&decoy, b"synthetic decoy").unwrap();
+
+        let attempts: Vec<(&str, io::Result<()>)> = vec![
+            ("remove", fs::remove_file(&path)),
+            ("rename away", fs::rename(&path, &aside)),
+            ("rename a decoy over it", fs::rename(&decoy, &path)),
+            ("replace bytes", fs::write(&path, FOREIGN)),
+            (
+                "write open",
+                OpenOptions::new().write(true).open(&path).map(|_| ()),
+            ),
+            ("hard link", fs::hard_link(&decoy, &path)),
+            (
+                "delete access",
+                OpenOptions::new()
+                    .read(true)
+                    .access_mode(DELETE)
+                    .open(&path)
+                    .map(|_| ()),
+            ),
+        ];
+
+        for (label, result) in &attempts {
+            eprintln!("OBSERVED N1 {label}: {}", describe(result));
+            assert!(result.is_err(), "{label} was not refused");
+        }
+
+        child_put_fails(&scratch.root(), &path, FOREIGN);
+
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(facts_of(&staging).unwrap(), saved, "identity and facts");
+        assert_eq!(names(&scratch.state_dir()), vec![file_name_of(&path)]);
+        assert_eq!(fs::read(&decoy).unwrap(), b"synthetic decoy");
+        assert!(!aside.exists());
+    }
+
+    #[test]
+    fn staging_fact_the_legacy_store_works_around_a_held_staging_and_reset_is_busy() {
+        let full = v1_bytes();
+        let half = full[..full.len() / 2].to_vec();
+
+        for (label, content) in [("complete", full), ("half", half), ("empty", Vec::new())] {
+            let scratch = Scratch::new(&format!("g12t-n2-{label}"));
+            let (_pin, staging, path) = held_staging(&scratch, &content);
+            let saved = facts_of(&staging).unwrap();
+            let store = scratch.store();
+            let before = snapshot(&scratch.state_dir());
+
+            assert_eq!(
+                store.load(&loc(LOCAL)),
+                StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts),
+                "{label}: load"
+            );
+            assert_eq!(
+                store.create(&state(LOCAL)),
+                Err(StoreError::UnresolvedArtifacts),
+                "{label}: create"
+            );
+            assert_eq!(
+                store.evidence(&loc(LOCAL)).unwrap().artifact_count(),
+                1,
+                "{label}: evidence"
+            );
+            assert_eq!(
+                store.delete(&loc(LOCAL)),
+                Err(StoreError::RemovalRefused(RemovalRefusal::Busy)),
+                "{label}: delete"
+            );
+
+            assert_eq!(fs::read(&path).unwrap(), content, "{label}: bytes");
+            assert_eq!(facts_of(&staging).unwrap(), saved, "{label}: facts");
+            assert_eq!(
+                names(&scratch.state_dir()),
+                vec![file_name_of(&path)],
+                "{label}: nothing else appeared"
+            );
+            assert_eq!(
+                snapshot(&scratch.state_dir()),
+                before,
+                "{label}: the tree moved"
+            );
+        }
+    }
+
+    #[test]
+    fn staging_fact_a_held_staging_renames_onto_the_record_beside_a_sharing_reader() {
+        let scratch = Scratch::new("g12t-n3");
+        let bytes = v1_bytes();
+        let (pin, staging, temp) = held_staging(&scratch, &bytes);
+        let state_dir = scratch.state_dir();
+        let store = scratch.store();
+        let leaf = record_leaf();
+        let record = scratch.record(LOCAL);
+
+        let other = scratch.staging(OTHER_LOCAL, TOKEN);
+        let other_key = record_key(&loc(OTHER_LOCAL));
+        let third_key = record_key(&loc(THIRD_LOCAL));
+        let third = state_dir.join(format!("{third_key}.json"));
+
+        fs::write(&other, b"synthetic artifact of another location").unwrap();
+        fs::write(&third, b"synthetic unrelated file with a third key prefix").unwrap();
+
+        let others_before = lines_with(&state_dir, &[&other_key, &third_key]);
+
+        assert_eq!(others_before.len(), 2);
+
+        let saved = facts_of(&staging).unwrap();
+        let mut reader = File::open(&temp).unwrap();
+
+        let status = rename_into_directory_no_replace(&staging, &pin, OsStr::new(&leaf));
+
+        assert_eq!(status, RenameStatus::Renamed);
+        assert_eq!(take_last_rename_status(), Some(0));
+        eprintln!("OBSERVED N3 rename beside a sharing reader: {status:?} native=0");
+
+        assert!(!temp.exists(), "the staging name is gone");
+        assert_eq!(fs::read(&record).unwrap(), bytes);
+
+        let mut seen = Vec::new();
+
+        reader.read_to_end(&mut seen).unwrap();
+
+        assert_eq!(seen, bytes, "the earlier reader still reads the bytes");
+
+        let facts = facts_of(&staging).unwrap();
+
+        assert_eq!(facts.identity(), saved.identity());
+        assert_eq!(facts.link_count(), 1);
+        assert!(!facts.is_delete_pending());
+        assert_eq!(identity_of(&record), saved.identity());
+
+        // While held, the published record cannot be overwritten or removed.
+        child_put_fails(&scratch.root(), &record, FOREIGN);
+        assert!(fs::remove_file(&record).is_err());
+        assert_eq!(fs::read(&record).unwrap(), bytes);
+
+        assert!(matches!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Loaded(found) if *found == state(LOCAL)
+        ));
+
+        drop(reader);
+        drop(staging);
+        drop(pin);
+
+        assert!(matches!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Loaded(found) if *found == state(LOCAL)
+        ));
+        assert_eq!(
+            lines_with(&state_dir, &[&other_key, &third_key]),
+            others_before,
+            "the unrelated entries did not change"
+        );
+        assert_eq!(
+            names(&state_dir),
+            sorted(vec![file_name_of(&other), file_name_of(&third), leaf])
+        );
+    }
+
+    #[test]
+    fn staging_fact_a_collision_never_replaces_any_occupant() {
+        let bytes = v1_bytes();
+        let leaf = record_leaf();
+
+        for kind in ["file", "directory", "junction"] {
+            let scratch = Scratch::new(&format!("g12t-n4-{kind}"));
+            let (pin, staging, temp) = held_staging(&scratch, &bytes);
+            let state_dir = scratch.state_dir();
+            let record = scratch.record(LOCAL);
+            let elsewhere = scratch.root().join("junction-target");
+
+            match kind {
+                "file" => fs::write(&record, COMPETITOR).unwrap(),
+                "directory" => {
+                    fs::create_dir(&record).unwrap();
+                    fs::write(record.join("inner.txt"), b"synthetic inner").unwrap();
+                }
+                _ => {
+                    fs::create_dir_all(&elsewhere).unwrap();
+                    fs::write(elsewhere.join("inner.txt"), b"synthetic target").unwrap();
+                    make_junction(&record, &elsewhere);
+                }
+            }
+
+            let occupant_before = lines_with(&state_dir, &[&leaf]);
+            let elsewhere_before = (kind == "junction").then(|| snapshot(&elsewhere));
+
+            assert!(!occupant_before.is_empty(), "{kind}: an occupant exists");
+
+            let status = rename_into_directory_no_replace(&staging, &pin, OsStr::new(&leaf));
+
+            eprintln!(
+                "OBSERVED N4 {kind}: {status:?} native={:?}",
+                take_last_rename_status()
+            );
+
+            assert_eq!(
+                status,
+                RenameStatus::Refused(DefiniteRefusal::NameCollision),
+                "{kind}"
+            );
+            assert_eq!(lines_with(&state_dir, &[&leaf]), occupant_before, "{kind}");
+            assert!(temp.exists(), "{kind}: the staging name is untouched");
+
+            delete_by_handle(&staging).unwrap();
+            drop(staging);
+
+            assert!(!temp.exists(), "{kind}: only our staging was removed");
+            assert_eq!(lines_with(&state_dir, &[&leaf]), occupant_before, "{kind}");
+            assert_eq!(names(&state_dir), vec![leaf.clone()], "{kind}");
+
+            if let Some(before) = elsewhere_before {
+                assert_eq!(
+                    snapshot(&elsewhere),
+                    before,
+                    "nothing went through the junction"
+                );
+            }
+
+            drop(pin);
+        }
+    }
+
+    #[test]
+    fn staging_fact_a_hard_link_to_a_held_staging_can_reach_the_record_name() {
+        // N5. MEASURED on Windows 10 build 19045, local NTFS (not generalized):
+        //   1. a hard link to the held staging is NOT prevented: two names, one object;
+        //   2. `fs::rename(alias, record)` SUCCEEDS, so the record name then refers to
+        //      the very same file object as the staging name;
+        //   3. the handle-bound no-replace rename of the staging onto that record name
+        //      returns `Renamed` (native status 0), NOT a collision. The staging name is
+        //      consumed; the object keeps ONE name (the record), its identity and its
+        //      exact bytes; nothing foreign is modified.
+        // The earlier prediction (`Refused(NameCollision)`) was wrong.
+        //
+        // LIMITATION for any future publication classifier: a successful handle-bound
+        // no-replace rename on NTFS does NOT necessarily prove that the destination
+        // pathname was previously absent. A destination that already refers to the SAME
+        // file object can produce `Renamed`. This test does not show that a FOREIGN
+        // object can be overwritten (N4 shows that a collision with a foreign file,
+        // directory or junction is refused), and nothing here is generalized beyond the
+        // measured scope. The evidence below is physical (identity, names, link counts,
+        // bytes), never the returned status alone.
+        let scratch = Scratch::new("g12t-n5");
+        let bytes = v1_bytes();
+        let (pin, staging, temp) = held_staging(&scratch, &bytes);
+        let saved = facts_of(&staging).unwrap();
+        let state_dir = scratch.state_dir();
+        let store = scratch.store();
+        let alias = scratch.root().join("alias.bin");
+        let record = scratch.record(LOCAL);
+        let leaf = record_leaf();
+        let temp_name = file_name_of(&temp);
+        let unrelated = state_dir.join("unrelated-n5-decoy.txt");
+
+        fs::write(&unrelated, b"synthetic unrelated decoy").unwrap();
+
+        let unrelated_before = lines_with(&state_dir, &["unrelated-n5-decoy"]);
+
+        // 1. The hard link is not prevented.
+        let linked = fs::hard_link(&temp, &alias);
+
+        eprintln!("OBSERVED N5 hard_link={}", describe(&linked));
+        linked.expect("a hard link to the held staging was refused");
+
+        let linked_facts = facts_of(&staging).unwrap();
+
+        assert_eq!(linked_facts.link_count(), 2, "the file now has two names");
+        assert_eq!(linked_facts.identity(), saved.identity());
+        assert_eq!(identity_of(&alias), saved.identity());
+        assert!(!linked_facts.is_delete_pending());
+
+        child_put_fails(&scratch.root(), &alias, FOREIGN);
+        assert_eq!(fs::read(&alias).unwrap(), bytes, "the data is protected");
+
+        // 2. The alias is renamed onto the record name.
+        let renamed = fs::rename(&alias, &record);
+
+        eprintln!("OBSERVED N5 alias_rename={}", describe(&renamed));
+        renamed.expect("the alias rename onto the record name was refused");
+
+        assert!(!alias.exists());
+        assert_eq!(fs::read(&record).unwrap(), bytes);
+        assert_eq!(
+            identity_of(&record),
+            saved.identity(),
+            "the record name refers to the staged object"
+        );
+        assert_eq!(identity_of(&temp), saved.identity());
+        assert_eq!(facts_of(&staging).unwrap().link_count(), 2);
+        assert_eq!(
+            names(&state_dir),
+            sorted(vec![
+                leaf.clone(),
+                temp_name.clone(),
+                file_name_of(&unrelated)
+            ]),
+            "before the handle-bound rename both names exist"
+        );
+
+        // 3. The handle-bound no-replace rename onto a name of the same object.
+        let status = rename_into_directory_no_replace(&staging, &pin, OsStr::new(&leaf));
+        let native = take_last_rename_status();
+
+        eprintln!("OBSERVED N5 status={status:?} native={native:?}");
+        assert_eq!(status, RenameStatus::Renamed);
+        assert_eq!(native, Some(0));
+
+        let after = facts_of(&staging).unwrap();
+
+        eprintln!(
+            "OBSERVED N5 after: names={:?} links={} pending={}",
+            names(&state_dir),
+            after.link_count(),
+            after.is_delete_pending()
+        );
+
+        assert!(!temp.exists(), "the staging name was consumed");
+        assert!(!alias.exists());
+        assert_eq!(
+            names(&state_dir),
+            sorted(vec![leaf.clone(), file_name_of(&unrelated)]),
+            "only the record and the unrelated file remain; no unexpected name appeared"
+        );
+        assert_eq!(after.identity(), saved.identity(), "the same object");
+        assert_eq!(after.link_count(), 1, "one name is left");
+        assert!(!after.is_delete_pending());
+        assert!(after.is_local_ntfs());
+        assert_eq!(fs::read(&record).unwrap(), bytes, "exact bytes");
+        assert_eq!(identity_of(&record), saved.identity());
+
+        let fresh = facts_of(&File::open(&record).unwrap()).unwrap();
+
+        assert_eq!(fresh.identity(), saved.identity());
+        assert_eq!(fresh.link_count(), 1);
+        assert!(!fresh.is_delete_pending());
+
+        // Nothing else moved, and the result is an ordinary loadable record.
+        assert_eq!(
+            lines_with(&state_dir, &["unrelated-n5-decoy"]),
+            unrelated_before,
+            "no unrelated object changed"
+        );
+        assert!(!scratch.root().join("child-source.bin").exists());
+        assert!(matches!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Loaded(found) if *found == state(LOCAL)
+        ));
+    }
+
+    #[test]
+    fn staging_fact_a_delete_mark_counts_one_less_and_spares_other_names() {
+        let bytes = v1_bytes();
+
+        // A single name: 1 -> 0, delete-pending, same identity, name gone after close.
+        {
+            let scratch = Scratch::new("g12t-n6-single");
+            let (_pin, staging, temp) = held_staging(&scratch, &bytes);
+            let saved = facts_of(&staging).unwrap();
+
+            assert_eq!(saved.link_count(), 1);
+            assert!(!saved.is_delete_pending());
+
+            delete_by_handle(&staging).unwrap();
+
+            let marked = facts_of(&staging).unwrap();
+
+            assert_eq!(marked.identity(), saved.identity());
+            assert_eq!(marked.link_count(), 0);
+            assert!(marked.is_delete_pending());
+
+            drop(staging);
+
+            assert!(!temp.exists());
+            assert!(names(&scratch.state_dir()).is_empty());
+        }
+
+        // With an alias: 2 -> 1; the alias keeps its bytes, one link, not pending.
+        {
+            let scratch = Scratch::new("g12t-n6-alias");
+            let (_pin, staging, temp) = held_staging(&scratch, &bytes);
+            let saved = facts_of(&staging).unwrap();
+            let alias = scratch.root().join("alias.bin");
+
+            fs::hard_link(&temp, &alias).unwrap();
+
+            assert_eq!(facts_of(&staging).unwrap().link_count(), 2);
+
+            delete_by_handle(&staging).unwrap();
+
+            let marked = facts_of(&staging).unwrap();
+
+            assert_eq!(marked.identity(), saved.identity());
+            assert_eq!(marked.link_count(), 1);
+            assert!(marked.is_delete_pending());
+
+            drop(staging);
+
+            assert!(!temp.exists());
+            assert_eq!(fs::read(&alias).unwrap(), bytes);
+
+            let survivor = facts_of(&File::open(&alias).unwrap()).unwrap();
+
+            assert_eq!(survivor.identity(), saved.identity());
+            assert_eq!(survivor.link_count(), 1);
+            assert!(!survivor.is_delete_pending());
+        }
+    }
+
+    #[test]
+    fn staging_fact_the_pin_holds_the_directory_during_staging() {
+        let scratch = Scratch::new("g12t-n7");
+        let bytes = v1_bytes();
+        let (_pin, staging, temp) = held_staging(&scratch, &bytes);
+        let saved = facts_of(&staging).unwrap();
+        let state_dir = scratch.state_dir();
+        let root = scratch.root();
+        let moved_state = root.join("sync-state-moved");
+        let sibling = root.with_file_name(format!("{}-g12t-n7-moved", file_name_of(&root)));
+
+        let rename = fs::rename(&state_dir, &moved_state);
+        // (The directory is not empty, so this removal would fail anyway; the rename
+        // above is the meaningful pin check.)
+        let remove = fs::remove_dir(&state_dir);
+
+        eprintln!("OBSERVED N7 state-dir rename={}", describe(&rename));
+        eprintln!("OBSERVED N7 state-dir remove={}", describe(&remove));
+
+        assert!(rename.is_err(), "the pinned directory was renamed");
+        assert!(remove.is_err(), "the pinned directory was removed");
+
+        // The grandparent: either result is accepted; it is restored at once.
+        let grandparent = fs::rename(&root, &sibling);
+
+        match &grandparent {
+            Ok(()) => {
+                let held_ok = facts_of(&staging).map(|facts| facts == saved);
+
+                eprintln!(
+                    "OBSERVED N7 root rename=SUCCEEDED held facts unchanged={held_ok:?} \
+                     (restored)"
+                );
+
+                fs::rename(&sibling, &root).expect("the test directory must be restored");
+            }
+            Err(_) => eprintln!("OBSERVED N7 root rename=FAILED {}", describe(&grandparent)),
+        }
+
+        assert!(
+            root.exists() && !sibling.exists(),
+            "the test directory is back"
+        );
+        assert!(!moved_state.exists());
+        assert_eq!(fs::read(&temp).unwrap(), bytes);
+        assert_eq!(facts_of(&staging).unwrap(), saved);
+        assert_eq!(names(&state_dir), vec![file_name_of(&temp)]);
+    }
+
+    #[test]
+    fn staging_fact_a_process_can_observe_but_not_change_the_held_staging() {
+        // N8. MEASURED on Windows 10 build 19045, local NTFS: real child `cmd.exe`
+        // processes against the held staging. `type` opens its source with read-only
+        // sharing, which conflicts with our write handle, so the child cannot even read
+        // the staging (a sharing violation, exit code 1, no output). That is stricter
+        // than first predicted and physically safe. Every operation is judged
+        // independently by its POSTCONDITIONS (names, bytes, physical identity, link
+        // count, unrelated files); an exit code is recorded but never trusted alone
+        // (`del` reports success even when it fails).
+        let scratch = Scratch::new("g12t-n8");
+        let bytes = v1_bytes();
+        let (_pin, staging, path) = held_staging(&scratch, &bytes);
+        let saved = facts_of(&staging).unwrap();
+        let state_dir = scratch.state_dir();
+        let root = scratch.root();
+        let unrelated = state_dir.join("unrelated-n8-decoy.txt");
+
+        fs::write(&unrelated, b"synthetic unrelated decoy").unwrap();
+
+        let unrelated_before = lines_with(&state_dir, &["unrelated-n8-decoy"]);
+        let expected_names = sorted(vec![file_name_of(&path), file_name_of(&unrelated)]);
+        let copy_out = root.join("n8-copy-out.bin");
+        let os = OsStr::new;
+        let cmd = |args: &[&OsStr]| Command::new("cmd").arg("/C").args(args).output().unwrap();
+
+        // Everything that must hold after EACH command, whatever its exit code.
+        let assert_untouched = |label: &str| {
+            assert!(path.exists(), "{label}: the staging name survived");
+            assert_eq!(names(&state_dir), expected_names, "{label}: names");
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{label}: bytes");
+            assert_eq!(
+                facts_of(&staging).unwrap(),
+                saved,
+                "{label}: physical identity, link count and pending state"
+            );
+            assert_eq!(identity_of(&path), saved.identity(), "{label}: identity");
+            assert_eq!(
+                lines_with(&state_dir, &["unrelated-n8-decoy"]),
+                unrelated_before,
+                "{label}: an unrelated file changed"
+            );
+            assert!(
+                !root.join("child-source.bin").exists(),
+                "{label}: helper residue"
+            );
+        };
+
+        let report = |label: &str, output: &std::process::Output| {
+            eprintln!(
+                "OBSERVED N8 {label}: exit={:?} stdout_len={} stderr={:?}",
+                output.status.code(),
+                output.stdout.len(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        // 1. type: a read by a child that shares read only.
+        let typed = cmd(&[os("type"), path.as_os_str()]);
+
+        report("type", &typed);
+        assert_eq!(typed.status.code(), Some(1), "type: a sharing violation");
+        assert!(typed.stdout.is_empty(), "type: nothing was read");
+        assert_untouched("type");
+
+        // 2. ren: a rename of the held name.
+        let renamed_to = state_dir.join("g12t-n8-renamed.bin");
+        let renamed = cmd(&[os("ren"), path.as_os_str(), os("g12t-n8-renamed.bin")]);
+
+        report("ren", &renamed);
+        assert_eq!(renamed.status.code(), Some(1), "ren: refused (measured)");
+        assert!(!renamed_to.exists(), "ren: no new name appeared");
+        assert_untouched("ren");
+
+        // 3. del: a forced delete of the held name (judge by what is left).
+        let deleted = cmd(&[os("del"), os("/F"), path.as_os_str()]);
+
+        // Measured: `del /F` exits 0 although it failed (the name survived). The exit
+        // code is recorded only; the postconditions are what is asserted.
+        report("del /F", &deleted);
+        assert_untouched("del /F");
+
+        // 4a. copy onto the staging: an overwrite attempt.
+        let overwritten = cmd(&[os("copy"), os("/Y"), os("NUL"), path.as_os_str()]);
+
+        report("copy NUL -> staging", &overwritten);
+        assert_eq!(
+            overwritten.status.code(),
+            Some(1),
+            "copy onto the staging: refused (measured)"
+        );
+        assert_untouched("copy NUL -> staging");
+
+        // 4b. copy FROM the staging into a test-owned output file outside the state
+        // directory: a read of the source, which must not modify it.
+        let copied = cmd(&[os("copy"), os("/Y"), path.as_os_str(), copy_out.as_os_str()]);
+
+        report("copy staging -> out", &copied);
+        // Measured: refused like `type` (a sharing violation), and no output file.
+        assert_eq!(
+            copied.status.code(),
+            Some(1),
+            "copy from the staging: refused (measured)"
+        );
+        assert!(
+            !copy_out.exists(),
+            "copy from the staging: no output file appeared"
+        );
+        assert_untouched("copy staging -> out");
+    }
+
+    #[test]
+    fn staging_fact_exactly_one_of_two_held_stagings_takes_the_record_name() {
+        let scratch = Scratch::new("g12t-n9");
+        let state_dir = scratch.state_dir();
+        let record = scratch.record(LOCAL);
+        let leaf = record_leaf();
+        let key = record_key(&loc(LOCAL));
+        let mut wins = [0usize; 2];
+
+        fs::create_dir_all(&state_dir).unwrap();
+
+        for iteration in 0..25u128 {
+            let barrier = Arc::new(Barrier::new(2));
+            let threads: Vec<_> = (0..2usize)
+                .map(|side| {
+                    let barrier = Arc::clone(&barrier);
+                    let dir = state_dir.clone();
+                    let leaf = leaf.clone();
+                    let token = format!("{:032x}", 0x9000_0000 + iteration * 2 + side as u128);
+                    let path = dir.join(format!("{key}.{token}.tmp"));
+                    let bytes =
+                        format!("SYNTHETIC-N9-ITERATION-{iteration}-SIDE-{side}").into_bytes();
+
+                    std::thread::spawn(move || {
+                        let pin = open_directory_pin(&dir).unwrap();
+                        let mut staging = OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .create_new(true)
+                            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+                            .share_mode(FILE_SHARE_READ)
+                            .open(&path)
+                            .unwrap();
+
+                        staging.write_all(&bytes).unwrap();
+                        staging.flush().unwrap();
+                        staging.sync_all().unwrap();
+
+                        barrier.wait();
+
+                        let status =
+                            rename_into_directory_no_replace(&staging, &pin, OsStr::new(&leaf));
+
+                        (status, staging, pin, bytes)
+                    })
+                })
+                .collect();
+
+            let mut results: Vec<_> = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect();
+            let second = results.pop().unwrap();
+            let first = results.pop().unwrap();
+
+            let (winner, loser, side) = match (first.0, second.0) {
+                (RenameStatus::Renamed, RenameStatus::Refused(DefiniteRefusal::NameCollision)) => {
+                    (first, second, 0)
+                }
+                (RenameStatus::Refused(DefiniteRefusal::NameCollision), RenameStatus::Renamed) => {
+                    (second, first, 1)
+                }
+                other => panic!("iteration {iteration}: statuses {other:?}"),
+            };
+
+            wins[side] += 1;
+
+            assert_eq!(
+                fs::read(&record).unwrap(),
+                winner.3,
+                "iteration {iteration}: the record holds the winner's bytes"
+            );
+
+            delete_by_handle(&loser.1).unwrap();
+            drop(loser);
+
+            assert_eq!(
+                names(&state_dir),
+                vec![leaf.clone()],
+                "iteration {iteration}: only the record remains"
+            );
+
+            drop(winner);
+            fs::remove_file(&record).unwrap();
+
+            assert!(names(&state_dir).is_empty());
+        }
+
+        eprintln!(
+            "OBSERVED N9 25 iterations: wins side0={} side1={}",
+            wins[0], wins[1]
+        );
+    }
+
+    // ---- S: source guard ---------------------------------------------------------------
+
+    #[test]
+    fn characterized_sites_are_exactly_the_known_ones() {
+        // Slice 2 inverts this: the path-based link and the path-based removals leave
+        // `create`, and the handle-bound publication takes their place.
+        let source = include_str!("sync_state_store.rs");
+        let production = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("the first test module")];
+
+        assert_eq!(production.matches("fs::hard_link(").count(), 1);
+        assert_eq!(production.matches("fs::remove_file(").count(), 3);
+
+        let signature = "pub fn create(&self, state: &SyncState) -> Result<(), StoreError> {";
+        let start = production.find(signature).expect("create");
+        let body = &production[start..start + production[start..].find("\n    }\n").unwrap()];
+
+        assert!(
+            body.contains("fs::hard_link("),
+            "the guard is anchored on the right body"
+        );
+        assert!(!body.contains("rename_into_directory_no_replace"));
+    }
+}
