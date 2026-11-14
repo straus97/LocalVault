@@ -2,6 +2,7 @@ pub mod backup;
 pub(crate) mod file_identity;
 pub(crate) mod handle_ops;
 pub(crate) mod held_removal;
+pub(crate) mod held_staging;
 #[cfg(all(test, windows))]
 mod legacy_layout_assessment;
 #[cfg(all(test, windows))]

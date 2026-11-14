@@ -155,14 +155,41 @@
 //! the names were then verified absent. The guarantees and limits are listed on
 //! [`SyncStateStore::delete_if_evidence_matches`].
 //!
+//! # Handle-bound creation (Stage 1U-4 G12T-2; gate G12-temp for create)
+//!
+//! [`SyncStateStore::create`] no longer links or removes anything by path. It pins
+//! the directory (`held_removal::DirectoryPin`), creates its staging file exclusively
+//! and **holds it open** (`held_staging::StagingFile`: read, write and delete access,
+//! read-only sharing), writes and judges the bytes through that handle, and publishes
+//! it with the handle-bound no-replace rename (`handle_ops`). The staging path is never
+//! the source of a publication step. A staging file is removed only through its own
+//! handle, only after the handle has shown that it still denotes the one name that the
+//! staging path resolves to, and **never after a rename that returned `Renamed` or an
+//! unclassified status**: the name may then be the record.
+//!
+//! What a successful `create` means is stated as four separate properties (see
+//! [`SyncStateStore::create`]): **A** the staged bytes are correct, **B** the record
+//! name is the exact staged file object, **C** no foreign destination object was
+//! overwritten or destroyed. `Ok(())` establishes A, B and C at the instant of the
+//! checks. It does **not** establish **D**, that the destination name was absent before:
+//! on NTFS a destination that already names a hard link to the same file object can
+//! produce a successful no-replace rename (measured by G12T-1). A verified same-object
+//! publication is accepted only on full physical evidence; a foreign object is never
+//! overwritten or adopted. Two new fixed errors, [`StoreError::PublicationUnknown`] and
+//! [`StoreError::IncompleteStagingCleanup`], report outcomes that are ambiguous; neither
+//! authorizes a retry, a reset or an overwrite. Initial binding is refused
+//! ([`StoreError::NoClobberUnsupported`]) when the state directory cannot be pinned as a
+//! plain directory on local NTFS (approved decision A); nothing existing is touched.
+//!
 //! # Guarantees and limits
 //!
-//! * **Create** is no-clobber because publication is `hard_link(temp, record)`,
-//!   which fails if the name exists (verified: `ERROR_ALREADY_EXISTS` on NTFS).
-//!   `fs::rename` is *not* used for creation: on Windows it replaces an existing
-//!   destination, so check-then-rename would be a race. A filesystem without
-//!   hard links yields [`StoreError::NoClobberUnsupported`]; there is no
-//!   fallback to an overwriting rename.
+//! * **Create** is no-clobber because the publication is a handle-bound rename that
+//!   replaces nothing (`ReplaceIfExists` is false; a foreign file, directory or junction
+//!   at the record name is refused and left unchanged). It is not `fs::rename`, which
+//!   replaces an existing destination on Windows. There is no fallback of any kind: a
+//!   directory that cannot be pinned as a plain directory on local NTFS yields
+//!   [`StoreError::NoClobberUnsupported`]. Sharing modes bind ordinary processes only;
+//!   power loss and an operating-system crash are not claimed.
 //! * **Replace** (unit-test builds only since Stage 1U-4 D4; normal and release
 //!   builds contain no store replacement) is a re-read, compare, temp-write, re-read,
 //!   rename sequence. It is **not** compare-and-swap against an arbitrary competing
@@ -191,11 +218,15 @@
 //!   never a path, locator, vault id, binding id or record body.
 
 use std::{
+    ffi::OsStr,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
+    io::{self, Read},
     path::{Path, PathBuf},
 };
+
+#[cfg(test)]
+use std::io::Write;
 
 #[cfg(test)]
 use localvault_core::sync_state::SyncBase;
@@ -207,8 +238,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::{
-    file_identity::{facts_of, FileIdentity},
+    file_identity::{facts_of, FileIdentity, HandleFacts, IdentityError},
+    handle_ops::{DefiniteRefusal, RenameStatus},
     held_removal::{DirectoryPin, HeldFile, RemovalMark},
+    held_staging::{AbandonResult, Ownership, StagingFile},
 };
 
 /// Subdirectory of the supplied application-data root that holds all records.
@@ -494,6 +527,20 @@ pub enum StoreError {
     /// before any removal** in the call that returns it: nothing was removed.
     #[error("the sync-state files could not be held for removal; nothing was removed")]
     RemovalRefused(RemovalRefusal),
+    /// G12T-2. Produced **only by `create`**: whether the record was published is not
+    /// established (the rename status was unclassified, or a refusal was contradicted by
+    /// the staging name). Fixed text; no path. It never authorizes a retry, a reset or an
+    /// overwrite, and no staging cleanup follows it.
+    #[error(
+        "it is not established whether the sync-state record was published; nothing was retried"
+    )]
+    PublicationUnknown,
+    /// G12T-2. Produced **only by `create`**: a staging file could not be proven removed
+    /// (ownership not proven, a cleanup step refused, or the mark not proven). It takes
+    /// precedence over the original definite error, so that a definite error never
+    /// coexists with a surviving staging file. Fixed text; no path. No retry, no reset.
+    #[error("a sync-state staging file could not be proven removed; nothing was retried")]
+    IncompleteStagingCleanup,
 }
 
 /// Why a deletion refused to start (B3c-3b-2d-1). Every one of them means this call
@@ -728,6 +775,22 @@ enum Point {
     AfterHold,
     /// After the last handle has been closed, before the absence is verified.
     AfterClose,
+    /// `create`: after the directory is pinned and the staging file is held, before any
+    /// byte is written (G12T-2).
+    StagingWrite,
+    /// `create`: before the judgment of the held staging file.
+    StagingFacts,
+    /// `create`: the recheck of the pinned directory after the staging file was made.
+    DirectoryRecheck,
+    /// `create`: immediately before the native rename call. A test action here runs
+    /// when the rename is certainly not yet performed.
+    BeforeNativeRename,
+    /// `create`: after the native rename **returned `Renamed`**. The publication may
+    /// already exist, so a failure here is never "definitely unpublished" and is never
+    /// followed by cleanup.
+    AfterRename,
+    /// `create`: before a staging cleanup would start.
+    BeforeCleanup,
 }
 
 #[cfg(test)]
@@ -871,12 +934,31 @@ impl SyncStateStore {
         }
     }
 
-    /// Publish a new record. Succeeds only if the record is definitely absent,
-    /// no recovery artifact exists, publication is no-clobber, and the record
-    /// reads back byte-identical and decodes to `state`.
+    /// Publish a new record through a **held** staging file (G12T-2). The sequence is in
+    /// the module documentation; in short: the directory is pinned, the staging file is
+    /// created exclusively and held, written and judged through its own handle, and
+    /// published with the handle-bound no-replace rename. A staging file is removed only
+    /// through its handle, only with proven ownership, and never after `Renamed` or an
+    /// unclassified status.
     ///
-    /// After `VerificationFailed` or an `Io` error the record may or may not
-    /// exist: call [`load`](Self::load) before deciding anything.
+    /// # What `Ok(())` means
+    ///
+    /// Four properties are kept apart. **A**: the staged bytes were correct (written and
+    /// read back through one handle). **B**: at the moment of the checks the record name
+    /// is the exact staged file object (same physical identity, one name, not
+    /// delete-pending, local NTFS, exact bytes, decodes to `state`). **C**: no foreign
+    /// object at the record name was overwritten or destroyed. `Ok(())` establishes A, B
+    /// and C at the instant of those checks. It does **not** establish **D**: that the
+    /// record name was absent at every earlier instant (a successful handle-bound rename
+    /// onto a name that already denoted a hard link to the same file object is
+    /// physically identical to an ordinary publication). It also proves nothing after
+    /// the handles close, no authenticity (the version-1 record is a checksum, not a
+    /// MAC) and no durability across a power loss or an operating-system crash.
+    ///
+    /// After `VerificationFailed`, `PublicationUnknown`, `IncompleteStagingCleanup` or an
+    /// `Io` error of stage `Replace` the record may or may not exist and a staging file
+    /// may remain: call [`load`](Self::load) before deciding anything. None of them
+    /// authorizes a retry, a reset or an overwrite.
     pub fn create(&self, state: &SyncState) -> Result<(), StoreError> {
         let bytes = state.encode().map_err(StoreError::Encode)?;
         let key = record_key(state.local_locator());
@@ -884,7 +966,7 @@ impl SyncStateStore {
         self.ensure_directory()?;
 
         // Refuse-only. There is deliberately no second check later in this method:
-        // publication is a no-clobber link and the caller reloads afterwards.
+        // publication is a no-replace rename and the caller reloads afterwards.
         self.legacy_gate(&key).map_err(StoreError::from)?;
 
         let record = self.record_path(&key);
@@ -908,21 +990,205 @@ impl SyncStateStore {
             return Err(StoreError::UnresolvedArtifacts);
         }
 
-        let temp = self.write_temp(&key, &bytes)?;
+        self.publish_staged(&key, &bytes, state)
+    }
 
-        let published = self
-            .hook(Point::Publish)
-            .and_then(|()| fs::hard_link(&temp, &record));
+    /// Steps 1 to 11 of the handle-bound creation: everything after the existence check
+    /// and the artifact scan of [`create`](Self::create). `bytes` are the encoding of
+    /// `state`.
+    fn publish_staged(&self, key: &str, bytes: &[u8], state: &SyncState) -> Result<(), StoreError> {
+        let record = self.record_path(key);
+        let leaf = format!("{key}.{RECORD_EXTENSION}");
 
-        // The temp name is only a staging name; the record is now (or never
-        // will be) a second name for the same synced file.
-        let _ = fs::remove_file(&temp);
+        // 1. Pin the directory (plain, local NTFS), then confirm the ancestors after the
+        //    pin so a redirection installed before it is caught.
+        let pin =
+            DirectoryPin::acquire(&self.directory).map_err(|_| StoreError::NoClobberUnsupported)?;
 
-        if let Err(error) = published {
-            return Err(map_publish_error(&error));
+        if self.confirm_ancestors().is_err() {
+            return Err(StoreError::LayoutUncertain);
         }
 
-        self.verify(&record, &bytes, state)
+        // 2. The staging file: created exclusively and held from here to the end.
+        let (mut staging, temp) = self.create_staging(key)?;
+
+        // 3. The directory is still the pinned one.
+        if self.hook(Point::DirectoryRecheck).is_err() || !pin.still_names(&self.directory) {
+            return Err(self.cleanup_staging(staging, &temp, StoreError::LayoutUncertain));
+        }
+
+        // 4. Write and flush through the held handle.
+        if let Err(error) = self
+            .hook(Point::StagingWrite)
+            .and_then(|()| staging.write_exact(bytes))
+        {
+            let reason = StoreError::Io {
+                stage: IoStage::Write,
+                kind: error.kind(),
+            };
+
+            return Err(self.cleanup_staging(staging, &temp, reason));
+        }
+
+        if let Err(error) = self.hook(Point::TempSync).and_then(|()| staging.sync()) {
+            let reason = StoreError::Io {
+                stage: IoStage::Sync,
+                kind: error.kind(),
+            };
+
+            return Err(self.cleanup_staging(staging, &temp, reason));
+        }
+
+        // 5. Judge the handle and read the bytes back through it.
+        let saved = match self
+            .hook(Point::StagingFacts)
+            .ok()
+            .and_then(|()| staging.judge(bytes))
+        {
+            Some(facts) => facts,
+            None => return Err(self.cleanup_staging(staging, &temp, StoreError::LayoutUncertain)),
+        };
+
+        // 6. The last narrowing checks before the one native call. They narrow the
+        //    window; they do not close it.
+        if let Err(error) = self.hook(Point::Publish) {
+            return Err(self.cleanup_staging(staging, &temp, map_publish_error(&error)));
+        }
+
+        if staging.facts() != Ok(saved) || !pin.still_names(&self.directory) {
+            return Err(self.cleanup_staging(staging, &temp, StoreError::LayoutUncertain));
+        }
+
+        if let Err(error) = self.hook(Point::BeforeNativeRename) {
+            return Err(self.cleanup_staging(staging, &temp, map_publish_error(&error)));
+        }
+
+        // 7. Publish: the held handle is renamed into the pinned directory, replacing
+        //    nothing. The staging path plays no part.
+        let status = staging.publish_no_replace(&pin, OsStr::new(&leaf));
+
+        // 8. Classify. After `Renamed` or an unclassified status the staging name may be
+        //    the record, so NOTHING below those two arms ever removes anything.
+        match status {
+            RenameStatus::Renamed => {
+                // A failure of the hook is an interruption AFTER the native rename: the
+                // publication may exist, so it is unverified, never "unpublished".
+                let verified = self.hook(Point::AfterRename).is_ok()
+                    && classify_renamed(
+                        &saved,
+                        &staging.facts(),
+                        pin.still_names(&self.directory),
+                        read_physical(&record).as_ref(),
+                        bytes,
+                    ) == RenamedVerdict::Verified;
+
+                if !verified {
+                    staging.release();
+
+                    return Err(StoreError::VerificationFailed);
+                }
+            }
+            RenameStatus::Unknown => {
+                staging.release();
+
+                return Err(StoreError::PublicationUnknown);
+            }
+            RenameStatus::Refused(refusal) => {
+                return Err(self.after_refusal(staging, &temp, refusal_error(refusal)));
+            }
+            RenameStatus::Rejected => {
+                return Err(self.after_refusal(staging, &temp, rejected_error()));
+            }
+        }
+
+        // 9. Release the handle (no mark).
+        staging.release();
+
+        // 10. An independent read of the record: the very object that was staged.
+        if self.hook(Point::Verify).is_err() {
+            return Err(StoreError::VerificationFailed);
+        }
+
+        match read_physical(&record) {
+            Some(read) if record_confirms(&saved, &read, bytes, state) => {}
+            _ => return Err(StoreError::VerificationFailed),
+        }
+
+        // 11. The pin is dropped; the record is ordinary data again.
+        drop(pin);
+
+        Ok(())
+    }
+
+    /// Step 2: up to [`TEMP_ALLOCATION_ATTEMPTS`] fresh names of the recognized staging
+    /// grammar; the first one created exclusively is held.
+    fn create_staging(&self, key: &str) -> Result<(StagingFile, PathBuf), StoreError> {
+        for _ in 0..TEMP_ALLOCATION_ATTEMPTS {
+            let name = format!("{key}.{}.{ARTIFACT_EXTENSION}", Uuid::new_v4().simple());
+            let path = self.directory.join(name);
+
+            match StagingFile::create_new(&path) {
+                Ok(staging) => return Ok((staging, path)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(StoreError::Io {
+                        stage: IoStage::Open,
+                        kind: error.kind(),
+                    })
+                }
+            }
+        }
+
+        Err(StoreError::Io {
+            stage: IoStage::Open,
+            kind: io::ErrorKind::AlreadyExists,
+        })
+    }
+
+    /// The one cleanup of `create`, for a failure that happened **before** any rename
+    /// call or after a rename that was definitely refused. The staging file is removed
+    /// only through its handle and only with proven ownership. `reason` is returned when
+    /// the removal is proven; otherwise [`StoreError::IncompleteStagingCleanup`] replaces
+    /// it, so a definite error never coexists with a surviving staging file. No retry.
+    fn cleanup_staging(&self, staging: StagingFile, temp: &Path, reason: StoreError) -> StoreError {
+        if self.hook(Point::BeforeCleanup).is_err() {
+            staging.release();
+
+            return StoreError::IncompleteStagingCleanup;
+        }
+
+        match staging.abandon(temp) {
+            AbandonResult::Clean => reason,
+            AbandonResult::Retained | AbandonResult::Uncertain => {
+                StoreError::IncompleteStagingCleanup
+            }
+        }
+    }
+
+    /// Step 8 for a rename that was definitely refused (or rejected before any native
+    /// call). The refusal is believed only when the staging handle still denotes the one
+    /// name that the staging path resolves to. Otherwise nothing is removed.
+    fn after_refusal(
+        &self,
+        staging: StagingFile,
+        temp: &Path,
+        clean_reason: StoreError,
+    ) -> StoreError {
+        match staging.ownership(temp) {
+            Ownership::Sole(_) => self.cleanup_staging(staging, temp, clean_reason),
+            // The file may be reachable under another name (possibly the record).
+            Ownership::OtherNames | Ownership::Unknown => {
+                staging.release();
+
+                StoreError::IncompleteStagingCleanup
+            }
+            // The refusal is contradicted: the staging name no longer names this file.
+            Ownership::NameNotOurs => {
+                staging.release();
+
+                StoreError::PublicationUnknown
+            }
+        }
     }
 
     /// **Unit-test builds only (Stage 1U-4 D4).** This method is compiled solely under
@@ -1743,7 +2009,10 @@ impl SyncStateStore {
         Ok(found)
     }
 
-    /// Create, fill, flush and close a staging file; remove it on any failure.
+    /// **Unit-test builds only (G12T-2).** The path-based staging of the characterized
+    /// `replace`: create, fill, flush and close a staging file; remove it on any failure.
+    /// `create` no longer uses it.
+    #[cfg(test)]
     fn write_temp(&self, key: &str, bytes: &[u8]) -> Result<PathBuf, StoreError> {
         let (path, mut file) = self.create_temp(key)?;
 
@@ -1778,6 +2047,8 @@ impl SyncStateStore {
         }
     }
 
+    /// **Unit-test builds only (G12T-2).** See [`write_temp`](Self::write_temp).
+    #[cfg(test)]
     fn create_temp(&self, key: &str) -> Result<(PathBuf, File), StoreError> {
         for _ in 0..TEMP_ALLOCATION_ATTEMPTS {
             let name = format!("{key}.{}.{ARTIFACT_EXTENSION}", Uuid::new_v4().simple());
@@ -1801,8 +2072,10 @@ impl SyncStateStore {
         })
     }
 
-    /// Read the record back; it must be byte-identical to what was written and
-    /// decode to the intended state.
+    /// **Unit-test builds only (G12T-2).** Read the record back (by path); it must be
+    /// byte-identical to what was written and decode to the intended state. Used by the
+    /// characterized `replace`; `create` verifies through [`read_physical`] instead.
+    #[cfg(test)]
     fn verify(
         &self,
         record: &Path,
@@ -2064,6 +2337,138 @@ fn map_publish_error(error: &io::Error) -> StoreError {
     }
 }
 
+/// The clean error for a rename that NTFS definitely refused, once the staging file was
+/// proven ours and removed. A name collision is the only one that says something about
+/// the record; every other refusal keeps the existing, ambiguous `Replace` mapping.
+fn refusal_error(refusal: DefiniteRefusal) -> StoreError {
+    match refusal {
+        DefiniteRefusal::NameCollision => StoreError::AlreadyExists,
+        DefiniteRefusal::AccessDenied => StoreError::Io {
+            stage: IoStage::Replace,
+            kind: io::ErrorKind::PermissionDenied,
+        },
+        DefiniteRefusal::NotSameDevice
+        | DefiniteRefusal::NameInvalid
+        | DefiniteRefusal::InvalidParameter
+        | DefiniteRefusal::SharingViolation => StoreError::Io {
+            stage: IoStage::Replace,
+            kind: io::ErrorKind::Other,
+        },
+    }
+}
+
+/// The clean error for a leaf the rename primitive rejected before any native call.
+fn rejected_error() -> StoreError {
+    StoreError::Io {
+        stage: IoStage::Replace,
+        kind: io::ErrorKind::InvalidInput,
+    }
+}
+
+/// One file read through ONE handle: its facts and its bytes, both from that handle.
+struct PhysicalRead {
+    facts: HandleFacts,
+    bytes: Vec<u8>,
+}
+
+/// Open `path` without following a reparse point (the existing reader, compatible with a
+/// staging handle that is still held), judge a plain file within the size bound, and read
+/// the facts and the bytes from that same handle. Never `HeldFile::open`, whose access
+/// mode is refused while a staging file is held. Any doubt is `None`.
+fn read_physical(path: &Path) -> Option<PhysicalRead> {
+    let file = open_no_follow(path).ok()?;
+    let metadata = file.metadata().ok()?;
+
+    if !is_plain_file(&metadata) || metadata.len() > MAX_SYNC_STATE_BYTES as u64 {
+        return None;
+    }
+
+    let facts = facts_of(&file).ok()?;
+    let mut bytes = Vec::new();
+
+    (&file)
+        .take(MAX_SYNC_STATE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+
+    if bytes.len() > MAX_SYNC_STATE_BYTES {
+        return None;
+    }
+
+    // The same handle must still say the same thing after the read.
+    (facts_of(&file).ok()? == facts).then_some(PhysicalRead { facts, bytes })
+}
+
+/// What the physical evidence after a native `Renamed` established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenamedVerdict {
+    /// Every required physical check holds.
+    Verified,
+    /// Any one of them does not. Nothing may be deleted on this path.
+    Unverified,
+}
+
+/// The pure decision of step 8 for a rename that returned `Renamed`. `Renamed` alone is
+/// never success: on NTFS a destination that already names a hard link to the same file
+/// object can produce it, and a status injected or reported without a rename produces it
+/// too. Verified only if ALL of these hold:
+///
+/// * the staging handle's fresh facts equal the facts saved when it was judged (same
+///   identity, one name, not delete-pending, local NTFS);
+/// * the pinned directory is still the one the path names;
+/// * an independent no-follow open of the record succeeded and read a plain file;
+/// * that record shows the saved identity, one name, not delete-pending, local NTFS;
+/// * its bytes are the candidate bytes.
+///
+/// One name on the held object plus the record path resolving to that object imply that
+/// the record is its only name; no separate proof that the staging name is gone is
+/// needed. It claims properties A, B and C only, never D.
+fn classify_renamed(
+    saved: &HandleFacts,
+    held: &Result<HandleFacts, IdentityError>,
+    directory_unchanged: bool,
+    record: Option<&PhysicalRead>,
+    expected: &[u8],
+) -> RenamedVerdict {
+    let Ok(held) = held else {
+        return RenamedVerdict::Unverified;
+    };
+
+    let verified = held == saved
+        && saved.has_single_link()
+        && !saved.is_delete_pending()
+        && saved.is_local_ntfs()
+        && directory_unchanged
+        && record.is_some_and(|read| record_matches(saved, read, expected));
+
+    if verified {
+        RenamedVerdict::Verified
+    } else {
+        RenamedVerdict::Unverified
+    }
+}
+
+/// The physical part of the final confirmation (also used by step 8): the saved identity,
+/// exactly one name, not delete-pending, local NTFS, exact bytes.
+fn record_matches(saved: &HandleFacts, read: &PhysicalRead, expected: &[u8]) -> bool {
+    read.facts.identity() == saved.identity()
+        && read.facts.has_single_link()
+        && !read.facts.is_delete_pending()
+        && read.facts.is_local_ntfs()
+        && read.bytes == expected
+}
+
+/// Step 10: the physical match, and the bytes decode to the state that was meant.
+fn record_confirms(
+    saved: &HandleFacts,
+    read: &PhysicalRead,
+    expected: &[u8],
+    intended: &SyncState,
+) -> bool {
+    record_matches(saved, read, expected)
+        && SyncState::decode(&read.bytes).is_ok_and(|decoded| decoded == *intended)
+}
+
 fn is_reparse_point(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -2087,7 +2492,10 @@ fn is_plain_directory(metadata: &fs::Metadata) -> bool {
     !is_reparse_point(metadata) && metadata.is_dir()
 }
 
-fn open_no_follow(path: &Path) -> io::Result<File> {
+/// Read access, the standard (fully shared) mode and no reparse follow. `pub(crate)`
+/// since G12T-2: `held_staging` probes the staging path with it, and `read_physical` reads
+/// the record with it while a staging handle is still held.
+pub(crate) fn open_no_follow(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
 
@@ -7002,6 +7410,113 @@ mod tests {
 
         // The other record is intact, and our staging file is gone.
         assert_eq!(fs::read(i.record()).unwrap(), planted);
+        assert_eq!(names(&i.state_dir()).len(), 1);
+    }
+
+    // ---- G12T-2: the same operation over the handle-bound `create` -------------------
+
+    #[test]
+    fn g12_temp_an_initial_binding_on_local_ntfs_is_bound_and_verified_through_the_held_staging() {
+        let i = Initial::new("g12t2-bound");
+        let store = i.store();
+
+        let (result, reads) = i.bind_in(&store);
+
+        assert_eq!(result, Ok(InitialBindingOutcome::BoundAndVerified));
+        assert_eq!(reads, 2);
+
+        // One record, one name, no staging file, a binding a fresh load accepts.
+        assert_eq!(
+            names(&i.state_dir()),
+            vec![format!("{}.json", record_key(&loc(&i.locator)))]
+        );
+
+        let facts = facts_of(&fs::File::open(i.record()).unwrap()).unwrap();
+
+        assert_eq!(facts.link_count(), 1);
+        assert!(matches!(
+            i.session.load_sync_state(&i.root),
+            SessionSyncState::Bound(_)
+        ));
+    }
+
+    #[test]
+    fn g12_temp_a_record_at_the_destination_in_the_call_gap_is_never_clobbered() {
+        let i = Initial::new("g12t2-appeared");
+        let faulted = i.store();
+        let planted = build(&i.locator, VAULT_ID, checkpoint(5), None)
+            .encode()
+            .unwrap();
+
+        // After the staging file is judged, immediately before the native rename.
+        run_at(&faulted, Point::BeforeNativeRename, {
+            let record = i.record();
+            let planted = planted.clone();
+
+            move || fs::write(&record, &planted).unwrap()
+        });
+
+        let (result, reads) = i.bind_in(&faulted);
+
+        assert_eq!(result, Err(InitialBindingRefusal::RecordAppeared));
+        assert_eq!(reads, 2);
+        assert_eq!(fs::read(i.record()).unwrap(), planted);
+        assert_eq!(names(&i.state_dir()).len(), 1, "our staging file is gone");
+    }
+
+    #[test]
+    fn g12_temp_a_failure_after_the_native_rename_is_unverified_and_never_not_persisted() {
+        let i = Initial::new("g12t2-after-rename");
+        let faulted = i.store();
+        let _ = crate::vault::handle_ops::take_last_delete_status();
+
+        fail_at(&faulted, Point::AfterRename, io::ErrorKind::Other);
+
+        let (result, reads) = i.bind_in(&faulted);
+
+        assert_eq!(result, Err(InitialBindingRefusal::PersistenceUnverified));
+        assert_eq!(reads, 2);
+        assert_eq!(
+            crate::vault::handle_ops::take_last_delete_status(),
+            None,
+            "no cleanup followed the native rename"
+        );
+
+        // The published record is kept, not deleted, rolled back or reset.
+        assert!(i.record().exists());
+        assert_eq!(names(&i.state_dir()).len(), 1);
+        assert_eq!(
+            i.bind_in(&i.store()).0,
+            Err(InitialBindingRefusal::ExistingBinding)
+        );
+    }
+
+    #[test]
+    fn g12_temp_an_unproven_staging_cleanup_is_unverified_and_blocks_a_new_binding() {
+        let i = Initial::new("g12t2-cleanup");
+        let faulted = i.store();
+
+        fail_at(&faulted, Point::TempSync, io::ErrorKind::Other);
+        fail_at(&faulted, Point::BeforeCleanup, io::ErrorKind::Other);
+
+        let (result, reads) = i.bind_in(&faulted);
+
+        assert_eq!(result, Err(InitialBindingRefusal::PersistenceUnverified));
+        assert_eq!(reads, 2);
+        assert!(!i.record().exists());
+        assert_eq!(
+            names(&i.state_dir()).len(),
+            1,
+            "the staging file is retained"
+        );
+
+        // Nothing is reset or removed for the caller: a new binding is refused.
+        assert!(matches!(
+            i.bind_in(&i.store()).0,
+            Err(InitialBindingRefusal::Unreadable(
+                UnreadableReason::UnresolvedArtifacts
+            ))
+        ));
         assert_eq!(names(&i.state_dir()).len(), 1);
     }
 }
@@ -12401,8 +12916,8 @@ mod held_reset_tests {
         assert!(!production.contains("fn remove(&self, point"));
         assert_eq!(
             production.matches("remove_file").count(),
-            3,
-            "only create, replace, write_temp"
+            2,
+            "only replace, write_temp"
         );
         assert_eq!(production.matches("mark_for_removal()").count(), 2);
     }
@@ -12862,11 +13377,12 @@ mod legacy_gate_isolation_tests {
 
 #[cfg(all(test, windows))]
 mod g12_temp_characterization_tests {
-    // KNOWN VULNERABILITY (G12-temp): the C-tests pin unsafe current behaviour of
-    // SyncStateStore::create. They document it, they do not approve it. A later slice
-    // inverts them. The N-tests measure native facts of a held staging handle; they do
-    // not add any production operation. All bytes are synthetic. Sharing modes bind
-    // ordinary processes only.
+    // G12-temp history: the C-tests first pinned KNOWN VULNERABILITIES of the path-based
+    // `create` (G12T-1). G12T-2 made `create` handle-bound and transformed them into
+    // tests of the SAFE behaviour; their historical names are kept in comments. The
+    // N-tests measure native facts of a held staging handle; they add no production
+    // operation and are unchanged. All bytes are synthetic. Sharing modes bind ordinary
+    // processes only.
     //
     // Every test is REAL NTFS under the git-ignored `.qa-local` scratch (the shared
     // `Scratch` refuses `%TEMP%`). Results marked `OBSERVED` are printed with
@@ -13006,36 +13522,69 @@ mod g12_temp_characterization_tests {
         held_staging_with(scratch, TOKEN, bytes)
     }
 
-    // ---- C: characterization of the CURRENT, path-based `create` ---------------------
+    // ---- C: the former characterizations of the path-based `create`, now SAFE ----------
+    //
+    // C1-C7 used to pin KNOWN VULNERABILITIES of the path-based `create` (a foreign file
+    // deleted or published through the temp name, a byte-identical foreign object adopted
+    // as ours, ignored cleanup failures, a definite error beside a surviving temp). G12T-2
+    // made `create` handle-bound, so each test below keeps its historical name in a
+    // "Formerly ..." comment and now pins the SAFE behaviour: every substitution attempt
+    // is made at the same hook point as before, and its result is recorded and asserted
+    // AFTER `create` returns. No foreign file may be deleted, replaced or adopted.
+
+    /// Results of the substitution attempts made inside a hook: `(label, was_refused)`.
+    type Attempts = Arc<Mutex<Vec<(&'static str, bool)>>>;
+
+    fn attempt(sink: &Attempts, label: &'static str, result: io::Result<()>) {
+        sink.lock().unwrap().push((label, result.is_err()));
+    }
 
     #[test]
-    fn known_race_write_failure_cleanup_deletes_a_foreign_file_at_the_temp_name() {
-        // KNOWN VULNERABILITY V1/V3. The open temp may be renamed away; the failed-write
-        // cleanup then deletes by NAME whatever holds that name.
+    fn c1_a_failed_write_cleanup_cannot_delete_or_replace_a_foreign_file_at_the_temp_name() {
+        // Formerly known_race_write_failure_cleanup_deletes_a_foreign_file_at_the_temp_name
+        // (KNOWN VULNERABILITY V1/V3): the open temp could be renamed away and the failed
+        // write's cleanup then deleted by NAME whatever held that name. The held staging
+        // refuses both the rename away and the foreign write, and the cleanup goes through
+        // the handle.
         let scratch = Scratch::new("g12t-c1");
         let store = scratch.store();
         let dir = scratch.state_dir();
         let key = record_key(&loc(LOCAL));
         let aside = scratch.root().join("aside.bin");
+        let decoy = scratch.root().join("foreign-decoy.bin");
+        let attempts: Attempts = Arc::default();
 
-        let (hook_dir, hook_key, hook_aside) = (dir.clone(), key.clone(), aside.clone());
+        fs::write(&decoy, FOREIGN).unwrap();
+
+        let (hook_dir, hook_key, hook_aside, sink) = (
+            dir.clone(),
+            key.clone(),
+            aside.clone(),
+            Arc::clone(&attempts),
+        );
 
         run_at(&store, Point::TempSync, move || {
             let temp = the_temp(&hook_dir, &hook_key);
 
-            fs::rename(&temp, &hook_aside).unwrap();
-            fs::write(&temp, FOREIGN).unwrap();
+            attempt(&sink, "rename away", fs::rename(&temp, &hook_aside));
+            attempt(&sink, "foreign write", fs::write(&temp, FOREIGN));
         });
         fail_at(&store, Point::TempSync, io::ErrorKind::Other);
 
+        let result = store.create(&state(LOCAL));
+
         assert_eq!(
-            store.create(&state(LOCAL)),
+            *attempts.lock().unwrap(),
+            vec![("rename away", true), ("foreign write", true)],
+            "both substitutions were refused"
+        );
+        assert_eq!(
+            result,
             Err(StoreError::Io {
                 stage: IoStage::Sync,
                 kind: io::ErrorKind::Other
             })
         );
-
         eprintln!(
             "OBSERVED C1 state-dir entries after create={:?}",
             names(&dir)
@@ -13043,38 +13592,50 @@ mod g12_temp_characterization_tests {
 
         assert!(
             names(&dir).is_empty(),
-            "the foreign file at the temp name was deleted and no record exists"
+            "our own staging was removed through its handle and nothing else exists"
         );
-        assert_eq!(fs::read(&aside).unwrap(), v1_bytes());
+        assert!(!aside.exists());
         assert!(!scratch.record(LOCAL).exists());
+        assert_eq!(
+            fs::read(&decoy).unwrap(),
+            FOREIGN,
+            "the foreign file is intact"
+        );
+        assert!(!create_error_may_follow_publication(result.unwrap_err()));
     }
 
     #[test]
-    fn known_race_foreign_bytes_at_the_temp_name_are_published() {
-        // KNOWN VULNERABILITY V4. The link source is resolved by name at call time.
+    fn c2_foreign_bytes_cannot_reach_the_record_through_the_temp_name() {
+        // Formerly known_race_foreign_bytes_at_the_temp_name_are_published (KNOWN
+        // VULNERABILITY V4): the link source was resolved by name at call time, so a
+        // swapped-in foreign file was published. Now the removal and the foreign write
+        // are refused and the record is the staged file.
         let scratch = Scratch::new("g12t-c2");
         let store = scratch.store();
         let dir = scratch.state_dir();
         let key = record_key(&loc(LOCAL));
-        let (hook_dir, hook_key) = (dir.clone(), key.clone());
+        let encoded = state(LOCAL).encode().unwrap();
+        let attempts: Attempts = Arc::default();
+        let (hook_dir, hook_key, sink) = (dir.clone(), key.clone(), Arc::clone(&attempts));
 
         run_at(&store, Point::Publish, move || {
             let temp = the_temp(&hook_dir, &hook_key);
 
-            fs::remove_file(&temp).unwrap();
-            fs::write(&temp, FOREIGN).unwrap();
+            attempt(&sink, "remove", fs::remove_file(&temp));
+            attempt(&sink, "foreign write", fs::write(&temp, FOREIGN));
         });
 
-        let result = store.create(&state(LOCAL));
-
-        assert_eq!(result, Err(StoreError::VerificationFailed));
-        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), FOREIGN);
-        assert_eq!(names(&dir), vec![record_leaf()], "the temp name is gone");
+        assert_eq!(store.create(&state(LOCAL)), Ok(()));
         assert_eq!(
-            store.load(&loc(LOCAL)),
-            StateLoad::Corrupt(CorruptReason::Undecodable)
+            *attempts.lock().unwrap(),
+            vec![("remove", true), ("foreign write", true)]
         );
-        assert!(create_error_may_follow_publication(result.unwrap_err()));
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), encoded);
+        assert_eq!(names(&dir), vec![record_leaf()], "the temp name is gone");
+        assert!(matches!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Loaded(found) if *found == state(LOCAL)
+        ));
     }
 
     #[derive(Default)]
@@ -13086,9 +13647,12 @@ mod g12_temp_characterization_tests {
     }
 
     #[test]
-    fn known_race_a_byte_identical_foreign_object_is_reported_as_verified_success() {
-        // KNOWN VULNERABILITY V6. A different physical object with the same bytes is
-        // swapped in; `create` returns Ok and the record is NOT the object it wrote.
+    fn c3_a_byte_identical_foreign_object_cannot_be_adopted_as_our_record() {
+        // Formerly known_race_a_byte_identical_foreign_object_is_reported_as_verified_success
+        // (KNOWN VULNERABILITY V6): a different physical object with the same bytes was
+        // swapped in and `create` returned Ok although the record was NOT the object it
+        // wrote. Both prerequisites are kept; now the removal and the rename-over are
+        // refused, the record is OUR object and the foreign file is untouched.
         let scratch = Scratch::new("g12t-c3");
         let store = scratch.store();
         let dir = scratch.state_dir();
@@ -13096,11 +13660,13 @@ mod g12_temp_characterization_tests {
         let foreign = scratch.root().join("foreign.bin");
         let encoded = state(LOCAL).encode().unwrap();
         let captured: Arc<Mutex<Captured>> = Arc::default();
+        let attempts: Attempts = Arc::default();
 
-        let (hook_dir, hook_key, hook_foreign, sink) = (
+        let (hook_dir, hook_key, hook_foreign, sink, seen) = (
             dir.clone(),
             key.clone(),
             foreign.clone(),
+            Arc::clone(&attempts),
             Arc::clone(&captured),
         );
         let hook_encoded = encoded.clone();
@@ -13119,10 +13685,10 @@ mod g12_temp_characterization_tests {
                 .unwrap()
                 .identity();
 
-            fs::remove_file(&temp).unwrap();
-            fs::rename(&hook_foreign, &temp).unwrap();
+            attempt(&sink, "remove", fs::remove_file(&temp));
+            attempt(&sink, "rename over", fs::rename(&hook_foreign, &temp));
 
-            let mut captured = sink.lock().unwrap();
+            let mut captured = seen.lock().unwrap();
 
             captured.ours = Some(ours);
             captured.theirs = Some(theirs);
@@ -13133,7 +13699,7 @@ mod g12_temp_characterization_tests {
         let result = store.create(&state(LOCAL));
         let captured = captured.lock().unwrap();
 
-        // The reproduction is only meaningful if both prerequisites held.
+        // The test is only meaningful if both prerequisites held.
         assert_eq!(
             captured.temp_equals_encoded,
             Some(true),
@@ -13149,174 +13715,261 @@ mod g12_temp_characterization_tests {
         let theirs = captured.theirs.expect("their identity was captured");
 
         assert_ne!(ours, theirs, "prerequisite: two different physical objects");
-        assert_eq!(result, Ok(()), "create reported verified success");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![("remove", true), ("rename over", true)]
+        );
+        assert_eq!(result, Ok(()));
         assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), encoded);
         assert_eq!(
             identity_of(&scratch.record(LOCAL)),
-            theirs,
-            "the record is the foreign object"
+            ours,
+            "the record is OUR object"
         );
-        assert_ne!(identity_of(&scratch.record(LOCAL)), ours);
+        assert_ne!(identity_of(&scratch.record(LOCAL)), theirs);
         assert_eq!(names(&dir), vec![record_leaf()]);
+        assert_eq!(
+            fs::read(&foreign).unwrap(),
+            encoded,
+            "the foreign file is intact"
+        );
+        assert_eq!(
+            identity_of(&foreign),
+            theirs,
+            "and it is still the same object"
+        );
     }
 
     #[test]
-    fn known_race_refused_publication_cleanup_deletes_a_foreign_file_at_the_temp_name() {
-        // KNOWN VULNERABILITY V5. The unconditional cleanup after a refused link
-        // deletes by name whatever is at the temp name.
+    fn c4_a_foreign_destination_is_preserved_after_a_publication_collision() {
+        // Formerly known_race_refused_publication_cleanup_deletes_a_foreign_file_at_the_temp_name
+        // (KNOWN VULNERABILITY V5): after a refused link the unconditional cleanup
+        // deleted by name whatever was at the temp name. Now a competitor at the record
+        // succeeds (it is a different writer), the attempts on our temp are refused, the
+        // collision is refused without touching the competitor, and only OUR staging is
+        // removed.
         let scratch = Scratch::new("g12t-c4");
         let store = scratch.store();
         let dir = scratch.state_dir();
         let key = record_key(&loc(LOCAL));
         let record = scratch.record(LOCAL);
-        let (hook_dir, hook_key, hook_record) = (dir.clone(), key.clone(), record.clone());
+        let attempts: Attempts = Arc::default();
+        let competitor_written = Arc::new(Mutex::new(false));
+        let (hook_dir, hook_key, hook_record, sink, wrote) = (
+            dir.clone(),
+            key.clone(),
+            record.clone(),
+            Arc::clone(&attempts),
+            Arc::clone(&competitor_written),
+        );
 
         run_at(&store, Point::Publish, move || {
             let temp = the_temp(&hook_dir, &hook_key);
 
-            fs::write(&hook_record, COMPETITOR).unwrap();
-            fs::remove_file(&temp).unwrap();
-            fs::write(&temp, FOREIGN).unwrap();
+            *wrote.lock().unwrap() = fs::write(&hook_record, COMPETITOR).is_ok();
+
+            attempt(&sink, "remove", fs::remove_file(&temp));
+            attempt(&sink, "foreign write", fs::write(&temp, FOREIGN));
         });
 
         assert_eq!(store.create(&state(LOCAL)), Err(StoreError::AlreadyExists));
+        assert!(*competitor_written.lock().unwrap(), "the competitor wrote");
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![("remove", true), ("foreign write", true)]
+        );
         assert_eq!(fs::read(&record).unwrap(), COMPETITOR);
         assert_eq!(
             names(&dir),
             vec![record_leaf()],
-            "the foreign file at the temp name was deleted"
+            "only the record remains: our staging was removed, nothing foreign was"
         );
     }
 
     #[test]
-    fn known_race_cleanup_failure_after_publication_is_silently_ignored() {
-        // KNOWN VULNERABILITY V5 (ignored result). Another handle without delete
-        // sharing makes the cleanup `remove_file` fail; `create` discards that result.
-        // Either outcome below is accepted; which one occurred is printed.
+    fn c5_publication_succeeds_beside_a_compatible_reader_and_leaves_no_staging_name() {
+        // Formerly known_race_cleanup_failure_after_publication_is_silently_ignored
+        // (KNOWN VULNERABILITY V5, ignored result): a handle without delete sharing made
+        // the cleanup `remove_file` fail and `create` discarded that result. There is no
+        // path-based cleanup now. A restrictive opener is refused outright; a fully
+        // sharing reader coexists and the publication leaves exactly one name.
         let scratch = Scratch::new("g12t-c5");
         let store = scratch.store();
         let dir = scratch.state_dir();
         let key = record_key(&loc(LOCAL));
         let record = scratch.record(LOCAL);
         let held: Arc<Mutex<Option<File>>> = Arc::default();
-        let (hook_dir, hook_key, sink) = (dir.clone(), key.clone(), Arc::clone(&held));
+        let attempts: Attempts = Arc::default();
+        let (hook_dir, hook_key, sink, keep) = (
+            dir.clone(),
+            key.clone(),
+            Arc::clone(&attempts),
+            Arc::clone(&held),
+        );
 
         run_at(&store, Point::Publish, move || {
             let temp = the_temp(&hook_dir, &hook_key);
-            let file = OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                .open(&temp)
-                .unwrap();
 
-            *sink.lock().unwrap() = Some(file);
+            // The old restrictive opener: read access, sharing READ|WRITE, no DELETE.
+            attempt(
+                &sink,
+                "restrictive opener",
+                OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .open(&temp)
+                    .map(|_| ()),
+            );
+
+            // A fully sharing reader (the standard open) is compatible and is kept.
+            *keep.lock().unwrap() = Some(File::open(&temp).unwrap());
         });
 
         let result = store.create(&state(LOCAL));
-        let temp = the_temp(&dir, &key);
 
         eprintln!("OBSERVED C5 result={result:?}");
 
-        match result {
-            Ok(()) => {
-                // (a) published, and the failed cleanup was silently ignored.
-                assert_eq!(fs::read(&record).unwrap(), v1_bytes());
-                assert_eq!(fs::read(&temp).unwrap(), v1_bytes());
-                assert_eq!(identity_of(&record), identity_of(&temp));
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            vec![("restrictive opener", true)]
+        );
+        assert_eq!(fs::read(&record).unwrap(), v1_bytes());
+        assert_eq!(names(&dir), vec![record_leaf()], "no staging name is left");
 
-                let guard = held.lock().unwrap();
-                let facts = facts_of(guard.as_ref().expect("the extra handle")).unwrap();
+        let mut guard = held.lock().unwrap();
+        let reader = guard.as_mut().expect("the compatible reader");
+        let facts = facts_of(reader).unwrap();
 
-                assert_eq!(facts.link_count(), 2, "one file object with two names");
-                eprintln!("OBSERVED C5 branch=(a) published; cleanup failure ignored; links=2");
-            }
-            Err(StoreError::Io {
-                stage: IoStage::Replace,
-                ..
-            }) => {
-                // (b) the link itself was refused before publication.
-                assert!(!record.exists(), "no record was published");
-                eprintln!("OBSERVED C5 branch=(b) publication refused; temp left; no record");
-            }
-            other => panic!("C5: unexpected result {other:?}"),
-        }
+        assert_eq!(facts.link_count(), 1, "one name: the record");
+        assert_eq!(facts.identity(), identity_of(&record));
 
-        assert!(temp.exists(), "the temp name still exists after create");
+        let mut seen = Vec::new();
 
-        held.lock().unwrap().take();
+        reader.read_to_end(&mut seen).unwrap();
+
+        assert_eq!(
+            seen,
+            v1_bytes(),
+            "the reader still reads the published bytes"
+        );
+
+        guard.take();
     }
 
     #[test]
-    fn known_race_failed_write_cleanup_failure_is_classified_as_definite() {
-        // KNOWN VULNERABILITY V7. A temp survives a failed write, but the error is
-        // classified "definite, nothing created".
+    fn c6_a_failed_sync_never_yields_a_definite_error_beside_a_surviving_staging_file() {
+        // Formerly known_race_failed_write_cleanup_failure_is_classified_as_definite
+        // (KNOWN VULNERABILITY V7): a temp survived a failed write but the error was
+        // "definite, nothing created". Whether the name vanishes while a compatible
+        // reader is still open is a native fact, so exactly two outcomes are accepted and
+        // the observed one is printed:
+        //   (a) the mark succeeded and the name is gone at once: Io{Sync,Other}, no temp,
+        //       classified definite; or
+        //   (b) the name could not be proven gone: IncompleteStagingCleanup, the temp is
+        //       present, classified ambiguous.
+        // A definite error with a surviving temp must never occur.
         let scratch = Scratch::new("g12t-c6");
         let store = scratch.store();
         let dir = scratch.state_dir();
         let key = record_key(&loc(LOCAL));
         let held: Arc<Mutex<Option<File>>> = Arc::default();
-        let (hook_dir, hook_key, sink) = (dir.clone(), key.clone(), Arc::clone(&held));
+        let attempts: Attempts = Arc::default();
+        let (hook_dir, hook_key, sink, keep) = (
+            dir.clone(),
+            key.clone(),
+            Arc::clone(&attempts),
+            Arc::clone(&held),
+        );
 
         run_at(&store, Point::TempSync, move || {
             let temp = the_temp(&hook_dir, &hook_key);
-            let file = OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                .open(&temp)
-                .unwrap();
 
-            *sink.lock().unwrap() = Some(file);
+            attempt(
+                &sink,
+                "restrictive opener",
+                OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                    .open(&temp)
+                    .map(|_| ()),
+            );
+
+            *keep.lock().unwrap() = Some(File::open(&temp).unwrap());
         });
         fail_at(&store, Point::TempSync, io::ErrorKind::Other);
 
         let error = store.create(&state(LOCAL)).unwrap_err();
+        let leftover: Vec<String> = names(&dir);
 
         assert_eq!(
-            error,
+            *attempts.lock().unwrap(),
+            vec![("restrictive opener", true)]
+        );
+
+        match error {
             StoreError::Io {
                 stage: IoStage::Sync,
-                kind: io::ErrorKind::Other
+                kind: io::ErrorKind::Other,
+            } => {
+                eprintln!("OBSERVED C6 branch=(a) mark proven, name gone; definite Io{{Sync}}");
+                assert!(leftover.is_empty(), "(a): no temp survived: {leftover:?}");
+                assert!(!create_error_may_follow_publication(error));
+                assert_eq!(scratch.store().load(&loc(LOCAL)), StateLoad::NotConfigured);
             }
-        );
-        assert!(
-            the_temp(&dir, &key).exists(),
-            "a temp artifact survived the failed write"
-        );
-        assert!(
-            !create_error_may_follow_publication(error),
-            "and the error is still classified as definite"
-        );
-        assert_eq!(
-            scratch.store().load(&loc(LOCAL)),
-            StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts)
-        );
+            StoreError::IncompleteStagingCleanup => {
+                eprintln!("OBSERVED C6 branch=(b) cleanup unproven; IncompleteStagingCleanup");
+                assert_eq!(leftover.len(), 1, "(b): the temp is present: {leftover:?}");
+                assert!(is_artifact_name(&leftover[0], &key));
+                assert!(create_error_may_follow_publication(error));
+                assert_eq!(
+                    scratch.store().load(&loc(LOCAL)),
+                    StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts)
+                );
+            }
+            other => panic!("C6: unexpected result {other:?}"),
+        }
 
         held.lock().unwrap().take();
     }
 
     #[test]
-    fn known_race_the_open_temp_allows_a_foreign_writer() {
-        // KNOWN VULNERABILITY V1. The temp is opened with default (full) sharing, so a
-        // second writer can overwrite it while `create` still has it open.
+    fn c7_a_foreign_writer_cannot_modify_the_held_staging_object() {
+        // Formerly known_race_the_open_temp_allows_a_foreign_writer (KNOWN VULNERABILITY
+        // V1): the temp was opened with full sharing, so a second writer could overwrite
+        // it. Now both the write open and the whole-file write are refused and the
+        // record is exactly the encoded state.
         let scratch = Scratch::new("g12t-c7");
         let store = scratch.store();
         let dir = scratch.state_dir();
         let key = record_key(&loc(LOCAL));
         let junk = vec![b'J'; v1_bytes().len()];
-        let (hook_dir, hook_key, hook_junk) = (dir.clone(), key.clone(), junk.clone());
+        let attempts: Attempts = Arc::default();
+        let (hook_dir, hook_key, hook_junk, sink) = (
+            dir.clone(),
+            key.clone(),
+            junk.clone(),
+            Arc::clone(&attempts),
+        );
 
         run_at(&store, Point::TempSync, move || {
             let temp = the_temp(&hook_dir, &hook_key);
-            let mut writer = OpenOptions::new().write(true).open(&temp).unwrap();
 
-            writer.write_all(&hook_junk).unwrap();
+            attempt(
+                &sink,
+                "write open",
+                OpenOptions::new().write(true).open(&temp).map(|_| ()),
+            );
+            attempt(&sink, "whole-file write", fs::write(&temp, &hook_junk));
         });
 
+        assert_eq!(store.create(&state(LOCAL)), Ok(()));
         assert_eq!(
-            store.create(&state(LOCAL)),
-            Err(StoreError::VerificationFailed)
+            *attempts.lock().unwrap(),
+            vec![("write open", true), ("whole-file write", true)]
         );
-        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), junk);
+        assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), v1_bytes());
+        assert_ne!(fs::read(scratch.record(LOCAL)).unwrap(), junk);
         assert_eq!(names(&dir), vec![record_leaf()]);
     }
 
@@ -13999,24 +14652,1986 @@ mod g12_temp_characterization_tests {
 
     #[test]
     fn characterized_sites_are_exactly_the_known_ones() {
-        // Slice 2 inverts this: the path-based link and the path-based removals leave
-        // `create`, and the handle-bound publication takes their place.
+        // S1, INVERTED by G12T-2. It formerly pinned the path-based sites of `create`
+        // (`fs::hard_link(` once, `fs::remove_file(` three times). The link and the
+        // path-based removals have left `create`; the two `fs::remove_file(` that remain
+        // belong to the test-only `replace` and its `write_temp`, and `create` contains
+        // no path mutation at all.
+        let source = include_str!("sync_state_store.rs");
+        let production = &source[..source
+            .find(
+                "
+#[cfg(test)]
+mod tests {",
+            )
+            .expect("the first test module")];
+
+        assert_eq!(production.matches("fs::hard_link(").count(), 0);
+        assert_eq!(production.matches("fs::remove_file(").count(), 2);
+
+        // Both remaining removals sit in a function gated by `#[cfg(test)]`.
+        for (at, _) in production.match_indices("fs::remove_file(") {
+            let before = &production[..at];
+            let declaration = before
+                .rfind(
+                    "
+    fn ",
+                )
+                .max(before.rfind(
+                    "
+    pub fn ",
+                ))
+                .expect("an enclosing method");
+            let above: Vec<&str> = before[..declaration]
+                .lines()
+                .rev()
+                .take_while(|line| line.starts_with("    ///") || line.starts_with("    #["))
+                .collect();
+
+            assert!(
+                above.contains(&"    #[cfg(test)]"),
+                "a path-based removal outside test-only code"
+            );
+        }
+
+        let signature = "pub fn create(&self, state: &SyncState) -> Result<(), StoreError> {";
+        let start = production.find(signature).expect("create");
+        let body = &production[start
+            ..start
+                + production[start..]
+                    .find(
+                        "
+    }
+",
+                    )
+                    .unwrap()];
+
+        assert!(
+            body.contains("publish_staged("),
+            "the guard is anchored on the right body"
+        );
+
+        for forbidden in ["fs::rename(", "hard_link", "remove_file"] {
+            assert!(!body.contains(forbidden), "{forbidden} in create");
+        }
+    }
+}
+
+/// Stage 1U-4 G12T-2 (gate G12-temp for `create`): real NTFS tests of the handle-bound
+/// `SyncStateStore::create`, driven through the real method and its private fault hooks.
+///
+/// Every test uses synthetic bytes under the git-ignored `.qa-local` scratch (the shared
+/// `Scratch` refuses `%TEMP%`), and every test that reasons about physical safety asserts
+/// names, physical identity, link counts and bytes, never a status alone. Results marked
+/// `OBSERVED` are printed with `eprintln!`; run with `--nocapture` to read them. A measured
+/// result is valid for the tested Windows / local NTFS configuration only.
+///
+/// What this module does NOT show: protection from privileged, kernel or filter-driver
+/// actors; power-loss or operating-system-crash behaviour (T20 is process exit on a
+/// running system); rollback resistance; authenticity of the version-1 record; that a
+/// record name was absent before the rename (property D); anything after the handles
+/// close.
+#[cfg(all(test, windows))]
+mod g12_temp_handle_bound_tests {
+    use std::{
+        fs::{self, File, OpenOptions},
+        io,
+        os::windows::fs::OpenOptionsExt,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier, Mutex,
+        },
+    };
+
+    use super::b3c3b1_support::{loc, names, state, Scratch, LOCAL, OTHER_LOCAL};
+    use super::*;
+    use crate::vault::{
+        file_identity::{facts_of, FileIdentity, FileSystemKind, HandleFacts, IdentityError},
+        handle_ops::{
+            inject_delete_status, inject_rename_status, take_last_delete_status,
+            take_last_rename_status,
+            test_support::{make_junction, snapshot},
+            DefiniteRefusal,
+        },
+        held_staging,
+        session::{create_error_may_follow_publication, replace_error_may_follow_publication},
+    };
+
+    const FOREIGN: &[u8] = b"SYNTHETIC-FOREIGN-BYTES-NOT-A-REAL-RECORD";
+    const COMPETITOR: &[u8] = b"SYNTHETIC-COMPETITOR-RECORD-BYTES";
+    const DECOY: &[u8] = b"synthetic unrelated decoy";
+
+    const DELETE: u32 = 0x0001_0000;
+
+    const STATUS_COLLISION: i32 = 0xC000_0035_u32 as i32;
+    const STATUS_NOT_SAME_DEVICE: i32 = 0xC000_00D4_u32 as i32;
+    const STATUS_NAME_INVALID: i32 = 0xC000_0033_u32 as i32;
+    const STATUS_INVALID_PARAMETER: i32 = 0xC000_000D_u32 as i32;
+    const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
+    const STATUS_SHARING_VIOLATION: i32 = 0xC000_0043_u32 as i32;
+
+    // ---- helpers ----------------------------------------------------------------
+
+    fn fail_at(store: &SyncStateStore, point: Point, kind: io::ErrorKind) {
+        store
+            .faults
+            .lock()
+            .unwrap()
+            .push((point, Action::Fail(kind)));
+    }
+
+    fn run_at(store: &SyncStateStore, point: Point, run: impl Fn() + Send + 'static) {
+        store
+            .faults
+            .lock()
+            .unwrap()
+            .push((point, Action::Run(Box::new(run))));
+    }
+
+    /// The staging artifacts of `key` in `dir`.
+    fn temps(dir: &Path, key: &str) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| is_artifact_name(name, key))
+            })
+            .map(|entry| entry.path())
+            .collect()
+    }
+
+    /// The single staging artifact; panics unless there is exactly one.
+    fn the_temp(dir: &Path, key: &str) -> PathBuf {
+        let mut found = temps(dir, key);
+
+        assert_eq!(found.len(), 1, "exactly one staging temp was expected");
+
+        found.pop().unwrap()
+    }
+
+    fn file_name_of(path: &Path) -> String {
+        path.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    fn sorted(mut list: Vec<String>) -> Vec<String> {
+        list.sort();
+
+        list
+    }
+
+    fn facts_at(path: &Path) -> HandleFacts {
+        facts_of(&File::open(path).unwrap()).unwrap()
+    }
+
+    fn identity_of(path: &Path) -> FileIdentity {
+        facts_at(path).identity()
+    }
+
+    fn link(existing: &Path, alias: &Path) {
+        fs::hard_link(existing, alias).unwrap();
+    }
+
+    fn lines_with(dir: &Path, needles: &[&str]) -> Vec<String> {
+        snapshot(dir)
+            .into_iter()
+            .filter(|line| needles.iter().any(|needle| line.contains(needle)))
+            .collect()
+    }
+
+    fn encoded() -> Vec<u8> {
+        state(LOCAL).encode().unwrap()
+    }
+
+    /// Run a real `cmd.exe` command line; returns its exit code (never trusted alone).
+    fn cmd(args: &[&std::ffi::OsStr]) -> Option<i32> {
+        Command::new("cmd")
+            .arg("/C")
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .code()
+    }
+
+    /// The seven substitution attempts of N1 against `temp`; the labels of those that
+    /// were NOT refused (must be empty).
+    fn substitutions_not_refused(temp: &Path, decoy: &Path, aside: &Path) -> Vec<&'static str> {
+        let attempts: Vec<(&'static str, bool)> = vec![
+            ("remove", fs::remove_file(temp).is_err()),
+            ("rename away", fs::rename(temp, aside).is_err()),
+            ("rename over", fs::rename(decoy, temp).is_err()),
+            ("replace bytes", fs::write(temp, FOREIGN).is_err()),
+            (
+                "write open",
+                OpenOptions::new().write(true).open(temp).is_err(),
+            ),
+            ("hard link", fs::hard_link(decoy, temp).is_err()),
+            (
+                "delete access",
+                OpenOptions::new()
+                    .read(true)
+                    .access_mode(DELETE)
+                    .open(temp)
+                    .is_err(),
+            ),
+        ];
+
+        attempts
+            .into_iter()
+            .filter(|(_, refused)| !refused)
+            .map(|(label, _)| label)
+            .collect()
+    }
+
+    struct Fx {
+        scratch: Scratch,
+        store: SyncStateStore,
+        dir: PathBuf,
+        key: String,
+        record: PathBuf,
+        leaf: String,
+    }
+
+    impl Fx {
+        fn new(name: &str) -> Self {
+            let scratch = Scratch::new(&format!("g12t2-{name}"));
+            let store = scratch.store();
+            let key = record_key(&loc(LOCAL));
+
+            // The shared reference scenario must not depend on earlier injections.
+            let _ = take_last_delete_status();
+            let _ = take_last_rename_status();
+
+            Self {
+                store,
+                dir: scratch.state_dir(),
+                record: scratch.record(LOCAL),
+                leaf: format!("{key}.json"),
+                key,
+                scratch,
+            }
+        }
+
+        fn root(&self) -> PathBuf {
+            self.scratch.root()
+        }
+
+        fn alias(&self) -> PathBuf {
+            self.root().join("alias.bin")
+        }
+
+        fn alias2(&self) -> PathBuf {
+            self.root().join("alias2.bin")
+        }
+
+        fn decoy(&self) -> PathBuf {
+            self.root().join("decoy.bin")
+        }
+
+        fn temp(&self) -> PathBuf {
+            the_temp(&self.dir, &self.key)
+        }
+
+        fn create(&self) -> Result<(), StoreError> {
+            self.store.create(&state(LOCAL))
+        }
+
+        fn at(&self, point: Point, run: impl Fn() + Send + 'static) {
+            run_at(&self.store, point, run);
+        }
+
+        fn fail(&self, point: Point, kind: io::ErrorKind) {
+            fail_at(&self.store, point, kind);
+        }
+
+        fn fresh(&self) -> SyncStateStore {
+            self.scratch.store()
+        }
+
+        /// A decoy of ours, outside the state directory, planted before `create`.
+        fn plant_decoy(&self) {
+            fs::write(self.decoy(), DECOY).unwrap();
+        }
+
+        fn assert_decoy(&self) {
+            assert_eq!(fs::read(self.decoy()).unwrap(), DECOY, "the decoy changed");
+        }
+
+        /// The record is a loadable, exact copy of the encoded state with one name.
+        fn assert_published_once(&self, label: &str) {
+            assert_eq!(fs::read(&self.record).unwrap(), encoded(), "{label}: bytes");
+            assert_eq!(facts_at(&self.record).link_count(), 1, "{label}: links");
+            assert_eq!(names(&self.dir), vec![self.leaf.clone()], "{label}: names");
+            assert!(
+                matches!(
+                    self.fresh().load(&loc(LOCAL)),
+                    StateLoad::Loaded(found) if *found == state(LOCAL)
+                ),
+                "{label}: load"
+            );
+        }
+    }
+
+    // ---- T1: the normal path ------------------------------------------------------
+
+    #[test]
+    fn t01_a_normal_create_publishes_exactly_the_staged_object() {
+        let fx = Fx::new("t01");
+        let staged: Arc<Mutex<Option<FileIdentity>>> = Arc::default();
+        let during: Arc<Mutex<Option<(FileIdentity, u32, bool)>>> = Arc::default();
+        let (dir, key, sink) = (fx.dir.clone(), fx.key.clone(), Arc::clone(&staged));
+        let (record, probe) = (fx.record.clone(), Arc::clone(&during));
+
+        // A fully sharing reader sees the staged object's identity while it is held.
+        fx.at(Point::TempSync, move || {
+            *sink.lock().unwrap() = Some(identity_of(&the_temp(&dir, &key)));
+        });
+        // U4: the independent no-follow reader works while the staging handle is held.
+        fx.at(Point::AfterRename, move || {
+            let file = open_no_follow(&record).unwrap();
+            let facts = facts_of(&file).unwrap();
+
+            *probe.lock().unwrap() = Some((
+                facts.identity(),
+                facts.link_count(),
+                facts.is_delete_pending(),
+            ));
+        });
+
+        assert_eq!(fx.create(), Ok(()));
+
+        let staged = staged.lock().unwrap().expect("the staged identity");
+        let (seen, links, pending) = during.lock().unwrap().expect("the U4 probe");
+
+        assert_eq!(seen, staged, "U4: the record opened while staging was held");
+        assert_eq!(links, 1);
+        assert!(!pending);
+        assert_eq!(
+            identity_of(&fx.record),
+            staged,
+            "the record IS the staged object"
+        );
+        fx.assert_published_once("t01");
+    }
+
+    // ---- T2: substitution attempts ---------------------------------------------------
+
+    #[test]
+    fn t02_every_substitution_attempt_is_refused_at_publish_and_at_cleanup() {
+        // At Publish: create still succeeds.
+        let fx = Fx::new("t02-publish");
+        let escaped: Arc<Mutex<Option<Vec<&'static str>>>> = Arc::default();
+        let (dir, key, decoy, aside, sink) = (
+            fx.dir.clone(),
+            fx.key.clone(),
+            fx.decoy(),
+            fx.root().join("aside.bin"),
+            Arc::clone(&escaped),
+        );
+
+        fx.plant_decoy();
+        fx.at(Point::Publish, move || {
+            let temp = the_temp(&dir, &key);
+
+            *sink.lock().unwrap() = Some(substitutions_not_refused(&temp, &decoy, &aside));
+        });
+
+        assert_eq!(fx.create(), Ok(()));
+        assert_eq!(escaped.lock().unwrap().clone(), Some(Vec::new()));
+        assert!(!fx.root().join("aside.bin").exists());
+        fx.assert_decoy();
+        fx.assert_published_once("t02-publish");
+
+        // At BeforeCleanup (a failed sync): the cleanup then removes only our staging.
+        let fx = Fx::new("t02-cleanup");
+        let escaped: Arc<Mutex<Option<Vec<&'static str>>>> = Arc::default();
+        let (dir, key, decoy, aside, sink) = (
+            fx.dir.clone(),
+            fx.key.clone(),
+            fx.decoy(),
+            fx.root().join("aside.bin"),
+            Arc::clone(&escaped),
+        );
+
+        fx.plant_decoy();
+        fx.at(Point::BeforeCleanup, move || {
+            let temp = the_temp(&dir, &key);
+
+            *sink.lock().unwrap() = Some(substitutions_not_refused(&temp, &decoy, &aside));
+        });
+        fx.fail(Point::TempSync, io::ErrorKind::Other);
+
+        assert_eq!(
+            fx.create(),
+            Err(StoreError::Io {
+                stage: IoStage::Sync,
+                kind: io::ErrorKind::Other
+            })
+        );
+        assert_eq!(escaped.lock().unwrap().clone(), Some(Vec::new()));
+        assert!(names(&fx.dir).is_empty(), "only our staging was removed");
+        assert!(!fx.root().join("aside.bin").exists());
+        fx.assert_decoy();
+    }
+
+    // ---- T3 - T11: hard links to the held staging -----------------------------------
+
+    #[test]
+    fn t03_an_alias_before_publication_retains_everything_and_blocks_a_reset_until_removed() {
+        let fx = Fx::new("t03");
+        let (dir, key, alias) = (fx.dir.clone(), fx.key.clone(), fx.alias());
+
+        fx.at(Point::Publish, move || link(&the_temp(&dir, &key), &alias));
+
+        let result = fx.create();
+
+        assert_eq!(result, Err(StoreError::IncompleteStagingCleanup));
+        assert!(create_error_may_follow_publication(result.unwrap_err()));
+
+        let temp = fx.temp();
+
+        assert!(!fx.record.exists(), "no record was published");
+        assert_eq!(names(&fx.dir), vec![file_name_of(&temp)]);
+        assert_eq!(identity_of(&temp), identity_of(&fx.alias()), "one object");
+        assert_eq!(facts_at(&temp).link_count(), 2);
+        assert_eq!(fs::read(&temp).unwrap(), encoded());
+        assert_eq!(fs::read(fx.alias()).unwrap(), encoded());
+
+        // The next load refuses, and a reset refuses ExtraNames and removes nothing.
+        let store = fx.fresh();
+
+        assert_eq!(
+            store.load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts)
+        );
+
+        let before = snapshot(fx.scratch.dir.path());
+
+        assert_eq!(
+            store.delete(&loc(LOCAL)),
+            Err(StoreError::RemovalRefused(RemovalRefusal::ExtraNames))
+        );
+        assert_eq!(
+            snapshot(fx.scratch.dir.path()),
+            before,
+            "nothing was removed"
+        );
+
+        // Once the test removes its own alias, the reset succeeds.
+        fs::remove_file(fx.alias()).unwrap();
+
+        assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
+        assert!(names(&fx.dir).is_empty());
+    }
+
+    #[test]
+    fn t04_an_alias_renamed_to_the_record_before_publication_is_ambiguous_and_resettable() {
+        let fx = Fx::new("t04");
+        let (dir, key, alias, record) = (
+            fx.dir.clone(),
+            fx.key.clone(),
+            fx.alias(),
+            fx.record.clone(),
+        );
+
+        fx.at(Point::Publish, move || {
+            link(&the_temp(&dir, &key), &alias);
+            fs::rename(&alias, &record).unwrap();
+        });
+
+        let result = fx.create();
+
+        assert_eq!(result, Err(StoreError::IncompleteStagingCleanup));
+
+        let temp = fx.temp();
+
+        assert_eq!(
+            names(&fx.dir),
+            sorted(vec![fx.leaf.clone(), file_name_of(&temp)])
+        );
+        assert_eq!(identity_of(&fx.record), identity_of(&temp), "one object");
+        assert_eq!(facts_at(&fx.record).link_count(), 2);
+        assert_eq!(fs::read(&fx.record).unwrap(), encoded());
+
+        // The existing reset path for a record plus one alias of it.
+        let store = fx.fresh();
+        let evidence = store.evidence(&loc(LOCAL)).unwrap();
+
+        assert_eq!(
+            store.delete_if_evidence_matches(&loc(LOCAL), &evidence),
+            Ok(DeleteOutcome::Removed)
+        );
+        assert!(names(&fx.dir).is_empty());
+    }
+
+    #[test]
+    fn t05_an_alias_elsewhere_in_the_call_gap_is_verification_failed_and_keeps_everything() {
+        let fx = Fx::new("t05");
+        let ours: Arc<Mutex<Option<FileIdentity>>> = Arc::default();
+        let (dir, key, alias, sink) = (
+            fx.dir.clone(),
+            fx.key.clone(),
+            fx.alias(),
+            Arc::clone(&ours),
+        );
+
+        fx.at(Point::BeforeNativeRename, move || {
+            let temp = the_temp(&dir, &key);
+
+            *sink.lock().unwrap() = Some(identity_of(&temp));
+            link(&temp, &alias);
+        });
+
+        let result = fx.create();
+
+        assert_eq!(result, Err(StoreError::VerificationFailed));
+        assert!(create_error_may_follow_publication(result.unwrap_err()));
+
+        let ours = ours.lock().unwrap().expect("our identity");
+
+        assert_eq!(
+            names(&fx.dir),
+            vec![fx.leaf.clone()],
+            "the staging name is gone"
+        );
+        assert_eq!(identity_of(&fx.record), ours, "the record is our object");
+        assert_eq!(facts_at(&fx.record).link_count(), 2);
+        assert_eq!(identity_of(&fx.alias()), ours, "the alias survives");
+        assert_eq!(fs::read(&fx.record).unwrap(), encoded());
+        assert_eq!(fs::read(fx.alias()).unwrap(), encoded());
+    }
+
+    #[test]
+    fn t06_an_alias_renamed_to_the_record_in_the_call_gap_is_a_verified_publication() {
+        // N5 through the real `create`. A same-object destination makes the handle-bound
+        // no-replace rename return `Renamed`; the physical evidence (identity, one name,
+        // exact bytes) establishes properties A, B and C. Property D (the record name was
+        // absent earlier) is NOT claimed and is not established.
+        let fx = Fx::new("t06");
+        let ours: Arc<Mutex<Option<FileIdentity>>> = Arc::default();
+        let (dir, key, alias, record, sink) = (
+            fx.dir.clone(),
+            fx.key.clone(),
+            fx.alias(),
+            fx.record.clone(),
+            Arc::clone(&ours),
+        );
+
+        fx.at(Point::BeforeNativeRename, move || {
+            let temp = the_temp(&dir, &key);
+
+            *sink.lock().unwrap() = Some(identity_of(&temp));
+            link(&temp, &alias);
+            fs::rename(&alias, &record).unwrap();
+        });
+
+        let result = fx.create();
+
+        eprintln!(
+            "OBSERVED T6 result={result:?} native={:?}",
+            take_last_rename_status()
+        );
+
+        assert_eq!(result, Ok(()));
+
+        let ours = ours.lock().unwrap().expect("our identity");
+
+        assert_eq!(identity_of(&fx.record), ours);
+        assert!(!fx.alias().exists());
+        fx.assert_published_once("t06");
+    }
+
+    #[test]
+    fn t07_two_aliases_with_one_renamed_to_the_record_is_never_a_verified_publication() {
+        let fx = Fx::new("t07");
+        let ours: Arc<Mutex<Option<FileIdentity>>> = Arc::default();
+        let (dir, key, alias, alias2, record, sink) = (
+            fx.dir.clone(),
+            fx.key.clone(),
+            fx.alias(),
+            fx.alias2(),
+            fx.record.clone(),
+            Arc::clone(&ours),
+        );
+
+        fx.at(Point::BeforeNativeRename, move || {
+            let temp = the_temp(&dir, &key);
+
+            *sink.lock().unwrap() = Some(identity_of(&temp));
+            link(&temp, &alias);
+            link(&temp, &alias2);
+            fs::rename(&alias, &record).unwrap();
+        });
+
+        let result = fx.create();
+
+        eprintln!(
+            "OBSERVED T7 result={result:?} native={:?} names={:?}",
+            take_last_rename_status(),
+            names(&fx.dir)
+        );
+
+        match result {
+            Err(StoreError::VerificationFailed) => {}
+            Ok(()) => panic!("T7 STOP: Ok(()) with extra names present"),
+            other => panic!("T7: the plan predicts VerificationFailed, observed {other:?}"),
+        }
+
+        let ours = ours.lock().unwrap().expect("our identity");
+        let links = facts_at(&fx.record).link_count();
+
+        eprintln!("OBSERVED T7 record links={links}");
+
+        assert_eq!(identity_of(&fx.record), ours);
+        assert_ne!(links, 1, "extra names must never verify");
+        assert_eq!(identity_of(&fx.alias2()), ours, "the second alias survives");
+        assert_eq!(fs::read(&fx.record).unwrap(), encoded());
+        assert_eq!(fs::read(fx.alias2()).unwrap(), encoded());
+    }
+
+    #[test]
+    fn t08_a_case_variant_of_the_record_name_is_decided_by_identity() {
+        let fx = Fx::new("t08");
+        let ours: Arc<Mutex<Option<FileIdentity>>> = Arc::default();
+        let variant = fx.dir.join(fx.leaf.to_uppercase());
+        let (dir, key, alias, sink) = (
+            fx.dir.clone(),
+            fx.key.clone(),
+            fx.alias(),
+            Arc::clone(&ours),
+        );
+        let hook_variant = variant.clone();
+
+        fx.at(Point::BeforeNativeRename, move || {
+            let temp = the_temp(&dir, &key);
+
+            *sink.lock().unwrap() = Some(identity_of(&temp));
+            link(&temp, &alias);
+            fs::rename(&alias, &hook_variant).unwrap();
+        });
+
+        let result = fx.create();
+        let after = names(&fx.dir);
+
+        eprintln!(
+            "OBSERVED T8 result={result:?} native={:?} names={after:?}",
+            take_last_rename_status()
+        );
+
+        let ours = ours.lock().unwrap().expect("our identity");
+
+        // Whatever the outcome, our object survives with exact bytes under every name
+        // it still has, and nothing foreign exists to be changed.
+        let named: Vec<&String> = after
+            .iter()
+            .filter(|name| identity_of(&fx.dir.join(name)) == ours)
+            .collect();
+
+        assert!(!named.is_empty(), "the staged object lost all its names");
+        assert_eq!(named.len(), after.len(), "no unexpected object appeared");
+
+        for name in &after {
+            assert_eq!(fs::read(fx.dir.join(name)).unwrap(), encoded());
+        }
+
+        match result {
+            Ok(()) => {
+                assert_eq!(after.len(), 1, "Ok(()) needs exactly one name");
+                assert_eq!(facts_at(&fx.record).link_count(), 1);
+                assert_eq!(identity_of(&fx.record), ours);
+            }
+            Err(
+                StoreError::VerificationFailed
+                | StoreError::IncompleteStagingCleanup
+                | StoreError::PublicationUnknown,
+            ) => {}
+            other => panic!("T8: unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t09_an_alias_after_the_rename_is_verification_failed_and_nothing_is_deleted() {
+        let fx = Fx::new("t09");
+        let (record, alias) = (fx.record.clone(), fx.alias());
+
+        fx.at(Point::AfterRename, move || link(&record, &alias));
+
+        assert_eq!(fx.create(), Err(StoreError::VerificationFailed));
+        assert_eq!(names(&fx.dir), vec![fx.leaf.clone()]);
+        assert_eq!(identity_of(&fx.alias()), identity_of(&fx.record));
+        assert_eq!(facts_at(&fx.record).link_count(), 2);
+        assert_eq!(fs::read(&fx.record).unwrap(), encoded());
+        assert_eq!(fs::read(fx.alias()).unwrap(), encoded());
+    }
+
+    #[test]
+    fn t10_an_alias_after_release_is_caught_by_the_final_read() {
+        let fx = Fx::new("t10");
+        let (record, alias) = (fx.record.clone(), fx.alias());
+
+        fx.at(Point::Verify, move || link(&record, &alias));
+
+        assert_eq!(fx.create(), Err(StoreError::VerificationFailed));
+        assert_eq!(names(&fx.dir), vec![fx.leaf.clone()]);
+        assert_eq!(identity_of(&fx.alias()), identity_of(&fx.record));
+        assert_eq!(facts_at(&fx.record).link_count(), 2);
+        assert_eq!(fs::read(&fx.record).unwrap(), encoded());
+    }
+
+    #[test]
+    fn t11_an_alias_removed_by_a_child_before_classification_still_verifies() {
+        let fx = Fx::new("t11");
+        let (dir, key, alias) = (fx.dir.clone(), fx.key.clone(), fx.alias());
+        let removed = alias.clone();
+        let hits = Arc::new(Mutex::new(0usize));
+        let counter = Arc::clone(&hits);
+
+        fx.at(Point::BeforeNativeRename, move || {
+            link(&the_temp(&dir, &key), &alias);
+        });
+        fx.at(Point::AfterRename, move || {
+            // A real child deletes the alias; the postcondition decides, not the exit code.
+            let code = cmd(&[
+                std::ffi::OsStr::new("del"),
+                std::ffi::OsStr::new("/F"),
+                removed.as_os_str(),
+            ]);
+
+            eprintln!("OBSERVED T11 child del exit={code:?}");
+
+            assert!(!removed.exists(), "the child did not remove the alias");
+
+            *counter.lock().unwrap() += 1;
+        });
+
+        assert_eq!(fx.create(), Ok(()));
+        assert_eq!(*hits.lock().unwrap(), 1);
+        assert!(!fx.alias().exists());
+        fx.assert_published_once("t11");
+    }
+
+    // ---- T12, T13: foreign objects at the record name ---------------------------------
+
+    #[test]
+    fn t12_a_foreign_file_directory_or_junction_at_the_record_is_never_touched() {
+        for kind in ["file", "directory", "junction"] {
+            let fx = Fx::new(&format!("t12-{kind}"));
+            let elsewhere = fx.root().join("junction-target");
+            let before: Arc<Mutex<Vec<String>>> = Arc::default();
+            let (record, leaf, dir, target, sink) = (
+                fx.record.clone(),
+                fx.leaf.clone(),
+                fx.dir.clone(),
+                elsewhere.clone(),
+                Arc::clone(&before),
+            );
+
+            fs::create_dir_all(&elsewhere).unwrap();
+            fs::write(elsewhere.join("inner.txt"), b"synthetic target").unwrap();
+
+            let elsewhere_before = snapshot(&elsewhere);
+
+            fx.at(Point::BeforeNativeRename, move || {
+                match kind {
+                    "file" => fs::write(&record, COMPETITOR).unwrap(),
+                    "directory" => {
+                        fs::create_dir(&record).unwrap();
+                        fs::write(record.join("inner.txt"), b"synthetic inner").unwrap();
+                    }
+                    _ => make_junction(&record, &target),
+                }
+
+                *sink.lock().unwrap() = lines_with(&dir, &[&leaf]);
+            });
+
+            assert_eq!(fx.create(), Err(StoreError::AlreadyExists), "{kind}");
+
+            let occupant = before.lock().unwrap().clone();
+
+            assert!(!occupant.is_empty(), "{kind}: an occupant existed");
+            assert_eq!(lines_with(&fx.dir, &[&fx.leaf]), occupant, "{kind}");
+            assert_eq!(
+                names(&fx.dir),
+                vec![fx.leaf.clone()],
+                "{kind}: our staging is gone"
+            );
+            assert_eq!(
+                snapshot(&elsewhere),
+                elsewhere_before,
+                "{kind}: nothing went through"
+            );
+
+            if kind == "file" {
+                assert_eq!(fs::read(&fx.record).unwrap(), COMPETITOR);
+            }
+        }
+    }
+
+    #[test]
+    fn t13_a_foreign_record_plus_an_alias_retains_the_staging_and_the_alias() {
+        let fx = Fx::new("t13");
+        let foreign_identity: Arc<Mutex<Option<FileIdentity>>> = Arc::default();
+        let (dir, key, alias, record, sink) = (
+            fx.dir.clone(),
+            fx.key.clone(),
+            fx.alias(),
+            fx.record.clone(),
+            Arc::clone(&foreign_identity),
+        );
+
+        fx.at(Point::BeforeNativeRename, move || {
+            fs::write(&record, COMPETITOR).unwrap();
+            *sink.lock().unwrap() = Some(identity_of(&record));
+            link(&the_temp(&dir, &key), &alias);
+        });
+
+        let result = fx.create();
+
+        assert_eq!(result, Err(StoreError::IncompleteStagingCleanup));
+        assert!(create_error_may_follow_publication(result.unwrap_err()));
+
+        let temp = fx.temp();
+
+        assert_eq!(
+            names(&fx.dir),
+            sorted(vec![fx.leaf.clone(), file_name_of(&temp)])
+        );
+        assert_eq!(
+            fs::read(&fx.record).unwrap(),
+            COMPETITOR,
+            "foreign is intact"
+        );
+        assert_eq!(
+            Some(identity_of(&fx.record)),
+            *foreign_identity.lock().unwrap(),
+            "and is the same foreign object"
+        );
+        assert_eq!(identity_of(&temp), identity_of(&fx.alias()));
+        assert_eq!(facts_at(&temp).link_count(), 2);
+        assert_eq!(fs::read(&temp).unwrap(), encoded());
+        assert_eq!(fs::read(fx.alias()).unwrap(), encoded());
+    }
+
+    // ---- T14 - T17: readers, children, fresh stores ------------------------------------
+
+    #[test]
+    fn t14_a_sharing_reader_during_a_failed_write_gives_only_the_two_accepted_outcomes() {
+        // U2: whether the name vanishes while a compatible reader is open is measured and
+        // printed. Both branches are safe; a definite error beside a surviving temp is not.
+        let fx = Fx::new("t14");
+        let held: Arc<Mutex<Option<File>>> = Arc::default();
+        let (dir, key, keep) = (fx.dir.clone(), fx.key.clone(), Arc::clone(&held));
+
+        fx.at(Point::StagingWrite, move || {
+            *keep.lock().unwrap() = Some(File::open(the_temp(&dir, &key)).unwrap());
+        });
+        fx.fail(Point::StagingWrite, io::ErrorKind::Other);
+
+        let error = fx.create().unwrap_err();
+        let leftover = names(&fx.dir);
+
+        match error {
+            StoreError::Io {
+                stage: IoStage::Write,
+                kind: io::ErrorKind::Other,
+            } => {
+                eprintln!("OBSERVED T14 branch=(a) mark proven; definite Io{{Write}}");
+                assert!(leftover.is_empty(), "(a): {leftover:?}");
+                assert!(!create_error_may_follow_publication(error));
+            }
+            StoreError::IncompleteStagingCleanup => {
+                eprintln!("OBSERVED T14 branch=(b) cleanup unproven; temp present");
+                assert_eq!(leftover.len(), 1, "(b): {leftover:?}");
+                assert!(create_error_may_follow_publication(error));
+            }
+            other => panic!("T14: unexpected {other:?}"),
+        }
+
+        held.lock().unwrap().take();
+    }
+
+    #[test]
+    fn t15_child_processes_cannot_read_rename_delete_or_overwrite_the_held_staging() {
+        // N8 through the real `create`. Exit codes are recorded; the POSTCONDITIONS decide.
+        let fx = Fx::new("t15");
+        let hits = Arc::new(Mutex::new(0usize));
+        let (dir, key, root, counter) =
+            (fx.dir.clone(), fx.key.clone(), fx.root(), Arc::clone(&hits));
+
+        fx.at(Point::Publish, move || {
+            use std::ffi::OsStr;
+
+            let temp = the_temp(&dir, &key);
+            let saved = facts_at(&temp);
+            let copy_out = root.join("t15-copy-out.bin");
+            let renamed = dir.join("t15-renamed.bin");
+            let os = OsStr::new;
+            let untouched = |label: &str| {
+                assert!(temp.exists(), "{label}: the staging name survived");
+                assert_eq!(facts_at(&temp), saved, "{label}: facts");
+                assert_eq!(fs::read(&temp).unwrap(), encoded(), "{label}: bytes");
+                assert_eq!(names(&dir), vec![file_name_of(&temp)], "{label}: names");
+            };
+
+            assert_eq!(cmd(&[os("type"), temp.as_os_str()]), Some(1), "type");
+            untouched("type");
+            assert_eq!(
+                cmd(&[os("ren"), temp.as_os_str(), os("t15-renamed.bin")]),
+                Some(1),
+                "ren"
+            );
+            assert!(!renamed.exists());
+            untouched("ren");
+            let _ = cmd(&[os("del"), os("/F"), temp.as_os_str()]);
+            untouched("del /F");
+            assert_eq!(
+                cmd(&[os("copy"), os("/Y"), os("NUL"), temp.as_os_str()]),
+                Some(1),
+                "copy onto"
+            );
+            untouched("copy NUL");
+            assert_eq!(
+                cmd(&[os("copy"), os("/Y"), temp.as_os_str(), copy_out.as_os_str()]),
+                Some(1),
+                "copy from"
+            );
+            assert!(!copy_out.exists());
+            untouched("copy from");
+
+            *counter.lock().unwrap() += 1;
+        });
+
+        assert_eq!(fx.create(), Ok(()));
+        assert_eq!(*hits.lock().unwrap(), 1, "the child commands ran");
+        fx.assert_published_once("t15");
+    }
+
+    #[test]
+    fn t16_a_fresh_store_cannot_delete_the_staging_of_a_create_in_progress() {
+        let fx = Fx::new("t16");
+        let seen: Arc<Mutex<Option<Result<DeleteOutcome, StoreError>>>> = Arc::default();
+        let (root, sink) = (fx.root(), Arc::clone(&seen));
+
+        fx.at(Point::TempSync, move || {
+            let other = SyncStateStore::new(&root).unwrap();
+
+            *sink.lock().unwrap() = Some(other.delete(&loc(LOCAL)));
+        });
+
+        assert_eq!(fx.create(), Ok(()));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(Err(StoreError::RemovalRefused(RemovalRefusal::Busy)))
+        );
+        fx.assert_published_once("t16");
+    }
+
+    #[test]
+    fn t17_a_second_create_during_staging_sees_the_artifact_and_the_first_still_wins() {
+        let fx = Fx::new("t17");
+        let seen: Arc<Mutex<Option<Result<(), StoreError>>>> = Arc::default();
+        let (root, sink) = (fx.root(), Arc::clone(&seen));
+
+        fx.at(Point::TempSync, move || {
+            let other = SyncStateStore::new(&root).unwrap();
+
+            *sink.lock().unwrap() = Some(other.create(&state(LOCAL)));
+        });
+
+        assert_eq!(fx.create(), Ok(()));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(Err(StoreError::UnresolvedArtifacts))
+        );
+        fx.assert_published_once("t17");
+    }
+
+    // ---- T18: concurrent creates --------------------------------------------------------
+
+    #[test]
+    fn t18_two_concurrent_creates_produce_exactly_one_record_and_no_temp() {
+        let mut wins = [0usize; 2];
+        let mut layout_refusals = 0usize;
+
+        for iteration in 0..25usize {
+            let scratch = Scratch::new(&format!("g12t2-t18-{iteration}"));
+            let barrier = Arc::new(Barrier::new(2));
+            let threads: Vec<_> = (0..2usize)
+                .map(|_| {
+                    let (barrier, root) = (Arc::clone(&barrier), scratch.root());
+
+                    std::thread::spawn(move || {
+                        let store = SyncStateStore::new(&root).unwrap();
+                        let candidate = state(LOCAL);
+                        let staged = Arc::new(AtomicBool::new(false));
+                        let flag = Arc::clone(&staged);
+
+                        // The first hook after this thread's own staging file exists.
+                        run_at(&store, Point::DirectoryRecheck, move || {
+                            flag.store(true, Ordering::SeqCst);
+                        });
+
+                        barrier.wait();
+
+                        (store.create(&candidate), staged.load(Ordering::SeqCst))
+                    })
+                })
+                .collect();
+            let outcomes: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+            let results: Vec<_> = outcomes.iter().map(|(result, _)| *result).collect();
+            let oks = results.iter().filter(|result| result.is_ok()).count();
+
+            assert_eq!(oks, 1, "iteration {iteration}: {outcomes:?}");
+
+            for (result, staged) in &outcomes {
+                match result {
+                    Ok(()) | Err(StoreError::AlreadyExists | StoreError::UnresolvedArtifacts) => {}
+                    // The EXISTING compatibility gate refuses closed when the directory
+                    // changed during its two-pass scan (`ChangedDuringScan`): the other
+                    // writer's staging file appeared or went. That refusal precedes this
+                    // thread's own pin and staging, so it is accepted ONLY for a thread
+                    // that never created a staging file.
+                    Err(StoreError::LayoutUncertain) if !staged => {
+                        layout_refusals += 1;
+                    }
+                    other => panic!("iteration {iteration}: {other:?} (staged={staged})"),
+                }
+            }
+
+            wins[usize::from(results[1].is_ok())] += 1;
+
+            let record = scratch.record(LOCAL);
+
+            assert_eq!(
+                names(&scratch.state_dir()),
+                vec![file_name_of(&record)],
+                "iteration {iteration}: one record and no temp"
+            );
+            assert_eq!(fs::read(&record).unwrap(), encoded());
+            assert_eq!(facts_at(&record).link_count(), 1);
+            assert!(matches!(
+                scratch.store().load(&loc(LOCAL)),
+                StateLoad::Loaded(found) if *found == state(LOCAL)
+            ));
+        }
+
+        eprintln!(
+            "OBSERVED T18 25 iterations: wins side0={} side1={} gate-refused-before-staging={layout_refusals}",
+            wins[0], wins[1]
+        );
+    }
+
+    // ---- T19: directory identity ---------------------------------------------------------
+
+    #[test]
+    fn t19_a_junction_before_the_pin_and_a_rename_of_the_pinned_directory_are_refused() {
+        // (a) A junction at the state directory before `create`: refused, and nothing
+        // is written through it.
+        {
+            let fx = Fx::new("t19-junction");
+            let elsewhere = fx.root().join("junction-target");
+
+            fs::create_dir_all(&elsewhere).unwrap();
+            fs::write(elsewhere.join("inner.txt"), b"synthetic target").unwrap();
+            make_junction(&fx.dir, &elsewhere);
+
+            let before = snapshot(&elsewhere);
+            let result = fx.create();
+
+            eprintln!("OBSERVED T19 junction result={result:?}");
+
+            assert!(result.is_err(), "a redirected directory must refuse");
+            assert_eq!(
+                snapshot(&elsewhere),
+                before,
+                "nothing went through the junction"
+            );
+            assert!(!fx.record.exists());
+        }
+
+        // (b) and (c): at Publish, the pinned directory cannot be renamed; the
+        // grandparent rename is printed and restored at once; never a false Ok.
+        let fx = Fx::new("t19-rename");
+        let outcomes: Arc<Mutex<Vec<String>>> = Arc::default();
+        let (dir, root, sink) = (fx.dir.clone(), fx.root(), Arc::clone(&outcomes));
+
+        fx.at(Point::Publish, move || {
+            let moved = root.join("sync-state-moved");
+            let sibling = root.with_file_name(format!("{}-g12t2-t19-moved", file_name_of(&root)));
+            let state_dir = fs::rename(&dir, &moved);
+            let grandparent = fs::rename(&root, &sibling);
+
+            if grandparent.is_ok() {
+                fs::rename(&sibling, &root).expect("the test directory must be restored");
+            }
+
+            sink.lock().unwrap().push(format!(
+                "state-dir={} grandparent={}",
+                if state_dir.is_ok() {
+                    "SUCCEEDED"
+                } else {
+                    "refused"
+                },
+                if grandparent.is_ok() {
+                    "SUCCEEDED (restored)"
+                } else {
+                    "refused"
+                }
+            ));
+        });
+
+        let result = fx.create();
+
+        eprintln!(
+            "OBSERVED T19 {:?} result={result:?}",
+            outcomes.lock().unwrap()
+        );
+
+        assert!(
+            outcomes.lock().unwrap()[0].starts_with("state-dir=refused"),
+            "the pinned directory was renamed"
+        );
+        assert!(fx.scratch.root().exists());
+
+        if result.is_ok() {
+            fx.assert_published_once("t19");
+        } else {
+            // Never a false Ok: an Err leaves either nothing or a retained, named state.
+            assert!(!matches!(result, Err(StoreError::AlreadyExists)));
+        }
+    }
+
+    // ---- T20: real process exit ---------------------------------------------------------
+
+    const CHILD_TEST: &str = "real_process_exit_child";
+    const ENV_POINT: &str = "LV_G12T2_CHILD";
+    const ENV_ROOT: &str = "LV_G12T2_ROOT";
+    const ENV_MARKER: &str = "LV_G12T2_MARKER";
+    const MARKER_FILE: &str = "g12t2-owner.marker";
+    const CHILD_PREFIX: &str = "g12t2-t20-";
+    const EXIT_CODE: i32 = 86;
+
+    fn scratch_base() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".qa-local")
+            .join("sync-state-b3c3b1-tests")
+    }
+
+    /// Everything the child must establish BEFORE it mutates anything.
+    fn child_fixture_is_the_parents(root: &Path, marker: &str) -> Result<(), &'static str> {
+        if !root.is_absolute() || marker.trim().is_empty() {
+            return Err("not absolute or no marker");
+        }
+
+        let base = fs::canonicalize(scratch_base()).map_err(|_| "base unresolvable")?;
+        let canonical = fs::canonicalize(root).map_err(|_| "root unresolvable")?;
+
+        if canonical.parent() != Some(base.as_path()) {
+            return Err("not an owned child of the scratch base");
+        }
+
+        let name = canonical
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        if !name.starts_with(CHILD_PREFIX) || root.file_name() != canonical.file_name() {
+            return Err("unexpected name or a redirection");
+        }
+
+        let lowered = canonical.to_string_lossy().to_ascii_lowercase();
+
+        if lowered.contains("\\appdata\\") || lowered.ends_with("\\appdata") {
+            return Err("application data");
+        }
+
+        match fs::read_to_string(root.join(MARKER_FILE)) {
+            Ok(found) if found == marker => {}
+            _ => return Err("marker mismatch"),
+        }
+
+        let contents: Vec<String> = names(root);
+
+        if contents != [MARKER_FILE] {
+            return Err("unexpected contents");
+        }
+
+        Ok(())
+    }
+
+    /// A NORMAL test (not ignored): it returns at once unless the parent invoked it with
+    /// its environment, `--exact` and the owned fixture.
+    #[test]
+    fn real_process_exit_child() {
+        let Some(selector) = std::env::var_os(ENV_POINT) else {
+            return;
+        };
+        let selector = selector.into_string().expect("the selector is text");
+        let args: Vec<String> = std::env::args().collect();
+
+        assert!(
+            args.iter().any(|arg| arg == "--exact")
+                && args.iter().any(|arg| arg.ends_with(CHILD_TEST)),
+            "the child was not invoked as the exact child test"
+        );
+
+        let root = PathBuf::from(std::env::var(ENV_ROOT).expect("root"));
+        let marker = std::env::var(ENV_MARKER).expect("marker");
+
+        if let Err(refusal) = child_fixture_is_the_parents(&root, &marker) {
+            panic!("the child refuses to mutate anything: {refusal}");
+        }
+
+        let store = SyncStateStore::new(&root).unwrap();
+        let announce = selector.clone();
+        let exit = move || {
+            eprintln!("G12T2-CHILD-EXIT-POINT {announce}");
+
+            std::process::exit(EXIT_CODE);
+        };
+
+        match selector.as_str() {
+            "StagingWrite" => run_at(&store, Point::StagingWrite, exit),
+            "TempSync" => run_at(&store, Point::TempSync, exit),
+            "Publish" => run_at(&store, Point::Publish, exit),
+            "AfterRename" => run_at(&store, Point::AfterRename, exit),
+            "AfterMark" => {
+                fail_at(&store, Point::TempSync, io::ErrorKind::Other);
+                held_staging::set_after_mark_hook(exit);
+            }
+            other => panic!("unknown selector {other}"),
+        }
+
+        let _ = store.create(&state(LOCAL));
+
+        panic!("the selected exit point was never reached");
+    }
+
+    #[test]
+    fn t20_a_real_process_exit_at_each_point_leaves_a_classifiable_state() {
+        assert!(
+            std::env::var_os(ENV_POINT).is_none(),
+            "recursion guard: the parent must not run inside the child"
+        );
+
+        for point in [
+            "StagingWrite",
+            "TempSync",
+            "Publish",
+            "AfterRename",
+            "AfterMark",
+        ] {
+            let scratch = Scratch::new(&format!("{CHILD_PREFIX}{}", point.to_ascii_lowercase()));
+            let marker = Uuid::new_v4().to_string();
+
+            fs::write(scratch.root().join(MARKER_FILE), &marker).unwrap();
+            assert_eq!(
+                child_fixture_is_the_parents(&scratch.root(), &marker),
+                Ok(())
+            );
+
+            let test_path = format!(
+                "{}::{CHILD_TEST}",
+                module_path!().split_once("::").expect("a crate prefix").1
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    test_path.as_str(),
+                    "--exact",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(ENV_POINT, point)
+                .env(ENV_ROOT, scratch.root())
+                .env(ENV_MARKER, &marker)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let store = scratch.store();
+            let load = store.load(&loc(LOCAL));
+            let found = names(&scratch.state_dir());
+
+            eprintln!(
+                "OBSERVED T20 point={point} exit={:?} load={load:?} entries={found:?}",
+                output.status.code()
+            );
+
+            assert_eq!(
+                output.status.code(),
+                Some(EXIT_CODE),
+                "{point}: unexpected child status\nstderr: {stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("G12T2-CHILD-EXIT-POINT {point}")),
+                "{point}: the child did not report the selected exit point"
+            );
+
+            match point {
+                "StagingWrite" | "TempSync" | "Publish" => {
+                    assert_eq!(
+                        load,
+                        StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts),
+                        "{point}"
+                    );
+                    assert_eq!(found.len(), 1, "{point}: one staging file");
+                    assert!(is_artifact_name(&found[0], &record_key(&loc(LOCAL))));
+                }
+                "AfterRename" => {
+                    assert!(
+                        matches!(&load, StateLoad::Loaded(state_found) if **state_found == state(LOCAL)),
+                        "{point}: {load:?}"
+                    );
+                    assert_eq!(found, vec![format!("{}.json", record_key(&loc(LOCAL)))]);
+                    assert_eq!(facts_at(&scratch.record(LOCAL)).link_count(), 1);
+                    assert_eq!(fs::read(scratch.record(LOCAL)).unwrap(), encoded());
+                }
+                _ => {
+                    assert_eq!(load, StateLoad::NotConfigured, "{point}");
+                    assert!(found.is_empty(), "{point}: {found:?}");
+                }
+            }
+
+            if point == "StagingWrite" {
+                // A reset then resolves the abandoned staging file.
+                assert_eq!(store.delete(&loc(LOCAL)), Ok(DeleteOutcome::Removed));
+                assert!(names(&scratch.state_dir()).is_empty());
+                assert_eq!(store.load(&loc(LOCAL)), StateLoad::NotConfigured);
+            }
+        }
+    }
+
+    // ---- the mandatory post-Renamed regression -------------------------------------------
+
+    #[test]
+    fn after_a_native_renamed_a_failing_hook_is_unverified_never_cleaned_up_and_never_unpublished()
+    {
+        // If the native rename returned `Renamed`, an interruption at AfterRename may
+        // already have a publication behind it: no cleanup, no retry, never `NotPersisted`,
+        // the published object and every foreign file kept.
+        for kind in [io::ErrorKind::Other, io::ErrorKind::Interrupted] {
+            let fx = Fx::new("after-renamed");
+            let unrelated = fx.dir.join("unrelated-decoy.txt");
+
+            fs::create_dir_all(&fx.dir).unwrap();
+            fs::write(&unrelated, DECOY).unwrap();
+
+            let unrelated_before = lines_with(&fx.dir, &["unrelated-decoy"]);
+
+            fx.fail(Point::AfterRename, kind);
+
+            let result = fx.create();
+
+            assert_eq!(result, Err(StoreError::VerificationFailed), "{kind:?}");
+            assert!(
+                create_error_may_follow_publication(result.unwrap_err()),
+                "{kind:?}: never classified as definitely unpublished"
+            );
+            assert_eq!(
+                take_last_rename_status(),
+                Some(0),
+                "{kind:?}: the native rename"
+            );
+            assert_eq!(take_last_delete_status(), None, "{kind:?}: no cleanup ran");
+            assert_eq!(
+                names(&fx.dir),
+                sorted(vec![fx.leaf.clone(), file_name_of(&unrelated)]),
+                "{kind:?}: the published object is retained and nothing else appeared"
+            );
+            assert_eq!(fs::read(&fx.record).unwrap(), encoded(), "{kind:?}");
+            assert_eq!(facts_at(&fx.record).link_count(), 1);
+            assert_eq!(
+                lines_with(&fx.dir, &["unrelated-decoy"]),
+                unrelated_before,
+                "{kind:?}: no foreign file changed"
+            );
+            assert_eq!(
+                fx.fresh().load(&loc(LOCAL)),
+                StateLoad::Loaded(Box::new(state(LOCAL))),
+                "{kind:?}: a later fresh load finds the record"
+            );
+        }
+    }
+
+    // ---- fault injection (all results are INJECTED, not native) ---------------------------
+
+    #[test]
+    fn injected_write_and_sync_failures_leave_no_staging_and_a_definite_error() {
+        for (point, stage, kind) in [
+            (Point::StagingWrite, IoStage::Write, io::ErrorKind::Other),
+            (
+                Point::TempSync,
+                IoStage::Sync,
+                io::ErrorKind::PermissionDenied,
+            ),
+        ] {
+            let fx = Fx::new("fi-write");
+
+            fx.fail(point, kind);
+
+            let result = fx.create();
+
+            assert_eq!(result, Err(StoreError::Io { stage, kind }), "{point:?}");
+            assert!(!create_error_may_follow_publication(result.unwrap_err()));
+            assert!(names(&fx.dir).is_empty(), "{point:?}: no temp, no record");
+            assert!(
+                take_last_delete_status().is_some(),
+                "{point:?}: one cleanup"
+            );
+            assert_eq!(fx.fresh().load(&loc(LOCAL)), StateLoad::NotConfigured);
+        }
+    }
+
+    #[test]
+    fn injected_identity_and_directory_recheck_failures_are_layout_uncertain_and_clean() {
+        for point in [Point::StagingFacts, Point::DirectoryRecheck] {
+            let fx = Fx::new("fi-facts");
+
+            fx.fail(point, io::ErrorKind::Other);
+
+            let result = fx.create();
+
+            assert_eq!(result, Err(StoreError::LayoutUncertain), "{point:?}");
+            assert!(!create_error_may_follow_publication(result.unwrap_err()));
+            assert!(names(&fx.dir).is_empty(), "{point:?}");
+            assert!(
+                take_last_delete_status().is_some(),
+                "{point:?}: one cleanup"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_cleanup_failures_replace_the_original_error_and_retain_the_staging() {
+        // BeforeCleanup failure, a refused delete, and a delete reported as success
+        // without a mark: each is IncompleteStagingCleanup, the staging is retained with
+        // its bytes, and nothing is retried (a retry would have removed it).
+        for label in [
+            "before cleanup",
+            "delete refused",
+            "delete ok without a mark",
+        ] {
+            let fx = Fx::new("fi-cleanup");
+            let expected_delete = match label {
+                "before cleanup" => {
+                    fx.fail(Point::BeforeCleanup, io::ErrorKind::Other);
+
+                    None
+                }
+                "delete refused" => {
+                    fx.at(Point::BeforeCleanup, || {
+                        inject_delete_status(STATUS_ACCESS_DENIED)
+                    });
+
+                    Some(STATUS_ACCESS_DENIED)
+                }
+                _ => {
+                    fx.at(Point::BeforeCleanup, || inject_delete_status(0));
+
+                    Some(0)
+                }
+            };
+
+            fx.fail(Point::TempSync, io::ErrorKind::Other);
+
+            let result = fx.create();
+
+            assert_eq!(result, Err(StoreError::IncompleteStagingCleanup), "{label}");
+            assert!(create_error_may_follow_publication(result.unwrap_err()));
+            assert_eq!(take_last_delete_status(), expected_delete, "{label}");
+
+            let temp = fx.temp();
+
+            assert_eq!(names(&fx.dir), vec![file_name_of(&temp)], "{label}");
+            assert_eq!(
+                fs::read(&temp).unwrap(),
+                encoded(),
+                "{label}: bytes retained"
+            );
+            assert!(!fx.record.exists(), "{label}");
+            assert_eq!(
+                fx.fresh().load(&loc(LOCAL)),
+                StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_definite_rename_refusals_with_proven_ownership_clean_up_and_say_so() {
+        let other = StoreError::Io {
+            stage: IoStage::Replace,
+            kind: io::ErrorKind::Other,
+        };
+
+        for (label, status, expected) in [
+            (
+                "name collision",
+                STATUS_COLLISION,
+                StoreError::AlreadyExists,
+            ),
+            ("not same device", STATUS_NOT_SAME_DEVICE, other),
+            ("name invalid", STATUS_NAME_INVALID, other),
+            ("invalid parameter", STATUS_INVALID_PARAMETER, other),
+            (
+                "access denied",
+                STATUS_ACCESS_DENIED,
+                StoreError::Io {
+                    stage: IoStage::Replace,
+                    kind: io::ErrorKind::PermissionDenied,
+                },
+            ),
+            ("sharing violation", STATUS_SHARING_VIOLATION, other),
+        ] {
+            let fx = Fx::new("fi-refusal");
+
+            fx.at(Point::BeforeNativeRename, move || {
+                inject_rename_status(status)
+            });
+
+            let result = fx.create();
+
+            assert_eq!(result, Err(expected), "{label}");
+            assert_eq!(take_last_rename_status(), Some(status), "{label}");
+            assert!(take_last_delete_status().is_some(), "{label}: one cleanup");
+            assert!(names(&fx.dir).is_empty(), "{label}: temp gone, no record");
+        }
+    }
+
+    #[test]
+    fn an_injected_refusal_with_an_alias_present_retains_the_staging() {
+        let fx = Fx::new("fi-refusal-alias");
+        let (dir, key, alias) = (fx.dir.clone(), fx.key.clone(), fx.alias());
+
+        fx.at(Point::BeforeNativeRename, move || {
+            link(&the_temp(&dir, &key), &alias);
+            inject_rename_status(STATUS_ACCESS_DENIED);
+        });
+
+        assert_eq!(fx.create(), Err(StoreError::IncompleteStagingCleanup));
+        assert_eq!(take_last_delete_status(), None, "no delete call was made");
+
+        let temp = fx.temp();
+
+        assert_eq!(identity_of(&temp), identity_of(&fx.alias()));
+        assert_eq!(facts_at(&temp).link_count(), 2);
+        assert_eq!(fs::read(&temp).unwrap(), encoded());
+    }
+
+    #[test]
+    fn an_injected_success_without_a_rename_is_unverified_and_nothing_is_deleted() {
+        let fx = Fx::new("fi-status-zero");
+
+        fx.at(Point::BeforeNativeRename, || inject_rename_status(0));
+
+        assert_eq!(fx.create(), Err(StoreError::VerificationFailed));
+        assert_eq!(take_last_rename_status(), Some(0));
+        assert_eq!(take_last_delete_status(), None, "nothing was deleted");
+        assert!(
+            !fx.record.exists(),
+            "no record (a retry would have made one)"
+        );
+
+        let temp = fx.temp();
+
+        assert_eq!(names(&fx.dir), vec![file_name_of(&temp)]);
+        assert_eq!(fs::read(&temp).unwrap(), encoded());
+    }
+
+    #[test]
+    fn injected_unclassified_statuses_are_publication_unknown_with_no_cleanup_and_no_retry() {
+        for status in [
+            0x0000_0103,
+            0x8000_0005_u32 as i32,
+            1,
+            0x4000_0000,
+            0xC000_0001_u32 as i32,
+        ] {
+            let fx = Fx::new("fi-unknown");
+
+            fx.at(Point::BeforeNativeRename, move || {
+                inject_rename_status(status)
+            });
+
+            let result = fx.create();
+
+            assert_eq!(result, Err(StoreError::PublicationUnknown), "{status:#x}");
+            assert!(create_error_may_follow_publication(result.unwrap_err()));
+            assert_eq!(take_last_rename_status(), Some(status));
+            assert_eq!(
+                take_last_delete_status(),
+                None,
+                "{status:#x}: no delete call"
+            );
+            assert!(!fx.record.exists(), "{status:#x}: not retried");
+
+            let temp = fx.temp();
+
+            assert_eq!(fs::read(&temp).unwrap(), encoded(), "{status:#x}: retained");
+        }
+    }
+
+    // ---- pure tests ------------------------------------------------------------------------
+
+    fn facts(links: u32, pending: bool, id: u8, kind: FileSystemKind, local: bool) -> HandleFacts {
+        HandleFacts::for_test(7, [id; 16], links, pending, kind, local)
+    }
+
+    fn good() -> HandleFacts {
+        facts(1, false, 1, FileSystemKind::Ntfs, true)
+    }
+
+    fn read_of(facts: HandleFacts, bytes: &[u8]) -> PhysicalRead {
+        PhysicalRead {
+            facts,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn pure_classify_renamed_is_verified_only_when_every_field_holds() {
+        let bytes = b"synthetic candidate bytes";
+        let saved = good();
+        let held = Ok(saved);
+        let verdict = |saved: &HandleFacts,
+                       held: &Result<HandleFacts, IdentityError>,
+                       directory: bool,
+                       record: Option<&PhysicalRead>,
+                       expected: &[u8]| {
+            classify_renamed(saved, held, directory, record, expected)
+        };
+        let record = read_of(saved, bytes);
+
+        assert_eq!(
+            verdict(&saved, &held, true, Some(&record), bytes),
+            RenamedVerdict::Verified
+        );
+
+        // The held facts.
+        let other_identity = Ok(facts(1, false, 2, FileSystemKind::Ntfs, true));
+        let two_links = Ok(facts(2, false, 1, FileSystemKind::Ntfs, true));
+        let pending = Ok(facts(1, true, 1, FileSystemKind::Ntfs, true));
+
+        for (label, held) in [
+            ("query failed", Err(IdentityError::Lookup)),
+            ("unsupported", Err(IdentityError::Unsupported)),
+            ("another identity", other_identity),
+            ("two links", two_links),
+            ("delete-pending", pending),
+        ] {
+            assert_eq!(
+                verdict(&saved, &held, true, Some(&record), bytes),
+                RenamedVerdict::Unverified,
+                "held: {label}"
+            );
+        }
+
+        // The saved facts themselves must be the single-link, local NTFS ones.
+        for (label, bad) in [
+            (
+                "saved two links",
+                facts(2, false, 1, FileSystemKind::Ntfs, true),
+            ),
+            (
+                "saved pending",
+                facts(1, true, 1, FileSystemKind::Ntfs, true),
+            ),
+            (
+                "saved not NTFS",
+                facts(1, false, 1, FileSystemKind::Refs, true),
+            ),
+            (
+                "saved not local",
+                facts(1, false, 1, FileSystemKind::Ntfs, false),
+            ),
+        ] {
+            assert_eq!(
+                verdict(&bad, &Ok(bad), true, Some(&read_of(bad, bytes)), bytes),
+                RenamedVerdict::Unverified,
+                "{label}"
+            );
+        }
+
+        // The directory and the independent record read.
+        assert_eq!(
+            verdict(&saved, &held, false, Some(&record), bytes),
+            RenamedVerdict::Unverified,
+            "directory changed"
+        );
+        assert_eq!(
+            verdict(&saved, &held, true, None, bytes),
+            RenamedVerdict::Unverified,
+            "record unreadable"
+        );
+
+        for (label, facts) in [
+            (
+                "record other identity",
+                facts(1, false, 2, FileSystemKind::Ntfs, true),
+            ),
+            (
+                "record two links",
+                facts(2, false, 1, FileSystemKind::Ntfs, true),
+            ),
+            (
+                "record zero links",
+                facts(0, false, 1, FileSystemKind::Ntfs, true),
+            ),
+            (
+                "record pending",
+                facts(1, true, 1, FileSystemKind::Ntfs, true),
+            ),
+            (
+                "record not NTFS",
+                facts(1, false, 1, FileSystemKind::Refs, true),
+            ),
+            (
+                "record not local",
+                facts(1, false, 1, FileSystemKind::Ntfs, false),
+            ),
+        ] {
+            assert_eq!(
+                verdict(&saved, &held, true, Some(&read_of(facts, bytes)), bytes),
+                RenamedVerdict::Unverified,
+                "{label}"
+            );
+        }
+
+        for (label, found) in [
+            ("record other bytes", b"synthetic candidate byteZ".to_vec()),
+            ("record shorter", bytes[..bytes.len() - 1].to_vec()),
+            ("record longer", [bytes.as_slice(), b"!"].concat()),
+            ("record empty", Vec::new()),
+        ] {
+            assert_eq!(
+                verdict(&saved, &held, true, Some(&read_of(saved, &found)), bytes),
+                RenamedVerdict::Unverified,
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn pure_record_confirms_needs_the_physical_match_and_the_intended_state() {
+        let intended = state(LOCAL);
+        let bytes = encoded();
+        let saved = good();
+
+        assert!(record_confirms(
+            &saved,
+            &read_of(saved, &bytes),
+            &bytes,
+            &intended
+        ));
+        // Same physical facts and bytes, but the bytes do not decode to the intended state.
+        let garbage = b"synthetic bytes that decode to nothing".to_vec();
+
+        assert!(!record_confirms(
+            &saved,
+            &read_of(saved, &garbage),
+            &garbage,
+            &intended
+        ));
+        assert!(!record_confirms(
+            &saved,
+            &read_of(facts(2, false, 1, FileSystemKind::Ntfs, true), &bytes),
+            &bytes,
+            &intended
+        ));
+        assert!(!record_confirms(
+            &saved,
+            &read_of(saved, &bytes),
+            &bytes,
+            &state(OTHER_LOCAL)
+        ));
+    }
+
+    #[test]
+    fn pure_the_two_new_errors_are_ambiguous_in_both_session_classifications() {
+        for error in [
+            StoreError::PublicationUnknown,
+            StoreError::IncompleteStagingCleanup,
+        ] {
+            assert!(create_error_may_follow_publication(error), "{error:?}");
+            assert!(replace_error_may_follow_publication(error), "{error:?}");
+        }
+
+        // The definite ones stay definite for `create`.
+        for error in [
+            StoreError::AlreadyExists,
+            StoreError::NoClobberUnsupported,
+            StoreError::UnresolvedArtifacts,
+            StoreError::Io {
+                stage: IoStage::Open,
+                kind: io::ErrorKind::Other,
+            },
+        ] {
+            assert!(!create_error_may_follow_publication(error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn pure_refusals_map_to_the_approved_errors() {
+        let io_replace = |kind| StoreError::Io {
+            stage: IoStage::Replace,
+            kind,
+        };
+
+        assert_eq!(
+            refusal_error(DefiniteRefusal::NameCollision),
+            StoreError::AlreadyExists
+        );
+        assert_eq!(
+            refusal_error(DefiniteRefusal::AccessDenied),
+            io_replace(io::ErrorKind::PermissionDenied)
+        );
+
+        for refusal in [
+            DefiniteRefusal::NotSameDevice,
+            DefiniteRefusal::NameInvalid,
+            DefiniteRefusal::InvalidParameter,
+            DefiniteRefusal::SharingViolation,
+        ] {
+            assert_eq!(refusal_error(refusal), io_replace(io::ErrorKind::Other));
+        }
+
+        assert_eq!(rejected_error(), io_replace(io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn pure_the_new_errors_and_the_staging_value_reveal_nothing() {
+        let scratch = Scratch::new("g12t2-redaction");
+        let path = scratch.root().join("SECRET-NAME-MARK.bin");
+        let staging = held_staging::StagingFile::create_new(&path).unwrap();
+        let mut shown = vec![
+            format!("{:?}", StoreError::PublicationUnknown),
+            StoreError::PublicationUnknown.to_string(),
+            format!("{:?}", StoreError::IncompleteStagingCleanup),
+            StoreError::IncompleteStagingCleanup.to_string(),
+            format!("{staging:?}"),
+            format!("{:?}", RenamedVerdict::Verified),
+            format!("{:?}", RenamedVerdict::Unverified),
+        ];
+
+        shown.push(format!("{:?}", read_of(good(), b"SECRET-BYTES").facts));
+
+        for text in &shown {
+            for mark in [
+                "SECRET",
+                ".tmp",
+                ".json",
+                "\\",
+                "0x",
+                ".qa-local",
+                "LOCAL-MARKER",
+            ] {
+                assert!(!text.contains(mark), "{mark:?} in {text}");
+            }
+        }
+
+        assert_ne!(
+            StoreError::PublicationUnknown.to_string(),
+            StoreError::IncompleteStagingCleanup.to_string()
+        );
+    }
+
+    #[test]
+    fn pure_the_staging_name_grammar_is_the_recognized_artifact_grammar() {
+        let key = record_key(&loc(LOCAL));
+        let token = Uuid::new_v4().simple().to_string();
+        let name = format!("{key}.{token}.{ARTIFACT_EXTENSION}");
+
+        assert!(is_artifact_name(&name, &key));
+        assert!(!is_artifact_name(&name, &record_key(&loc(OTHER_LOCAL))));
+        assert!(!is_artifact_name(&format!("{key}.{token}.bin"), &key));
+        assert!(!is_artifact_name(&format!("{key}.json"), &key));
+        assert_eq!(token.len(), ARTIFACT_TOKEN_LEN);
+
+        // The REAL grammar: a retained staging file is exactly one recognized artifact.
+        let fx = Fx::new("grammar");
+
+        fx.fail(Point::TempSync, io::ErrorKind::Other);
+        fx.fail(Point::BeforeCleanup, io::ErrorKind::Other);
+
+        assert_eq!(fx.create(), Err(StoreError::IncompleteStagingCleanup));
+
+        let temp = fx.temp();
+
+        assert!(is_artifact_name(&file_name_of(&temp), &fx.key));
+        assert_eq!(
+            fx.fresh().load(&loc(LOCAL)),
+            StateLoad::Unreadable(UnreadableReason::UnresolvedArtifacts),
+            "the gate reads it as an artifact, never as an unrecognized entry"
+        );
+    }
+
+    #[test]
+    fn pure_source_scans_pin_one_publication_and_no_cleanup_after_renamed_or_unknown() {
         let source = include_str!("sync_state_store.rs");
         let production = &source[..source
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("the first test module")];
+        let body = |signature: &str| -> &str {
+            let start = production.find(signature).expect(signature);
 
-        assert_eq!(production.matches("fs::hard_link(").count(), 1);
-        assert_eq!(production.matches("fs::remove_file(").count(), 3);
+            &production[start..start + production[start..].find("\n    }\n").unwrap()]
+        };
 
-        let signature = "pub fn create(&self, state: &SyncState) -> Result<(), StoreError> {";
-        let start = production.find(signature).expect("create");
-        let body = &production[start..start + production[start..].find("\n    }\n").unwrap()];
+        let publish = body("fn publish_staged(");
 
-        assert!(
-            body.contains("fs::hard_link("),
-            "the guard is anchored on the right body"
-        );
-        assert!(!body.contains("rename_into_directory_no_replace"));
+        // Exactly one native publication and no loop around it: nothing retries.
+        assert_eq!(publish.matches("publish_no_replace(").count(), 1);
+        assert!(!publish.contains("loop {") && !publish.contains("while "));
+        assert_eq!(publish.matches("legacy_gate(").count(), 0);
+
+        // The Renamed and Unknown arms never reach any cleanup path.
+        let renamed_arm = &publish[publish.find("RenameStatus::Renamed =>").unwrap()
+            ..publish.find("RenameStatus::Refused(").unwrap()];
+
+        for forbidden in [
+            "cleanup_staging",
+            "abandon",
+            "after_refusal",
+            "delete_by_handle",
+        ] {
+            assert!(
+                !renamed_arm.contains(forbidden),
+                "{forbidden} in the Renamed/Unknown arms"
+            );
+        }
+
+        // The AfterRename hook runs inside the Renamed arm, before any classification.
+        let hook = renamed_arm.find("Point::AfterRename").expect("hook");
+        let classify = renamed_arm.find("classify_renamed(").expect("classify");
+
+        assert!(hook < classify);
+
+        // The create body and the cleanup helpers make no path mutation.
+        for signature in [
+            "pub fn create(&self, state: &SyncState) -> Result<(), StoreError> {",
+            "fn publish_staged(",
+            "fn create_staging(",
+            "fn cleanup_staging(",
+            "fn after_refusal(",
+        ] {
+            let text = body(signature);
+
+            for forbidden in [
+                "fs::rename(",
+                "hard_link",
+                "remove_file",
+                "fs::write(",
+                "fs::copy(",
+            ] {
+                assert!(!text.contains(forbidden), "{forbidden} in {signature}");
+            }
+        }
     }
 }

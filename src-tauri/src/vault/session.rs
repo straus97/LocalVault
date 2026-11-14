@@ -2631,21 +2631,29 @@ pub(crate) fn replace_error_may_follow_publication(error: StoreError) -> bool {
         // Only the deletion produces it (and only before any removal); neither
         // `replace` nor `create` can, so an unexpected one fails closed.
         | StoreError::RemovalRefused(_)
-        | StoreError::IncompleteDeletion => true,
+        | StoreError::IncompleteDeletion
+        // G12T-2: produced only by the handle-bound `create`; ambiguous by definition,
+        // so an unexpected one here fails closed as well.
+        | StoreError::PublicationUnknown
+        | StoreError::IncompleteStagingCleanup => true,
     }
 }
 
 /// Whether a `SyncStateStore::create` error could have happened at or after
-/// publication. Derived from the store's own sequence: encoding, the directory,
-/// the existence check, the artifact scan and temp staging (`Directory`,
-/// `Inspect`, `Scan`, `Open`, `Write`, `Sync`) all fail before the hard link and
-/// leave the record unpublished, and `AlreadyExists` and `NoClobberUnsupported`
-/// are the link itself refusing, so nothing was created by this call. Any other
-/// failure of the link (`Replace`, which `create` reports for a link error that
-/// is neither of those) cannot be shown not to have published, and
-/// `VerificationFailed` is by construction post-publication. The match is
-/// exhaustive on purpose; an error `create` does not produce, or one that is not
-/// understood, fails closed as ambiguous.
+/// publication. Derived from the store's own sequence (handle-bound since G12T-2):
+/// encoding, the directory, the existence check, the artifact scan, the directory pin
+/// and staging (`Directory`, `Inspect`, `Scan`, `Open`, `Write`, `Sync`) all fail before
+/// the rename and leave the record unpublished, and `AlreadyExists` (a refused or
+/// pre-detected collision) and `NoClobberUnsupported` (the directory cannot be pinned as
+/// a plain directory on local NTFS) mean nothing was created by this call. A definite
+/// error is returned only when the staging file was also **proven removed**; an
+/// unproven removal becomes `IncompleteStagingCleanup`, which is ambiguous, so a definite
+/// error never coexists with a surviving staging file. Any other failure of the rename
+/// (`Replace`) cannot be shown not to have published; `VerificationFailed` is by
+/// construction post-publication; `PublicationUnknown` (an unclassified rename status or
+/// a contradicted refusal) is ambiguous by definition. None of them grants a retry, a
+/// reset or an overwrite. The match is exhaustive on purpose; an error `create` does not
+/// produce, or one that is not understood, fails closed as ambiguous.
 pub(crate) fn create_error_may_follow_publication(error: StoreError) -> bool {
     use super::sync_state_store::IoStage;
 
@@ -2687,7 +2695,11 @@ pub(crate) fn create_error_may_follow_publication(error: StoreError) -> bool {
         | StoreError::TrustedHistoryRegression
         // Only the deletion produces it; `create` cannot, so it fails closed.
         | StoreError::RemovalRefused(_)
-        | StoreError::IncompleteDeletion => true,
+        | StoreError::IncompleteDeletion
+        // G12T-2: the two ambiguous outcomes of the handle-bound `create`. Neither is a
+        // definite "not published"; neither grants a retry, a reset or an overwrite.
+        | StoreError::PublicationUnknown
+        | StoreError::IncompleteStagingCleanup => true,
     }
 }
 
@@ -6682,6 +6694,9 @@ mod tests {
                 StoreError::IncompleteDeletion,
                 // Produced only by a deletion; fails closed here.
                 StoreError::RemovalRefused(crate::vault::sync_state_store::RemovalRefusal::Busy),
+                // G12T-2: the two ambiguous outcomes of the handle-bound `create`.
+                StoreError::PublicationUnknown,
+                StoreError::IncompleteStagingCleanup,
             ] {
                 assert!(
                     create_error_may_follow_publication(ambiguous),

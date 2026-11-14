@@ -17,7 +17,11 @@
 //!
 //! This module knows nothing about record keys, file-name grammar or which files a
 //! reset may remove: the store decides that, and passes paths. It creates, moves,
-//! links and writes nothing. It adds no native call, no foreign function and no
+//! links and writes nothing. Since G12T-2 two of its pieces are also used by
+//! `held_staging` (the creation of a new record): [`DirectoryPin`] (with its borrowed
+//! handle, for the handle-bound rename) and the pure mark judgment [`judge_mark`].
+//! That adds no removal path here: [`HeldFile`] is still the only way this module
+//! marks a file. It adds no native call, no foreign function and no
 //! dependency: it composes `new_copy_file::open_directory_pin`,
 //! `file_identity::{facts_of, directory_identity_of}` and `handle_ops::delete_by_handle`.
 //!
@@ -121,6 +125,9 @@ impl DirectoryPin {
     /// **handle**: a plain directory, not a reparse point, on local NTFS, not
     /// delete-pending, with a meaningful identity. Any failure is
     /// [`RemovalRefusal::DirectoryUnsupported`]; nothing has been touched.
+    ///
+    /// Since G12T-2 the same pin also holds the directory for the legacy `create`
+    /// (see `held_staging`); this function and its refusal are unchanged.
     pub(crate) fn acquire(dir: &Path) -> Result<Self, RemovalRefusal> {
         let handle = open_directory_pin(dir).map_err(|_| RemovalRefusal::DirectoryUnsupported)?;
 
@@ -147,6 +154,13 @@ impl DirectoryPin {
             Ok(fresh) => directory_identity_of(&fresh) == Ok(self.identity),
             Err(_) => false,
         }
+    }
+
+    /// The pinned directory handle, borrowed. For the handle-bound rename into the
+    /// directory (`handle_ops::rename_into_directory_no_replace`) only: the pin stays
+    /// owned by the caller, and nothing else is exposed.
+    pub(crate) fn handle(&self) -> &File {
+        &self.handle
     }
 }
 
@@ -271,8 +285,9 @@ pub(crate) enum RemovalMark {
 /// handle had when it was judged, `after` the result of the query made on the same
 /// handle after the native call. The identity and the physical invariants are
 /// compared one by one: the whole facts are not compared, because the delete-pending
-/// flag and the link count legitimately change at a mark.
-fn judge_mark(
+/// flag and the link count legitimately change at a mark. `pub(crate)` since G12T-2:
+/// `held_staging` judges the mark of a staging file with this same function.
+pub(crate) fn judge_mark(
     native_ok: bool,
     after: Result<HandleFacts, IdentityError>,
     saved: &HandleFacts,

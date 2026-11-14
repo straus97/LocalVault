@@ -11,8 +11,12 @@
 //!
 //! Callers of [`delete_by_handle`]: `new_copy_file` removes its own staging file
 //! with it, and, since Stage 1U-4 B3c-3b-2d-1, `held_removal` removes legacy
-//! sync-state files with it, each through a handle it held and verified. That second
-//! use added no native code here. It reads the result from the same handle:
+//! sync-state files with it, each through a handle it held and verified. Since
+//! G12T-2, `held_staging` (the staging file of the legacy sync-state `create`) is a
+//! third caller of both functions: it renames its held staging file into the pinned
+//! directory with [`rename_into_directory_no_replace`] and, only after proving
+//! ownership, removes it with [`delete_by_handle`]. The later uses added no native
+//! code here. It reads the result from the same handle:
 //! **Observed (build 19045, local NTFS):** after a successful call the handle reports
 //! delete-pending and one link fewer (`1 -> 0` for a single-name file, `2 -> 1` for
 //! one of two names), the name stays visible until the handle closes, and the other
